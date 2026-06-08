@@ -1,6 +1,6 @@
 # shale
 
-Horizontal-scale layer for embedded KV stores. Each instance you import is a cluster node; consistent hashing distributes keys across nodes; durability is whatever backend you plug in (SlateDB on object storage by default).
+Horizontal-scale layer for embedded KV stores. Each instance you import is a cluster node; consistent hashing distributes keys across nodes; durability is whatever backend you plug in.
 
 ```go
 import "github.com/Zamua/shale/pkg/cluster"
