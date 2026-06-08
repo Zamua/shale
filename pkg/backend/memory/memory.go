@@ -1,5 +1,5 @@
 // Package memory provides an in-process map-backed Backend. Used by
-// tests + dev tools. Not durable — every restart loses data. Not
+// tests + dev tools. Not durable - every restart loses data. Not
 // shardable on its own; the cluster layer handles sharding by
 // instantiating one Memory backend per node.
 package memory

@@ -2,13 +2,13 @@
 // this package + call cluster.Open(cfg) to get a Cluster handle that
 // routes KV operations across nodes.
 //
-// v0.1 (current): single-node mode only — Cluster wraps one Backend
+// v0.1 (current): single-node mode only - Cluster wraps one Backend
 // directly. Calling cluster.Open without any peer config gives you a
 // functioning KV API that just delegates to the local Backend. This
 // is the API lockup release; useful for apps that may scale-out
 // later but want the same import + interface today.
 //
-// v0.2 (planned): multi-node mode — Cluster uses memberlist for
+// v0.2 (planned): multi-node mode - Cluster uses memberlist for
 // membership discovery + buraksezer/consistent for the hash ring +
 // gRPC for inter-node forwarding. Peer config in Config enables it.
 //
@@ -85,7 +85,7 @@ func (c *Cluster) Put(key, value []byte) error {
 	if c.backend == nil {
 		return backend.ErrClosed
 	}
-	// v0.1: single-node — delegate. v0.2+: ring.LocateKey + maybe gRPC.
+	// v0.1: single-node - delegate. v0.2+: ring.LocateKey + maybe gRPC.
 	return c.backend.Put(key, value)
 }
 
@@ -106,8 +106,8 @@ func (c *Cluster) Delete(key []byte) error {
 }
 
 // ScanPrefix returns an iterator over keys with the given prefix on
-// the owning shard. In multi-node mode this is single-shard only —
-// the prefix is treated as a shard key + routed to that shard. For
+// the owning shard. In multi-node mode this is single-shard only:
+// the prefix is treated as a shard key and routed to that shard. For
 // cross-shard scans, use Aggregate.
 func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	if c.backend == nil {
@@ -129,7 +129,7 @@ func (c *Cluster) Begin(level backend.IsolationLevel) (backend.Transaction, erro
 // Aggregate runs fn locally on each node's Backend in parallel +
 // collects the per-node results. Use for cross-shard operations
 // (admin lists, full-table scans, computed aggregates). NOT for
-// hot-path queries — use shard-aware key design for those.
+// hot-path queries - use shard-aware key design for those.
 //
 // In v0.1 single-node mode, fn runs once locally + the result is a
 // 1-element slice.

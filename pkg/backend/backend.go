@@ -5,15 +5,15 @@
 // owns a slice of the keyspace + exposes raw KV operations on it.
 //
 // Implementations shipped:
-//   - pkg/backend/memory   — in-process map; tests + local dev
-//   - pkg/backend/slate    — SlateDB-on-object-storage (planned)
+//   - pkg/backend/memory   - in-process map; tests + local dev
+//   - pkg/backend/slate    - SlateDB-on-object-storage (planned)
 //
 // BYO: implement this interface for any KV-shaped engine. The contract
 // is deliberately minimal so it's hard to write a wrong implementation.
 package backend
 
 // Backend is the per-node storage engine. All operations are LOCAL to
-// this node's slice of the keyspace — the cluster layer ensures keys
+// this node's slice of the keyspace - the cluster layer ensures keys
 // are routed to the right Backend before any of these methods are
 // called.
 type Backend interface {
@@ -23,7 +23,7 @@ type Backend interface {
 	// Get returns the value for key, or (nil, ErrNotFound) if absent.
 	Get(key []byte) ([]byte, error)
 
-	// Delete removes key. Idempotent — deleting an absent key is OK.
+	// Delete removes key. Idempotent - deleting an absent key is OK.
 	Delete(key []byte) error
 
 	// ScanPrefix iterates over all keys (in key-ascending order) that
@@ -31,7 +31,7 @@ type Backend interface {
 	ScanPrefix(prefix []byte) (Iterator, error)
 
 	// Begin starts a transaction at the given isolation level. The
-	// transaction is local to this Backend — cluster.go's transaction
+	// transaction is local to this Backend - cluster.go's transaction
 	// proxy ensures all keys touched in one transaction belong to the
 	// same shard before delegating here.
 	Begin(level IsolationLevel) (Transaction, error)

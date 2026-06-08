@@ -1,4 +1,4 @@
-# shale — contributor guide
+# shale - contributor guide
 
 Read this before doing substantive work on shale. Read [`docs/SPEC.md`](docs/SPEC.md) next for what shale actually does.
 
@@ -14,7 +14,7 @@ Before any code change that adds or alters product behavior:
 2. Confirm the spec already describes what you're about to build. If not, edit the spec first, re-read it, confirm it still hangs together as a whole.
 3. Then write the code.
 
-In a single commit, the spec should reflect the behavior the code in that commit implements — not what existed before, not what we plan next. The spec is the source of truth for what shale does. The code is the implementation.
+In a single commit, the spec should reflect the behavior the code in that commit implements - not what existed before, not what we plan next. The spec is the source of truth for what shale does. The code is the implementation.
 
 ### Implementation discipline: DDD + TDD
 
