@@ -10,8 +10,9 @@ import (
 
 // runTopology handles `shale topology`. With --json, emits a
 // structured object compatible with `jq`. Without --json, prints a
-// short human summary - in single-node v0.1 that's literally
-// "single-node cluster, node=<id>", matching the spec.
+// short human summary: "single-node cluster, node=<id>" when there is
+// exactly one node, otherwise a header + one line per node with the
+// local node tagged "(this)".
 func runTopology(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("topology", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -48,6 +49,7 @@ func runTopology(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 		type nodeOut struct {
 			NodeID   string `json:"node_id"`
 			GRPCAddr string `json:"grpc_addr,omitempty"`
+			IsSelf   bool   `json:"is_self"`
 		}
 		out := struct {
 			NodeID     string    `json:"node_id"`
@@ -62,6 +64,7 @@ func runTopology(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 			out.Nodes = append(out.Nodes, nodeOut{
 				NodeID:   n.GetNodeId(),
 				GRPCAddr: n.GetGrpcAddr(),
+				IsSelf:   n.GetNodeId() == resp.GetNodeId(),
 			})
 		}
 		enc := json.NewEncoder(stdout)
@@ -76,14 +79,16 @@ func runTopology(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "single-node cluster, node=%s\n", resp.GetNodeId())
 		return exitOK
 	}
-	// v0.2+ multi-node: list each node on its own line.
-	fmt.Fprintf(stdout, "cluster, local-node=%s, %d nodes:\n", resp.GetNodeId(), len(resp.GetNodes()))
+	// Multi-node: header + one line per node. The local node is
+	// tagged "(this)" so an operator scanning the output sees which
+	// node served the RPC at a glance.
+	fmt.Fprintf(stdout, "cluster: %d nodes\n", len(resp.GetNodes()))
 	for _, n := range resp.GetNodes() {
-		if addr := n.GetGrpcAddr(); addr != "" {
-			fmt.Fprintf(stdout, "  %s @ %s\n", n.GetNodeId(), addr)
-		} else {
-			fmt.Fprintf(stdout, "  %s\n", n.GetNodeId())
+		suffix := ""
+		if n.GetNodeId() == resp.GetNodeId() {
+			suffix = "  (this)"
 		}
+		fmt.Fprintf(stdout, "  %s  %s%s\n", n.GetNodeId(), n.GetGrpcAddr(), suffix)
 	}
 	return exitOK
 }
