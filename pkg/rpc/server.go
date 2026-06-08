@@ -102,10 +102,15 @@ func (s *Server) ScanPrefix(req *pb.ScanPrefixRequest, stream grpc.ServerStreami
 
 func (s *Server) Topology(_ context.Context, _ *pb.TopologyRequest) (*pb.TopologyResponse, error) {
 	id := s.c.NodeID()
+	members := s.c.Members()
+	nodes := make([]*pb.NodeInfo, 0, len(members))
+	for _, m := range members {
+		nodes = append(nodes, &pb.NodeInfo{NodeId: m.ID, GrpcAddr: m.Addr})
+	}
 	return &pb.TopologyResponse{
 		NodeId:     id,
-		SingleNode: true,
-		Nodes:      []*pb.NodeInfo{{NodeId: id}},
+		SingleNode: len(nodes) <= 1,
+		Nodes:      nodes,
 	}, nil
 }
 
