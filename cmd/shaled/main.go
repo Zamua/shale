@@ -79,22 +79,27 @@ func run(argv []string, stderr *os.File) error {
 		return err
 	}
 
+	// We must reserve the gRPC listener BEFORE opening the cluster so
+	// that the GRPCAddr we broadcast to peers is the resolved bound
+	// address (matters when --grpc-addr uses port 0 for an ephemeral
+	// listener; tests do this).
+	lis, err := net.Listen("tcp", cfg.grpcAddr)
+	if err != nil {
+		_ = closeBackend()
+		return fmt.Errorf("listen %s: %w", cfg.grpcAddr, err)
+	}
+
 	c, err := cluster.Open(cluster.Config{
 		NodeID:   cfg.nodeID,
 		Backend:  be,
 		BindAddr: cfg.bindAddr,
+		GRPCAddr: lis.Addr().String(),
 		Seeds:    cfg.seeds,
 	})
 	if err != nil {
+		_ = lis.Close()
 		_ = closeBackend()
 		return fmt.Errorf("open cluster: %w", err)
-	}
-
-	lis, err := net.Listen("tcp", cfg.grpcAddr)
-	if err != nil {
-		_ = c.Close()
-		_ = closeBackend()
-		return fmt.Errorf("listen %s: %w", cfg.grpcAddr, err)
 	}
 
 	grpcServer := grpc.NewServer()
@@ -102,9 +107,9 @@ func run(argv []string, stderr *os.File) error {
 
 	logger.Printf("shaled: node=%s grpc=%s backend=%s",
 		cfg.nodeID, lis.Addr().String(), cfg.backend)
-	if cfg.bindAddr != "" || len(cfg.seeds) > 0 {
-		logger.Printf("shaled: bind-addr=%s seeds=%v (reserved for v0.2, unused in v0.1)",
-			cfg.bindAddr, cfg.seeds)
+	if cfg.bindAddr != "" {
+		logger.Printf("shaled: bind-addr=%s seeds=%v", cfg.bindAddr, cfg.seeds)
+		logger.Printf("shaled: joined cluster, members=%d", len(c.Members()))
 	}
 
 	// Serve in the background; surface listener errors back on serveErr.
