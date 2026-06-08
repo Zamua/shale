@@ -2,23 +2,6 @@
 
 Horizontal-scale layer for embedded KV stores. Each instance you import is a cluster node; consistent hashing distributes keys across nodes; durability is whatever backend you plug in.
 
-```go
-import "github.com/Zamua/shale/pkg/cluster"
-
-c, _ := cluster.Open(cluster.Config{
-    NodeID:   "node-1",
-    BindAddr: ":7946",
-    Seeds:    []string{"node-2:7946", "node-3:7946"},
-    Backend:  slate.New(slate.Config{Bucket: "my-data", ...}),
-})
-defer c.Close()
-
-c.Put([]byte("user:alice"), []byte("data"))
-val, _ := c.Get([]byte("user:alice"))
-```
-
-The cluster layer routes `user:alice` to whichever node owns that hash range, forwards over gRPC, and writes through to that node's local backend. Add a node → keys rebalance with minimal data movement. Remove a node → ownership shifts.
-
 ## Why it exists
 
 Sharded KV stores either:
