@@ -5,10 +5,10 @@ go 1.25.4
 require (
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
+	slatedb.io/slatedb-go v0.13.1
 )
 
 require (
-	github.com/buraksezer/consistent v0.10.0 // indirect
 	golang.org/x/net v0.51.0 // indirect
 	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.34.0 // indirect
