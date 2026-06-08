@@ -1,0 +1,8 @@
+/bin/
+/vendor/
+*.test
+*.out
+.DS_Store
+*.log
+/dist/
+/coverage.*
