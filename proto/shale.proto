@@ -1,0 +1,146 @@
+// shale.proto - the gRPC service exposed by every shale node.
+//
+// In v0.1, this is the only protocol the shale CLI uses to talk to a
+// running shaled. Starting in v0.2 (multi-node), it ALSO serves as the
+// inter-node forwarding protocol: when node A receives a Put for a key
+// owned by node B, A forwards the operation to B via this same service.
+// One protocol, two callers; keeps the wire surface small.
+//
+// Transactions (Backend.Begin / Commit / Rollback) are intentionally
+// NOT exposed in v0.1. A streaming transaction RPC needs careful design
+// around connection lifetime + idempotency + cross-shard rejection; it
+// will land in v0.2+ alongside the rest of the multi-node machinery.
+// Local-process apps that need transactions today should use the
+// cluster.Cluster.Begin API directly without going through gRPC.
+syntax = "proto3";
+
+package shale.v1;
+
+option go_package = "github.com/Zamua/shale/pkg/rpc/proto;shalepb";
+
+// ShaleNode is what a shaled process serves on its gRPC listen address.
+// All methods are per-key operations or cluster-wide queries; nothing
+// here is shard-aware on the wire (the server decides locally whether
+// to handle a key or, in v0.2+, forward it).
+service ShaleNode {
+  // Put stores value under key.
+  rpc Put(PutRequest) returns (PutResponse);
+
+  // Get returns the value for key. If absent, the response has
+  // not_found=true + an empty value (instead of a gRPC error code, so
+  // callers don't have to distinguish "absent" from "transport error").
+  rpc Get(GetRequest) returns (GetResponse);
+
+  // Delete removes key. Idempotent: deleting an absent key succeeds.
+  rpc Delete(DeleteRequest) returns (DeleteResponse);
+
+  // ScanPrefix server-streams every key/value pair whose key starts
+  // with the given prefix, in key-ascending order. The stream closes
+  // cleanly when the scan is exhausted.
+  rpc ScanPrefix(ScanPrefixRequest) returns (stream ScanPrefixResponse);
+
+  // Topology describes the current cluster membership + ring layout.
+  // In v0.1 single-node mode, single_node=true + nodes contains exactly
+  // this one node. In v0.2+ it reports the full memberlist view.
+  rpc Topology(TopologyRequest) returns (TopologyResponse);
+
+  // Stats returns per-node counters: how many keys this node holds,
+  // request counts since process start, latency percentiles. The
+  // percentile fields are placeholders in v0.1 (always zero) until the
+  // observability work in v0.5 wires up a real histogram.
+  rpc Stats(StatsRequest) returns (StatsResponse);
+
+  // Ping is a no-op round trip for liveness checks. Useful for the CLI
+  // `shale ping` subcommand + for inter-node health probes later.
+  rpc Ping(PingRequest) returns (PingResponse);
+}
+
+// -- Put -------------------------------------------------------------
+
+message PutRequest {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+message PutResponse {}
+
+// -- Get -------------------------------------------------------------
+
+message GetRequest {
+  bytes key = 1;
+}
+
+message GetResponse {
+  bytes value = 1;
+  bool not_found = 2;
+}
+
+// -- Delete ----------------------------------------------------------
+
+message DeleteRequest {
+  bytes key = 1;
+}
+
+message DeleteResponse {}
+
+// -- ScanPrefix ------------------------------------------------------
+
+message ScanPrefixRequest {
+  bytes prefix = 1;
+}
+
+message ScanPrefixResponse {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+// -- Topology --------------------------------------------------------
+
+message TopologyRequest {}
+
+message TopologyResponse {
+  // node_id of the node that served this RPC (the local node).
+  string node_id = 1;
+
+  // single_node is true when this is a v0.1-style standalone node with
+  // no peers. Callers can short-circuit ring-display logic in that case.
+  bool single_node = 2;
+
+  // nodes is the full membership view as seen by this node. In v0.1
+  // it contains a single entry (this node).
+  repeated NodeInfo nodes = 3;
+}
+
+message NodeInfo {
+  string node_id = 1;
+  string grpc_addr = 2;
+}
+
+// -- Stats -----------------------------------------------------------
+
+message StatsRequest {}
+
+message StatsResponse {
+  // keys_held is the number of keys the local Backend currently owns.
+  // Computed via a prefix-scan of the empty prefix in v0.1; a future
+  // version will switch to a maintained counter.
+  uint64 keys_held = 1;
+
+  // Lifetime request counters since process start.
+  uint64 puts = 2;
+  uint64 gets = 3;
+  uint64 deletes = 4;
+  uint64 scans = 5;
+
+  // Latency percentiles (milliseconds). Placeholders in v0.1 (zero);
+  // wired up to a real histogram in v0.5 alongside the Prometheus
+  // metrics work.
+  double latency_ms_p50 = 6;
+  double latency_ms_p99 = 7;
+}
+
+// -- Ping ------------------------------------------------------------
+
+message PingRequest {}
+
+message PingResponse {}

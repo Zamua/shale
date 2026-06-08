@@ -67,6 +67,9 @@ func Open(cfg Config) (*Cluster, error) {
 	return &Cluster{cfg: cfg, backend: cfg.Backend}, nil
 }
 
+// NodeID returns this node's stable identity, as supplied in Config.
+func (c *Cluster) NodeID() string { return c.cfg.NodeID }
+
 // Close releases all cluster resources. After Close, no other method
 // may be called. Idempotent.
 func (c *Cluster) Close() error {
