@@ -278,6 +278,88 @@ The CLI + shaled aren't "nice-to-have"; they're the daily-driver tools for every
 
 ---
 
+## System testing
+
+Local multi-node testing on a single machine is a first-class workflow. It validates the distributed-systems correctness (routing, membership transitions, rebalancing) in a controllable environment without paying for a real cloud cluster.
+
+### Available per version
+
+  - **v0.1**: NOT available. v0.1 ships single-node only. Multiple shaled processes run side-by-side but are independent islands; no cross-node routing.
+  - **v0.2+**: full local multi-node testing. N shaled processes join a single logical cluster via memberlist + gRPC forwarding. Throughput tests + topology-change tests become possible.
+  - **v0.3+**: rebalancing tests (kill a node, watch keys migrate to survivors; bring the node back, watch keys rebalance home).
+  - **v0.4+**: replication tests (with R>1, kill a node mid-test, observe reads + writes continue against the surviving replicas).
+
+### Local 3-node cluster (v0.2+ example)
+
+Each node uses a distinct bucket prefix in shared object storage so their SlateDB stores don't conflict on the single-writer epoch:
+
+```
+# shared object storage (any S3-compatible; local MinIO works)
+# each node writes under its own prefix:
+#   shale-test/node-1/
+#   shale-test/node-2/
+#   shale-test/node-3/
+
+shaled --node-id n1 --grpc-addr :7947 --bind-addr :7946 \
+       --backend slate --slate-bucket shale-test --slate-db-name node-1 \
+       --slate-endpoint http://localhost:9000 ...
+
+shaled --node-id n2 --grpc-addr :7949 --bind-addr :7948 --seeds 127.0.0.1:7946 \
+       --backend slate --slate-bucket shale-test --slate-db-name node-2 ...
+
+shaled --node-id n3 --grpc-addr :7951 --bind-addr :7950 --seeds 127.0.0.1:7946 \
+       --backend slate --slate-bucket shale-test --slate-db-name node-3 ...
+
+# inspect + load test
+shale topology --addr 127.0.0.1:7947   # all 3 nodes + ring assignments
+shale bench --addr 127.0.0.1:7947 --writes 100k --keys-prefix bench:
+```
+
+`shale bench` (v0.5+) reports aggregate throughput, per-node request distribution, p50/p99 latencies.
+
+### Throughput scaling expectations
+
+On a single local machine, throughput should grow as nodes are added until a shared bottleneck is hit:
+
+  - **CPU**: linear up to about (cores - 1) nodes. Each shaled process is small but each one runs its own SlateDB compaction, gRPC handlers, etc.
+  - **Object storage**: usually the dominant bottleneck. A single local MinIO process serializes I/O; aggregate write throughput plateaus once MinIO saturates regardless of how many shaled nodes are above it.
+  - **Local loopback network**: not a real constraint at our scales.
+
+To exercise more dramatic local scaling, run multiple MinIO instances (each on its own port) and point each shaled node at its own dedicated MinIO. Bottleneck then moves to NVMe + CPU; typical 4-6x linear scaling before hitting limits on a beefy dev machine.
+
+True linear scaling requires distributing nodes across machines (or against a managed object store like R2/S3 with independent capacity per shard). The local single-machine test demonstrates the routing + load-distribution patterns; cloud testing validates the linear-scaling claim under real network + storage isolation.
+
+### Topology-change tests
+
+The more valuable local tests are the failure-injection ones:
+
+  1. **Node kill**: start 3 nodes serving 100k keys; pull the plug on one mid-test.
+     - v0.2 with R=1: requests for that node's keys fail. Cluster topology view shrinks.
+     - v0.4+ with R>1: replicas take over reads + writes seamlessly.
+
+  2. **Node return**: bring the killed node back.
+     - v0.2: it rejoins as an empty node. New keys hashing to it will land; old keys it used to own stay on the temporary takeover node (which v0.2 doesn't have, so they're just gone).
+     - v0.3+: rebalancer migrates keys back from successors; ownership returns to the rejoined node.
+
+  3. **Network partition**: simulate one side losing sight of the other (block memberlist UDP between two groups of processes).
+     - v0.2 with R=1: both sides accept writes to keys they think they own. On heal, writes diverge; conflicts resolve via LWW or whatever policy is configured.
+     - v0.4+ with R>=2: quorum reads/writes prevent split-brain divergence.
+
+  4. **Slow node**: tc/iptables-induce 500ms latency on one node's gRPC.
+     - Validates timeouts + retries at the cluster layer.
+     - Validates that the bounded-loads consistent hashing doesn't pile work onto a struggling node.
+
+  5. **Backend failure**: kill the MinIO instance one node depends on.
+     - Validates that the node detects the failure, marks itself unhealthy, propagates that to memberlist, peers route around it.
+
+### Test framework
+
+The `tests/integration/` directory (per CLAUDE.md layout) holds in-process tests that spin up N nodes via goroutines + ephemeral ports. No external services required for the basic correctness tests. The MinIO-backed scaling tests are separate (`tests/scaling/`) and require an operator to bring up MinIO first.
+
+The CI matrix runs the integration tests on every PR; the scaling tests run on demand.
+
+---
+
 ## Roadmap
 
 - [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.
