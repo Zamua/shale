@@ -215,18 +215,79 @@ If a transaction touches keys owned by multiple nodes, shale returns an error. A
 
 ---
 
+## CLI + standalone binary
+
+shale ships two binaries from v0.1, separate from the library import path. Their purpose is dev-cycle ergonomics: poking at a running cluster from the shell, spinning up nodes for integration tests, inspecting topology + state during debugging.
+
+### `shaled` (standalone node)
+
+Runs a shale node as its own process, without an app embedding it. Backend chosen via flag. Useful for:
+  - Integration tests (shell scripts spin up N nodes on ephemeral ports)
+  - Local multi-node dev clusters
+  - Operators who want a managed shale process per host (instead of embedding inside their app)
+
+```
+shaled \
+  --node-id node-1 \
+  --bind-addr :7946 \
+  --grpc-addr :7947 \
+  --seeds node-2:7946,node-3:7946 \
+  --backend memory|slate \
+  --slate-bucket my-bucket           # if --backend=slate
+```
+
+shaled exposes the same gRPC service the inter-node forwarding layer uses. The CLI talks to it via that gRPC. For v0.1 (single-node), shaled is functional standalone: one node, one Backend, gRPC up so the CLI can hit it.
+
+### `shale` (CLI)
+
+Connects to ONE node's gRPC endpoint (via `--addr` flag or `SHALE_NODE` env, defaults to `127.0.0.1:7947`). All subcommands are operator + developer ergonomics; they're NOT a replacement for the library API (apps embed shale, they don't shell out to it).
+
+Subcommands shipped in v0.1:
+
+  - `shale put <key> <value>` - one-shot write; the node routes per the ring (single-node in v0.1 = always local)
+  - `shale get <key>` - one-shot read; prints value to stdout, exits non-zero on not-found
+  - `shale delete <key>` - one-shot delete; idempotent
+  - `shale scan <prefix>` - prints key=value pairs for everything under prefix
+  - `shale topology` - prints the cluster membership + ring: which nodes exist, what range each owns. In single-node v0.1, prints "single-node cluster, node=<id>"
+  - `shale stats` - per-node counters: key count, request rate, p50/p99 latency for Put/Get
+  - `shale ping` - liveness check; exits 0 if the node responds
+
+Subcommands shipped in later versions:
+
+  - v0.3+: `shale rebalance` - trigger immediate rebalance (normally automatic)
+  - v0.3+: `shale migrate-from <backend-spec>` - one-shot migrator from an existing backend (e.g. raw SlateDB) into the shale cluster
+  - v0.5+: `shale bench` - load tester; reads + writes at configurable rates
+
+### Output conventions
+
+  - One value per line on stdout, parseable by shell tools
+  - Status / errors on stderr
+  - Exit codes: 0 success, 1 generic error, 2 not-found, 3 connection error, 4 timeout
+  - `--json` flag on every read subcommand for structured output (topology, stats)
+
+### Why ship the CLI in v0.1
+
+The library-only argument is "developers will write Go to test it." That's right for the LIBRARY surface (Put/Get/Delete from app code), but wrong for the OPERATOR surface (is the cluster healthy? who owns this key? what's the per-node load?). Without the CLI:
+
+  - Dev cycle is slow: every quick check requires `go run`-ing a one-off program
+  - Integration tests need scaffolding to spin up nodes; shaled lets shell scripts do it
+  - Debugging a misbehaving cluster means writing custom inspect-via-Go programs
+  - Migration tools (v0.3+) don't have a natural home
+
+The CLI + shaled aren't "nice-to-have"; they're the daily-driver tools for everyone touching shale. Build them with v0.1.
+
+---
+
 ## Roadmap
 
-| Version | Scope |
-| --- | --- |
-| v0.1 | Single-node `Cluster` wrapping one Backend. Memory backend impl. SlateDB backend impl. API lockup. |
-| v0.2 | Multi-node + memberlist + hash ring + gRPC forwarding. Static topology (no rebalance). |
-| v0.3 | Rebalancing on join/leave. Atomic ownership swap. |
-| v0.4 | Replication factor R + read consistency settings (nearest / quorum / all). LWW conflict resolution. |
-| v0.5 | Prometheus metrics, tracing hooks, real benchmarks vs single-node SlateDB. |
-| v0.6 | hostthis migration: swap `slatedb.Db` for `shale.Cluster` with backend=SlateDB. Validate on production-like data. |
+- [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.
+- [ ] **v0.2** - multi-node + memberlist + hash ring + gRPC forwarding. Static topology (no rebalance). `shale topology` now shows real membership + ring.
+- [ ] **v0.3** - rebalancing on join/leave. Atomic ownership swap. `shale rebalance` + `shale migrate-from` subcommands.
+- [ ] **v0.4** - replication factor R + read consistency settings (nearest / quorum / all). LWW conflict resolution.
+- [ ] **v0.5** - Prometheus metrics, tracing hooks, real benchmarks vs single-node SlateDB. `shale bench` subcommand.
+- [ ] **v0.6** - hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Validate on production-like data.
 
-Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly) and grow into v0.2+ when their workload demands it.
+Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly, plus the CLI for daily ergonomics) and grow into v0.2+ when their workload demands it.
 
 ---
 

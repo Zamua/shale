@@ -13,11 +13,11 @@ shale is the third option: thin Go library, BYO backend, scales by adding proces
 
 ## Roadmap
 
-- [ ] v0.1: single-node `Cluster` wrapping one Backend (API lockup)
+- [ ] v0.1: single-node Cluster, gRPC service, `shaled` standalone binary, `shale` CLI (put/get/delete/scan/topology/stats/ping). API lockup.
 - [ ] v0.2: multi-node hash ring + gRPC forwarding (static topology)
-- [ ] v0.3: shard rebalancing on membership changes
+- [ ] v0.3: shard rebalancing on membership changes; `shale migrate-from` for backend handoff
 - [ ] v0.4: replication (R replicas per shard, quorum reads/writes)
-- [ ] v0.5: observability + benchmarks
+- [ ] v0.5: observability + benchmarks; `shale bench`
 
 Don't use in production yet.
 

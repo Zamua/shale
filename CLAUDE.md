@@ -58,8 +58,11 @@ pkg/
   rpc/                 gRPC server + client for inter-node ops
   rebalance/           shard handoff during membership changes
 cmd/
-  shaled/              standalone node binary (for ops/testing)
-  shale-bench/         load tester
+  shaled/              standalone node binary; runs a shale node as its own process
+                       (chooses Backend via flag, exposes gRPC for the CLI + for
+                       inter-node forwarding once multi-node lands in v0.2)
+  shale/               CLI; put/get/delete/scan/topology/stats/ping over gRPC
+                       against a running node (defaults to 127.0.0.1:7947)
 internal/              private helpers + test fixtures
 tests/
   unit/                per-package tests
