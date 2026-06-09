@@ -496,6 +496,21 @@ shale bench --addr 127.0.0.1:7947 --writes 100k --keys-prefix bench:
 
 `shale bench` (v0.5+) reports aggregate throughput, per-node request distribution, p50/p99 latencies.
 
+### Comparative benchmark harness (v0.5+)
+
+`shale bench` measures one running cluster at the operator's chosen R + W/R consistency. The separate `cmd/shale-bench` harness (driven by `make bench-v0.5` -> `scripts/run-bench.sh`) answers the comparison question:
+
+> "What is shale's overhead vs the raw backend, and what does R=3 cost vs R=1?"
+
+It spins up every scenario in one process via the same in-process pattern as `tests/integration/` (loopback memberlist + ephemeral-port gRPC), drives an identical workload through `putGetter` adapters that wrap either a bare `backend.Backend` or a `*cluster.Cluster`, and emits one markdown table. Scenarios:
+
+  - `raw-pebble` / `raw-memory` - baseline; no shale layer
+  - `cluster-*-n1-r1` - shale overhead at 1 node, R=1 (cluster code path, no gRPC hop)
+  - `cluster-*-n3-r1` - sharding cost (3 nodes, one fan-out per Put)
+  - `cluster-*-n3-r3` - replication cost (3 nodes, R=3, WriteQuorum + ReadQuorum)
+
+Output lives in `docs/BENCH-v0.5.md`. Numbers are machine-specific by design; the canonical use is "operator runs the suite on their target hardware before vs after a change to spot regressions."
+
 ### Throughput scaling expectations
 
 On a single local machine, throughput should grow as nodes are added until a shared bottleneck is hit:
@@ -536,6 +551,15 @@ The more valuable local tests are the failure-injection ones:
 The `tests/integration/` directory (per CLAUDE.md layout) holds in-process tests that spin up N nodes via goroutines + ephemeral ports. No external services required for the basic correctness tests. The MinIO-backed scaling tests are separate (`tests/scaling/`) and require an operator to bring up MinIO first.
 
 The CI matrix runs the integration tests on every PR; the scaling tests run on demand.
+
+### SlateDB backend end-to-end coverage
+
+`pkg/backend/slate` ships two test layers:
+
+  - **Default** (`slatedb` build tag): drives the binding against an in-process `memory:///` object store. Fast, no Docker, no S3.
+  - **End-to-end** (`slatedb integration` build tags): spins up a real MinIO container via testcontainers-go, creates a fresh bucket, and runs the Slate type against it. Covers 1k small keys, 10x 1MB blobs, durability across writer reopen, and the writer-epoch fencing guarantee (two writers against the same DB → second fences the first). Operator entry point: `make test-slate-minio`. v0.6 (the hostthis migration) gates on this passing against the deployment's chosen object store.
+
+Default `go test ./...` skips both layers (no cgo, no Docker), so the regular dev loop stays fast.
 
 ---
 
