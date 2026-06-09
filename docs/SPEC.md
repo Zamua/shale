@@ -850,7 +850,7 @@ Default `go test ./...` skips both layers (no cgo, no Docker), so the regular de
 - [ ] **v0.4.1** - hinted handoff for replicas down at Put time; foundations for anti-entropy.
 - [ ] **v0.5** - Prometheus metrics, tracing hooks, real benchmarks vs single-node SlateDB. `shale bench` subcommand.
 - [ ] **v0.5.x** - multi-module monorepo split: `backends/slate` + `backends/pebble` move out of `pkg/backend/` into their own Go modules; backend-specific `Settings` pass-through (`Config.Settings *engine.Settings` on each backend); `cmd/shaled` becomes a thin core shell with per-backend builds living alongside each backend module. Import-path break-and-bump (no deprecation forwarders). Done before v0.6 stabilizes the API.
-- [ ] **v0.6** - hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Validate on production-like data.
+- [ ] **v0.6** - hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Default config: `slate.Config{WriteOptions: &slatedb.WriteOptions{AwaitDurable: false}}` paired with `cluster.Config{ReplicationFactor: 3}`. The v0.5 bench measured this at 11,661 puts/s on the cluster-n3-r3 production shape, ~150x the strict baseline of 77 puts/s, with the durability budget covered by 3-way replication during the ~100ms per-replica WAL-flush window. Validate on production-like data.
 
 Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly, plus the CLI for daily ergonomics) and grow into v0.2+ when their workload demands it.
 
