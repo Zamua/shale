@@ -193,13 +193,99 @@ v0.1-v0.3 ship with R=1 only (no replication). v0.4 adds it.
 
 ### Rebalancing (v0.3+)
 
-When a node joins / leaves:
-1. Recompute ring → determines which key ranges change owners
-2. For each migrating range: old owner pushes keys to new owner via gRPC
-3. Atomic ownership swap: new owner accepts writes; old owner stops accepting
-4. Old owner deletes migrated keys locally
+v0.2 ships the gossip ring but does not migrate data: when membership changes, the ring redirects lookups to a node that does not hold the key, so reads against the new owner return not-found and writes land on the wrong shard. v0.3 closes that gap by physically migrating keys when membership changes, so the data state catches up to the ring state.
 
-Window during which a key range is being migrated: reads may go to either owner (consistent because storage is single-writer per range). Writes briefly block (~ms) at the swap point.
+The design optimizes for an implementation small enough to reason about end to end, on the assumption that shale is embedded in apps run by individual developers and small teams (not Google-scale operators). It accepts brief per-range unavailability (tens of seconds for the streaming copy, milliseconds at the ownership swap) in exchange for: no coordinator election, no per-Backend WAL-tailing requirement, no five-state-machine recovery protocol. v0.4 adds replication (R>1), which is the natural place to recover read availability during migration by serving reads off a replica that already holds the range; trying to engineer that into v0.3 at R=1 buys little and complicates a lot.
+
+R=1 throughout this section. Notes on what changes for R>1 are flagged at the end.
+
+#### Trigger
+
+Migration is driven by membership change, with a settling delay.
+
+When `Membership` reports a join or leave, the node records the event and schedules a `rebalance.Evaluate()` for `T_settle` seconds in the future (default 5s, configurable via `Config.RebalanceSettleDelay`). Any further membership event inside the window resets the timer. When the timer fires, the node snapshots the current ring and proceeds.
+
+The settling delay collapses bursts (rolling restart, several nodes joining within a second, a flapping peer) into one rebalance pass instead of thrashing the cluster through intermediate ring shapes. It also gives the existing membership reconciler (~5s) time to absorb missed events, so by the time `Evaluate` runs, every node tends to have the same view of who is in the cluster.
+
+There is no consensus and no coordinator election. Each node independently decides what to send and what to receive based on its local view of membership. Because memberlist converges in bounded time and each node uses the same ring algorithm against the same member list, peers reach the same migration decisions without negotiation. Disagreement during convergence is handled by the existing forwarding loop-guard plus the per-range cutover below.
+
+An operator can also trigger evaluation explicitly:
+
+  - `shale rebalance --dry-run` prints the plan the local node would execute against the current ring without doing the migration.
+  - `shale rebalance --apply` runs `Evaluate` immediately, bypassing the settling delay. Useful for planned topology changes (node decommission) where the operator wants to watch the plan before pulling the trigger.
+
+#### Plan
+
+Each node computes its plan locally from two inputs:
+
+  - the previous ring snapshot (cached from the last evaluation, or empty on first run)
+  - the new ring snapshot
+
+The unit of migration is the **key range**, defined as the contiguous arc of the hash ring between two adjacent virtual nodes. `buraksezer/consistent` exposes enough state to enumerate ranges. For each range, the node compares old owner and new owner:
+
+  - old=self, new=peer: schedule **send** to peer
+  - old=peer, new=self: schedule **receive** from peer (passive; the source is the one who initiates the stream)
+  - old=self, new=self: no-op
+  - old=peer1, new=peer2: no-op for this node; the two peers handle it between themselves
+
+Both sides of any (send, receive) pair derive the plan from the same ring inputs, so they agree on who sends what without explicit negotiation. The plan is held in memory; there is no persisted plan object and no plan ID. A crash mid-migration is recovered by the next `Evaluate` run on restart: the node observes the current ring versus what it actually holds and re-issues whatever migrations are still needed. This recovery path is the same code path as the steady-state one.
+
+#### Wire
+
+A single server-streaming gRPC method:
+
+```
+rpc MigrateRange(RangeSpec) returns (stream MigrateChunk)
+```
+
+`RangeSpec` identifies the arc of the ring being transferred (start + end hash values, plus the ring snapshot hash so the source can detect stale requests). `MigrateChunk` carries either a `(key, value)` pair or a terminal marker with the count + checksum of all keys sent.
+
+The destination initiates the call (it is the node whose ring says "I am the new owner"). The source iterates its local Backend over keys whose hashed shard key falls in the range, streams `(key, value)` pairs, then closes with the terminal marker. The destination writes each pair to its local Backend as it arrives. Backpressure is gRPC flow control; no per-key acknowledgement is needed.
+
+One range per RPC. Multiple ranges between the same source and destination run sequentially to keep the resource footprint predictable and the per-peer protocol single-threaded.
+
+If the source's Backend does not support a range-bounded scan, it falls back to a full `ScanPrefix("")` with a range filter applied per key. This is wasteful but correct; backend authors are encouraged to implement a faster path.
+
+#### Cutover
+
+Each range has a lifecycle:
+
+1. **Pre-migration**: source owns the range. Source serves reads and writes. Destination's ring already lists destination as the new owner, but `MigrateRange` has not started or is queued behind earlier ranges.
+2. **Migrating**: destination opens `MigrateRange`. Source marks the range as migrating-out, destination marks it as migrating-in. While in this state:
+   - **Reads** for keys in the range are served by the **source**. The forwarding loop-guard ensures that a read landing on the destination via stale ring is forwarded back to the source.
+   - **Writes** for keys in the range are **rejected by the source** with a transient error (`Unavailable` with retry hint). The destination, if it receives a write via the new ring, also rejects with `Unavailable`. Clients retry with backoff; the SDK's client wrapper handles this transparently with a bounded retry budget.
+   - This is the chosen cutover semantics. Rejecting writes during the streaming copy is what avoids the "did this write make it across the cutover" problem without a WAL-tailing catch-up phase. The write-unavailability window per range is bounded by streaming time for that range's data.
+3. **Swap**: source completes the stream and waits for the destination to send `MigrateAck(range, checksum)`. On match, source flips ownership state for the range from "owner" to "former owner, forwards reads". This flip is atomic per range.
+4. **Post-migration**: destination is authoritative for reads and writes. Source forwards any straggler read it receives for the range to the destination via the standard forwarding path. Once the source observes that all peers' rings agree the destination owns the range (or after a grace period of `T_drain`, default 30s), source deletes its local copy of the range's keys.
+
+The write-rejection window is the price paid for avoiding WAL-tailing. At hostthis-scale workloads (tens of thousands of keys per range, small values), the streaming copy completes in well under a minute on a local network; clients retrying with exponential backoff over that window do not see user-visible errors.
+
+#### Failure handling
+
+  - **Source crashes mid-stream**: destination's `MigrateRange` call returns an error. Destination discards what it received (the partial range is not authoritative). On the next `Evaluate` pass, if the source comes back, migration retries. If the source does not come back, the range is owned by no one at R=1; reads return not-found, writes are rejected. This is the unavoidable R=1 failure mode and is the central motivation for v0.4 replication.
+  - **Destination crashes mid-stream**: source's stream returns an error. Source remains the owner. On next `Evaluate`, migration retries to whichever node the new ring assigns.
+  - **Checksum mismatch on `MigrateAck`**: destination rolls back its writes for the range (deletes the range), source remains owner, migration retries on the next `Evaluate`. Checksum is computed over the sorted `(key, value)` byte stream.
+  - **Ring divergence during cutover**: handled by the existing loop-guard. A read or write landing on the wrong node gets one forward; if the forwarded-to node also disagrees, the request returns `FailedPrecondition` and the client retries after the rings converge.
+  - **Operator cancellation**: `shale rebalance --cancel` aborts in-progress streams. Source remains owner of any range not yet swapped; destination discards any partial state.
+
+#### Observability
+
+  - `shale topology` shows each range's state (`stable | migrating-out | migrating-in | draining`) and, for in-flight migrations, the source, destination, bytes streamed so far, and elapsed time.
+  - Per-node counters: `rebalance_ranges_migrated_total`, `rebalance_bytes_streamed_total`, `rebalance_writes_rejected_total`, `rebalance_failures_total`.
+  - Structured log line per range transition with `range_id`, `from`, `to`, `key_count`, `bytes`, `duration_ms`.
+
+#### What v0.4 changes
+
+With R>1, the read-unavailability problem largely disappears: reads can be served from any replica, including ones not currently sending or receiving. The migration unit becomes a (range, replica-position) pair rather than just a range. The write-rejection window can shrink to the duration of the ownership swap rather than the entire streaming copy, because the destination can receive writes via the replication path while the bulk copy is in flight and the conflict resolver (LWW, v0.4) reconciles. The wire protocol stays the same shape; the cutover protocol gains a "live writes also flow via replication" overlay.
+
+The v0.3 design does not preclude any of this. It deliberately leaves the per-range cutover as the only place where v0.4 needs to intervene.
+
+#### Known limitations in v0.3
+
+  - **Write-unavailability window per migrating range** is proportional to the size of that range. A range with millions of small keys can stall writes for tens of seconds. Operators with hot ranges should plan topology changes during low-traffic windows or wait for v0.4.
+  - **No live progress streaming**: the source streams to one destination; if the operator wants finer-grained progress than the per-range chunk counter, they can watch the gRPC stream metrics directly, but there is no built-in real-time per-key progress feed.
+  - **Backend scan efficiency varies**: backends without range-bounded scans pay an O(total keys) cost per migrating range. The memory backend is fine; SlateDB's range scan is efficient; future backend authors should implement bounded range scans for production workloads.
+  - **No throttling of concurrent migrations**: if many ranges change owners at once (e.g. a 3-node cluster grows to 6 nodes), every node opens its `MigrateRange` calls in parallel against its peers. Object-store IO is the practical limiter today; an explicit per-node concurrency cap is a v0.3.x follow-up if hot-spotting shows up in practice.
 
 ---
 
