@@ -282,7 +282,9 @@ func (c *Cluster) NodeID() string { return c.cfg.NodeID }
 
 // Members returns a snapshot of the cluster's current ring membership.
 // In single-node mode this is a single-element slice containing the
-// local node with an empty Addr (no gRPC peer routing is set up).
+// local node with Addr=cfg.GRPCAddr (which can be empty if the caller
+// didn't set GRPCAddr; no gRPC peer routing is set up in single-node
+// mode regardless).
 func (c *Cluster) Members() []ring.Member {
 	if c.ring == nil {
 		return []ring.Member{{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}}
