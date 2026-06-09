@@ -184,12 +184,76 @@ Under the hood, `Aggregate` snapshots each peer's local keyspace via an internal
 
 ### Replication (v0.4+)
 
-For replication factor R > 1:
-- Writes go to the R "closest" nodes on the ring (primary + R-1 successors)
-- Reads can be from any of the R (configurable: nearest, quorum, all)
-- Failure of < R nodes doesn't lose writes (depending on consistency setting)
+v0.1-v0.3 ship with R=1: each key has exactly one owner, no copies. v0.4 introduces optional replication. The defaults preserve v0.3 behavior (R=1, single-owner) so existing deployments are not silently re-shaped; HA is opt-in via `Config.ReplicationFactor`.
 
-v0.1-v0.3 ship with R=1 only (no replication). v0.4 adds it.
+#### Configuration knobs
+
+Three knobs on `Config`, all per-cluster (not per-key):
+
+  - **`ReplicationFactor int`** (default `1`). The number of nodes that hold a copy of each key. With R=1 the cluster behaves exactly as in v0.3: one owner per key, no replicas, no LWW envelope cost paid on the read path. With R>1 each write fans out to R nodes (primary + R-1 successors on the ring).
+  - **`WriteConsistency`** (`One | Quorum | All`, default `Quorum`). The number of replica acks required before `Put` / `Delete` returns success. `Quorum = floor(R/2) + 1`. `All` requires every replica to ack; any down replica fails the write. `One` returns as soon as the primary acks and is the loosest setting.
+  - **`ReadConsistency`** (`Nearest | Quorum | All`, default `Nearest`). `Nearest` reads from the primary only (one network hop in the common case, R=1 behavior). `Quorum` reads from floor(R/2)+1 replicas and returns the LWW winner. `All` reads from every replica.
+
+The default pairing (`Quorum` writes, `Nearest` reads) is the v0.4 baseline: writes are durable across a quorum loss, reads are cheap. Operators who want stronger read freshness flip `ReadConsistency` to `Quorum`. Operators willing to tolerate write loss for lower write latency flip `WriteConsistency` to `One`. The two knobs are independent.
+
+#### Value envelope
+
+When R>1, every Backend value is wrapped in an LWW envelope before storage:
+
+```
+Envelope {
+  Stamp { TimestampNanos int64; NodeID string }
+  Payload []byte
+}
+```
+
+The envelope is opaque to `Backend`: the cluster layer encodes on `Put` and decodes on `Get`, so backend implementations are unchanged. A value written in v0.3 (no envelope) decodes as `Stamp{0, ""}`: it loses every comparison against a stamped write and is re-stamped on the next `Put`. This is the migration path; no offline conversion step is required.
+
+`Delete` writes a tombstone: an empty-payload envelope carrying the current `Stamp`. The tombstone participates in LWW like any other write, so a delete that races with a concurrent write resolves by timestamp rather than by op order. `Get` treats an empty payload as `NotFound`. Tombstone GC is deferred (see "Out of scope" below).
+
+#### LWW comparator
+
+For two envelopes A and B, A wins iff:
+
+  1. `A.Stamp.TimestampNanos > B.Stamp.TimestampNanos`, OR
+  2. timestamps equal AND `A.Stamp.NodeID > B.Stamp.NodeID` (lexicographic).
+
+`TimestampNanos` is `time.Now().UnixNano()` taken by the **originating node** at the moment `Put` is called, before fan-out. Every replica stores the same Stamp for that write; replicas do NOT re-stamp on receipt. This keeps the clock single-sourced per write and avoids skew between the primary's stamp and a successor's stamp for the same `Put`. The NodeID tiebreak resolves the rare case where two originators race with identical nanosecond clocks.
+
+Clock skew between nodes is the standard LWW caveat: a node with a forward-skewed clock can shadow honestly-timestamped writes from healthier peers. Operators run NTP. shale does not synthesize a hybrid logical clock in v0.4; that lands later if real workloads hit the skew limitation.
+
+#### Fan-out + ack accounting
+
+With R>1, `ring.LocateKeyN(key, R)` returns the primary plus R-1 successors on the ring. Put dials all R in parallel:
+
+  - The local node, if it is one of the R, writes via its local Backend.
+  - Remote replicas receive a forwarded Put RPC carrying the envelope as-is.
+
+`Put` returns success once W acks have arrived (W per `WriteConsistency`). Acks above W are not waited on but are NOT cancelled: the surplus writes continue in the background so the eventually-consistent state matches the consistency setting's intent. Failures above (R - W) cause `Put` to return error.
+
+#### Read path
+
+`Get` issues read RPCs to N replicas per `ReadConsistency` (1 / quorum / R). Each replica returns its local envelope (or `NotFound`). The cluster layer:
+
+  1. Collects responses up to the consistency target.
+  2. Picks the LWW winner across the collected envelopes.
+  3. Returns the winner's payload (or `NotFound` if the winner is a tombstone or no replica had the key).
+
+On `Quorum` / `All`, if the collected envelopes disagree (any replica returned an older Stamp than the winner, or `NotFound` while a peer has a value), the cluster issues **read-repair**: an async forwarded Put of the winner envelope to every lagging replica. Read-repair is best-effort: errors are swallowed, no retry. Read-repair is **skipped on `Nearest`** because a single-replica read has nothing to compare against; lagging replicas catch up via the next quorum/all read or via future anti-entropy (v0.4.1+).
+
+#### Failure modes
+
+  - **Replica down at Put time**: tolerated up to `R - W` simultaneous failures. With the default R=3 W=2, one replica down still completes writes. With `WriteConsistency=All`, any replica down fails the write.
+  - **Network partition**: both sides accept writes for keys they can reach a sufficient quorum on. Writes on either side carry the originator's Stamp. On heal, the LWW comparator reconciles deterministically: the higher-timestamp write wins, lower-timestamp writes are lost. This is the AP choice (see "Consistency model"); workloads that cannot tolerate write loss should use a CP system.
+  - **All R replicas down**: `Put` and `Get` return `Unavailable`. No way to make progress without at least one replica.
+  - **Replica down at Read time**: tolerated up to (R - N) where N is the consistency-target count. `Nearest` with primary down falls back to the next ring successor; `Quorum` / `All` collect from surviving replicas and fail if too few respond.
+
+#### Out of scope for v0.4
+
+  - **Hinted handoff** (deferred to v0.4.1): when a replica is down at Put time, the coordinator should durably hint the missed write and replay it when the replica returns. v0.4 ships without hints, so a write that lands on (R - W) acks succeeds but the down replicas miss it permanently until a Quorum / All read repairs them or anti-entropy reconciles. The hint protocol is a v0.4.1 follow-up.
+  - **Anti-entropy / Merkle-tree repair** (v0.4.1+): a background process that walks ranges + reconciles cold replicas without waiting for a read. Not in v0.4.
+  - **Per-key replication factor**: every key in the cluster uses the same R. Per-key overrides are out of scope; operators who need per-prefix replication policy should run separate clusters.
+  - **Rebalance-with-replication**: a separate workflow (planned post-v0.4) that integrates the v0.3 rebalance protocol with the v0.4 replication overlay so live writes flow via replication during the bulk copy and the per-range write-rejection window collapses to the ownership swap.
 
 ### Rebalancing (v0.3+)
 
@@ -303,9 +367,9 @@ If a transaction touches keys owned by multiple nodes, shale returns an error. A
 
 ## Failure handling
 
-- **Single node crashes**: keys it owned are temporarily unavailable. With R > 1, replicas take over reads + writes.
-- **Network partition**: nodes on each side see the other as failed. Both sides accept writes. On heal, conflicts resolve via Last-Write-Wins (LWW) using node-local timestamps. (R = 1 has no replication conflicts; R > 1 needs LWW.)
-- **Backend failure on one node**: that node reports unhealthy to memberlist; gets removed from ring; data unavailable until restored.
+- **Single node crashes**: keys it owned are temporarily unavailable at R=1. With R>1 (v0.4+), replicas take over reads + writes up to (R - W) / (R - N) tolerated failures per the configured consistency.
+- **Network partition**: nodes on each side see the other as failed. Both sides accept writes. On heal, conflicts resolve via Last-Write-Wins (LWW) using the originator's wall-clock timestamp + nodeID tiebreak (see "Replication (v0.4+)" for the full envelope + comparator). R=1 has no replication conflicts; R>1 relies on LWW.
+- **Backend failure on one node**: that node reports unhealthy to memberlist; gets removed from ring; data unavailable until restored (or served from replicas under R>1).
 
 ---
 
@@ -469,7 +533,17 @@ The CI matrix runs the integration tests on every PR; the scaling tests run on d
 - [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.
 - [ ] **v0.2** - multi-node + memberlist + hash ring + gRPC forwarding. Static topology (no rebalance). `shale topology` now shows real membership + ring.
 - [ ] **v0.3** - rebalancing on join/leave. Atomic ownership swap. `shale rebalance` + `shale migrate-from` subcommands.
-- [ ] **v0.4** - replication factor R + read consistency settings (nearest / quorum / all). LWW conflict resolution.
+- [~] **v0.4** (in progress) - replication factor R + tunable consistency. LWW conflict resolution. Sub-tasks:
+  - [ ] LWW value envelope (Stamp + Payload), encoded on Put / decoded on Get, transparent to Backend
+  - [ ] v0.3-value compatibility: bare values decode as `Stamp{0, ""}`, re-stamped on next Put
+  - [ ] `Config.ReplicationFactor` (default 1) + `ring.LocateKeyN(key, R)`
+  - [ ] `Config.WriteConsistency` (One / Quorum / All, default Quorum) with parallel fan-out + ack accounting
+  - [ ] `Config.ReadConsistency` (Nearest / Quorum / All, default Nearest)
+  - [ ] LWW comparator (higher TimestampNanos wins, NodeID lex tiebreak; stamped by originator pre-fan-out)
+  - [ ] Async read-repair on Quorum / All when replicas disagree (skipped on Nearest; best-effort, errors swallowed)
+  - [ ] Delete as empty-payload tombstone envelope; Get treats empty payload as NotFound
+  - [ ] Failure handling: tolerate down replicas up to (R - W) / (R - N); Unavailable when all R down
+- [ ] **v0.4.1** - hinted handoff for replicas down at Put time; foundations for anti-entropy.
 - [ ] **v0.5** - Prometheus metrics, tracing hooks, real benchmarks vs single-node SlateDB. `shale bench` subcommand.
 - [ ] **v0.6** - hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Validate on production-like data.
 
