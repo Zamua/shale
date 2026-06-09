@@ -2,7 +2,7 @@
 //
 // After a source completes a stream + flips to StateHandedOff, it
 // still owns the local copy of the range's keys. The grace period
-// (Options.GraceDuration, default 60s) gives peers + clients time to
+// (Options.GraceDuration, default 30s) gives peers + clients time to
 // observe the new ring + retire stragglers that landed on the old
 // owner. Once the grace window elapses, the sweep:
 //

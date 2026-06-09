@@ -223,7 +223,7 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 		gotAddr, newAddr, stillCached)
 }
 
-// TestPut_DuringMigrationReturnsFailedPrecondition pins the v0.3
+// TestPut_DuringMigrationReturnsUnavailable pins the v0.3
 // "Cutover" contract end-to-end on the cluster.Put guard: when the
 // local Coordinator says a key's partition is mid-migration
 // (StateSending), Put returns codes.FailedPrecondition with a
@@ -237,7 +237,7 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 // node or a timing-race against memberlist convergence. The
 // blockingMigrateSource holds the partitions there so the guard
 // window stays open long enough for the assertion to run.
-func TestPut_DuringMigrationReturnsFailedPrecondition(t *testing.T) {
+func TestPut_DuringMigrationReturnsUnavailable(t *testing.T) {
 	port := freeTCPPort(t)
 	be := memory.New()
 	c, err := Open(Config{
