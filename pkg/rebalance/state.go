@@ -100,6 +100,31 @@ type Options struct {
 	// recorded in StateReceiving but never advance, which is useful
 	// for tests that only care about source-side behavior.
 	Destination MigrateDestination
+
+	// AwaitHandoffSignal gates how runSend decides when to flip a
+	// partition Sending -> HandedOff. When false (the test default),
+	// runSend drains its local source scan + flips immediately on
+	// scan completion, no destination involvement. When true (the
+	// cluster wires this), runSend waits for an explicit
+	// MarkSendComplete call before flipping: the source observes the
+	// gRPC handler's return value before exposing the partition to
+	// the sweep + deleting any keys.
+	//
+	// Without this, a destination crash mid-stream still flips the
+	// source to HandedOff (because the source's local scan ran
+	// independently of the stream), the grace timer expires, and the
+	// sweep deletes the keys -- data loss on backends that don't
+	// snapshot like the memory backend does. The wired path makes the
+	// handler's success/error the load-bearing signal for the flip.
+	AwaitHandoffSignal bool
+
+	// HandoffTimeout bounds the runSend wait for MarkSendComplete
+	// when AwaitHandoffSignal is true. If no signal arrives within
+	// the window, runSend transitions to StateDone with an error so
+	// the next Evaluate pass can re-register + retry. Defaults to
+	// 5 minutes (DefaultOptions); cluster integration tests shrink
+	// it. Zero falls back to a sensible default at New() time.
+	HandoffTimeout time.Duration
 }
 
 // DefaultOptions returns the spec-aligned tunables. Callers that
@@ -110,10 +135,11 @@ type Options struct {
 //	c := rebalance.New(self, be, opts)
 func DefaultOptions() Options {
 	return Options{
-		SettleDelay:   5 * time.Second,
-		GraceDuration: 60 * time.Second,
-		ChunkSize:     64,
-		RetryAfterMs:  50,
+		SettleDelay:    5 * time.Second,
+		GraceDuration:  60 * time.Second,
+		ChunkSize:      64,
+		RetryAfterMs:   50,
+		HandoffTimeout: 5 * time.Minute,
 	}
 }
 
@@ -156,9 +182,24 @@ type Coordinator struct {
 	stopCh  chan struct{}
 	stopped bool
 
-	mu     sync.Mutex
-	ranges map[uint64]*rangeRecord
-	gen    uint64
+	mu       sync.Mutex
+	ranges   map[uint64]*rangeRecord
+	gen      uint64
+	handoffs map[uint64]chan handoffSignal
+}
+
+// handoffSignal carries the destination-observed outcome of one
+// outgoing range stream. The gRPC handler (cluster integration
+// only) calls MarkSendComplete after the source-to-destination
+// stream returns; runSend waits for the signal before flipping the
+// partition Sending -> HandedOff. err == nil + totalKeys >= 0 means
+// "destination acked the count + checksum"; err != nil means the
+// stream errored (destination crashed mid-stream, checksum mismatch,
+// etc.) + the partition must NOT advance to HandedOff so the sweep
+// won't delete the source's local copy.
+type handoffSignal struct {
+	totalKeys int
+	err       error
 }
 
 // New constructs a Coordinator. If opts.Source is nil, a default
@@ -168,14 +209,18 @@ type Coordinator struct {
 // does not start the background sweep automatically; call
 // (*Coordinator).RunSweep(ctx) from the cluster layer to enable it.
 func New(self Member, local backend.Backend, opts Options) *Coordinator {
+	if opts.HandoffTimeout <= 0 {
+		opts.HandoffTimeout = 5 * time.Minute
+	}
 	c := &Coordinator{
-		self:   self,
-		local:  local,
-		opts:   opts,
-		source: opts.Source,
-		dest:   opts.Destination,
-		stopCh: make(chan struct{}),
-		ranges: make(map[uint64]*rangeRecord),
+		self:     self,
+		local:    local,
+		opts:     opts,
+		source:   opts.Source,
+		dest:     opts.Destination,
+		stopCh:   make(chan struct{}),
+		ranges:   make(map[uint64]*rangeRecord),
+		handoffs: make(map[uint64]chan handoffSignal),
 	}
 	return c
 }
@@ -278,25 +323,35 @@ func (c *Coordinator) transition(pid uint64, to RangeState, err error, keyCount 
 	}
 }
 
-// runSend drains the local source for the move's partition. v0.3
-// has the destination dial in to pull, not the source push, but at
-// the Coordinator level we still need to mark the source-side
-// progress: count the keys we would stream, flip Sending ->
-// HandedOff once the destination is known to have completed. The
-// cluster integration wires the actual stream-served bytes back
-// here via FinishSend.
+// runSend drives a Sending partition forward. Two execution shapes,
+// selected by Options.AwaitHandoffSignal:
 //
-// In tests + in the in-process destination, the destination uses
-// the same MigrateSource interface, so by the time the destination
-// returns from FetchRange the source's scan has also drained. We
-// model that by counting the source-side keys here (cheap with the
-// memory backend, sized work with slate) and flipping straight to
-// HandedOff. The grace timer is the sweep's responsibility.
+//  1. Local-scan mode (AwaitHandoffSignal=false, the test default):
+//     drain the source once locally to count keys, then flip to
+//     HandedOff. There is no destination involvement; the sweep
+//     deletes after grace. Useful for tests that don't model the
+//     full source-destination round trip.
+//
+//  2. Wired mode (AwaitHandoffSignal=true, the cluster sets this):
+//     skip the local scan entirely. Wait on a per-partition signal
+//     channel that MarkSendComplete will publish to when the gRPC
+//     handler returns. A successful return flips to HandedOff; an
+//     error keeps the partition out of HandedOff so the sweep won't
+//     delete the source's local copy + the next Evaluate retries.
+//     This is the fix that closes the v0.3 data-loss path where the
+//     source was previously flipping HandedOff independently of the
+//     destination's outcome.
 func (c *Coordinator) runSend(m Move, source MigrateSource) {
-	// Count what we would have shipped so RangeStatus.KeyCount is
-	// meaningful. The destination's FetchRange call against the
-	// same MigrateSource will trigger an independent scan in the
-	// in-process test; that's intentional (the scan is read-only).
+	if c.opts.AwaitHandoffSignal {
+		c.runSendWired(m)
+		return
+	}
+
+	// Local-scan mode: count what we would have shipped so
+	// RangeStatus.KeyCount is meaningful. The destination's FetchRange
+	// call against the same MigrateSource will trigger an independent
+	// scan in the in-process test; that's intentional (the scan is
+	// read-only).
 	kvCh, errCh := source.OpenRange([]uint64{m.PartitionID}, c.currentGen())
 	count := 0
 	for kv := range kvCh {
@@ -308,6 +363,110 @@ func (c *Coordinator) runSend(m Move, source MigrateSource) {
 		return
 	}
 	c.transition(m.PartitionID, StateHandedOff, nil, count)
+}
+
+// runSendWired waits for the gRPC handler (the source-side server
+// for MigrateRange) to signal completion via MarkSendComplete. The
+// signal carries the destination-acked count + the stream's terminal
+// error (nil on clean Done). The Coordinator then flips state:
+//
+//   - clean signal (err == nil): Sending -> HandedOff. Sweep will
+//     delete after grace.
+//   - error signal (err != nil): Sending -> Done with error attached.
+//     Sweep skips the partition; next Evaluate sees the terminal
+//     state + re-registers the Send if the new ring still warrants
+//     one.
+//   - timeout (no signal within Options.HandoffTimeout): treat as
+//     "destination never even asked." Same Done-with-error path so
+//     a stuck partition can be retried by the next Evaluate.
+//   - Stop: return without transitioning; the cluster is shutting
+//     down + further state changes would race with teardown.
+func (c *Coordinator) runSendWired(m Move) {
+	ch := c.registerHandoff(m.PartitionID)
+	defer c.clearHandoff(m.PartitionID)
+
+	timer := time.NewTimer(c.opts.HandoffTimeout)
+	defer timer.Stop()
+
+	select {
+	case sig, ok := <-ch:
+		if !ok {
+			// Handoff channel was closed without a signal (Coordinator
+			// stop / clear race). Don't transition.
+			return
+		}
+		if sig.err != nil {
+			c.transition(m.PartitionID, StateDone, fmt.Errorf("rebalance: handoff: %w", sig.err), 0)
+			return
+		}
+		c.transition(m.PartitionID, StateHandedOff, nil, sig.totalKeys)
+	case <-c.stopCh:
+		return
+	case <-timer.C:
+		c.transition(m.PartitionID, StateDone,
+			fmt.Errorf("rebalance: handoff: timed out after %s waiting for destination ack", c.opts.HandoffTimeout),
+			0)
+	}
+}
+
+// registerHandoff creates the per-partition signal channel runSendWired
+// reads from, OR returns the existing one if a prior call already
+// registered. A buffered channel of capacity 1 means MarkSendComplete
+// never blocks (the latest signal wins). Held in c.handoffs so the
+// gRPC handler -> Coordinator lookup is O(1).
+func (c *Coordinator) registerHandoff(pid uint64) chan handoffSignal {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ch, ok := c.handoffs[pid]; ok {
+		return ch
+	}
+	ch := make(chan handoffSignal, 1)
+	c.handoffs[pid] = ch
+	return ch
+}
+
+// clearHandoff drops the per-partition signal channel after runSendWired
+// has consumed (or timed out on) the signal. Idempotent; safe to call
+// even if no entry exists.
+func (c *Coordinator) clearHandoff(pid uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.handoffs, pid)
+}
+
+// MarkSendComplete publishes the destination's stream outcome for a
+// single partition. The cluster's gRPC handler defers a call to this
+// with the gRPC server-streaming return value as err (nil on clean
+// completion, non-nil if Send() failed at any point or the source's
+// scan errored). totalKeys is the count the source actually streamed.
+//
+// Non-blocking + create-on-demand: if runSendWired hasn't yet
+// registered the per-partition channel (the destination's MigrateRange
+// can fire before the source's settle timer elapses + Evaluate runs),
+// MarkSendComplete creates the channel itself and parks the signal
+// on it. The signal sits buffered until runSendWired arrives + reads
+// it. This rendezvous is what makes the source-observes-destination
+// guarantee hold even when the destination opens its stream before
+// the source has computed its plan.
+//
+// Only meaningful when Options.AwaitHandoffSignal is true; with the
+// default false, runSend never reads the channel + the parked signal
+// is GC'd at clearHandoff time. The cluster integration sets the
+// flag; tests that want the wired behavior should set it too.
+func (c *Coordinator) MarkSendComplete(pid uint64, totalKeys int, err error) {
+	c.mu.Lock()
+	ch, ok := c.handoffs[pid]
+	if !ok {
+		ch = make(chan handoffSignal, 1)
+		c.handoffs[pid] = ch
+	}
+	c.mu.Unlock()
+	select {
+	case ch <- handoffSignal{totalKeys: totalKeys, err: err}:
+	default:
+		// Channel was already signaled (rare; e.g. a re-fired stream
+		// before clearHandoff). The first signal wins.
+	}
 }
 
 // runReceive pulls one partition from its source. On success the

@@ -209,13 +209,36 @@ func (s *Server) Ping(_ context.Context, _ *pb.PingRequest) (*pb.PingResponse, e
 // ours, we return FailedPrecondition so the destination's next
 // Evaluate pass re-issues against the new ring rather than us
 // streaming data that will be discarded.
-func (s *Server) MigrateRange(req *pb.RangeSpec, stream grpc.ServerStreamingServer[pb.MigrateChunk]) error {
-	kvCh, errCh, err := s.c.MigrateRangeSource(req.GetPartitionIds(), req.GetRingGeneration())
+//
+// Handoff signaling: the handler's return value carries the
+// destination-observed outcome of the stream. A nil return means
+// the gRPC runtime delivered every chunk (the final Send(Done)
+// succeeded and the destination read it before closing its end);
+// non-nil means the destination disconnected or the source's scan
+// errored. SignalMigrateRangeComplete threads that outcome back to
+// the Coordinator's source-side runSend, which only flips Sending
+// -> HandedOff on a clean return. Without this, the source flipped
+// HandedOff based on its own local scan + the sweep deleted keys
+// even when the destination crashed mid-stream. See
+// docs/SPEC.md "Cutover" + "Failure handling".
+func (s *Server) MigrateRange(req *pb.RangeSpec, stream grpc.ServerStreamingServer[pb.MigrateChunk]) (retErr error) {
+	pids := req.GetPartitionIds()
+	kvCh, errCh, err := s.c.MigrateRangeSource(pids, req.GetRingGeneration())
 	if err != nil {
+		s.c.SignalMigrateRangeComplete(pids, 0, err)
 		return err
 	}
 	hasher := crc32.NewIEEE()
 	var count uint64
+	defer func() {
+		// retErr captures the handler's return value. Nil iff every
+		// stream.Send (including the terminal Done) succeeded + the
+		// source scan finished without an error: that is the source
+		// observing the destination acked the full transfer. Any
+		// non-nil retErr keeps the partitions out of HandedOff at
+		// the Coordinator level.
+		s.c.SignalMigrateRangeComplete(pids, int(count), retErr)
+	}()
 	for kv := range kvCh {
 		if err := stream.Send(&pb.MigrateChunk{
 			Body: &pb.MigrateChunk_Kv{

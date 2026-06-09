@@ -33,6 +33,13 @@ import (
 // stays at the package defaults (10s sweep, 60s grace); the
 // integration tests need sub-second feedback so the sweep can fire
 // within the per-test wall-clock budgets.
+//
+// This file is helpers_test.go (not helpers.go) because TestMain is
+// only honored in _test.go files; an earlier helpers.go landed the
+// setter where go test silently ignored it, leaving every sweep
+// running at the 10s production interval + masking timing bugs in
+// rebalance tests. Renaming the file fixes that without changing
+// content (testNode + friends are test-only anyway).
 func TestMain(m *testing.M) {
 	rebalance.SetSweepInterval(50 * time.Millisecond)
 	os.Exit(m.Run())
@@ -50,7 +57,28 @@ type testNode struct {
 	BindAddr string
 	GRPCAddr string
 
-	stop func()
+	stop       func()
+	grpcServer *grpc.Server
+}
+
+// KillGRPC force-stops the node's gRPC server WITHOUT waiting for
+// in-flight streams to drain (grpc.Server.Stop, not GracefulStop).
+// Used by the destination-failure tests to interrupt an open
+// MigrateRange stream + verify the source treats it as a failed
+// handoff (does NOT flip Sending -> HandedOff, does NOT delete the
+// source-side keys via the sweep).
+//
+// The membership layer remains untouched: from peers' point of view
+// the killed node is still a ring member (gossip hasn't dropped it
+// yet). That's intentional -- the test wants to simulate a process
+// that lost its gRPC listener but still appears reachable for a
+// brief window, which is the worst-case window for the data-loss
+// path the fix closes.
+func (n *testNode) KillGRPC() {
+	if n.grpcServer != nil {
+		n.grpcServer.Stop()
+		n.grpcServer = nil
+	}
 }
 
 // Close tears the node down: shuts the gRPC server, closes the cluster
@@ -105,9 +133,14 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 		// grace is long enough for the destination's pull to
 		// complete (a few hundred keys over loopback gRPC), then
 		// the sweep fires + the post-test assertions see clean
-		// per-node ownership.
-		RebalanceSettleDelay:   500 * time.Millisecond,
-		RebalanceGraceDuration: 3 * time.Second,
+		// per-node ownership. HandoffTimeout shrunk from the
+		// 5-minute default so the failure-mode test that wedges a
+		// source-side runSend (destination never asks) fails fast
+		// + the integration suite stays under its wall-clock
+		// budget; production keeps the wide default.
+		RebalanceSettleDelay:    500 * time.Millisecond,
+		RebalanceGraceDuration:  3 * time.Second,
+		RebalanceHandoffTimeout: 4 * time.Second,
 	}
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}
@@ -126,11 +159,12 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 	}()
 
 	n := &testNode{
-		ID:       id,
-		Cluster:  c,
-		Backend:  mem,
-		BindAddr: bindAddr,
-		GRPCAddr: grpcAddr,
+		ID:         id,
+		Cluster:    c,
+		Backend:    mem,
+		BindAddr:   bindAddr,
+		GRPCAddr:   grpcAddr,
+		grpcServer: grpcSrv,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone

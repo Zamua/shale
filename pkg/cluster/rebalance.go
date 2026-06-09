@@ -87,6 +87,15 @@ func (c *Cluster) initRebalance() {
 	// to come from the same ring snapshot the plan was computed
 	// against).
 	opts.Destination = &clusterDestination{c: c}
+	// AwaitHandoffSignal gates the source's Sending -> HandedOff flip
+	// on the destination acknowledging the stream. Without it, the
+	// source's local scan independently triggers the flip + the
+	// sweep deletes the keys on grace, even if the destination
+	// crashed mid-stream. With it, MarkSendComplete (called by the
+	// gRPC handler in pkg/rpc/server.go) carries the only signal that
+	// flips the source state.
+	opts.AwaitHandoffSignal = true
+	opts.HandoffTimeout = c.handoffTimeout()
 	rb := rebalance.New(self, c.backend, opts)
 	c.rebalance.Store(rb)
 
@@ -147,6 +156,19 @@ func (c *Cluster) settleDelay() time.Duration {
 		return c.cfg.RebalanceSettleDelay
 	}
 	return defaultSettleDelay
+}
+
+// handoffTimeout returns the configured handoff timeout, falling
+// back to the rebalance package default (5 minutes) when
+// Config.RebalanceHandoffTimeout is zero. The Coordinator's New()
+// also applies its own default if we pass zero, but propagating the
+// cluster-level config here lets the replaceCoordinator path honor
+// the same value without re-reading rebalance defaults.
+func (c *Cluster) handoffTimeout() time.Duration {
+	if c.cfg.RebalanceHandoffTimeout > 0 {
+		return c.cfg.RebalanceHandoffTimeout
+	}
+	return 5 * time.Minute
 }
 
 // bumpRingGen records that the ring shape has changed + schedules an
@@ -530,6 +552,8 @@ func (c *Cluster) replaceCoordinator() {
 		opts.RetryAfterMs = c.cfg.RebalanceRetryAfterMs
 	}
 	opts.Destination = &clusterDestination{c: c}
+	opts.AwaitHandoffSignal = true
+	opts.HandoffTimeout = c.handoffTimeout()
 	c.rebalance.Store(rebalance.New(self, c.backend, opts))
 
 	// Reset the lastEvalRing baseline to the current ring so the
@@ -574,6 +598,30 @@ func (c *Cluster) MigrateRangeSource(partitionIDs []uint64, ringGen uint64) (<-c
 	source := rebalance.NewLocalSource(c.backend, partFn)
 	kvCh, errCh := source.OpenRange(partitionIDs, ringGen)
 	return kvCh, errCh, nil
+}
+
+// SignalMigrateRangeComplete is the gRPC handler's callback after a
+// MigrateRange stream returns. It threads the destination-observed
+// outcome (totalKeys + terminal err) back to the Coordinator so the
+// source-side runSend can flip Sending -> HandedOff only on a clean
+// completion. The handler in pkg/rpc/server.go calls this in a defer
+// with the stream's return value.
+//
+// One MigrateRange call may cover multiple partitions; the same
+// signal is delivered to each, so a partial-stream failure rolls
+// every partition in the call back to Done-with-error together.
+//
+// No-op in single-node mode (no Coordinator). Safe to call after
+// Close: the Coordinator's stop channel cuts pending waiters; this
+// just drops the signal.
+func (c *Cluster) SignalMigrateRangeComplete(partitionIDs []uint64, totalKeys int, err error) {
+	rb := c.rebalance.Load()
+	if rb == nil {
+		return
+	}
+	for _, pid := range partitionIDs {
+		rb.MarkSendComplete(pid, totalKeys, err)
+	}
 }
 
 // -- internals shared with cluster.go --------------------------------

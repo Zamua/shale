@@ -99,6 +99,14 @@ type Config struct {
 	// falls back to rebalance.DefaultOptions (60s). Integration
 	// tests + faster-feedback fixtures pass small values.
 	RebalanceGraceDuration time.Duration
+
+	// RebalanceHandoffTimeout bounds how long the source's runSend
+	// waits for the destination to ack the gRPC stream. Past the
+	// timeout the partition transitions Done-with-error (the next
+	// Evaluate retries). Zero falls back to the package default
+	// (rebalance.DefaultOptions, 5 minutes). Integration tests
+	// shrink it so a "destination never asks" scenario fails fast.
+	RebalanceHandoffTimeout time.Duration
 }
 
 // Cluster is the public handle apps use. All operations are
