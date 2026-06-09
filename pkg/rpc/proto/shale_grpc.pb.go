@@ -38,6 +38,7 @@ const (
 	ShaleNode_Get_FullMethodName        = "/shale.v1.ShaleNode/Get"
 	ShaleNode_Delete_FullMethodName     = "/shale.v1.ShaleNode/Delete"
 	ShaleNode_ScanPrefix_FullMethodName = "/shale.v1.ShaleNode/ScanPrefix"
+	ShaleNode_LocalScan_FullMethodName  = "/shale.v1.ShaleNode/LocalScan"
 	ShaleNode_Topology_FullMethodName   = "/shale.v1.ShaleNode/Topology"
 	ShaleNode_Stats_FullMethodName      = "/shale.v1.ShaleNode/Stats"
 	ShaleNode_Ping_FullMethodName       = "/shale.v1.ShaleNode/Ping"
@@ -64,6 +65,14 @@ type ShaleNodeClient interface {
 	// with the given prefix, in key-ascending order. The stream closes
 	// cleanly when the scan is exhausted.
 	ScanPrefix(ctx context.Context, in *ScanPrefixRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ScanPrefixResponse], error)
+	// LocalScan is an admin-only variant of ScanPrefix that bypasses
+	// ring-based routing + reads keys directly from the receiving
+	// node's local Backend. Cross-shard machinery in pkg/cluster
+	// (Aggregate snapshotting, Stats keys_held) uses it to ask peers
+	// "what's actually on YOUR disk" without the request being
+	// re-routed through ownerOf, which would otherwise route everything
+	// to whichever node owns the empty prefix.
+	LocalScan(ctx context.Context, in *LocalScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalScanResponse], error)
 	// Topology describes the current cluster membership + ring layout.
 	// In v0.1 single-node mode, single_node=true + nodes contains exactly
 	// this one node. In v0.2+ it reports the full memberlist view.
@@ -135,6 +144,25 @@ func (c *shaleNodeClient) ScanPrefix(ctx context.Context, in *ScanPrefixRequest,
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ShaleNode_ScanPrefixClient = grpc.ServerStreamingClient[ScanPrefixResponse]
 
+func (c *shaleNodeClient) LocalScan(ctx context.Context, in *LocalScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalScanResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ShaleNode_ServiceDesc.Streams[1], ShaleNode_LocalScan_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[LocalScanRequest, LocalScanResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShaleNode_LocalScanClient = grpc.ServerStreamingClient[LocalScanResponse]
+
 func (c *shaleNodeClient) Topology(ctx context.Context, in *TopologyRequest, opts ...grpc.CallOption) (*TopologyResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(TopologyResponse)
@@ -186,6 +214,14 @@ type ShaleNodeServer interface {
 	// with the given prefix, in key-ascending order. The stream closes
 	// cleanly when the scan is exhausted.
 	ScanPrefix(*ScanPrefixRequest, grpc.ServerStreamingServer[ScanPrefixResponse]) error
+	// LocalScan is an admin-only variant of ScanPrefix that bypasses
+	// ring-based routing + reads keys directly from the receiving
+	// node's local Backend. Cross-shard machinery in pkg/cluster
+	// (Aggregate snapshotting, Stats keys_held) uses it to ask peers
+	// "what's actually on YOUR disk" without the request being
+	// re-routed through ownerOf, which would otherwise route everything
+	// to whichever node owns the empty prefix.
+	LocalScan(*LocalScanRequest, grpc.ServerStreamingServer[LocalScanResponse]) error
 	// Topology describes the current cluster membership + ring layout.
 	// In v0.1 single-node mode, single_node=true + nodes contains exactly
 	// this one node. In v0.2+ it reports the full memberlist view.
@@ -219,6 +255,9 @@ func (UnimplementedShaleNodeServer) Delete(context.Context, *DeleteRequest) (*De
 }
 func (UnimplementedShaleNodeServer) ScanPrefix(*ScanPrefixRequest, grpc.ServerStreamingServer[ScanPrefixResponse]) error {
 	return status.Error(codes.Unimplemented, "method ScanPrefix not implemented")
+}
+func (UnimplementedShaleNodeServer) LocalScan(*LocalScanRequest, grpc.ServerStreamingServer[LocalScanResponse]) error {
+	return status.Error(codes.Unimplemented, "method LocalScan not implemented")
 }
 func (UnimplementedShaleNodeServer) Topology(context.Context, *TopologyRequest) (*TopologyResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Topology not implemented")
@@ -315,6 +354,17 @@ func _ShaleNode_ScanPrefix_Handler(srv interface{}, stream grpc.ServerStream) er
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type ShaleNode_ScanPrefixServer = grpc.ServerStreamingServer[ScanPrefixResponse]
 
+func _ShaleNode_LocalScan_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(LocalScanRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ShaleNodeServer).LocalScan(m, &grpc.GenericServerStream[LocalScanRequest, LocalScanResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShaleNode_LocalScanServer = grpc.ServerStreamingServer[LocalScanResponse]
+
 func _ShaleNode_Topology_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(TopologyRequest)
 	if err := dec(in); err != nil {
@@ -405,6 +455,11 @@ var ShaleNode_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "ScanPrefix",
 			Handler:       _ShaleNode_ScanPrefix_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "LocalScan",
+			Handler:       _ShaleNode_LocalScan_Handler,
 			ServerStreams: true,
 		},
 	},

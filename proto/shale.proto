@@ -39,6 +39,15 @@ service ShaleNode {
   // cleanly when the scan is exhausted.
   rpc ScanPrefix(ScanPrefixRequest) returns (stream ScanPrefixResponse);
 
+  // LocalScan is an admin-only variant of ScanPrefix that bypasses
+  // ring-based routing + reads keys directly from the receiving
+  // node's local Backend. Cross-shard machinery in pkg/cluster
+  // (Aggregate snapshotting, Stats keys_held) uses it to ask peers
+  // "what's actually on YOUR disk" without the request being
+  // re-routed through ownerOf, which would otherwise route everything
+  // to whichever node owns the empty prefix.
+  rpc LocalScan(LocalScanRequest) returns (stream LocalScanResponse);
+
   // Topology describes the current cluster membership + ring layout.
   // In v0.1 single-node mode, single_node=true + nodes contains exactly
   // this one node. In v0.2+ it reports the full memberlist view.
@@ -55,11 +64,19 @@ service ShaleNode {
   rpc Ping(PingRequest) returns (PingResponse);
 }
 
+// The `forwarded` flag on each per-key op is the cluster-internal
+// loop guard. A node receiving a forwarded=true request that doesn't
+// own the key returns FailedPrecondition instead of forwarding again,
+// so a stale ring on the sender can't trigger an infinite
+// A->B->A->B... ping-pong. Clients dialing this service from outside
+// the cluster (CLI, embedded library callers) leave the flag false.
+
 // -- Put -------------------------------------------------------------
 
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
+  bool forwarded = 3;
 }
 
 message PutResponse {}
@@ -68,6 +85,7 @@ message PutResponse {}
 
 message GetRequest {
   bytes key = 1;
+  bool forwarded = 2;
 }
 
 message GetResponse {
@@ -79,6 +97,7 @@ message GetResponse {
 
 message DeleteRequest {
   bytes key = 1;
+  bool forwarded = 2;
 }
 
 message DeleteResponse {}
@@ -87,9 +106,21 @@ message DeleteResponse {}
 
 message ScanPrefixRequest {
   bytes prefix = 1;
+  bool forwarded = 2;
 }
 
 message ScanPrefixResponse {
+  bytes key = 1;
+  bytes value = 2;
+}
+
+// -- LocalScan -------------------------------------------------------
+
+message LocalScanRequest {
+  bytes prefix = 1;
+}
+
+message LocalScanResponse {
   bytes key = 1;
   bytes value = 2;
 }
