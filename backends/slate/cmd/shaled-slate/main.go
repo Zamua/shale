@@ -143,4 +143,3 @@ func (c slateConfig) validate() error {
 //
 // Only one is in any given build. main.go references the symbol
 // without knowing which file defined it.
-

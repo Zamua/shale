@@ -20,21 +20,33 @@ jobs:
           check-latest: true
           cache: true
 
-      # Workspace mode: run vet + build + tests across every module
-      # in go.work (core + backends/pebble + backends/slate). This is
-      # the dev-loop shape; cross-module changes are tested in one
-      # pass without needing to bump versions between modules.
-      - name: go vet (workspace)
+      # Workspace-mode dev loop: vet + build + tests across every
+      # module in go.work (core + backends/pebble + backends/slate).
+      # `go test ./...` only walks the current module, so each module
+      # needs its own invocation; go.work transparently resolves cross-
+      # module deps without bumping versions between them.
+      #
+      # MODULES is the canonical list of go.work members. Append a new
+      # backend here when it lands.
+      - name: go vet (workspace, all modules)
         run: |
-          go vet ./...
-          (cd backends/pebble && go vet ./...)
-          (cd backends/slate && go vet ./...)
+          set -euo pipefail
+          MODULES=(. backends/pebble backends/slate)
+          for m in "${MODULES[@]}"; do
+            echo "::group::go vet $m"
+            (cd "$m" && go vet ./...)
+            echo "::endgroup::"
+          done
 
-      - name: go build (workspace)
+      - name: go build (workspace, all modules)
         run: |
-          go build ./...
-          (cd backends/pebble && go build ./...)
-          (cd backends/slate && go build ./...)
+          set -euo pipefail
+          MODULES=(. backends/pebble backends/slate)
+          for m in "${MODULES[@]}"; do
+            echo "::group::go build $m"
+            (cd "$m" && go build ./...)
+            echo "::endgroup::"
+          done
 
       # Full test suite under the race detector. Serialized across
       # packages (-p 1) and within each package (-parallel 1) so the
@@ -43,21 +55,33 @@ jobs:
       # peak RSS measured at ~3 GB with this shape, vs ~4 GB at
       # default parallelism with high variance; serial trades a
       # minute of wall clock for a predictable upper bound.
-      - name: go test (race, workspace)
+      - name: go test (race, workspace, all modules)
         run: |
-          go test ./... -race -timeout 300s -p 1 -parallel 1
-          (cd backends/pebble && go test ./... -race -timeout 300s -p 1 -parallel 1)
-          (cd backends/slate && go test ./... -race -timeout 300s -p 1 -parallel 1)
+          set -euo pipefail
+          MODULES=(. backends/pebble backends/slate)
+          for m in "${MODULES[@]}"; do
+            echo "::group::go test $m"
+            (cd "$m" && go test ./... -race -timeout 300s -p 1 -parallel 1)
+            echo "::endgroup::"
+          done
 
       # Per-module release-validation pass: each backend module must
       # also build standalone with GOWORK=off so the published module
       # graph is self-consistent (no implicit workspace dependency on
-      # sibling modules). The slate module's slatedb tag is NOT
-      # exercised here because it requires the cgo toolchain + a
-      # locally-built libslatedb_uniffi cdylib; that path is covered
-      # by the `test-slate` Makefile target running locally (and a
-      # follow-up MinIO CI fixture when it lands).
+      # sibling modules via go.work replace directives). Catches the
+      # case where a backend forgets to require a dep in its own
+      # go.mod and only compiles because the workspace had it.
+      #
+      # The slate module's slatedb tag is NOT exercised here because
+      # it requires the cgo toolchain + a locally-built libslatedb_uniffi
+      # cdylib; that path is covered by the `test-slate` Makefile target
+      # running locally (and a follow-up MinIO CI fixture when it lands).
       - name: per-module build (GOWORK=off)
         run: |
-          (cd backends/pebble && GOWORK=off go build ./...)
-          (cd backends/slate && GOWORK=off go build ./...)
+          set -euo pipefail
+          BACKENDS=(backends/pebble backends/slate)
+          for m in "${BACKENDS[@]}"; do
+            echo "::group::GOWORK=off go build $m"
+            (cd "$m" && GOWORK=off go build ./...)
+            echo "::endgroup::"
+          done

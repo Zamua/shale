@@ -9,6 +9,18 @@ jobs:
   lint:
     name: golangci-lint + gofmt
     runs-on: ubuntu-latest
+    strategy:
+      # Each module in go.work is linted independently. Don't fail-
+      # fast: if pebble lints clean but slate has an issue, we still
+      # want the pebble run to surface (no half-finished signal). When
+      # a new backend lands, append it to this matrix AND to MODULES
+      # in test.yml.
+      fail-fast: false
+      matrix:
+        module:
+          - .
+          - backends/pebble
+          - backends/slate
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,12 +32,23 @@ jobs:
           check-latest: true
           cache: true
 
-      - name: golangci-lint
+      # golangci-lint is module-scoped: at any given working dir it
+      # loads exactly one module's packages, walks ./... within that
+      # module, and applies the .golangci.yml it finds. We point it at
+      # each go.work member in turn. The root .golangci.yml is reused
+      # for the backend modules via the search-upwards behavior of
+      # golangci-lint's config loader.
+      - name: golangci-lint (${{ matrix.module }})
         uses: golangci/golangci-lint-action@v7
         with:
           version: v2.12.2
+          working-directory: ${{ matrix.module }}
 
+      # gofmt across the whole tree once (cheap, no module boundaries).
+      # Only runs on the root job to avoid redundant identical checks
+      # in each matrix shard.
       - name: gofmt
+        if: matrix.module == '.'
         run: |
           gofmt -l . | tee /tmp/gofmt.out
           test ! -s /tmp/gofmt.out
