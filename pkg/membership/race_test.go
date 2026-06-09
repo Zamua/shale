@@ -9,12 +9,18 @@ package membership
 // serializes against its alive/dead transitions) instead of
 // dereferencing Node pointers on the read path.
 //
-// The test stands up a 2-node cluster, then aggressively hammers
-// Members() / Snapshot() from one goroutine while another goroutine
-// forces churn (open + close a peer repeatedly). Run under -race the
-// test must complete cleanly; a regression that reads Node fields on
-// the snapshot path will be caught by the race detector and fail the
-// test.
+// The regression test is a load test for the alive-broadcast write
+// path. The original race fires when memberlist's internal aliveNode
+// routine writes a Node's Name + Meta concurrent with our read path
+// dereferencing the same fields. To make that collision dense enough
+// for -race to catch it within a short test budget we explicitly
+// drive memberlist.UpdateNode() on every peer at a high cadence;
+// UpdateNode re-broadcasts the local node's alive state, which routes
+// through aliveNode() on every receiving peer + on the local node
+// itself and writes Name/Meta during the handler. With five peers each
+// pumping UpdateNode at 50ms intervals, the seed sees a steady stream
+// of aliveNode writes against the Node pointers Members()/Snapshot()
+// would dereference under the pre-fix code.
 
 import (
 	"io"
@@ -26,26 +32,30 @@ import (
 )
 
 // TestMembers_NoRaceWithMemberlistInternal pins the no-race property
-// of Members/Snapshot under concurrent memberlist alive-node activity.
-// Run with `go test -race` for the assertion to mean anything; without
-// -race it still exercises the code path but won't detect the
-// regression.
+// of Members/Snapshot under heavy alive-broadcast pressure. Run with
+// `go test -race` for the assertion to mean anything; without -race
+// it still exercises the code path but won't detect the regression.
 //
 // Layout:
 //
 //   - One seed Membership we hammer Members/Snapshot on.
-//   - Three long-lived peers gossiping with the seed continuously; their
-//     periodic alive broadcasts drive memberlist's aliveNode write path
-//     against the Node pointers the seed's Members() observes.
-//   - A churn goroutine that joins + leaves short-lived peers, which
-//     pushes NotifyJoin / NotifyLeave through the seed's event delegate
-//     and exercises the cache write path under the read load.
+//   - Four long-lived companion peers, each driving UpdateNode() at a
+//     50ms cadence so memberlist's aliveNode write path is firing
+//     constantly against every Node pointer the seed holds.
 //   - Many reader goroutines so the snapshot path is constantly inside
-//     the cache read while writes pour in.
+//     the read window while alive writes pour in.
+//
+// To verify this test actually pins the fix: revert Members() to
+// dereference *memberlist.Node directly (i.e. iterate m.ml.Members()
+// and call nodeToMember on each) + rerun under -race. The test should
+// reliably fail with a `DATA RACE` report against
+// memberlist.(*Memberlist).aliveNode vs membership.nodeToMember.
 func TestMembers_NoRaceWithMemberlistInternal(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping race exercise in short mode")
 	}
+	const peerCount = 4
+
 	seedPort := ephemeralPort(t)
 	seed := openTestMembership(t, Config{
 		NodeID:    "seed",
@@ -54,28 +64,45 @@ func TestMembers_NoRaceWithMemberlistInternal(t *testing.T) {
 		LogOutput: io.Discard,
 	})
 
-	// Open three long-lived companion peers so gossip + probing
-	// runs continuously for the whole duration; their periodic alive
-	// broadcasts produce a steady stream of internal aliveNode writes
-	// against the same Node pointers Members() observes.
-	for i, name := range []string{"alpha", "beta", "gamma"} {
+	// Open long-lived companion peers so gossip + probing runs
+	// continuously. We retain handles so we can drive UpdateNode on
+	// each one to force alive-broadcast pressure into the seed.
+	peers := make([]*Membership, 0, peerCount)
+	for i, name := range []string{"alpha", "beta", "gamma", "delta"}[:peerCount] {
 		port := ephemeralPort(t)
-		_ = openTestMembership(t, Config{
+		p := openTestMembership(t, Config{
 			NodeID:    name,
 			BindAddr:  bindAddr(port),
 			GRPCAddr:  "127.0.0.1:" + strconv.Itoa(31001+i),
 			Seeds:     []string{bindAddr(seedPort)},
 			LogOutput: io.Discard,
 		})
+		peers = append(peers, p)
+	}
+
+	// Wait briefly for the cluster to converge so all peers know each
+	// other and UpdateNode actually has somewhere to broadcast. If we
+	// race UpdateNode in before convergence the alive-handler writes
+	// still happen, but the read path has fewer Node pointers to fight
+	// over and the test takes longer to flake out a regression.
+	if err := waitForMembers(seed, map[string]string{
+		"seed":  "127.0.0.1:30001",
+		"alpha": "127.0.0.1:31001",
+		"beta":  "127.0.0.1:31002",
+		"gamma": "127.0.0.1:31003",
+		"delta": "127.0.0.1:31004",
+	}, 10*time.Second); err != nil {
+		t.Fatalf("cluster convergence: %v", err)
 	}
 
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
 	var snapshots atomic.Uint64
+	var updates atomic.Uint64
 
-	// Many reader goroutines hammering Members + Snapshot. With
-	// runtime.GOMAXPROCS readers we keep the cache read path hot
-	// while the gossip-driven write path is firing.
+	// Many reader goroutines hammering Members + Snapshot. With more
+	// readers than peers we keep the cache read path saturated while
+	// the gossip-driven write path fires.
 	const readers = 8
 	for i := 0; i < readers; i++ {
 		wg.Add(1)
@@ -94,57 +121,51 @@ func TestMembers_NoRaceWithMemberlistInternal(t *testing.T) {
 		}()
 	}
 
-	// Churner: open + close short-lived peers in a tight loop so the
-	// seed sees fresh NotifyJoin / NotifyLeave events on top of the
-	// steady gossip from the long-lived peers.
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		i := 0
-		for {
-			select {
-			case <-stop:
-				return
-			default:
+	// Drive UpdateNode() on each peer at a 50ms cadence. UpdateNode
+	// re-advertises the local node, which fires memberlist's
+	// alive-handler on every receiving peer (including the seed) and
+	// writes Name/Meta into the Node entries the seed's Members()
+	// would dereference under the pre-fix code. Hammering from every
+	// peer simultaneously turns up the write pressure enough that the
+	// race detector reliably catches a regression within a few
+	// seconds.
+	for _, p := range peers {
+		wg.Add(1)
+		go func(p *Membership) {
+			defer wg.Done()
+			tick := time.NewTicker(50 * time.Millisecond)
+			defer tick.Stop()
+			for {
+				select {
+				case <-stop:
+					return
+				case <-tick.C:
+					// 500ms broadcast budget is well above the
+					// per-tick interval; on a loopback this
+					// returns in ms. Errors here are not
+					// interesting -- the test asserts on the
+					// absence of a race detector hit, not on
+					// broadcast success.
+					_ = p.ml.UpdateNode(500 * time.Millisecond)
+					updates.Add(1)
+				}
 			}
-			port := ephemeralPort(t)
-			peer, err := Open(Config{
-				NodeID:    churnID(i),
-				BindAddr:  bindAddr(port),
-				GRPCAddr:  "127.0.0.1:1",
-				Seeds:     []string{bindAddr(seedPort)},
-				LogOutput: io.Discard,
-			})
-			if err != nil {
-				// A transient seed-unreachable on a busy box is
-				// acceptable; just spin and retry. We are not
-				// asserting on join success, only on the absence
-				// of a race.
-				continue
-			}
-			_ = peer.Close()
-			i++
-		}
-	}()
+		}(p)
+	}
 
-	// Five seconds is enough to drive thousands of alive-node writes
-	// alongside thousands of Members snapshots; the original race
-	// fires inside the first second on a loaded machine.
-	time.Sleep(5 * time.Second)
+	// 10s is enough to drive a couple hundred UpdateNode broadcasts
+	// across the four peers + tens of thousands of snapshot reads on
+	// the seed. The original race fires inside the first second on a
+	// loaded machine once UpdateNode is driving aliveNode at this
+	// cadence.
+	time.Sleep(10 * time.Second)
 	close(stop)
 	wg.Wait()
 
 	if snapshots.Load() == 0 {
 		t.Fatalf("reader goroutines never ran a snapshot; test misconfigured")
 	}
-}
-
-// churnID produces a unique node ID for the i-th churn iteration.
-// Pulled out so the loop body stays focused.
-func churnID(i int) string {
-	const hex = "0123456789abcdef"
-	// 4 hex chars is enough headroom for any sensible iteration count
-	// inside the 5s test window (max ~few hundred).
-	b := []byte{'c', 'h', 'u', 'r', 'n', '-', hex[(i>>12)&0xf], hex[(i>>8)&0xf], hex[(i>>4)&0xf], hex[i&0xf]}
-	return string(b)
+	if updates.Load() == 0 {
+		t.Fatalf("UpdateNode broadcasts never fired; test misconfigured")
+	}
 }
