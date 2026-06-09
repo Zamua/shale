@@ -43,24 +43,30 @@ test(membership): pin node-leave triggers shard rebalance
 docs(spec): clarify replication semantics for R=1
 ```
 
-## Repo layout (planned; some not yet created)
+## Repo layout (multi-module)
 
 ```
 pkg/
   backend/             abstract Backend interface
-    backend.go         the interface
-    memory/            in-memory impl for tests + dev
-    slate/             SlateDB-on-object-storage impl
+    backend.go         the interface (the only thing every impl depends on)
+    memory/            in-memory impl for tests + dev (lives in the core module)
   cluster/             public API surface (what apps import)
     cluster.go         Cluster struct, Put/Get/Delete/ScanPrefix/Begin
   ring/                consistent hash ring (wraps buraksezer/consistent)
   membership/          memberlist wrapper + topology change events
   rpc/                 gRPC server + client for inter-node ops
   rebalance/           shard handoff during membership changes
+  shaled/              shared run-loop helper used by every shaled-* binary
+backends/              each backend is its own Go module (own go.mod, own deps)
+  slate/               SlateDB-on-object-storage impl
+                       module: github.com/Zamua/shale/backends/slate
+    cmd/shaled-slate/  per-backend shaled binary (slate-only)
+  pebble/              Pebble local-disk LSM impl
+                       module: github.com/Zamua/shale/backends/pebble
+    cmd/shaled-pebble/ per-backend shaled binary (pebble-only)
 cmd/
-  shaled/              standalone node binary; runs a shale node as its own process
-                       (chooses Backend via flag, exposes gRPC for the CLI + for
-                       inter-node forwarding once multi-node lands in v0.2)
+  shaled/              the reference shaled binary; memory backend only
+                       (no heavy storage deps in the core module)
   shale/               CLI; put/get/delete/scan/topology/stats/ping over gRPC
                        against a running node (defaults to 127.0.0.1:7947)
 internal/              private helpers + test fixtures
@@ -69,6 +75,10 @@ tests/
   integration/         multi-node in-process cluster, full path
 docs/
   SPEC.md              the canonical design doc
+go.work                workspace file - lets `go test ./...` from the root traverse
+                       the core module + every backend module without a publish cycle
+                       (release builds use GOWORK=off so each module's go.mod is
+                       the source of truth for its own deps)
 LICENSE                Apache 2.0
 README.md              user-facing intro
 CLAUDE.md              this file

@@ -259,7 +259,7 @@ v0.5 introduces: `import "github.com/Zamua/shale/backends/slate"` + a separate `
 The recommended path is **break + bump**:
 
   - v0.4.x is the last release with `pkg/backend/{slate,pebble}` import paths.
-  - v0.5.0 ships the new layout. The CHANGELOG documents the import-path change as a one-line `gofmt -r`-able rewrite; consumers update + bump.
+  - v0.5.0 ships the new layout. The rewrite is mechanical: a single `gofmt -r 'github.com/Zamua/shale/pkg/backend/slate -> github.com/Zamua/shale/backends/slate'` over the consumer's tree, followed by the same for pebble (`gofmt -r 'github.com/Zamua/shale/pkg/backend/pebble -> github.com/Zamua/shale/backends/pebble'`), then `go mod tidy` to pick up the new `require` lines. There is no CHANGELOG file in this repo; the conventional-commit history is the changelog.
   - The old paths are deleted, not deprecated-with-forwarders. The pre-v1 contract says API breaks are allowed at minor versions; forwarders would either (a) pull slate's deps back into the core module (defeating the split) or (b) live as build-tag-gated empty stubs that confuse more than they help.
 
 Operators who can't rewrite immediately stay on the v0.4 line until they're ready. The v0.4 line gets bug fixes for the v0.4.x window only; new development moves to v0.5.
