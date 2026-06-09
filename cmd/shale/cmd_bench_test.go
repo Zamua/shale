@@ -121,6 +121,7 @@ func TestRunBenchFlagParsingRejectsBadValues(t *testing.T) {
 		{"bench", "--reads", "-1"},
 		{"bench", "--value-size", "-1"},
 		{"bench", "--concurrency", "0"},
+		{"bench", "--replication-factor", "-1"},
 		{"bench", "extra-arg"},
 	}
 	for _, args := range cases {
@@ -130,6 +131,56 @@ func TestRunBenchFlagParsingRejectsBadValues(t *testing.T) {
 			t.Fatalf("args=%v: want exitGeneric, got %d (stderr=%q)", args, code, stderr.String())
 		}
 	}
+}
+
+// TestRunBenchReplicationFactorPropagates pins that --replication-factor
+// shows up in both the human output (single label line at the top) and
+// the JSON envelope (top-level replication_factor field). This is the
+// only contract bench owes: it's a label, not a switch, but the label
+// MUST round-trip so R1/R2/R3 comparison runs stay distinguishable.
+func TestRunBenchReplicationFactorPropagates(t *testing.T) {
+	addr, cleanup := startNode(t)
+	defer cleanup()
+	t.Setenv(envAddr, "")
+
+	t.Run("human", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--addr", addr, "bench",
+			"--writes", "5", "--reads", "5",
+			"--value-size", "8", "--concurrency", "2",
+			"--replication-factor", "3",
+		}
+		if code := run(args, &stdout, &stderr); code != exitOK {
+			t.Fatalf("code=%d stderr=%s", code, stderr.String())
+		}
+		if !strings.Contains(stdout.String(), "replication_factor=3") {
+			t.Fatalf("human output missing replication_factor=3:\n%s", stdout.String())
+		}
+	})
+
+	t.Run("json", func(t *testing.T) {
+		var stdout, stderr bytes.Buffer
+		args := []string{
+			"--addr", addr, "bench",
+			"--writes", "5", "--reads", "5",
+			"--value-size", "8", "--concurrency", "2",
+			"--replication-factor", "2",
+			"--json",
+		}
+		if code := run(args, &stdout, &stderr); code != exitOK {
+			t.Fatalf("code=%d stderr=%s", code, stderr.String())
+		}
+		var out struct {
+			ReplicationFactor int `json:"replication_factor"`
+		}
+		if err := json.Unmarshal(stdout.Bytes(), &out); err != nil {
+			t.Fatalf("invalid JSON: %v\n%s", err, stdout.String())
+		}
+		if out.ReplicationFactor != 2 {
+			t.Fatalf("JSON replication_factor: got %d want 2", out.ReplicationFactor)
+		}
+	})
 }
 
 // TestRunBenchHumanRoundtrip drives a real bench against an in-process

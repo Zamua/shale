@@ -63,7 +63,15 @@ type benchOutput struct {
 	KeysPrefix  string       `json:"keys_prefix"`
 	ValueSize   int          `json:"value_size_bytes"`
 	Concurrency int          `json:"concurrency"`
-	Phases      []phaseStats `json:"phases"`
+	// ReplicationFactor is the R the operator was driving the target
+	// cluster at; bench itself only talks to one node's gRPC + does
+	// not configure replication on the server side, so this is a
+	// label-only field that lets a wrapper script keep R1 / R2 / R3
+	// runs distinguishable in the output stream. Per docs/SPEC.md
+	// "Replication (v0.4+)" R is per-cluster config, set when shaled
+	// starts; bench reports the value the operator asked it to record.
+	ReplicationFactor int          `json:"replication_factor,omitempty"`
+	Phases            []phaseStats `json:"phases"`
 }
 
 // runBench handles `shale bench`. See file header for design notes.
@@ -74,12 +82,16 @@ func runBench(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 		fmt.Fprint(stderr, `Usage: shale bench [flags]
 
 Flags:
-  --writes N            Put operations (default 10000)
-  --reads N             Get operations after writes (default 10000)
-  --keys-prefix PREFIX  key prefix (default "bench:")
-  --value-size BYTES    payload bytes per Put (default 256, random fill)
-  --concurrency N       parallel goroutines (default 8)
-  --json                emit a single JSON object covering both phases
+  --writes N                Put operations (default 10000)
+  --reads N                 Get operations after writes (default 10000)
+  --keys-prefix PREFIX      key prefix (default "bench:")
+  --value-size BYTES        payload bytes per Put (default 256, random fill)
+  --concurrency N           parallel goroutines (default 8)
+  --replication-factor R    record the cluster's R in the output (label-only;
+                            the actual R is set on the running node, this
+                            flag just tags the run so R1/R2/R3 comparisons
+                            stay distinguishable in --json output)
+  --json                    emit a single JSON object covering both phases
 `)
 	}
 	writes := fs.Int("writes", 10000, "Put operations")
@@ -87,6 +99,7 @@ Flags:
 	keysPrefix := fs.String("keys-prefix", "bench:", "key prefix")
 	valueSize := fs.Int("value-size", 256, "payload bytes per Put")
 	concurrency := fs.Int("concurrency", 8, "parallel goroutines")
+	replicationFactor := fs.Int("replication-factor", 0, "label-only R for output (default 0 = unspecified)")
 	jsonOut := fs.Bool("json", false, "structured output")
 	if err := fs.Parse(args); err != nil {
 		return exitGeneric
@@ -105,6 +118,10 @@ Flags:
 	}
 	if *concurrency < 1 {
 		fmt.Fprintf(stderr, "shale bench: --concurrency must be >= 1\n")
+		return exitGeneric
+	}
+	if *replicationFactor < 0 {
+		fmt.Fprintf(stderr, "shale bench: --replication-factor must be >= 0\n")
 		return exitGeneric
 	}
 	// --json on either the global or subcommand flag turns on JSON
@@ -146,12 +163,13 @@ Flags:
 
 	if wantJSON {
 		out := benchOutput{
-			Writes:      *writes,
-			Reads:       *reads,
-			KeysPrefix:  *keysPrefix,
-			ValueSize:   *valueSize,
-			Concurrency: *concurrency,
-			Phases:      phases,
+			Writes:            *writes,
+			Reads:             *reads,
+			KeysPrefix:        *keysPrefix,
+			ValueSize:         *valueSize,
+			Concurrency:       *concurrency,
+			ReplicationFactor: *replicationFactor,
+			Phases:            phases,
 		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
@@ -161,6 +179,9 @@ Flags:
 		return exitOK
 	}
 
+	if *replicationFactor > 0 {
+		fmt.Fprintf(stdout, "replication_factor=%d\n", *replicationFactor)
+	}
 	for _, p := range phases {
 		fmt.Fprintln(stdout, formatPhaseHuman(p))
 	}
