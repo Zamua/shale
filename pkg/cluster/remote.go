@@ -127,11 +127,12 @@ type clusterTx struct {
 	c     *Cluster
 	level backend.IsolationLevel
 
-	mu      sync.Mutex
-	pinned  bool
-	ownerID string
-	tx      backend.Transaction
-	done    bool
+	mu       sync.Mutex
+	pinned   bool
+	ownerID  string
+	tx       backend.Transaction
+	done     bool
+	pinError error // sticky if prepare failed to acquire the underlying tx
 }
 
 func (t *clusterTx) prepare(key []byte) (backend.Transaction, error) {
@@ -140,15 +141,24 @@ func (t *clusterTx) prepare(key []byte) (backend.Transaction, error) {
 	if t.done {
 		return nil, errors.New("cluster: transaction already finalized")
 	}
+	// If a previous prepare failed (e.g. remote-pinned tx), every
+	// subsequent op returns the same sticky error rather than
+	// re-running prepare and dereferencing a nil t.tx.
+	if t.pinError != nil {
+		return nil, t.pinError
+	}
 	owner, local := t.c.ownerOf(key)
 	if !t.pinned {
 		t.pinned = true
 		t.ownerID = owner.ID
 		if !local {
-			return nil, fmt.Errorf("%w: v0.2 cannot proxy transactions to remote owner %s", backend.ErrCrossShard, owner.ID)
+			err := fmt.Errorf("%w: v0.2 cannot proxy transactions to remote owner %s", backend.ErrCrossShard, owner.ID)
+			t.pinError = err
+			return nil, err
 		}
 		tx, err := t.c.backend.Begin(t.level)
 		if err != nil {
+			t.pinError = err
 			return nil, err
 		}
 		t.tx = tx

@@ -336,6 +336,86 @@ func TestCloseRace(t *testing.T) {
 	}
 }
 
+// TestRemoteTx_StaysCrossShard pins the failure mode where a remote-
+// pinned transaction's first prepare set t.pinned=true but did NOT
+// open t.tx (because the pin landed on a remote owner, which v0.2
+// can't proxy). The second op then re-ran prepare, saw "already
+// pinned" + the owner matched, and returned t.tx == nil - which a
+// caller would then dereference and panic on.
+//
+// The contract: any op AFTER the failed prepare also returns
+// backend.ErrCrossShard (or a wrap thereof), never a nil tx.
+func TestRemoteTx_StaysCrossShard(t *testing.T) {
+	n1Mem := memory.New()
+	n2Mem := memory.New()
+
+	n1MemberPort := freePort(t)
+	n2MemberPort := freePort(t)
+
+	n1GRPC, n1stop := startGRPC(t)
+	defer n1stop()
+	n2GRPC, n2stop := startGRPC(t)
+	defer n2stop()
+
+	c1, err := cluster.Open(cluster.Config{
+		NodeID:    "n1",
+		Backend:   n1Mem,
+		BindAddr:  hostPort(n1MemberPort),
+		GRPCAddr:  n1GRPC.addr,
+		LogOutput: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("open n1: %v", err)
+	}
+	defer c1.Close()
+	n1GRPC.register(c1)
+
+	c2, err := cluster.Open(cluster.Config{
+		NodeID:    "n2",
+		Backend:   n2Mem,
+		BindAddr:  hostPort(n2MemberPort),
+		GRPCAddr:  n2GRPC.addr,
+		Seeds:     []string{hostPort(n1MemberPort)},
+		LogOutput: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("open n2: %v", err)
+	}
+	defer c2.Close()
+	n2GRPC.register(c2)
+
+	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
+		t.Fatalf("ring: %v", err)
+	}
+
+	// Find a key whose owner is n2; open a tx on n1 + pin it on
+	// that remote-owned key. The first op should return ErrCrossShard.
+	remoteKey := findKeyOwnedBy(t, c1, "n2", 1000)
+	tx, err := c1.Begin(backend.SnapshotIsolation)
+	if err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	defer tx.Rollback()
+
+	if err := tx.Put([]byte(remoteKey), []byte("v")); !errors.Is(err, backend.ErrCrossShard) {
+		t.Fatalf("first Put: want ErrCrossShard, got %v", err)
+	}
+
+	// Pre-fix: this second op would re-run prepare, see "already
+	// pinned, owner matches", return t.tx == nil, and panic on the
+	// nil dereference inside tx.Put -> nil.Put. Post-fix: the
+	// sticky pinError flips us straight back to ErrCrossShard.
+	if err := tx.Put([]byte(remoteKey), []byte("v2")); !errors.Is(err, backend.ErrCrossShard) {
+		t.Fatalf("second Put: want ErrCrossShard, got %v", err)
+	}
+	if _, err := tx.Get([]byte(remoteKey)); !errors.Is(err, backend.ErrCrossShard) {
+		t.Fatalf("Get after failed pin: want ErrCrossShard, got %v", err)
+	}
+	if err := tx.Delete([]byte(remoteKey)); !errors.Is(err, backend.ErrCrossShard) {
+		t.Fatalf("Delete after failed pin: want ErrCrossShard, got %v", err)
+	}
+}
+
 // TestAggregateResult_DistinguishesPeerError forces one peer to
 // return an error from its snapshot path + asserts that
 // AggregateResult.Err is set distinctly from AggregateResult.Value.
