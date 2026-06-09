@@ -1,6 +1,7 @@
 # shale
 
 [![test](https://github.com/Zamua/shale/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Zamua/shale/actions/workflows/test.yml)
+[![lint](https://github.com/Zamua/shale/actions/workflows/lint.yml/badge.svg?branch=main)](https://github.com/Zamua/shale/actions/workflows/lint.yml)
 
 Horizontal-scale layer for embedded KV stores. Each instance you import is a cluster node; consistent hashing distributes keys across nodes; durability is whatever backend you plug in.
 
@@ -25,6 +26,20 @@ shale is the third option: thin Go library, BYO backend, scales by adding proces
 - [ ] v0.6: hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend on production-shape data.
 
 Don't use in production yet.
+
+## Development
+
+One-time setup after cloning, to enable the repo-shipped lint + format
+hooks:
+
+```
+git config core.hooksPath .githooks
+```
+
+This points git at `.githooks/` for hook lookup, so the `pre-commit`
+script in that directory runs on every commit. It checks `gofmt`, runs
+`go vet`, and (when `golangci-lint` is installed) lints the staged diff.
+See `.githooks/README.md` for the install command and version pin.
 
 ## License
 

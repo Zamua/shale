@@ -1,0 +1,34 @@
+# golangci-lint configuration for shale.
+#
+# Schema version 2 (golangci-lint v2.x).
+# Pinned version: v2.12.2 (matches .githooks/README.md and .github/workflows/lint.yml).
+#
+# Run locally:  golangci-lint run ./...
+# Auto-fix:     golangci-lint run --fix ./...
+version: "2"
+
+run:
+  # Allow the long-running staticcheck pass to finish on CI's cold cache.
+  timeout: 5m
+
+linters:
+  # Start from the default set, then layer extras on.
+  default: standard
+  # Default set is: errcheck, govet, ineffassign, staticcheck, unused.
+  #   errcheck    - flags unchecked error returns
+  #   govet       - the same passes as `go vet`
+  #   ineffassign - assignments whose result is never read
+  #   staticcheck - deep static analysis (the SA / S / ST / QF rule sets)
+  #   unused      - dead code (unused vars, funcs, types, fields)
+  enable:
+    # Style + correctness linter (replacement for the long-deprecated golint).
+    - revive
+    # Catches typos in code + comments.
+    - misspell
+
+formatters:
+  # gofmt + goimports run as formatters in schema v2; they verify
+  # formatting in `run` mode and rewrite files in `--fix` mode.
+  enable:
+    - gofmt
+    - goimports
