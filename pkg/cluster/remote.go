@@ -42,6 +42,41 @@ func (c *peerClient) Close() error {
 	return err
 }
 
+// The *Forwarded variants set Forwarded=true on the wire request so
+// the receiving server can reject the op if it does not own the key
+// (instead of bouncing it back, which would loop A->B->A on diverged
+// rings). pkg/cluster only forwards via these variants; the plain
+// ones below remain for tests + future non-routed call sites.
+
+func (c *peerClient) PutForwarded(ctx context.Context, key, value []byte) error {
+	_, err := c.api.Put(ctx, &pb.PutRequest{Key: key, Value: value, Forwarded: true})
+	return err
+}
+
+func (c *peerClient) GetForwarded(ctx context.Context, key []byte) ([]byte, bool, error) {
+	resp, err := c.api.Get(ctx, &pb.GetRequest{Key: key, Forwarded: true})
+	if err != nil {
+		return nil, false, err
+	}
+	if resp.GetNotFound() {
+		return nil, false, nil
+	}
+	return resp.GetValue(), true, nil
+}
+
+func (c *peerClient) DeleteForwarded(ctx context.Context, key []byte) error {
+	_, err := c.api.Delete(ctx, &pb.DeleteRequest{Key: key, Forwarded: true})
+	return err
+}
+
+func (c *peerClient) ScanPrefixForwarded(ctx context.Context, prefix []byte) (grpc.ServerStreamingClient[pb.ScanPrefixResponse], error) {
+	return c.api.ScanPrefix(ctx, &pb.ScanPrefixRequest{Prefix: prefix, Forwarded: true})
+}
+
+// The plain (non-forwarded) variants are still here for tests +
+// future non-routed call sites; they leave Forwarded=false so the
+// server treats them as a first-hop request and routes normally.
+
 func (c *peerClient) Put(ctx context.Context, key, value []byte) error {
 	_, err := c.api.Put(ctx, &pb.PutRequest{Key: key, Value: value})
 	return err

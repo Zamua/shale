@@ -18,6 +18,8 @@ import (
 	"github.com/Zamua/shale/pkg/cluster"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // Server is the gRPC adapter on top of cluster.Cluster.
@@ -49,8 +51,20 @@ func (s *Server) Register(g *grpc.Server) {
 
 // -- KV RPCs ---------------------------------------------------------
 
+// errForwardLoop is returned when a forwarded=true request arrives at
+// a node that does not own the key. The originating cluster's ring
+// has drifted ahead of ours; bouncing it back would loop. The caller
+// sees FailedPrecondition + a descriptive message so it can refresh
+// its ring view + retry from scratch.
+func errForwardLoop(reason string) error {
+	return status.Error(codes.FailedPrecondition, "shale: forwarding loop refused: "+reason)
+}
+
 func (s *Server) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	s.puts.Add(1)
+	if req.GetForwarded() && !s.c.OwnsKey(req.GetKey()) {
+		return nil, errForwardLoop("Put: this node does not own the key")
+	}
 	if err := s.c.Put(req.GetKey(), req.GetValue()); err != nil {
 		return nil, err
 	}
@@ -59,6 +73,9 @@ func (s *Server) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 
 func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	s.gets.Add(1)
+	if req.GetForwarded() && !s.c.OwnsKey(req.GetKey()) {
+		return nil, errForwardLoop("Get: this node does not own the key")
+	}
 	v, err := s.c.Get(req.GetKey())
 	if errors.Is(err, backend.ErrNotFound) {
 		return &pb.GetResponse{NotFound: true}, nil
@@ -71,6 +88,9 @@ func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 
 func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	s.deletes.Add(1)
+	if req.GetForwarded() && !s.c.OwnsKey(req.GetKey()) {
+		return nil, errForwardLoop("Delete: this node does not own the key")
+	}
 	if err := s.c.Delete(req.GetKey()); err != nil {
 		return nil, err
 	}
@@ -79,6 +99,9 @@ func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteRes
 
 func (s *Server) ScanPrefix(req *pb.ScanPrefixRequest, stream grpc.ServerStreamingServer[pb.ScanPrefixResponse]) error {
 	s.scans.Add(1)
+	if req.GetForwarded() && !s.c.OwnsKey(req.GetPrefix()) {
+		return errForwardLoop("ScanPrefix: this node does not own the prefix")
+	}
 	it, err := s.c.ScanPrefix(req.GetPrefix())
 	if err != nil {
 		return err

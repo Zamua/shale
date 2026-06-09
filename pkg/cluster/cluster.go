@@ -191,6 +191,16 @@ func (c *Cluster) Members() []ring.Member {
 	return c.ring.Members()
 }
 
+// OwnsKey reports whether the local node is the ring owner of key.
+// Used by the gRPC server's forwarding-loop guard: a request that
+// arrives with forwarded=true but does NOT belong here is refused
+// rather than re-forwarded (which would loop A->B->A on diverged
+// rings).
+func (c *Cluster) OwnsKey(key []byte) bool {
+	_, local := c.ownerOf(key)
+	return local
+}
+
 // LocalScanPrefix returns an iterator over the LOCAL backend's keys
 // with the given prefix, bypassing ring routing entirely. Use this
 // for admin-style operations (peer snapshotting, per-node counters)
@@ -322,7 +332,7 @@ func (c *Cluster) Put(key, value []byte) error {
 	if err != nil {
 		return err
 	}
-	return cli.Put(context.Background(), key, value)
+	return cli.PutForwarded(context.Background(), key, value)
 }
 
 // Get returns the value for key, routing to the owning node.
@@ -338,7 +348,7 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	val, found, err := cli.Get(context.Background(), key)
+	val, found, err := cli.GetForwarded(context.Background(), key)
 	if err != nil {
 		return nil, err
 	}
@@ -361,7 +371,7 @@ func (c *Cluster) Delete(key []byte) error {
 	if err != nil {
 		return err
 	}
-	return cli.Delete(context.Background(), key)
+	return cli.DeleteForwarded(context.Background(), key)
 }
 
 // ScanPrefix returns an iterator over keys with the given prefix on
@@ -381,7 +391,7 @@ func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	stream, err := cli.ScanPrefix(ctx, prefix)
+	stream, err := cli.ScanPrefixForwarded(ctx, prefix)
 	if err != nil {
 		cancel()
 		return nil, err
