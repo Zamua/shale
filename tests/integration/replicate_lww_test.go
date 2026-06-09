@@ -63,14 +63,14 @@ func TestReplicate_LWW_HigherTimestampWins(t *testing.T) {
 	earlyEnv := cluster.Encode(cluster.Envelope{
 		Stamp: cluster.Stamp{
 			TimestampNanos: 50,
-			NodeID:   "writerA",
+			NodeID:         "writerA",
 		},
 		Payload: []byte("older"),
 	})
 	lateEnv := cluster.Encode(cluster.Envelope{
 		Stamp: cluster.Stamp{
 			TimestampNanos: 100,
-			NodeID:   "writerB",
+			NodeID:         "writerB",
 		},
 		Payload: []byte("newer"),
 	})

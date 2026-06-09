@@ -11,7 +11,7 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 	want := cluster.Envelope{
 		Stamp: cluster.Stamp{
 			TimestampNanos: 1_717_000_000_000_000_000,
-			NodeID:   "node-2",
+			NodeID:         "node-2",
 		},
 		Payload: []byte("hello, world"),
 	}

@@ -15,7 +15,6 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"os"
 	"strconv"
 	"testing"
 	"time"
@@ -25,6 +24,7 @@ import (
 	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
+	"go.uber.org/goleak"
 	"google.golang.org/grpc"
 )
 
@@ -34,6 +34,14 @@ import (
 // integration tests need sub-second feedback so the sweep can fire
 // within the per-test wall-clock budgets.
 //
+// Wraps goleak.VerifyTestMain so a regression that leaks goroutines
+// out of a Cluster (events loop, sweep, fanout drainer, read-repair,
+// etc.) surfaces as a test-binary leak at the end of the run. Known
+// third-party background goroutines (memberlist gossip / probe /
+// gRPC keepalive / etc.) are explicitly ignored: they're stable +
+// well-behaved in production but their teardown is async + can
+// flicker on a fast CI box.
+//
 // This file is helpers_test.go (not helpers.go) because TestMain is
 // only honored in _test.go files; an earlier helpers.go landed the
 // setter where go test silently ignored it, leaving every sweep
@@ -42,7 +50,31 @@ import (
 // content (testNode + friends are test-only anyway).
 func TestMain(m *testing.M) {
 	rebalance.SetSweepInterval(50 * time.Millisecond)
-	os.Exit(m.Run())
+	goleak.VerifyTestMain(m,
+		// memberlist background workers; see pkg/cluster/main_test.go
+		// for the rationale + the full enumeration.
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).probeNode"),
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).pushPullTrigger"),
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).gossip"),
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).triggerFunc"),
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).probe"),
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).streamListen"),
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).packetListen"),
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).packetHandler"),
+		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).deschedule"),
+		// gRPC client/server background loops that linger briefly past Stop.
+		goleak.IgnoreTopFunction("google.golang.org/grpc.(*ccBalancerWrapper).watcher"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/grpcsync.(*CallbackSerializer).run"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*controlBuffer).get"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*http2Client).keepalive"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*http2Client).reader"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*http2Server).keepalive"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*http2Server).HandleStreams"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.NewServerTransport.func2"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc.(*Server).handleStream"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc.(*addrConn).resetTransportAndUnlock"),
+		goleak.IgnoreAnyFunction("google.golang.org/grpc.(*addrConn).connect"),
+	)
 }
 
 // testNode is the bundle of state behind one node in an integration
