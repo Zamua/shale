@@ -65,27 +65,74 @@ ever sees the value. Other constructors that return `*slatedb.Settings`
 work the same way (`SettingsFromFile`, `SettingsFromEnv`,
 `SettingsFromJsonString`, ...).
 
-### Caveat: AwaitDurable is NOT a Settings field in slatedb-go v0.13.1
+### Note: AwaitDurable lives on WriteOptions, not Settings (slatedb-go v0.13.1)
 
-The shale spec gives `settings.AwaitDurable = false` as the motivating
-example for the pass-through (a fast-ack mode that acks at memtable
-insert instead of waiting for the WAL flush to object storage). That
-shape matches the Rust crate, but in the **slatedb-go v0.13.1 binding**:
+In the slatedb-go v0.13.1 binding `*slatedb.Settings` is an opaque
+uniffi handle with no exported struct fields; the only mutation API
+is `Set(key, valueJson string)`. `AwaitDurable` is NOT a Settings
+field at all in this binding: it lives on `slatedb.WriteOptions` as
+a per-write knob, consumed by `PutWithOptions` / `DeleteWithOptions`
+/ `WriteWithOptions` and by `DbTransaction.CommitWithOptions`.
 
-  - `*slatedb.Settings` is an opaque uniffi handle with no exported
-    struct fields; the only mutation API is
-    `Set(key, valueJson string)`.
-  - `AwaitDurable` lives on `slatedb.WriteOptions` (a per-write knob,
-    used by `DeleteWithOptions` / `PutWithOptions` /
-    `WriteWithOptions`), NOT on `Settings`.
+The shale spec example shows `settings.AwaitDurable = false`; that
+shape matches the Rust crate but does not compile against the Go
+binding. Use `Config.WriteOptions` (next section) for the same
+effect via the binding's actual API.
 
-Shale's slate backend always uses default `WriteOptions` internally,
-so `AwaitDurable=false` is not reachable through `slate.Config`
-today. If you need it, the slatedb-go binding has to surface either
-the per-field `Settings` accessors (matching Rust) or a way to set a
-backend-wide default `WriteOptions`. Upstreaming that to slatedb-go
-is the right fix; shale's pass-through is ready to forward whatever
-the binding exposes.
+## Relaxed durability mode
+
+`Config.WriteOptions` is a per-write pass-through into slatedb's
+`*WithOptions` APIs. Nil leaves shale out of the picture: every
+`Put`/`Delete` calls plain `db.Put`/`db.Delete` (which slatedb
+internally treats as `AwaitDurable=true`), and every transaction
+`Commit` calls plain `tx.Commit`. Non-nil is applied verbatim,
+per-call, to `PutWithOptions` / `DeleteWithOptions` /
+`CommitWithOptions`. Shale never reads, mutates, copies, or
+validates the value.
+
+Setting `AwaitDurable=false` opts every write into "ack at memtable
+insert, eventually durable" mode: the call returns when the row is
+visible to readers in the same process, without waiting for the WAL
+flush to object storage (which runs on a background loop, default
+~100ms). Wall-clock latency drops from tens-to-hundreds of
+milliseconds (S3 round trip) to microseconds.
+
+Tradeoff: if the writer process crashes inside the flush interval,
+every write that was ack'd but not yet flushed is lost. The window
+is bounded by the configured `flush_interval` (default 100ms in
+slatedb v0.13).
+
+```go
+import (
+    slatedb "slatedb.io/slatedb-go/uniffi"
+
+    "github.com/Zamua/shale/backends/slate"
+)
+
+be, err := slate.New(slate.Config{
+    Bucket: "my-bucket",
+    DbName: "my-db",
+    WriteOptions: &slatedb.WriteOptions{
+        AwaitDurable: false, // fast-ack, eventually-durable
+    },
+})
+```
+
+### Recommended pairing: shale ReplicationFactor >= 2
+
+Relaxed mode at R=1 (single replica per key) is unsafe: a writer
+crash inside the flush interval drops un-flushed writes with no
+recovery path. With `cluster.Config.ReplicationFactor >= 2`, the
+same write lands on at least one other node whose own flush
+schedule is independent; loss requires every ack'd replica to crash
+inside the same window, which is much rarer for uncorrelated
+failures.
+
+For correlated failures (whole-DC outage, same-software-bug crash
+cascade) even R>=2 doesn't fully cover the loss window; spreading
+replicas across failure domains helps. See the shale spec under
+"Backend durability is a backend concern" for the cluster-level
+framing: shale notes the recommendation but doesn't enforce it.
 
 ## Test layers
 

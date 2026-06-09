@@ -61,9 +61,31 @@ type Config struct {
 	// (e.g. `Set("flush_interval", "\"250ms\"")`). The Rust crate's
 	// per-field accessors are NOT yet exposed in Go. AwaitDurable in
 	// particular is a per-write knob on slatedb.WriteOptions and is
-	// NOT settable through Settings at all in this binding; shale
-	// always uses the default WriteOptions internally.
+	// NOT settable through Settings at all in this binding; reach it
+	// via WriteOptions below.
 	Settings *slatedb.Settings
+
+	// WriteOptions, if non-nil, is applied to every Put/Delete and to
+	// every transaction Commit via slatedb's *WithOptions APIs. Nil =
+	// slatedb defaults (AwaitDurable=true): Put/Delete route through
+	// plain db.Put/db.Delete and tx.Commit calls plain tx.Commit, the
+	// same path slate used pre-WriteOptions pass-through.
+	//
+	// Set AwaitDurable=false to opt into relaxed durability mode (ack
+	// at memtable insert, eventually durable via the background WAL
+	// flush). Pair with cluster.Config.ReplicationFactor >= 2; R=1
+	// relaxed is unsafe. See README "Relaxed durability mode" and the
+	// shale spec section "Backend durability is a backend concern".
+	//
+	// Shale never reads, mutates, copies, or validates this value. It
+	// is passed by-value to the slatedb-go *WithOptions APIs at each
+	// call site (slatedb's WriteOptions is a small struct, not a
+	// handle), so the operator-supplied pointer is dereferenced once
+	// per write; the operator may keep ownership and mutate it across
+	// the backend's lifetime if they want runtime-tunable durability,
+	// though doing so races with concurrent writes and is not
+	// recommended.
+	WriteOptions *slatedb.WriteOptions
 }
 
 func (c Config) validate() error {

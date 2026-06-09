@@ -102,7 +102,7 @@ BYO: implement the interface in your own Go module (the interface is small + sta
 
 Shale's contract is "Put returns when Backend.Put returns." What that ack MEANS (in-memory only? local fsync? round-trip to object storage?) is up to the backend. Shale doesn't translate, doesn't enforce, doesn't expose a Durability enum at the cluster level.
 
-This means a backend can ship a "fast-ack, eventually-durable" mode if it wants to. Slate, for instance, supports `await_durable=false` which acks at memtable insert (microseconds) rather than waiting for the WAL flush to S3 (~100ms). The slate backend constructor exposes this as `slate.WithAwaitDurable(false)`; operator picks it at backend construction, shale neither knows nor cares.
+This means a backend can ship a "fast-ack, eventually-durable" mode if it wants to. Slate, for instance, supports `await_durable=false` which acks at memtable insert (microseconds) rather than waiting for the WAL flush to S3 (~100ms). The slate backend exposes this as a `WriteOptions` pass-through on `slate.Config` (see "Backend-specific Settings pass-through" below); operator picks it at backend construction, shale neither knows nor cares.
 
 CAVEAT FOR FAST-ACK BACKENDS WITH SHALE REPLICATION
 
@@ -136,6 +136,16 @@ type Config struct {
     // here, slate.New hands it to NewDbBuilder. Shale neither inspects
     // nor copies it.
     Settings *slatedb.Settings
+
+    // WriteOptions, if non-nil, is applied to every Put/Delete and to
+    // every transaction Commit via slatedb's *WithOptions APIs. Nil =
+    // slatedb defaults (AwaitDurable=true). Set AwaitDurable=false to
+    // opt into fast-ack mode (see durability note above; pair with
+    // ReplicationFactor >= 2). slatedb-go separates database-level
+    // configuration (Settings, applied at Build) from per-write
+    // configuration (WriteOptions, applied per call); slate's
+    // pass-through mirrors that separation.
+    WriteOptions *slatedb.WriteOptions
 }
 
 // backends/pebble
@@ -150,16 +160,15 @@ type Config struct {
 type Config struct{} // nothing to pass through; no underlying engine.
 ```
 
-Example: an operator who wants slate's `await_durable=false` mode (acks at memtable insert, ~microseconds, instead of waiting for the WAL flush to object storage, ~100ms) builds the slatedb-side Settings before opening the backend:
+Example: an operator who wants slate's `await_durable=false` mode (acks at memtable insert, ~microseconds, instead of waiting for the WAL flush to object storage, ~100ms) hands a `WriteOptions` value to the backend. In the slatedb-go v0.13.1 binding `AwaitDurable` lives on `WriteOptions` (per-write knob), not on `Settings` (database-level config); the slate backend forwards both:
 
 ```go
-settings := slatedb.NewSettings()
-settings.AwaitDurable = false        // backend-specific knob, slatedb-owned
+wopts := &slatedb.WriteOptions{AwaitDurable: false} // fast-ack, backend-specific
 
 be, _ := slate.New(slate.Config{
-    Bucket:   "my-bucket",
-    DbName:   "my-db",
-    Settings: settings,
+    Bucket:       "my-bucket",
+    DbName:       "my-db",
+    WriteOptions: wopts,
 })
 
 c, _ := cluster.Open(cluster.Config{

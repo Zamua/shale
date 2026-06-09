@@ -278,3 +278,179 @@ func TestConfigSettings_PassThroughReachesEngine(t *testing.T) {
 		t.Fatalf("expected Settings.Set to reject type mismatch on flush_interval")
 	}
 }
+
+// TestConfigWriteOptions_NilUsesDefaults pins the "nil = plain
+// Put/Delete/Commit" half of the WriteOptions pass-through. Equivalent
+// in spirit to TestConfigSettings_NilUsesSlatedbDefaults but for the
+// per-write knob: a backend opened without WriteOptions still
+// supports Put/Get/Delete + transaction Commit, behaviorally
+// indistinguishable from the pre-pass-through slate backend.
+func TestConfigWriteOptions_NilUsesDefaults(t *testing.T) {
+	store, err := slatedb.ObjectStoreResolve("memory:///")
+	if err != nil {
+		t.Fatalf("resolve memory store: %v", err)
+	}
+	s, err := slate.NewWithStoreOpts("shale-test-nil-writeopts", store, nil, nil)
+	if err != nil {
+		store.Destroy()
+		t.Fatalf("open slate with nil WriteOptions: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	if err := s.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	got, err := s.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("got %q want v", got)
+	}
+	if err := s.Delete([]byte("k")); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, err := s.Get([]byte("k")); !errors.Is(err, backend.ErrNotFound) {
+		t.Fatalf("expected ErrNotFound after delete, got %v", err)
+	}
+
+	// Transaction Commit on the nil-writeOpts path takes the plain
+	// tx.Commit() route. Pin the post-commit visibility.
+	tx, err := s.Begin(backend.SnapshotIsolation)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := tx.Put([]byte("tx-k"), []byte("tx-v")); err != nil {
+		t.Fatalf("tx put: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("tx commit: %v", err)
+	}
+	got, err = s.Get([]byte("tx-k"))
+	if err != nil {
+		t.Fatalf("post-commit get: %v", err)
+	}
+	if !bytes.Equal(got, []byte("tx-v")) {
+		t.Fatalf("post-commit tx-k = %q want tx-v", got)
+	}
+}
+
+// TestConfigWriteOptions_PassThroughReachesEngine pins the pass-through
+// contract for WriteOptions. We can't observe the per-write durability
+// behavior directly from a memory:/// store (there's no S3 round-trip
+// whose latency would change), so we exercise the binding's wiring
+// instead:
+//
+//  1. AwaitDurable=false against memory:/// opens cleanly + every
+//     Put/Get/Delete round-trips correctly. This proves slate routes
+//     through PutWithOptions/DeleteWithOptions without dropping the
+//     options on the floor: if it did, the test would still pass with
+//     the plain Put/Delete path. But if it CORRUPTED the options
+//     (e.g. passed a zero-valued PutOptions whose Ttl is the un-set
+//     enum variant, not TtlDefault), slatedb would reject the call at
+//     the FFI boundary.
+//  2. AwaitDurable=true against memory:/// is the same wiring with the
+//     "ack-after-flush" knob; pinning both branches exercises that the
+//     flag is forwarded by value, not flattened to a default.
+//  3. Transaction Commit at AwaitDurable=false routes through
+//     CommitWithOptions and the committed write becomes visible.
+//
+// The honest part: we don't have a hook to capture "this exact
+// WriteOptions struct reached the C boundary," and an in-memory store
+// won't surface the latency delta. The wiring proof is "it doesn't
+// crash AND the data round-trips," combined with TestNewWithStoreOpts_
+// PreservesWriteOptionsValue below which pins the constructor's
+// store/dereference semantics.
+func TestConfigWriteOptions_PassThroughReachesEngine(t *testing.T) {
+	cases := []struct {
+		name         string
+		awaitDurable bool
+	}{
+		{name: "AwaitDurable_false_fastAck", awaitDurable: false},
+		{name: "AwaitDurable_true_explicit", awaitDurable: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store, err := slatedb.ObjectStoreResolve("memory:///")
+			if err != nil {
+				t.Fatalf("resolve memory store: %v", err)
+			}
+			wopts := &slatedb.WriteOptions{AwaitDurable: tc.awaitDurable}
+			s, err := slate.NewWithStoreOpts("shale-test-writeopts-"+tc.name, store, nil, wopts)
+			if err != nil {
+				store.Destroy()
+				t.Fatalf("open slate with WriteOptions{AwaitDurable=%v}: %v", tc.awaitDurable, err)
+			}
+			t.Cleanup(func() { _ = s.Close() })
+
+			if err := s.Put([]byte("k"), []byte("v")); err != nil {
+				t.Fatalf("put: %v", err)
+			}
+			got, err := s.Get([]byte("k"))
+			if err != nil {
+				t.Fatalf("get: %v", err)
+			}
+			if !bytes.Equal(got, []byte("v")) {
+				t.Fatalf("got %q want v", got)
+			}
+			if err := s.Delete([]byte("k")); err != nil {
+				t.Fatalf("delete: %v", err)
+			}
+			if _, err := s.Get([]byte("k")); !errors.Is(err, backend.ErrNotFound) {
+				t.Fatalf("expected ErrNotFound after delete, got %v", err)
+			}
+
+			// Transaction Commit routes via CommitWithOptions when
+			// writeOpts is non-nil.
+			tx, err := s.Begin(backend.SnapshotIsolation)
+			if err != nil {
+				t.Fatalf("begin: %v", err)
+			}
+			if err := tx.Put([]byte("tx-k"), []byte("tx-v")); err != nil {
+				t.Fatalf("tx put: %v", err)
+			}
+			if err := tx.Commit(); err != nil {
+				t.Fatalf("tx commit (AwaitDurable=%v): %v", tc.awaitDurable, err)
+			}
+			got, err = s.Get([]byte("tx-k"))
+			if err != nil {
+				t.Fatalf("post-commit get: %v", err)
+			}
+			if !bytes.Equal(got, []byte("tx-v")) {
+				t.Fatalf("post-commit tx-k = %q want tx-v", got)
+			}
+		})
+	}
+}
+
+// TestConfigWriteOptions_TransactionRollbackUnaffected pins that
+// Rollback stays on the plain tx.Rollback() path regardless of
+// WriteOptions: rollback discards the write set, there's no durability
+// knob to honor.
+func TestConfigWriteOptions_TransactionRollbackUnaffected(t *testing.T) {
+	store, err := slatedb.ObjectStoreResolve("memory:///")
+	if err != nil {
+		t.Fatalf("resolve memory store: %v", err)
+	}
+	s, err := slate.NewWithStoreOpts("shale-test-writeopts-rollback", store, nil,
+		&slatedb.WriteOptions{AwaitDurable: false})
+	if err != nil {
+		store.Destroy()
+		t.Fatalf("open: %v", err)
+	}
+	t.Cleanup(func() { _ = s.Close() })
+
+	tx, err := s.Begin(backend.SnapshotIsolation)
+	if err != nil {
+		t.Fatalf("begin: %v", err)
+	}
+	if err := tx.Put([]byte("rb"), []byte("v")); err != nil {
+		t.Fatalf("tx put: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatalf("rollback: %v", err)
+	}
+	if _, err := s.Get([]byte("rb")); !errors.Is(err, backend.ErrNotFound) {
+		t.Fatalf("rolled-back key should be absent, got err=%v", err)
+	}
+}

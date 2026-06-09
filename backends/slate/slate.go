@@ -38,9 +38,17 @@ import (
 
 // Slate is a SlateDB-backed Backend. It owns the underlying *slatedb.Db
 // and *slatedb.ObjectStore; both are released on Close.
+//
+// writeOpts, when non-nil, is applied per-call to PutWithOptions /
+// DeleteWithOptions on the db and to CommitWithOptions on transactions.
+// Nil routes through the plain Put/Delete/Commit calls (slatedb's
+// internal default = AwaitDurable=true), keeping behavior byte-exact
+// with the pre-WriteOptions slate backend for callers that don't opt in.
+// See Config.WriteOptions doc comment for the durability semantics.
 type Slate struct {
-	db    *slatedb.Db
-	store *slatedb.ObjectStore
+	db        *slatedb.Db
+	store     *slatedb.ObjectStore
+	writeOpts *slatedb.WriteOptions
 }
 
 // New opens a SlateDB instance backed by the configured object store.
@@ -51,6 +59,12 @@ type Slate struct {
 // If cfg.Settings is non-nil, it is applied to the DbBuilder before
 // Build (pass-through, no merging with shale defaults). Nil falls
 // back to slatedb's own defaults.
+//
+// If cfg.WriteOptions is non-nil, every Put/Delete on the returned
+// *Slate routes through PutWithOptions/DeleteWithOptions with the
+// supplied value, and every transaction Commit routes through
+// CommitWithOptions. Nil leaves the plain Put/Delete/Commit paths
+// in place (slatedb default AwaitDurable=true).
 func New(cfg Config) (*Slate, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -68,7 +82,7 @@ func New(cfg Config) (*Slate, error) {
 		store.Destroy()
 		return nil, fmt.Errorf("slate: open db %q: %w", cfg.DbName, err)
 	}
-	return &Slate{db: db, store: store}, nil
+	return &Slate{db: db, store: store, writeOpts: cfg.WriteOptions}, nil
 }
 
 // NewWithStore opens a SlateDB instance against an already-resolved
@@ -79,12 +93,6 @@ func New(cfg Config) (*Slate, error) {
 // settings, if non-nil, is forwarded verbatim to the DbBuilder before
 // Build (same pass-through semantics as Config.Settings in New).
 func NewWithStore(dbName string, store *slatedb.ObjectStore, settings ...*slatedb.Settings) (*Slate, error) {
-	if dbName == "" {
-		return nil, errors.New("slate: dbName required")
-	}
-	if store == nil {
-		return nil, errors.New("slate: store required")
-	}
 	if len(settings) > 1 {
 		return nil, errors.New("slate: at most one Settings may be passed")
 	}
@@ -92,11 +100,41 @@ func NewWithStore(dbName string, store *slatedb.ObjectStore, settings ...*slated
 	if len(settings) == 1 {
 		s = settings[0]
 	}
-	db, err := buildDb(dbName, store, s)
+	return NewWithStoreOpts(dbName, store, s, nil)
+}
+
+// NewWithStoreOpts is the long-form NewWithStore that also accepts a
+// per-write *WriteOptions (same pass-through semantics as
+// Config.WriteOptions in New). Nil writeOpts leaves the plain
+// Put/Delete/Commit paths in place; non-nil routes every Put/Delete to
+// the binding's *WithOptions APIs and every transaction Commit to
+// CommitWithOptions.
+//
+// Same test-targeted constructor as NewWithStore: useful for memory:///
+// stores without the AWS_* env-var dance. New is the production entry
+// point.
+func NewWithStoreOpts(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, writeOpts *slatedb.WriteOptions) (*Slate, error) {
+	if dbName == "" {
+		return nil, errors.New("slate: dbName required")
+	}
+	if store == nil {
+		return nil, errors.New("slate: store required")
+	}
+	db, err := buildDb(dbName, store, settings)
 	if err != nil {
 		return nil, fmt.Errorf("slate: open db %q: %w", dbName, err)
 	}
-	return &Slate{db: db, store: store}, nil
+	return &Slate{db: db, store: store, writeOpts: writeOpts}, nil
+}
+
+// defaultPutOptions returns the no-op PutOptions slate hands to
+// PutWithOptions when WriteOptions is set: TtlDefault means "no
+// override," equivalent to plain Db.Put on the TTL axis. We need to
+// pass *something* because the binding's PutWithOptions takes both a
+// PutOptions and a WriteOptions; the WriteOptions carries the
+// durability knob shale exposes, the PutOptions stays at defaults.
+func defaultPutOptions() slatedb.PutOptions {
+	return slatedb.PutOptions{Ttl: slatedb.TtlDefault{}}
 }
 
 // buildDb runs the DbBuilder pipeline shared by New + NewWithStore.
@@ -117,10 +155,18 @@ func buildDb(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settin
 	return db, nil
 }
 
-// Put stores value under key.
+// Put stores value under key. When Config.WriteOptions is non-nil,
+// routes through PutWithOptions with default PutOptions (TtlDefault)
+// and the operator-supplied WriteOptions; otherwise plain Db.Put.
 func (s *Slate) Put(key, value []byte) error {
 	if s.db == nil {
 		return backend.ErrClosed
+	}
+	if s.writeOpts != nil {
+		if _, err := s.db.PutWithOptions(key, value, defaultPutOptions(), *s.writeOpts); err != nil {
+			return fmt.Errorf("slate: put: %w", err)
+		}
+		return nil
 	}
 	if _, err := s.db.Put(key, value); err != nil {
 		return fmt.Errorf("slate: put: %w", err)
@@ -145,10 +191,18 @@ func (s *Slate) Get(key []byte) ([]byte, error) {
 	return append([]byte(nil), (*raw)...), nil
 }
 
-// Delete removes key. Idempotent at the SlateDB level too.
+// Delete removes key. Idempotent at the SlateDB level too. When
+// Config.WriteOptions is non-nil, routes through DeleteWithOptions;
+// otherwise plain Db.Delete.
 func (s *Slate) Delete(key []byte) error {
 	if s.db == nil {
 		return backend.ErrClosed
+	}
+	if s.writeOpts != nil {
+		if _, err := s.db.DeleteWithOptions(key, *s.writeOpts); err != nil {
+			return fmt.Errorf("slate: delete: %w", err)
+		}
+		return nil
 	}
 	if _, err := s.db.Delete(key); err != nil {
 		return fmt.Errorf("slate: delete: %w", err)
@@ -173,6 +227,13 @@ func (s *Slate) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 // Begin starts a SlateDB transaction at snapshot isolation. SlateDB's
 // only supported level today is SnapshotIsolation; serializable-snapshot
 // is rejected up-front so callers don't get silent downgrades.
+//
+// The transaction inherits the backend's writeOpts: Commit routes
+// through CommitWithOptions when non-nil, plain Commit otherwise. The
+// per-write knobs on slatedb-go's transaction Put/Delete (PutOptions)
+// are independent of WriteOptions (a TTL knob, not a durability knob),
+// so transaction writes use the plain Put/Delete paths regardless;
+// durability is only honored at Commit time.
 func (s *Slate) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
 	if s.db == nil {
 		return nil, backend.ErrClosed
@@ -184,7 +245,7 @@ func (s *Slate) Begin(level backend.IsolationLevel) (backend.Transaction, error)
 	if err != nil {
 		return nil, fmt.Errorf("slate: begin: %w", err)
 	}
-	return &transaction{tx: tx}, nil
+	return &transaction{tx: tx, writeOpts: s.writeOpts}, nil
 }
 
 // Close shuts the SlateDB down (flushing pending writes) and destroys
@@ -248,9 +309,13 @@ func (i *iterator) Close() error {
 
 // transaction wraps a *slatedb.DbTransaction. Commit and Rollback are
 // terminal; subsequent calls return backend.ErrClosed.
+//
+// writeOpts is inherited from the parent *Slate at Begin time. Commit
+// routes through CommitWithOptions when non-nil.
 type transaction struct {
-	tx   *slatedb.DbTransaction
-	done bool
+	tx        *slatedb.DbTransaction
+	writeOpts *slatedb.WriteOptions
+	done      bool
 }
 
 func (t *transaction) Get(key []byte) ([]byte, error) {
@@ -303,6 +368,12 @@ func (t *transaction) Commit() error {
 		return backend.ErrClosed
 	}
 	t.done = true
+	if t.writeOpts != nil {
+		if _, err := t.tx.CommitWithOptions(*t.writeOpts); err != nil {
+			return fmt.Errorf("slate: tx commit: %w", err)
+		}
+		return nil
+	}
 	if _, err := t.tx.Commit(); err != nil {
 		return fmt.Errorf("slate: tx commit: %w", err)
 	}
