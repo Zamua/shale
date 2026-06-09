@@ -28,11 +28,19 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/membership"
 	"github.com/Zamua/shale/pkg/ring"
 )
+
+// reconcileInterval is how often the cluster polls membership for a
+// full snapshot and reapplies any add/remove the event-channel layer
+// may have missed under backpressure. Small enough that a dropped
+// event recovers within seconds; large enough to be free in steady
+// state. Exposed as a var (not const) so tests can shrink it.
+var reconcileInterval = 5 * time.Second
 
 // Config configures a Cluster. NodeID + Backend are always required.
 // The peer-discovery fields (BindAddr, Seeds, GRPCAddr) are required
@@ -142,9 +150,16 @@ func Open(cfg Config) (*Cluster, error) {
 	}
 
 	// Run the events loop so future joins / leaves keep the ring in
-	// sync with membership.
-	c.loopWG.Add(1)
+	// sync with membership. Also run a slower reconciliation loop
+	// that re-syncs the ring against the authoritative membership
+	// snapshot on a fixed cadence - belt + suspenders against the
+	// rare event-channel drop (membership uses a non-blocking send
+	// to preserve no-deadlock guarantees; if a consumer ever falls
+	// behind a join/leave could be lost, leaving the ring stale
+	// forever without this loop).
+	c.loopWG.Add(2)
 	go c.runEventsLoop()
+	go c.runReconcileLoop()
 
 	return c, nil
 }
@@ -176,6 +191,74 @@ func (c *Cluster) runEventsLoop() {
 			return
 		}
 	}
+}
+
+// runReconcileLoop re-syncs the ring against membership.Members() on
+// a fixed cadence. The event-channel layer in membership drops events
+// on backpressure (intentional - keeps memberlist's callback goroutine
+// unblocked); without this loop, a single dropped join would leave the
+// ring permanently missing that node. With it, ring divergence
+// auto-heals within one tick.
+func (c *Cluster) runReconcileLoop() {
+	defer c.loopWG.Done()
+	t := time.NewTicker(reconcileInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-c.closeCh:
+			return
+		case <-t.C:
+			c.reconcileRingFromMembership()
+		}
+	}
+}
+
+// reconcileRingFromMembership reads the authoritative membership snapshot
+// and applies any missed adds/removes to the ring. Idempotent: an
+// already-present member's Add is a no-op (ring.Add overwrites the
+// same Member with itself) and a non-member's absence is the desired
+// state.
+func (c *Cluster) reconcileRingFromMembership() {
+	if c.membership == nil || c.ring == nil {
+		return
+	}
+	snap := c.membership.Snapshot()
+	want := make(map[string]ring.Member, len(snap))
+	for _, m := range snap {
+		want[m.ID] = ring.Member{ID: m.ID, Addr: m.Addr}
+	}
+	// Add anyone missing from the ring (or with a stale Addr).
+	for id, m := range want {
+		oldAddr := c.priorAddrForID(id)
+		if oldAddr != m.Addr {
+			c.ring.Add(m)
+			if oldAddr != "" {
+				c.evictClient(oldAddr)
+			}
+		}
+	}
+	// Remove anyone the ring still has but membership has dropped.
+	for _, m := range c.ring.Members() {
+		if _, ok := want[m.ID]; !ok {
+			c.ring.Remove(m.ID)
+			c.evictClient(m.Addr)
+		}
+	}
+}
+
+// priorAddrForID returns the Addr currently recorded in the ring for
+// the given ID, or "" if absent. Used by the reconciliation path to
+// evict a now-stale cached client when a peer's Addr changes.
+func (c *Cluster) priorAddrForID(id string) string {
+	if c.ring == nil {
+		return ""
+	}
+	for _, m := range c.ring.Members() {
+		if m.ID == id {
+			return m.Addr
+		}
+	}
+	return ""
 }
 
 // NodeID returns this node's stable identity, as supplied in Config.
