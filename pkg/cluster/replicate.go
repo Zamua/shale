@@ -1,7 +1,8 @@
 // Replication fan-out (v0.4+).
 //
 // When ReplicationFactor > 1, Put / Delete fan out to R replicas in
-// parallel. The fanout helper here is the shared machinery: it
+// parallel and Get fetches from N replicas in parallel per the read
+// consistency. The fanout helper here is the shared machinery: it
 // dispatches op to each replica concurrently, collects acks + errors
 // as they arrive, and returns once either requiredAcks succeed or
 // enough failures have accumulated that requiredAcks is unreachable.
@@ -24,6 +25,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"time"
 
@@ -192,6 +194,25 @@ func requiredWriteAcks(wc WriteConsistency, r int) int {
 	}
 }
 
+// requiredReadReplicas returns the number of replicas a Get should
+// query to satisfy the configured ReadConsistency over R replicas.
+//
+//	ReadNearest -> 1
+//	ReadQuorum  -> floor(R/2) + 1
+//	ReadAll     -> R
+func requiredReadReplicas(rc ReadConsistency, r int) int {
+	switch rc {
+	case ReadAll:
+		return r
+	case ReadQuorum:
+		return r/2 + 1
+	case ReadNearest:
+		fallthrough
+	default:
+		return 1
+	}
+}
+
 // replicationFactor returns the normalized R for this cluster. R=1 is
 // the v0.3 behavior (single owner, no replicas, no envelope cost).
 // Clamping against the live ring size happens at fan-out time inside
@@ -262,6 +283,190 @@ func (c *Cluster) dispatchReplicaPut(ctx context.Context, replica ring.Member, k
 		return err
 	}
 	return cli.PutForwarded(ctx, key, envBytes)
+}
+
+// getReplicated fetches the LWW winner across N replicas per
+// ReadConsistency, returning the winner's payload (or
+// backend.ErrNotFound if the winner is a tombstone / no replica had
+// the key).
+//
+// On Quorum / All, after the winner is determined any replica that
+// returned NotFound OR an older Stamp is read-repaired asynchronously
+// (best-effort, errors swallowed). Read-repair is skipped on Nearest
+// since there is nothing to compare against.
+func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
+	allReplicas := c.ring.LocateKeyN(c.shardKey(key), c.replicationFactor())
+	if len(allReplicas) == 0 {
+		return nil, status.Error(codes.Unavailable, "shale: no replicas available for key")
+	}
+	rc := c.cfg.ReadConsistency
+	n := requiredReadReplicas(rc, len(allReplicas))
+	if n > len(allReplicas) {
+		n = len(allReplicas)
+	}
+	queried := allReplicas[:n]
+
+	// requiredAcks for the read is "enough replicas to satisfy the
+	// consistency" which equals n itself: we want N responses (a
+	// response is success OR NotFound, both are first-class outcomes
+	// for LWW; only transport / migration errors are failures).
+	// Failure budget = (queried - n) = 0, so any non-transient error
+	// will trip the unreachable check. We forgive that by letting the
+	// caller still pick a winner from whatever DID land - read paths
+	// degrade more gracefully than writes since the surviving
+	// replicas can still serve consistent data.
+	_, _, resultsCh := fanout(context.Background(), queried, n,
+		func(ctx context.Context, replica ring.Member) ([]byte, error) {
+			return c.dispatchReplicaGet(ctx, replica, key)
+		})
+
+	// Collect first N usable responses (success or NotFound). For
+	// Nearest (n=1) this is one envelope; for Quorum / All it's the
+	// full set we asked for. Anything beyond N is surplus we read
+	// only for read-repair.
+	gathered := make([]collected, 0, n)
+	var nonTransientErr error
+
+	for res := range resultsCh {
+		if res.Err != nil {
+			if isTransientReplicaErr(res.Err) {
+				// Skip transient; another replica may land.
+				continue
+			}
+			if errors.Is(res.Err, backend.ErrNotFound) {
+				if len(gathered) < n {
+					gathered = append(gathered, collected{member: res.Member, env: Envelope{}, hadValue: false})
+				}
+				continue
+			}
+			if nonTransientErr == nil {
+				nonTransientErr = res.Err
+			}
+			continue
+		}
+		env, err := Decode(res.Value)
+		if err != nil {
+			// Corrupt envelope: treat as a replica failure but keep
+			// trying others.
+			if nonTransientErr == nil {
+				nonTransientErr = err
+			}
+			continue
+		}
+		if len(gathered) < n {
+			gathered = append(gathered, collected{member: res.Member, env: env, hadValue: true})
+		} else if rc != ReadNearest {
+			// Past the consistency target: keep draining so read-
+			// repair below sees every replica that responded after
+			// we decided. fanout's resultsCh closes once every
+			// dispatched op finishes.
+		}
+	}
+
+	if len(gathered) == 0 {
+		if nonTransientErr != nil {
+			return nil, nonTransientErr
+		}
+		return nil, backend.ErrNotFound
+	}
+
+	// LWW winner: highest Stamp.Greater wins. NotFound participates
+	// as a zero-Stamp envelope (loses every comparison against a real
+	// write, matching v0.3 compat behavior).
+	winner := gathered[0]
+	for _, g := range gathered[1:] {
+		if g.hadValue && (!winner.hadValue || g.env.Stamp.Greater(winner.env.Stamp)) {
+			winner = g
+		}
+	}
+
+	// Read-repair: on Quorum / All, push the winning envelope back to
+	// any replica that returned NotFound OR a strictly-older Stamp.
+	// Best-effort: errors swallowed, no retry. Skipped on Nearest
+	// (only one replica queried; nothing to compare).
+	if rc != ReadNearest && winner.hadValue {
+		c.scheduleReadRepair(key, winner.env, gathered, queried)
+	}
+
+	if !winner.hadValue {
+		return nil, backend.ErrNotFound
+	}
+	if len(winner.env.Payload) == 0 {
+		// Tombstone wins: surface as NotFound.
+		return nil, backend.ErrNotFound
+	}
+	return winner.env.Payload, nil
+}
+
+// dispatchReplicaGet routes one replica's read. Returns the raw
+// envelope bytes (which the caller Decodes) on success, the canonical
+// backend.ErrNotFound when the replica has no entry, or the gRPC
+// status error otherwise. Migration-guard Unavailable is surfaced
+// verbatim so the caller's classifier can skip it.
+func (c *Cluster) dispatchReplicaGet(ctx context.Context, replica ring.Member, key []byte) ([]byte, error) {
+	if replica.ID == c.cfg.NodeID {
+		v, err := c.backend.Get(key)
+		if err != nil {
+			return nil, err
+		}
+		return v, nil
+	}
+	cli, err := c.clientFor(replica.Addr)
+	if err != nil {
+		return nil, err
+	}
+	v, found, err := cli.GetForwarded(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, backend.ErrNotFound
+	}
+	return v, nil
+}
+
+// collected is one replica's contribution to the Get fan-out, ready
+// for LWW comparison + read-repair classification. hadValue is false
+// when the replica explicitly returned NotFound (which itself can win
+// LWW if no replica had a stamped value).
+type collected struct {
+	member   ring.Member
+	env      Envelope
+	hadValue bool
+}
+
+// scheduleReadRepair fires a best-effort async push of the winning
+// envelope to every queried replica that returned NotFound or a
+// strictly-older Stamp. Capped at len(queried) goroutines (one per
+// lagging replica); errors are swallowed.
+func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []collected, queried []ring.Member) {
+	winnerBytes := Encode(winnerEnv)
+	// Build a quick lookup: which gathered replicas saw an older or
+	// missing value. Members we queried but never heard back from
+	// (transient skip) are NOT repaired here - they'll catch up on
+	// the next quorum read or future anti-entropy.
+	laggers := make([]ring.Member, 0, len(gathered))
+	for _, g := range gathered {
+		if !g.hadValue {
+			laggers = append(laggers, g.member)
+			continue
+		}
+		if winnerEnv.Stamp.Greater(g.env.Stamp) {
+			laggers = append(laggers, g.member)
+		}
+	}
+	if len(laggers) == 0 {
+		return
+	}
+	// Detached context: read-repair MUST outlive the caller's Get
+	// (which has already returned by the time these fire), and we
+	// don't want a caller cancel to kill the repair mid-flight.
+	for _, m := range laggers {
+		m := m
+		go func() {
+			_ = c.dispatchReplicaPut(context.Background(), m, key, winnerBytes)
+		}()
+	}
 }
 
 // LocalReplicaPut writes bytes directly to the local backend on

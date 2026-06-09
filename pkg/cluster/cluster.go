@@ -692,9 +692,18 @@ func (c *Cluster) Put(key, value []byte) error {
 // successful Get rather than a transient error. Source-side
 // IsMigrating (StateSending / StateHandedOff) is fine: we still
 // have the data locally + serve the read normally.
+//
+// v0.4 replication: when ReplicationFactor > 1 the Get reads from N
+// replicas per ReadConsistency (1 / quorum / R), picks the LWW winner
+// across returned envelopes, and (on Quorum / All) asynchronously
+// pushes the winner back to any lagging replica. Tombstones (empty
+// payload) surface as backend.ErrNotFound. See docs/SPEC.md "Read path".
 func (c *Cluster) Get(key []byte) ([]byte, error) {
 	if c.closed.Load() || c.backend == nil {
 		return nil, backend.ErrClosed
+	}
+	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
+		return c.getReplicated(key)
 	}
 	owner, local := c.ownerOf(key)
 	if local {

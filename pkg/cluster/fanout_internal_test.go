@@ -141,6 +141,21 @@ func TestRequiredWriteAcks_All(t *testing.T) {
 	}
 }
 
+func TestRequiredReadReplicas(t *testing.T) {
+	if got := requiredReadReplicas(ReadNearest, 3); got != 1 {
+		t.Errorf("Nearest R=3: got %d want 1", got)
+	}
+	if got := requiredReadReplicas(ReadQuorum, 3); got != 2 {
+		t.Errorf("Quorum R=3: got %d want 2", got)
+	}
+	if got := requiredReadReplicas(ReadAll, 3); got != 3 {
+		t.Errorf("All R=3: got %d want 3", got)
+	}
+	if got := requiredReadReplicas(ReadQuorum, 5); got != 3 {
+		t.Errorf("Quorum R=5: got %d want 3", got)
+	}
+}
+
 func drain(ch <-chan replicaResult) {
 	for range ch {
 	}
