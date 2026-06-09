@@ -282,7 +282,97 @@ func TestAggregate_SingleNode(t *testing.T) {
 		}
 		return count
 	})
-	if len(results) != 1 || results[0].(int) != 2 {
-		t.Fatalf("expected single-node aggregate count=2, got %v", results)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d (%v)", len(results), results)
+	}
+	if results[0].Err != nil {
+		t.Fatalf("unexpected aggregate err: %v", results[0].Err)
+	}
+	if got := results[0].Value.(int); got != 2 {
+		t.Fatalf("expected single-node aggregate count=2, got %d (%v)", got, results)
+	}
+}
+
+// TestAggregateResult_DistinguishesPeerError forces one peer to
+// return an error from its snapshot path + asserts that
+// AggregateResult.Err is set distinctly from AggregateResult.Value.
+//
+// We force the error by killing one peer's gRPC server before
+// calling Aggregate. The local node still has the peer on its ring
+// (no leave event yet) so Aggregate fans out to it; the snapshot
+// transport fails; the per-peer result lands in .Err.
+func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
+	n1Mem := memory.New()
+	n2Mem := memory.New()
+
+	n1MemberPort := freePort(t)
+	n2MemberPort := freePort(t)
+
+	n1GRPC, n1stop := startGRPC(t)
+	defer n1stop()
+	n2GRPC, _ := startGRPC(t)
+
+	c1, err := cluster.Open(cluster.Config{
+		NodeID:    "n1",
+		Backend:   n1Mem,
+		BindAddr:  hostPort(n1MemberPort),
+		GRPCAddr:  n1GRPC.addr,
+		LogOutput: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("open n1: %v", err)
+	}
+	defer c1.Close()
+	n1GRPC.register(c1)
+
+	c2, err := cluster.Open(cluster.Config{
+		NodeID:    "n2",
+		Backend:   n2Mem,
+		BindAddr:  hostPort(n2MemberPort),
+		GRPCAddr:  n2GRPC.addr,
+		Seeds:     []string{hostPort(n1MemberPort)},
+		LogOutput: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("open n2: %v", err)
+	}
+	defer c2.Close()
+	n2GRPC.register(c2)
+
+	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
+		t.Fatalf("ring: %v", err)
+	}
+
+	// Hard-stop n2's gRPC. n1's ring still has n2; Aggregate's
+	// snapshotPeer for n2 will hit a transport error.
+	n2GRPC.server.Stop()
+	<-n2GRPC.done
+	// Brief settle so subsequent dials see a definite refused.
+	time.Sleep(100 * time.Millisecond)
+
+	results := c1.Aggregate(func(b backend.Backend) any {
+		return "fn-ran"
+	})
+	if len(results) != 2 {
+		t.Fatalf("expected 2 results, got %d (%v)", len(results), results)
+	}
+	// Exactly one entry has Value="fn-ran" (the local n1 path) and
+	// exactly one has Err set (the n2 snapshot failure).
+	var okCount, errCount int
+	for _, r := range results {
+		if r.Err != nil {
+			errCount++
+			if r.Value != nil {
+				t.Fatalf("AggregateResult has both Value=%v + Err=%v - they should be disjoint", r.Value, r.Err)
+			}
+		} else {
+			okCount++
+			if r.Value != "fn-ran" {
+				t.Fatalf("success result Value should be %q, got %v", "fn-ran", r.Value)
+			}
+		}
+	}
+	if okCount != 1 || errCount != 1 {
+		t.Fatalf("expected 1 ok + 1 err, got ok=%d err=%d (%v)", okCount, errCount, results)
 	}
 }

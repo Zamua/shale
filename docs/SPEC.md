@@ -46,7 +46,15 @@ func (c *Cluster) Begin(IsolationLevel) Transaction
 
 // Cross-shard operations are explicit so you can see the fan-out cost
 // at the call site.
-func (c *Cluster) Aggregate(fn func(backend.Backend) any) []any
+func (c *Cluster) Aggregate(fn func(backend.Backend) any) []AggregateResult
+
+// AggregateResult separates "fn ran + here's its return value" from
+// "shale couldn't even run fn here" (snapshot fetch failed, peer
+// unreachable). Exactly one of Value / Err is meaningful per entry.
+type AggregateResult struct {
+    Value any
+    Err   error
+}
 ```
 
 Single-key ops are O(1) routing → one local-or-remote backend call. Cross-shard ops fan out to all owners.
@@ -161,7 +169,9 @@ results := c.Aggregate(func(b backend.Backend) any {
     }
     return slugs
 })
-// results is []any - one per node. App flattens / merges as it sees fit.
+// results is []AggregateResult - one per node. App checks .Err
+// (snapshot-transport failure for that peer) before reading .Value,
+// then flattens / merges as it sees fit.
 ```
 
 Cost: O(K / N) per node, run in parallel. Wall-clock ≈ slowest-node scan + one gRPC round-trip. Bounded + safe for admin/rare operations. NOT recommended for hot-path queries (use shard keys to make those single-shard).

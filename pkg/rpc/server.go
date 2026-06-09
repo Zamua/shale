@@ -98,6 +98,32 @@ func (s *Server) ScanPrefix(req *pb.ScanPrefixRequest, stream grpc.ServerStreami
 	}
 }
 
+// LocalScan streams the local Backend's keys directly, bypassing the
+// ring entirely. Used by sibling shale nodes for admin-style snapshot
+// + counter operations (Aggregate, Stats.keys_held) where re-routing
+// through ownerOf would hash an empty prefix to a single shard and
+// undercount everything.
+func (s *Server) LocalScan(req *pb.LocalScanRequest, stream grpc.ServerStreamingServer[pb.LocalScanResponse]) error {
+	s.scans.Add(1)
+	it, err := s.c.LocalScanPrefix(req.GetPrefix())
+	if err != nil {
+		return err
+	}
+	defer it.Close()
+	for {
+		k, v, err := it.Next()
+		if err != nil {
+			return err
+		}
+		if k == nil {
+			return nil
+		}
+		if err := stream.Send(&pb.LocalScanResponse{Key: k, Value: v}); err != nil {
+			return err
+		}
+	}
+}
+
 // -- Cluster RPCs ----------------------------------------------------
 
 func (s *Server) Topology(_ context.Context, _ *pb.TopologyRequest) (*pb.TopologyResponse, error) {
@@ -135,11 +161,16 @@ func (s *Server) Ping(_ context.Context, _ *pb.PingRequest) (*pb.PingResponse, e
 	return &pb.PingResponse{}, nil
 }
 
-// keysHeld counts via an empty-prefix scan. Cheap for the small
-// memory-backed clusters we test against; a future revision will swap
-// in a maintained counter on the Backend side.
+// keysHeld counts via an empty-prefix scan of the LOCAL backend
+// (Cluster.LocalScanPrefix), not Cluster.ScanPrefix. The latter routes
+// the empty prefix through ownerOf, which in a multi-node cluster
+// hashes nil to a single shard - so every node would report the same
+// (wrong) count. LocalScanPrefix bypasses routing and gives us the
+// true per-node key count. Cheap for the small memory-backed clusters
+// we test against; a future revision will swap in a maintained
+// counter on the Backend side.
 func (s *Server) keysHeld() (uint64, error) {
-	it, err := s.c.ScanPrefix(nil)
+	it, err := s.c.LocalScanPrefix(nil)
 	if err != nil {
 		return 0, err
 	}

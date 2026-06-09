@@ -191,6 +191,18 @@ func (c *Cluster) Members() []ring.Member {
 	return c.ring.Members()
 }
 
+// LocalScanPrefix returns an iterator over the LOCAL backend's keys
+// with the given prefix, bypassing ring routing entirely. Use this
+// for admin-style operations (peer snapshotting, per-node counters)
+// where the receiver explicitly wants to see what's physically on
+// this node's storage, not "what the ring says belongs here".
+func (c *Cluster) LocalScanPrefix(prefix []byte) (backend.Iterator, error) {
+	if c.backend == nil {
+		return nil, backend.ErrClosed
+	}
+	return c.backend.ScanPrefix(prefix)
+}
+
 // Close releases all cluster resources. After Close, no other method
 // may be called. Idempotent.
 func (c *Cluster) Close() error {
@@ -399,21 +411,43 @@ func (c *Cluster) Begin(level backend.IsolationLevel) (backend.Transaction, erro
 	return &clusterTx{c: c, level: level}, nil
 }
 
+// AggregateResult is one entry in the slice returned by Aggregate:
+// either Value (whatever fn returned for that peer) or Err (a
+// transport / snapshotting failure that prevented fn from running for
+// that peer). Exactly one of the two is meaningful per entry; the
+// other is the zero value. Splitting them keeps Err distinct from a
+// peer that legitimately returned an error VALUE (fn might return
+// errors as part of its normal API).
+type AggregateResult struct {
+	// Value is what fn returned for this peer. Nil iff Err is set.
+	Value any
+	// Err is the cross-shard failure that prevented fn from running
+	// (snapshot transport failed, peer unreachable, etc.). Nil on
+	// success.
+	Err error
+}
+
 // Aggregate runs fn locally on each node's Backend in parallel +
 // collects the per-node results. Use for cross-shard operations
 // (admin lists, full-table scans, computed aggregates). NOT for
 // hot-path queries: use shard-aware key design for those.
 //
+// Each entry in the returned slice is an AggregateResult: Err is set
+// if shale couldn't even run fn for that peer (snapshot transport
+// failure, dial failure), otherwise Value holds whatever fn returned.
+// Order of results is unspecified.
+//
 // v0.2: peer fan-out walks the ring's member list and, for each peer
-// other than the local node, streams ScanPrefix(nil) over gRPC into a
-// local in-memory backend snapshot that fn sees. The local node runs
-// fn against its own backend directly. Order of results is unspecified.
-func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []any {
+// other than the local node, streams the peer's LOCAL backend over
+// gRPC (via the admin-only LocalScan RPC, which bypasses ring
+// routing) into a transient in-memory backend snapshot that fn sees.
+// The local node runs fn against its own backend directly.
+func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 	if c.backend == nil {
 		return nil
 	}
 	members := c.Members()
-	results := make([]any, len(members))
+	results := make([]AggregateResult, len(members))
 	var wg sync.WaitGroup
 	for i, m := range members {
 		i, m := i, m
@@ -421,24 +455,31 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []any {
 		go func() {
 			defer wg.Done()
 			if m.ID == c.cfg.NodeID {
-				results[i] = fn(c.backend)
+				results[i] = AggregateResult{Value: fn(c.backend)}
 				return
 			}
 			snap, err := c.snapshotPeer(m.Addr)
 			if err != nil {
-				results[i] = err
+				results[i] = AggregateResult{Err: err}
 				return
 			}
-			results[i] = fn(snap)
+			results[i] = AggregateResult{Value: fn(snap)}
 		}()
 	}
 	wg.Wait()
 	return results
 }
 
-// snapshotPeer pulls the full keyspace from a peer into a transient
-// in-process backend. Used by Aggregate. The snapshot is local to one
-// fn invocation; the backend is not exposed beyond it.
+// snapshotPeer pulls the full keyspace from a peer's LOCAL backend
+// into a transient in-process backend. Used by Aggregate. The
+// snapshot is local to one fn invocation; the backend is not exposed
+// beyond it.
+//
+// Uses LocalScan (admin path) rather than ScanPrefix so the receiving
+// node hands us its own keys directly. ScanPrefix would route the
+// empty prefix through ownerOf - hashing nil to whichever shard owns
+// it - and we'd get a single shard back N times instead of each
+// shard's slice once.
 func (c *Cluster) snapshotPeer(addr string) (backend.Backend, error) {
 	cli, err := c.clientFor(addr)
 	if err != nil {
@@ -446,7 +487,7 @@ func (c *Cluster) snapshotPeer(addr string) (backend.Backend, error) {
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	stream, err := cli.ScanPrefix(ctx, nil)
+	stream, err := cli.LocalScan(ctx, nil)
 	if err != nil {
 		return nil, err
 	}

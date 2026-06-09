@@ -67,6 +67,13 @@ func (c *peerClient) ScanPrefix(ctx context.Context, prefix []byte) (grpc.Server
 	return c.api.ScanPrefix(ctx, &pb.ScanPrefixRequest{Prefix: prefix})
 }
 
+// LocalScan is the admin-path scan: bypasses ring routing on the
+// receiving node + streams its raw backend keys back. Used by
+// Aggregate's snapshotPeer.
+func (c *peerClient) LocalScan(ctx context.Context, prefix []byte) (grpc.ServerStreamingClient[pb.LocalScanResponse], error) {
+	return c.api.LocalScan(ctx, &pb.LocalScanRequest{Prefix: prefix})
+}
+
 // clusterTx is the multi-node transaction wrapper returned by
 // Cluster.Begin. It defers opening the underlying Backend transaction
 // until the first key is touched: the shard pinning decision needs a
