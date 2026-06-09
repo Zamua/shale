@@ -26,14 +26,12 @@ jobs:
       - name: go build
         run: go build ./...
 
-      # Unit/package tests under the race detector. Integration tests
-      # are excluded here because the 3-node in-process cluster + race
-      # detector + memberlist gossip exhausts the GitHub runner's 7 GB
-      # of RAM and SIGTERM'd the process. They run without -race below.
-      - name: go test (race, no integration)
-        run: |
-          pkgs=$(go list ./... | grep -v /tests/integration)
-          go test -race -timeout 300s $pkgs
-
-      - name: go test (integration, no race)
-        run: go test -timeout 300s ./tests/integration/...
+      # Full test suite under the race detector. Serialized across
+      # packages (-p 1) and within each package (-parallel 1) so the
+      # 3-node in-process integration fixtures plus race-detector
+      # shadow memory fit inside ubuntu-latest's RAM budget. Local
+      # peak RSS measured at ~3 GB with this shape, vs ~4 GB at
+      # default parallelism with high variance; serial trades a
+      # minute of wall clock for a predictable upper bound.
+      - name: go test (race)
+        run: go test ./... -race -timeout 300s -p 1 -parallel 1
