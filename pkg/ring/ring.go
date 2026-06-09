@@ -138,6 +138,51 @@ func (r *Ring) LocateKey(key []byte) Member {
 	return r.members[m.String()]
 }
 
+// PartitionID returns the partition id that key belongs to. This is
+// the same partition the LocateKey lookup goes through; exposing it
+// lets the rebalance layer talk about "which partition" without
+// re-implementing the hash-to-partition math.
+func (r *Ring) PartitionID(key []byte) uint64 {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return uint64(r.hash.FindPartitionID(ShardKey(key)))
+}
+
+// Partitions returns the full set of partition ids the ring tracks,
+// in ascending order. The set is fixed at ring construction time (it
+// is derived from partitionCount, not from membership), so a caller
+// can rely on the same slice shape across Add/Remove calls. Empty
+// returns are reserved for the future case of a configurable
+// partitionCount of zero; today the slice is always non-empty.
+func (r *Ring) Partitions() []uint64 {
+	out := make([]uint64, partitionCount)
+	for i := 0; i < partitionCount; i++ {
+		out[i] = uint64(i)
+	}
+	return out
+}
+
+// Owner returns the Member that owns the given partition id. If the
+// ring has no Members (the partition table is empty) the zero Member
+// is returned; callers should guard with Empty() before iterating.
+// Partition ids outside the configured range also return the zero
+// Member.
+func (r *Ring) Owner(partitionID uint64) Member {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if len(r.members) == 0 {
+		return Member{}
+	}
+	if partitionID >= uint64(partitionCount) {
+		return Member{}
+	}
+	m := r.hash.GetPartitionOwner(int(partitionID))
+	if m == nil {
+		return Member{}
+	}
+	return r.members[m.String()]
+}
+
 // ShardKey extracts the hashed portion of key per the hash-tag rule:
 // if key contains a "{" followed by a "}", everything between the
 // first "{" and the first "}" AFTER it is returned. Empty braces

@@ -177,6 +177,55 @@ func TestAdd_ReplacesExistingMember(t *testing.T) {
 	}
 }
 
+func TestPartitions_FixedCount(t *testing.T) {
+	r := ring.New()
+	parts := r.Partitions()
+	if len(parts) == 0 {
+		t.Fatalf("Partitions should be non-empty even with no members")
+	}
+	// Partitions are ascending ids starting at 0; the count is the
+	// ring's configured partitionCount (271 at the time of writing).
+	for i := 0; i < len(parts); i++ {
+		if parts[i] != uint64(i) {
+			t.Fatalf("Partitions[%d] = %d, want %d", i, parts[i], i)
+		}
+	}
+}
+
+func TestOwner_EmptyRingReturnsZero(t *testing.T) {
+	r := ring.New()
+	got := r.Owner(0)
+	if got.ID != "" || got.Addr != "" {
+		t.Fatalf("Owner on empty ring should be zero Member, got %+v", got)
+	}
+}
+
+func TestOwner_AgreesWithLocateKey(t *testing.T) {
+	r := ring.New()
+	for _, id := range []string{"a", "b", "c", "d"} {
+		r.Add(ring.Member{ID: id, Addr: "h:" + id})
+	}
+	for i := 0; i < 50; i++ {
+		k := []byte(fmt.Sprintf("k-%d", i))
+		want := r.LocateKey(k)
+		got := r.Owner(r.PartitionID(k))
+		if got != want {
+			t.Fatalf("Owner(PartitionID(%q)) = %+v, want LocateKey = %+v", k, got, want)
+		}
+	}
+}
+
+func TestOwner_OutOfRange(t *testing.T) {
+	r := ring.New()
+	r.Add(ring.Member{ID: "a", Addr: "h:a"})
+	// Partition ids beyond the configured count must not panic and
+	// must return the zero Member.
+	got := r.Owner(1 << 30)
+	if got.ID != "" || got.Addr != "" {
+		t.Fatalf("Owner(huge) should be zero Member, got %+v", got)
+	}
+}
+
 func TestDistribution_BoundedByLoadFactor(t *testing.T) {
 	const (
 		members  = 5
