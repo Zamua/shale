@@ -148,11 +148,11 @@ func TestStamp_Greater_ZeroStampLoses(t *testing.T) {
 	// The v0.3-compat path produces a zero Stamp; any real stamp
 	// must beat it.
 	zero := cluster.Stamp{}
-	real_ := cluster.Stamp{TimestampNanos: 1, NodeID: ""}
-	if !real_.Greater(zero) {
+	real1 := cluster.Stamp{TimestampNanos: 1, NodeID: ""}
+	if !real1.Greater(zero) {
 		t.Errorf("real stamp should beat zero stamp")
 	}
-	if zero.Greater(real_) {
+	if zero.Greater(real1) {
 		t.Errorf("zero stamp should not beat real stamp")
 	}
 }

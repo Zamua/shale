@@ -31,7 +31,7 @@ func runRebalance(opts globalOpts, args []string, stdout, stderr io.Writer) int 
 	fs := flag.NewFlagSet("rebalance", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, `Usage: shale rebalance (--dry-run | --apply | --cancel)
+		_, _ = fmt.Fprint(stderr, `Usage: shale rebalance (--dry-run | --apply | --cancel)
 
 Modes (exactly one required):
   --dry-run   show the plan that WOULD run; no execution
@@ -78,13 +78,13 @@ func runRebalanceWithClient(cli rebalanceClient, opts globalOpts, dryRun, apply,
 
 	resp, err := cli.ProposeRebalance(ctx, dryRun, apply, cancel)
 	if err != nil {
-		fmt.Fprintf(stderr, "shale rebalance: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale rebalance: %v\n", err)
 		return exitCodeForRPCError(err)
 	}
 
 	switch {
 	case apply, cancel:
-		fmt.Fprintln(stdout, "ok")
+		_, _ = fmt.Fprintln(stdout, "ok")
 		return exitOK
 	case dryRun:
 		return emitDryRun(ctx, cli, resp, opts.json, stdout, stderr)
@@ -99,7 +99,7 @@ func runRebalanceWithClient(cli rebalanceClient, opts globalOpts, dryRun, apply,
 // from a follow-up Topology call so the operator sees plan-vs-cluster
 // context at a glance. Topology failure degrades gracefully: the
 // header is omitted, the plan is still printed.
-func emitDryRun(ctx context.Context, cli rebalanceClient, resp *pb.ProposeRebalanceResponse, asJSON bool, stdout, stderr io.Writer) int {
+func emitDryRun(ctx context.Context, cli rebalanceClient, resp *pb.ProposeRebalanceResponse, asJSON bool, stdout, _ io.Writer) int {
 	ranges := resp.GetRanges()
 	if asJSON {
 		return emitDryRunJSON(ranges, stdout)
@@ -107,16 +107,16 @@ func emitDryRun(ctx context.Context, cli rebalanceClient, resp *pb.ProposeRebala
 
 	clusterSize, topoOK := dryRunClusterSize(ctx, cli)
 	if topoOK {
-		fmt.Fprintf(stdout, "cluster: %d nodes\n", clusterSize)
+		_, _ = fmt.Fprintf(stdout, "cluster: %d nodes\n", clusterSize)
 	}
-	fmt.Fprintf(stdout, "proposed plan: %d partition moves\n", len(ranges))
+	_, _ = fmt.Fprintf(stdout, "proposed plan: %d partition moves\n", len(ranges))
 	var totalKeys uint64
 	for _, r := range ranges {
-		fmt.Fprintf(stdout, "  partition %d  %s → %s  (est ~%d keys)\n",
+		_, _ = fmt.Fprintf(stdout, "  partition %d  %s → %s  (est ~%d keys)\n",
 			r.GetPartitionId(), r.GetCurrentOwner(), r.GetProposedOwner(), r.GetEstimatedKeyCount())
 		totalKeys += r.GetEstimatedKeyCount()
 	}
-	fmt.Fprintf(stdout, "total estimated keys to migrate: %d\n", totalKeys)
+	_, _ = fmt.Fprintf(stdout, "total estimated keys to migrate: %d\n", totalKeys)
 	return exitOK
 }
 
@@ -181,12 +181,12 @@ func validateRebalanceMode(dryRun, apply, cancel bool, stderr io.Writer) int {
 	}
 	switch n {
 	case 0:
-		fmt.Fprintln(stderr, "shale rebalance: one of --dry-run, --apply, --cancel is required")
+		_, _ = fmt.Fprintln(stderr, "shale rebalance: one of --dry-run, --apply, --cancel is required")
 		return exitGeneric
 	case 1:
 		return exitOK
 	default:
-		fmt.Fprintln(stderr, "shale rebalance: --dry-run, --apply, and --cancel are mutually exclusive")
+		_, _ = fmt.Fprintln(stderr, "shale rebalance: --dry-run, --apply, and --cancel are mutually exclusive")
 		return exitGeneric
 	}
 }

@@ -68,7 +68,7 @@ func TestThreeNode_AggregateFansOutPerNode(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		defer it.Close()
+		defer func() { _ = it.Close() }()
 		count := 0
 		for {
 			k, _, err := it.Next()

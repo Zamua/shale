@@ -17,7 +17,7 @@ func runTopology(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("topology", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage: shale topology\n")
+		_, _ = fmt.Fprint(stderr, "Usage: shale topology\n")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitGeneric
@@ -38,7 +38,7 @@ func runTopology(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 
 	resp, err := cli.Topology(ctx)
 	if err != nil {
-		fmt.Fprintf(stderr, "shale topology: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale topology: %v\n", err)
 		return exitCodeForRPCError(err)
 	}
 
@@ -76,19 +76,19 @@ func runTopology(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	}
 
 	if resp.GetSingleNode() {
-		fmt.Fprintf(stdout, "single-node cluster, node=%s\n", resp.GetNodeId())
+		_, _ = fmt.Fprintf(stdout, "single-node cluster, node=%s\n", resp.GetNodeId())
 		return exitOK
 	}
 	// Multi-node: header + one line per node. The local node is
 	// tagged "(this)" so an operator scanning the output sees which
 	// node served the RPC at a glance.
-	fmt.Fprintf(stdout, "cluster: %d nodes\n", len(resp.GetNodes()))
+	_, _ = fmt.Fprintf(stdout, "cluster: %d nodes\n", len(resp.GetNodes()))
 	for _, n := range resp.GetNodes() {
 		suffix := ""
 		if n.GetNodeId() == resp.GetNodeId() {
 			suffix = "  (this)"
 		}
-		fmt.Fprintf(stdout, "  %s  %s%s\n", n.GetNodeId(), n.GetGrpcAddr(), suffix)
+		_, _ = fmt.Fprintf(stdout, "  %s  %s%s\n", n.GetNodeId(), n.GetGrpcAddr(), suffix)
 	}
 	return exitOK
 }

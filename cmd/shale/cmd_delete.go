@@ -16,7 +16,7 @@ func runDelete(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage: shale delete <key>\n")
+		_, _ = fmt.Fprint(stderr, "Usage: shale delete <key>\n")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitGeneric
@@ -36,7 +36,7 @@ func runDelete(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 
 	if err := cli.Delete(ctx, []byte(fs.Arg(0))); err != nil {
-		fmt.Fprintf(stderr, "shale delete: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale delete: %v\n", err)
 		return exitCodeForRPCError(err)
 	}
 	_ = stdout // intentionally silent on success

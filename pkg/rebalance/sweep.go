@@ -14,6 +14,7 @@
 // deletes (it batches partition ids first, then drops the
 // Coordinator mutex while it calls into Backend). This matters
 // because Backend.Delete may take real I/O time on slate / pebble.
+
 package rebalance
 
 import (
@@ -129,7 +130,7 @@ func (c *Coordinator) sweepHandedOff(ctx context.Context, now time.Time) {
 		c.mu.Unlock()
 		return
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 
 	var toDelete [][]byte
 	for {

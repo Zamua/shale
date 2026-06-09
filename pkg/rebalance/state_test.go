@@ -67,13 +67,13 @@ func findSendingKey(t *testing.T, oldR, newR *ring.Ring, sender, receiver string
 
 func TestIsMigrating_TrueDuringSending(t *testing.T) {
 	old := buildRing("n1")
-	new := buildRing("n1", "n2")
+	next := buildRing("n1", "n2")
 	self := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 
 	be := memory.New()
-	defer be.Close()
+	defer func() { _ = be.Close() }()
 
-	moving := findSendingKey(t, old, new, "n1", "n2")
+	moving := findSendingKey(t, old, next, "n1", "n2")
 
 	src := newBlockingSource()
 	opts := rebalance.DefaultOptions()
@@ -83,7 +83,7 @@ func TestIsMigrating_TrueDuringSending(t *testing.T) {
 	// Release once we are done so runSend can shut down.
 	defer src.release()
 
-	c.Evaluate(old, new, 1)
+	c.Evaluate(old, next, 1)
 
 	// runSend is now blocked waiting on src; the range is in
 	// StateSending. IsMigrating should report true for the moving
@@ -100,7 +100,7 @@ func TestIsMigrating_TrueDuringSending(t *testing.T) {
 	// Pick a key that never moves; IsMigrating should be false.
 	for i := 0; i < 5000; i++ {
 		k := []byte(fmt.Sprintf("stable-%d", i))
-		if old.LocateKey(k).ID == new.LocateKey(k).ID {
+		if old.LocateKey(k).ID == next.LocateKey(k).ID {
 			if c.IsMigrating(k) {
 				t.Fatalf("IsMigrating should be false for stable key %q; snapshot: %+v", k, c.Snapshot())
 			}
@@ -114,7 +114,7 @@ func TestIsMigrating_FalseForStableRing(t *testing.T) {
 	r := buildRing("n1", "n2")
 	self := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 	be := memory.New()
-	defer be.Close()
+	defer func() { _ = be.Close() }()
 
 	c := rebalance.New(self, be, rebalance.DefaultOptions())
 	defer c.Stop()
@@ -130,11 +130,11 @@ func TestIsMigrating_FalseForStableRing(t *testing.T) {
 
 func TestSnapshot_OrderedByPartitionID(t *testing.T) {
 	old := buildRing("n1")
-	new := buildRing("n1", "n2")
+	next := buildRing("n1", "n2")
 	self := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 
 	be := memory.New()
-	defer be.Close()
+	defer func() { _ = be.Close() }()
 
 	src := newBlockingSource()
 	opts := rebalance.DefaultOptions()
@@ -143,7 +143,7 @@ func TestSnapshot_OrderedByPartitionID(t *testing.T) {
 	defer c.Stop()
 	defer src.release()
 
-	c.Evaluate(old, new, 1)
+	c.Evaluate(old, next, 1)
 
 	// Let the Sends register; runSend will block in the source.
 	time.Sleep(50 * time.Millisecond)
@@ -163,7 +163,7 @@ func TestSnapshot_OrderedByPartitionID(t *testing.T) {
 func TestWaitForIdle_ReturnsImmediatelyWhenNothingPending(t *testing.T) {
 	self := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 	be := memory.New()
-	defer be.Close()
+	defer func() { _ = be.Close() }()
 
 	c := rebalance.New(self, be, rebalance.DefaultOptions())
 	defer c.Stop()
@@ -176,7 +176,7 @@ func TestWaitForIdle_ReturnsImmediatelyWhenNothingPending(t *testing.T) {
 func TestWaitForIdle_RespectsContextCancel(t *testing.T) {
 	self := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 	be := memory.New()
-	defer be.Close()
+	defer func() { _ = be.Close() }()
 
 	src := newBlockingSource()
 	opts := rebalance.DefaultOptions()
@@ -186,8 +186,8 @@ func TestWaitForIdle_RespectsContextCancel(t *testing.T) {
 	defer src.release()
 
 	old := buildRing("n1")
-	new := buildRing("n1", "n2")
-	c.Evaluate(old, new, 1)
+	next := buildRing("n1", "n2")
+	c.Evaluate(old, next, 1)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()

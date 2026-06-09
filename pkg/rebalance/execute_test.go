@@ -45,9 +45,9 @@ func TestFetchRange_CopiesAllKeys_ChecksumMatches(t *testing.T) {
 	r := buildRing("n1", "n2")
 
 	src := memory.New()
-	defer src.Close()
+	defer func() { _ = src.Close() }()
 	dst := memory.New()
-	defer dst.Close()
+	defer func() { _ = dst.Close() }()
 
 	seeded := seedKeysOwnedBy(t, src, r, "n1", 50)
 
@@ -101,7 +101,7 @@ func TestFetchRange_CopiesAllKeys_ChecksumMatches(t *testing.T) {
 
 func TestFetchRange_SourceErrorRollsBack(t *testing.T) {
 	dst := memory.New()
-	defer dst.Close()
+	defer func() { _ = dst.Close() }()
 
 	src := &failingSource{err: errors.New("simulated source failure")}
 	dest := rebalance.NewInProcessDestination(dst, func(_ rebalance.Member) (rebalance.MigrateSource, error) {
@@ -122,7 +122,7 @@ func TestFetchRange_SourceErrorRollsBack(t *testing.T) {
 
 func TestFetchRange_ContextCancelRollsBack(t *testing.T) {
 	dst := memory.New()
-	defer dst.Close()
+	defer func() { _ = dst.Close() }()
 
 	src := &blockingSource{}
 	src.cond = sync.NewCond(&src.mu)

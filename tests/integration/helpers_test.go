@@ -219,21 +219,6 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	return n
 }
 
-// waitForMembers polls c.Members() until it reports want entries or
-// the deadline expires. Returns an error describing the last observed
-// size so failing tests can pinpoint the divergence quickly.
-func waitForMembers(c *cluster.Cluster, want int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		if got := len(c.Members()); got == want {
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	got := c.Members()
-	return fmt.Errorf("members=%d want=%d (have=%v)", len(got), want, got)
-}
-
 // waitForMembersAll polls every cluster in cs until they each report
 // want members. Convergence under SWIM gossip is not synchronous - a
 // fresh join can reach the seed before reaching the other peers - so

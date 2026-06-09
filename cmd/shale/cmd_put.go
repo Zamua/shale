@@ -15,7 +15,7 @@ func runPut(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("put", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage: shale put <key> <value>\n")
+		_, _ = fmt.Fprint(stderr, "Usage: shale put <key> <value>\n")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitGeneric
@@ -35,7 +35,7 @@ func runPut(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 
 	if err := cli.Put(ctx, []byte(fs.Arg(0)), []byte(fs.Arg(1))); err != nil {
-		fmt.Fprintf(stderr, "shale put: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale put: %v\n", err)
 		return exitCodeForRPCError(err)
 	}
 	_ = stdout // intentionally silent on success

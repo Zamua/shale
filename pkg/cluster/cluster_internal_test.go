@@ -156,7 +156,7 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("oldLis: %v", err)
 	}
-	defer oldLis.Close()
+	defer func() { _ = oldLis.Close() }()
 	oldSrv := grpc.NewServer()
 	go func() { _ = oldSrv.Serve(oldLis) }()
 	defer oldSrv.Stop()
@@ -166,7 +166,7 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 	if err != nil {
 		t.Fatalf("newLis: %v", err)
 	}
-	defer newLis.Close()
+	defer func() { _ = newLis.Close() }()
 	newSrv := grpc.NewServer()
 	go func() { _ = newSrv.Serve(newLis) }()
 	defer newSrv.Stop()
@@ -277,11 +277,11 @@ func TestPut_DuringMigrationReturnsUnavailable(t *testing.T) {
 	for _, m := range c.ring.Members() {
 		old.Add(m)
 	}
-	new := ring.New()
+	next := ring.New()
 	for _, m := range c.ring.Members() {
-		new.Add(m)
+		next.Add(m)
 	}
-	new.Add(ring.Member{ID: "rb-elsewhere", Addr: "127.0.0.1:65535"})
+	next.Add(ring.Member{ID: "rb-elsewhere", Addr: "127.0.0.1:65535"})
 
 	// Swap the cluster's Coordinator for one whose source blocks
 	// indefinitely. Every Send goroutine pins its partition in
@@ -295,7 +295,7 @@ func TestPut_DuringMigrationReturnsUnavailable(t *testing.T) {
 	c.rebalance.Load().Stop()
 	rb := rebalance.New(rebalance.Member{ID: "rb-source"}, be, opts)
 	c.rebalance.Store(rb)
-	rb.Evaluate(old, new, c.ringGen.Load())
+	rb.Evaluate(old, next, c.ringGen.Load())
 	defer close(src.released)
 
 	// Wait until at least one of our seeded keys' partitions is

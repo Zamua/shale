@@ -13,6 +13,7 @@
 // current ring + the keys actually held and re-issues whatever
 // moves are needed. This is the same code path as the steady-state
 // one (docs/SPEC.md "Plan").
+
 package rebalance
 
 import (
@@ -36,6 +37,8 @@ import (
 //	StateDone         -- destination finished, or source cleanup complete
 type RangeState int
 
+// RangeState values, in lifecycle order. See the RangeState doc and
+// docs/SPEC.md "Cutover" for what each one means.
 const (
 	StatePreMigration RangeState = iota
 	StateSending

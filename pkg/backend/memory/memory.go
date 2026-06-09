@@ -25,6 +25,8 @@ type Memory struct {
 // New returns an empty Memory backend.
 func New() *Memory { return &Memory{data: make(map[string][]byte)} }
 
+// Put stores value under key, copying value so the caller can mutate
+// the slice after the call returns.
 func (m *Memory) Put(key, value []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -35,6 +37,8 @@ func (m *Memory) Put(key, value []byte) error {
 	return nil
 }
 
+// Get returns a copy of the value stored under key, or backend.ErrNotFound
+// when no value is present.
 func (m *Memory) Get(key []byte) ([]byte, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -48,6 +52,8 @@ func (m *Memory) Get(key []byte) ([]byte, error) {
 	return append([]byte(nil), v...), nil
 }
 
+// Delete removes key from the store. Deleting an absent key is a
+// no-op (no error).
 func (m *Memory) Delete(key []byte) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -58,6 +64,9 @@ func (m *Memory) Delete(key []byte) error {
 	return nil
 }
 
+// ScanPrefix returns an iterator over every key/value pair whose key
+// starts with prefix. The iterator holds a snapshot taken at call
+// time, so concurrent writes are not reflected.
 func (m *Memory) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	m.mu.RLock()
 	defer m.mu.RUnlock()
@@ -79,7 +88,9 @@ func (m *Memory) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	return &iterator{pairs: pairs}, nil
 }
 
-func (m *Memory) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
+// Begin starts a new transaction. The Memory backend ignores the
+// requested isolation level and always provides snapshot isolation.
+func (m *Memory) Begin(_ backend.IsolationLevel) (backend.Transaction, error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
@@ -92,6 +103,8 @@ func (m *Memory) Begin(level backend.IsolationLevel) (backend.Transaction, error
 	}, nil
 }
 
+// Close releases the backing map. Subsequent operations return
+// backend.ErrClosed.
 func (m *Memory) Close() error {
 	m.mu.Lock()
 	defer m.mu.Unlock()

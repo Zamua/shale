@@ -15,7 +15,7 @@ func runGet(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("get", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage: shale get <key>\n")
+		_, _ = fmt.Fprint(stderr, "Usage: shale get <key>\n")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitGeneric
@@ -36,11 +36,11 @@ func runGet(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 
 	val, found, err := cli.Get(ctx, []byte(fs.Arg(0)))
 	if err != nil {
-		fmt.Fprintf(stderr, "shale get: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale get: %v\n", err)
 		return exitCodeForRPCError(err)
 	}
 	if !found {
-		fmt.Fprintf(stderr, "shale get: key not found\n")
+		_, _ = fmt.Fprintf(stderr, "shale get: key not found\n")
 		return exitNotFound
 	}
 	// Trailing newline so the value is comfortable for shell tools

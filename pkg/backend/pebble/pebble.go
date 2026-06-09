@@ -310,7 +310,7 @@ func (t *transaction) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	if err != nil {
 		return nil, fmt.Errorf("pebble: tx scan prefix: %w", err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 
 	pairs := make(map[string][]byte)
 	for it.First(); it.Valid(); it.Next() {

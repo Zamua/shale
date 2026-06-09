@@ -53,7 +53,7 @@ func TestForwardingLoopGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dial non-owner %s: %v", nonOwner.ID, err)
 	}
-	defer conn.Close()
+	defer func() { _ = conn.Close() }()
 	api := pb.NewShaleNodeClient(conn)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -106,7 +106,7 @@ func TestForwardingLoopGuard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("rpc.NewClient: %v", err)
 	}
-	defer cli.Close()
+	defer func() { _ = cli.Close() }()
 	if err := cli.Put(ctx, []byte(key), []byte("ok")); err != nil {
 		t.Fatalf("non-forwarded Put via non-owner should succeed (routes internally), got: %v", err)
 	}

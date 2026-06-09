@@ -49,13 +49,13 @@ func TestComputePlan_OneNodeToTwoNodes_SplitsPartitions(t *testing.T) {
 	// partitions and ships ~half to n2. n2's plan is the mirror:
 	// it receives those partitions from n1.
 	old := buildRing("n1")
-	new := buildRing("n1", "n2")
+	next := buildRing("n1", "n2")
 
 	n1 := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 	n2 := rebalance.Member{ID: "n2", Addr: "addr:n2"}
 
-	n1Plan := rebalance.ComputePlan(n1, old, new, 2)
-	n2Plan := rebalance.ComputePlan(n2, old, new, 2)
+	n1Plan := rebalance.ComputePlan(n1, old, next, 2)
+	n2Plan := rebalance.ComputePlan(n2, old, next, 2)
 
 	if len(n1Plan.Receives) != 0 {
 		t.Fatalf("n1 should receive nothing in a 1->2 transition (it was the sole owner), got %d", len(n1Plan.Receives))
@@ -100,10 +100,10 @@ func TestComputePlan_TwoNodesToOneNode_NodeLeaves(t *testing.T) {
 	// n2 leaves. n1 picks up every partition n2 used to own. From
 	// n1's view: no Sends, Receives = (the partitions n2 used to own).
 	old := buildRing("n1", "n2")
-	new := buildRing("n1")
+	next := buildRing("n1")
 	n1 := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 
-	plan := rebalance.ComputePlan(n1, old, new, 3)
+	plan := rebalance.ComputePlan(n1, old, next, 3)
 
 	if len(plan.Sends) != 0 {
 		t.Fatalf("n1 should send nothing when n2 leaves; got %d", len(plan.Sends))
@@ -126,10 +126,10 @@ func TestComputePlan_NodeReplacesNode_IsNoopForUnrelatedSelf(t *testing.T) {
 	// view: some partitions move between n2 and the new node; none
 	// of them involve n1, so n1's plan should be empty.
 	old := buildRing("n1", "n2", "n4")
-	new := buildRing("n1", "n3", "n4")
+	next := buildRing("n1", "n3", "n4")
 	n1 := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 
-	plan := rebalance.ComputePlan(n1, old, new, 4)
+	plan := rebalance.ComputePlan(n1, old, next, 4)
 
 	// n1 may keep some partitions, send some it owned to n3, and
 	// receive some that used to be on n2. The "no Move involves
@@ -182,10 +182,10 @@ func TestComputePlan_EmptyNewRing_IsEmpty(t *testing.T) {
 
 func TestComputePlan_SendsSortedByPartitionID(t *testing.T) {
 	old := buildRing("n1")
-	new := buildRing("n1", "n2", "n3")
+	next := buildRing("n1", "n2", "n3")
 	n1 := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 
-	plan := rebalance.ComputePlan(n1, old, new, 7)
+	plan := rebalance.ComputePlan(n1, old, next, 7)
 	for i := 1; i < len(plan.Sends); i++ {
 		if plan.Sends[i-1].PartitionID >= plan.Sends[i].PartitionID {
 			t.Fatalf("Sends not ascending at index %d: %d then %d",

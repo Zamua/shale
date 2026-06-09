@@ -68,11 +68,11 @@ type Transaction interface {
 type IsolationLevel int
 
 const (
-	// SnapshotIsolation: reads see a consistent snapshot from
+	// SnapshotIsolation makes reads see a consistent snapshot from
 	// transaction begin time; writes don't conflict unless they
 	// overlap on the same key.
 	SnapshotIsolation IsolationLevel = iota
-	// SerializableSnapshot: SI + write-skew detection (full
-	// serializability).
+	// SerializableSnapshot is snapshot isolation plus write-skew
+	// detection (full serializability).
 	SerializableSnapshot
 )

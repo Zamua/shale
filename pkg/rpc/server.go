@@ -61,6 +61,9 @@ func errForwardLoop(reason string) error {
 	return status.Error(codes.FailedPrecondition, "shale: forwarding loop refused: "+reason)
 }
 
+// Put handles the gRPC Put RPC. A non-Forwarded request goes through
+// the cluster's full routing + replication; a Forwarded request is a
+// peer-to-peer single-replica write that bypasses re-routing.
 func (s *Server) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	s.puts.Add(1)
 	if req.GetForwarded() {
@@ -85,6 +88,9 @@ func (s *Server) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 	return &pb.PutResponse{}, nil
 }
 
+// Get handles the gRPC Get RPC. It serves out of the local backend
+// for in-flight migration reads and otherwise routes through the
+// cluster's read path.
 func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	s.gets.Add(1)
 	if req.GetForwarded() && !s.c.OwnsKey(req.GetKey()) {
@@ -125,6 +131,9 @@ func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 	return &pb.GetResponse{Value: v}, nil
 }
 
+// Delete handles the gRPC Delete RPC. At R>1 originators issue
+// Delete via the tombstone path; this method covers both that case
+// and the R=1 single-owner clear.
 func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	s.deletes.Add(1)
 	if req.GetForwarded() {
@@ -148,6 +157,9 @@ func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteRes
 	return &pb.DeleteResponse{}, nil
 }
 
+// ScanPrefix streams every key/value pair whose key starts with
+// req.Prefix. The stream ends when the iterator is exhausted or the
+// client cancels.
 func (s *Server) ScanPrefix(req *pb.ScanPrefixRequest, stream grpc.ServerStreamingServer[pb.ScanPrefixResponse]) error {
 	s.scans.Add(1)
 	if req.GetForwarded() && !s.c.OwnsKey(req.GetPrefix()) {
@@ -157,7 +169,7 @@ func (s *Server) ScanPrefix(req *pb.ScanPrefixRequest, stream grpc.ServerStreami
 	if err != nil {
 		return err
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 	for {
 		k, v, err := it.Next()
 		if err != nil {
@@ -183,7 +195,7 @@ func (s *Server) LocalScan(req *pb.LocalScanRequest, stream grpc.ServerStreaming
 	if err != nil {
 		return err
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 	for {
 		k, v, err := it.Next()
 		if err != nil {
@@ -200,6 +212,7 @@ func (s *Server) LocalScan(req *pb.LocalScanRequest, stream grpc.ServerStreaming
 
 // -- Cluster RPCs ----------------------------------------------------
 
+// Topology returns this node's current view of cluster membership.
 func (s *Server) Topology(_ context.Context, _ *pb.TopologyRequest) (*pb.TopologyResponse, error) {
 	id := s.c.NodeID()
 	members := s.c.Members()
@@ -214,6 +227,7 @@ func (s *Server) Topology(_ context.Context, _ *pb.TopologyRequest) (*pb.Topolog
 	}, nil
 }
 
+// Stats returns the per-node counters this Server has accumulated.
 func (s *Server) Stats(_ context.Context, _ *pb.StatsRequest) (*pb.StatsResponse, error) {
 	keys, err := s.keysHeld()
 	if err != nil {
@@ -231,6 +245,7 @@ func (s *Server) Stats(_ context.Context, _ *pb.StatsRequest) (*pb.StatsResponse
 	}, nil
 }
 
+// Ping is the liveness probe; it always returns an empty response.
 func (s *Server) Ping(_ context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
 	return &pb.PingResponse{}, nil
 }
@@ -299,6 +314,7 @@ func (s *Server) MigrateRange(req *pb.RangeSpec, stream grpc.ServerStreamingServ
 			// localSource exits cleanly instead of blocking on
 			// an un-read send. errCh below will produce its
 			// terminal value regardless.
+			//nolint:revive // empty-block: idiomatic channel drain.
 			for range kvCh {
 			}
 			<-errCh
@@ -360,7 +376,7 @@ func (s *Server) keysHeld() (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 	var n uint64
 	for {
 		k, _, err := it.Next()

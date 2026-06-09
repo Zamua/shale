@@ -279,6 +279,9 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 	// decision point gets torn down rather than leaking.
 	go func() {
 		defer cancelFanout()
+		// Drain the channel so the fanout goroutines can exit
+		// cleanly; we have already collected the acks we need.
+		//nolint:revive // empty-block: idiomatic channel drain.
 		for range resultsCh {
 		}
 	}()
@@ -493,7 +496,7 @@ type collected struct {
 // already started), we drop the repair on the floor rather than
 // spawning a doomed goroutine: read-repair is best-effort and the
 // post-Close window has no consumer anyway.
-func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []collected, queried []ring.Member) {
+func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []collected, _ []ring.Member) {
 	if c.repairCtx == nil {
 		return
 	}

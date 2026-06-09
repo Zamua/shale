@@ -39,6 +39,7 @@ func (c *Client) Close() error {
 
 // -- KV ops ----------------------------------------------------------
 
+// Put writes key=value through the server's Backend.
 func (c *Client) Put(ctx context.Context, key, value []byte) error {
 	_, err := c.api.Put(ctx, &pb.PutRequest{Key: key, Value: value})
 	return err
@@ -57,6 +58,7 @@ func (c *Client) Get(ctx context.Context, key []byte) ([]byte, bool, error) {
 	return resp.GetValue(), true, nil
 }
 
+// Delete removes key. Deleting an absent key is not an error.
 func (c *Client) Delete(ctx context.Context, key []byte) error {
 	_, err := c.api.Delete(ctx, &pb.DeleteRequest{Key: key})
 	return err
@@ -71,14 +73,19 @@ func (c *Client) ScanPrefix(ctx context.Context, prefix []byte) (grpc.ServerStre
 
 // -- Cluster ops -----------------------------------------------------
 
+// Topology returns the server's current view of cluster membership +
+// ring shape.
 func (c *Client) Topology(ctx context.Context) (*pb.TopologyResponse, error) {
 	return c.api.Topology(ctx, &pb.TopologyRequest{})
 }
 
+// Stats returns the server's per-node stats snapshot.
 func (c *Client) Stats(ctx context.Context) (*pb.StatsResponse, error) {
 	return c.api.Stats(ctx, &pb.StatsRequest{})
 }
 
+// Ping is the round-trip liveness probe; it returns nil when the
+// server is reachable.
 func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.api.Ping(ctx, &pb.PingRequest{})
 	return err

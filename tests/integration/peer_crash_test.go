@@ -25,9 +25,9 @@ func TestThreeNode_PeerCrashForwardingReturnsError(t *testing.T) {
 	time.Sleep(100 * time.Millisecond)
 
 	// Find a key owned by N3 (per the still-stale ring view on N1).
-	const max = 1000
+	const maxProbes = 1000
 	var target string
-	for i := 0; i < max; i++ {
+	for i := 0; i < maxProbes; i++ {
 		k := probeKey(i)
 		if ownerOf(f.N1.Cluster, k) == "n3" {
 			target = k
@@ -35,7 +35,7 @@ func TestThreeNode_PeerCrashForwardingReturnsError(t *testing.T) {
 		}
 	}
 	if target == "" {
-		t.Fatalf("could not find a key owned by n3 in %d probes (ring=%v)", max, f.N1.Cluster.Members())
+		t.Fatalf("could not find a key owned by n3 in %d probes (ring=%v)", maxProbes, f.N1.Cluster.Members())
 	}
 
 	// The Put must return - not hang, not panic - within a sensible

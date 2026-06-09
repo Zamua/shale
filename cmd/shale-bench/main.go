@@ -72,14 +72,14 @@ func main() {
 
 // scenario captures the inputs that drive one bench run.
 type scenario struct {
-	Mode         string // "raw" or "cluster"
-	Backend      string // "memory", "pebble", or "slate"
-	Nodes        int    // 1, 3, ...
-	R            int    // replication factor
-	Ops          int    // total ops per phase
-	ValueSize    int    // payload bytes per put
-	Concurrency  int    // parallel goroutines
-	PebbleDir    string // base dir for pebble backend (one subdir per node)
+	Mode        string // "raw" or "cluster"
+	Backend     string // "memory", "pebble", or "slate"
+	Nodes       int    // 1, 3, ...
+	R           int    // replication factor
+	Ops         int    // total ops per phase
+	ValueSize   int    // payload bytes per put
+	Concurrency int    // parallel goroutines
+	PebbleDir   string // base dir for pebble backend (one subdir per node)
 }
 
 // phaseStats holds the latency + throughput for one phase. Mirrors the
@@ -122,7 +122,7 @@ func run(argv []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("shale-bench", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, `Usage: shale-bench [flags]
+		_, _ = fmt.Fprint(stderr, `Usage: shale-bench [flags]
 
 Drives one comparative benchmark scenario end to end (write phase, then
 read phase) and prints latency + throughput.
@@ -163,36 +163,36 @@ Flags:
 		return 2
 	}
 	if *mode != "raw" && *mode != "cluster" {
-		fmt.Fprintf(stderr, "shale-bench: --mode must be raw or cluster\n")
+		_, _ = fmt.Fprintf(stderr, "shale-bench: --mode must be raw or cluster\n")
 		return 2
 	}
 	if *backendName != "memory" && *backendName != "pebble" && *backendName != "slate" {
-		fmt.Fprintf(stderr, "shale-bench: --backend must be memory, pebble, or slate\n")
+		_, _ = fmt.Fprintf(stderr, "shale-bench: --backend must be memory, pebble, or slate\n")
 		return 2
 	}
 	if *ops < 1 {
-		fmt.Fprintf(stderr, "shale-bench: --ops must be >= 1\n")
+		_, _ = fmt.Fprintf(stderr, "shale-bench: --ops must be >= 1\n")
 		return 2
 	}
 	if *concurrency < 1 {
-		fmt.Fprintf(stderr, "shale-bench: --concurrency must be >= 1\n")
+		_, _ = fmt.Fprintf(stderr, "shale-bench: --concurrency must be >= 1\n")
 		return 2
 	}
 	if *mode == "raw" && (*nodes != 1 || *rf != 1) {
-		fmt.Fprintf(stderr, "shale-bench: --mode=raw forces --nodes=1 --rf=1\n")
+		_, _ = fmt.Fprintf(stderr, "shale-bench: --mode=raw forces --nodes=1 --rf=1\n")
 		return 2
 	}
 	if *mode == "cluster" {
 		if *nodes < 1 {
-			fmt.Fprintf(stderr, "shale-bench: --nodes must be >= 1\n")
+			_, _ = fmt.Fprintf(stderr, "shale-bench: --nodes must be >= 1\n")
 			return 2
 		}
 		if *rf < 1 {
-			fmt.Fprintf(stderr, "shale-bench: --rf must be >= 1\n")
+			_, _ = fmt.Fprintf(stderr, "shale-bench: --rf must be >= 1\n")
 			return 2
 		}
 		if *rf > *nodes {
-			fmt.Fprintf(stderr, "shale-bench: --rf (%d) must be <= --nodes (%d)\n", *rf, *nodes)
+			_, _ = fmt.Fprintf(stderr, "shale-bench: --rf (%d) must be <= --nodes (%d)\n", *rf, *nodes)
 			return 2
 		}
 	}
@@ -204,11 +204,11 @@ Flags:
 	if *backendName == "pebble" {
 		dir, err := os.MkdirTemp("", "shale-bench-pebble-")
 		if err != nil {
-			fmt.Fprintf(stderr, "shale-bench: scratch dir: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "shale-bench: scratch dir: %v\n", err)
 			return 1
 		}
 		pebbleBaseDir = dir
-		defer os.RemoveAll(pebbleBaseDir)
+		defer func() { _ = os.RemoveAll(pebbleBaseDir) }()
 	}
 
 	sc := scenario{
@@ -228,25 +228,25 @@ Flags:
 
 	target, cleanup, err := buildTarget(sc, stderr)
 	if err != nil {
-		fmt.Fprintf(stderr, "shale-bench: build target: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale-bench: build target: %v\n", err)
 		return 1
 	}
 	defer cleanup()
 
 	payload := make([]byte, sc.ValueSize)
 	if _, err := rand.Read(payload); err != nil {
-		fmt.Fprintf(stderr, "shale-bench: random fill: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale-bench: random fill: %v\n", err)
 		return 1
 	}
 
 	writeStats, err := runPhase("write", target, sc.Concurrency, sc.Ops, payload, true)
 	if err != nil {
-		fmt.Fprintf(stderr, "shale-bench: write phase: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale-bench: write phase: %v\n", err)
 		return 1
 	}
 	readStats, err := runPhase("read", target, sc.Concurrency, sc.Ops, nil, false)
 	if err != nil {
-		fmt.Fprintf(stderr, "shale-bench: read phase: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale-bench: read phase: %v\n", err)
 		return 1
 	}
 
@@ -270,10 +270,10 @@ Flags:
 		return 0
 	}
 
-	fmt.Fprintf(stdout, "scenario=%s mode=%s backend=%s nodes=%d r=%d ops=%d value=%dB conc=%d\n",
+	_, _ = fmt.Fprintf(stdout, "scenario=%s mode=%s backend=%s nodes=%d r=%d ops=%d value=%dB conc=%d\n",
 		label, sc.Mode, sc.Backend, sc.Nodes, sc.R, sc.Ops, sc.ValueSize, sc.Concurrency)
-	fmt.Fprintln(stdout, formatPhaseHuman(writeStats))
-	fmt.Fprintln(stdout, formatPhaseHuman(readStats))
+	_, _ = fmt.Fprintln(stdout, formatPhaseHuman(writeStats))
+	_, _ = fmt.Fprintln(stdout, formatPhaseHuman(readStats))
 	return 0
 }
 
@@ -371,7 +371,7 @@ type builtCluster struct {
 // All cleanup is bundled into the returned func so callers don't have
 // to think about teardown order (gRPC GracefulStop -> Cluster.Close
 // -> Backend.Close).
-func buildCluster(sc scenario, stderr io.Writer) (putGetter, func(), error) {
+func buildCluster(sc scenario, _ io.Writer) (putGetter, func(), error) {
 	if sc.Nodes < 1 {
 		return nil, nil, fmt.Errorf("nodes must be >= 1")
 	}

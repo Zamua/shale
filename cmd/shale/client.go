@@ -19,7 +19,7 @@ import (
 func dial(addr string, stderr io.Writer) (*rpc.Client, func(), int) {
 	cli, err := rpc.NewClient(addr)
 	if err != nil {
-		fmt.Fprintf(stderr, "shale: dial %s: %v\n", addr, err)
+		_, _ = fmt.Fprintf(stderr, "shale: dial %s: %v\n", addr, err)
 		return nil, func() {}, exitConnection
 	}
 	return cli, func() { _ = cli.Close() }, exitOK

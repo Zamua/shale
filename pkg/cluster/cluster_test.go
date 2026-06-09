@@ -93,7 +93,7 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open n1: %v", err)
 	}
-	defer c1.Close()
+	defer func() { _ = c1.Close() }()
 	n1GRPC.register(c1)
 
 	c2, err := cluster.Open(cluster.Config{
@@ -107,7 +107,7 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open n2: %v", err)
 	}
-	defer c2.Close()
+	defer func() { _ = c2.Close() }()
 	n2GRPC.register(c2)
 
 	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
@@ -263,20 +263,20 @@ func waitForRingSize(c *cluster.Cluster, want int, timeout time.Duration) error 
 // findKeyOwnedBy scans synthetic keys until it finds one whose owner
 // (as the given cluster sees it) is wantOwner. The lookup uses the
 // public Members() snapshot + a freshly-constructed ring, so it sees
-// exactly the routing decision Put/Get would make. Bounded by max
+// exactly the routing decision Put/Get would make. Bounded by maxProbes
 // iterations so a misconfigured test fails loudly instead of looping.
-func findKeyOwnedBy(t *testing.T, c *cluster.Cluster, wantOwner string, max int) string {
+func findKeyOwnedBy(t *testing.T, c *cluster.Cluster, wantOwner string, maxProbes int) string {
 	t.Helper()
 	if len(c.Members()) < 2 {
 		t.Fatalf("findKeyOwnedBy: ring needs >=2 members, got %v", c.Members())
 	}
-	for i := 0; i < max; i++ {
+	for i := 0; i < maxProbes; i++ {
 		k := fmt.Sprintf("probe-%d", i)
 		if ownerFor(c, k) == wantOwner {
 			return k
 		}
 	}
-	t.Fatalf("could not find a key owned by %s in %d probes", wantOwner, max)
+	t.Fatalf("could not find a key owned by %s in %d probes", wantOwner, maxProbes)
 	return ""
 }
 
@@ -301,7 +301,7 @@ func TestAggregate_SingleNode(t *testing.T) {
 
 	results := c.Aggregate(func(b backend.Backend) any {
 		it, _ := b.ScanPrefix(nil)
-		defer it.Close()
+		defer func() { _ = it.Close() }()
 		count := 0
 		for {
 			k, _, err := it.Next()
@@ -396,7 +396,7 @@ func TestRemoteTx_StaysCrossShard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open n1: %v", err)
 	}
-	defer c1.Close()
+	defer func() { _ = c1.Close() }()
 	n1GRPC.register(c1)
 
 	c2, err := cluster.Open(cluster.Config{
@@ -410,7 +410,7 @@ func TestRemoteTx_StaysCrossShard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open n2: %v", err)
 	}
-	defer c2.Close()
+	defer func() { _ = c2.Close() }()
 	n2GRPC.register(c2)
 
 	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
@@ -424,7 +424,7 @@ func TestRemoteTx_StaysCrossShard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if err := tx.Put([]byte(remoteKey), []byte("v")); !errors.Is(err, backend.ErrCrossShard) {
 		t.Fatalf("first Put: want ErrCrossShard, got %v", err)
@@ -474,7 +474,7 @@ func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open n1: %v", err)
 	}
-	defer c1.Close()
+	defer func() { _ = c1.Close() }()
 	n1GRPC.register(c1)
 
 	c2, err := cluster.Open(cluster.Config{
@@ -488,7 +488,7 @@ func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open n2: %v", err)
 	}
-	defer c2.Close()
+	defer func() { _ = c2.Close() }()
 	n2GRPC.register(c2)
 
 	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
@@ -502,7 +502,7 @@ func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
 	// Brief settle so subsequent dials see a definite refused.
 	time.Sleep(100 * time.Millisecond)
 
-	results := c1.Aggregate(func(b backend.Backend) any {
+	results := c1.Aggregate(func(_ backend.Backend) any {
 		return "fn-ran"
 	})
 	if len(results) != 2 {
@@ -705,7 +705,7 @@ func countBackend(t *testing.T, be *memory.Memory) int {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 	n := 0
 	for {
 		k, _, err := it.Next()

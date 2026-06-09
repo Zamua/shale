@@ -34,7 +34,7 @@ import (
 
 // usage prints the top-level help text to w.
 func usage(w io.Writer) {
-	fmt.Fprint(w, `shale - operator CLI for a shale cluster node
+	_, _ = fmt.Fprint(w, `shale - operator CLI for a shale cluster node
 
 Usage:
   shale [global flags] <subcommand> [args...]
@@ -69,7 +69,7 @@ func main() {
 func run(args []string, stdout, stderr io.Writer) int {
 	opts, sub, subArgs, err := parseGlobal(args)
 	if err != nil {
-		fmt.Fprintf(stderr, "shale: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale: %v\n", err)
 		usage(stderr)
 		return exitGeneric
 	}
@@ -102,7 +102,7 @@ func run(args []string, stdout, stderr io.Writer) int {
 	case "rebalance":
 		return runRebalance(opts, subArgs, stdout, stderr)
 	default:
-		fmt.Fprintf(stderr, "shale: unknown subcommand %q\n", sub)
+		_, _ = fmt.Fprintf(stderr, "shale: unknown subcommand %q\n", sub)
 		usage(stderr)
 		return exitGeneric
 	}

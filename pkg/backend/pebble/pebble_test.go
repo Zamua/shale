@@ -74,7 +74,7 @@ func TestScanPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 
 	var keys []string
 	got := map[string]string{}
@@ -107,7 +107,7 @@ func TestScanPrefixEmpty(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 	k, _, err := it.Next()
 	if err != nil {
 		t.Fatalf("next: %v", err)
@@ -161,7 +161,7 @@ func TestTransaction_ReadYourOwnWrites(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	if err := tx.Put([]byte("k"), []byte("tx-write")); err != nil {
 		t.Fatalf("tx.Put: %v", err)
@@ -188,7 +188,7 @@ func TestTransaction_SnapshotIsolation(t *testing.T) {
 	if err != nil {
 		t.Fatalf("begin: %v", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	// Commit an outside change AFTER the snapshot was taken.
 	if err := p.Put([]byte("k"), []byte("v1")); err != nil {
@@ -229,7 +229,7 @@ func TestTransaction_ScanPrefixMergesOverlay(t *testing.T) {
 	_ = p.Put([]byte("user:bob"), []byte("b"))
 
 	tx, _ := p.Begin(backend.SnapshotIsolation)
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	_ = tx.Put([]byte("user:carol"), []byte("c"))  // overlay new
 	_ = tx.Put([]byte("user:alice"), []byte("a2")) // overlay update
@@ -239,7 +239,7 @@ func TestTransaction_ScanPrefixMergesOverlay(t *testing.T) {
 	if err != nil {
 		t.Fatalf("scan: %v", err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 
 	got := map[string]string{}
 	for {

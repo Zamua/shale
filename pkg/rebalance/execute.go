@@ -25,6 +25,7 @@
 // it streams; destination recomputes as it receives; mismatch causes
 // the destination to roll back its writes for the range and signal
 // failure so the next Evaluate pass retries.
+
 package rebalance
 
 import (
@@ -109,7 +110,7 @@ func (s *localSource) OpenRange(partitionIDs []uint64, _ uint64) (<-chan KeyValu
 			errCh <- fmt.Errorf("rebalance: open scan: %w", err)
 			return
 		}
-		defer it.Close()
+		defer func() { _ = it.Close() }()
 
 		for {
 			k, v, err := it.Next()
@@ -242,7 +243,7 @@ func SourceChecksum(be backend.Backend, partitionIDs []uint64, partitionFn Parti
 	if err != nil {
 		return nil, 0, err
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 
 	wanted := make(map[uint64]struct{}, len(partitionIDs))
 	for _, pid := range partitionIDs {

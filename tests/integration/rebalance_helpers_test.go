@@ -43,7 +43,7 @@ func countBackend(t *testing.T, be *memory.Memory, label string) int {
 	if err != nil {
 		t.Fatalf("scan backend %s: %v", label, err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 	n := 0
 	for {
 		k, _, err := it.Next()

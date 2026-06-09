@@ -20,7 +20,7 @@ func runScan(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("scan", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage: shale scan <prefix>\n")
+		_, _ = fmt.Fprint(stderr, "Usage: shale scan <prefix>\n")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitGeneric
@@ -43,7 +43,7 @@ func runScan(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 
 	stream, err := cli.ScanPrefix(ctx, []byte(fs.Arg(0)))
 	if err != nil {
-		fmt.Fprintf(stderr, "shale scan: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale scan: %v\n", err)
 		return exitCodeForRPCError(err)
 	}
 
@@ -53,7 +53,7 @@ func runScan(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 			return exitOK
 		}
 		if err != nil {
-			fmt.Fprintf(stderr, "shale scan: %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "shale scan: %v\n", err)
 			return exitCodeForRPCError(err)
 		}
 		// key=value\n - matches the spec ("key=value pairs"). Keys

@@ -29,11 +29,11 @@ func runUntil(d time.Duration, fn func() bool) bool {
 
 func TestSweep_DeletesHandedOffKeysAfterGrace(t *testing.T) {
 	old := buildRing("n1")
-	new := buildRing("n1", "n2")
+	next := buildRing("n1", "n2")
 	self := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 
 	be := memory.New()
-	defer be.Close()
+	defer func() { _ = be.Close() }()
 
 	// Seed both moving keys (partition shifts to n2) + stable keys
 	// (partition stays on n1). After sweep, moving keys are gone +
@@ -45,14 +45,18 @@ func TestSweep_DeletesHandedOffKeysAfterGrace(t *testing.T) {
 		}
 		k := []byte(fmt.Sprintf("k-%d", i))
 		oldOwner := old.LocateKey(k).ID
-		newOwner := new.LocateKey(k).ID
+		newOwner := next.LocateKey(k).ID
 		v := []byte(fmt.Sprintf("v-%d", i))
 		switch {
 		case oldOwner == "n1" && newOwner == "n2" && len(moving) < 5:
-			be.Put(k, v)
+			if err := be.Put(k, v); err != nil {
+				t.Fatalf("be.Put: %v", err)
+			}
 			moving = append(moving, k)
 		case oldOwner == "n1" && newOwner == "n1" && len(stable) < 5:
-			be.Put(k, v)
+			if err := be.Put(k, v); err != nil {
+				t.Fatalf("be.Put: %v", err)
+			}
 			stable = append(stable, k)
 		}
 	}
@@ -63,7 +67,7 @@ func TestSweep_DeletesHandedOffKeysAfterGrace(t *testing.T) {
 	c := rebalance.New(self, be, opts)
 	defer c.Stop()
 
-	c.Evaluate(old, new, 1)
+	c.Evaluate(old, next, 1)
 
 	// Wait until every move has reached at least HandedOff.
 	if !runUntil(2*time.Second, func() bool {
@@ -103,19 +107,21 @@ func TestSweep_DeletesHandedOffKeysAfterGrace(t *testing.T) {
 
 func TestSweep_PreGraceRangesUntouched(t *testing.T) {
 	old := buildRing("n1")
-	new := buildRing("n1", "n2")
+	next := buildRing("n1", "n2")
 	self := rebalance.Member{ID: "n1", Addr: "addr:n1"}
 
 	be := memory.New()
-	defer be.Close()
+	defer func() { _ = be.Close() }()
 
 	// Seed a moving key so there is something the sweep could delete.
 	var moving []byte
 	for i := 0; i < 5000; i++ {
 		k := []byte(fmt.Sprintf("k-%d", i))
-		if old.LocateKey(k).ID == "n1" && new.LocateKey(k).ID == "n2" {
+		if old.LocateKey(k).ID == "n1" && next.LocateKey(k).ID == "n2" {
 			moving = k
-			be.Put(k, []byte("v"))
+			if err := be.Put(k, []byte("v")); err != nil {
+				t.Fatalf("be.Put: %v", err)
+			}
 			break
 		}
 	}
@@ -129,7 +135,7 @@ func TestSweep_PreGraceRangesUntouched(t *testing.T) {
 	c := rebalance.New(self, be, opts)
 	defer c.Stop()
 
-	c.Evaluate(old, new, 1)
+	c.Evaluate(old, next, 1)
 
 	// Wait until at least one range reaches HandedOff.
 	if !runUntil(2*time.Second, func() bool {

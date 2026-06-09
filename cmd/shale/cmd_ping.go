@@ -17,7 +17,7 @@ func runPing(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("ping", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage: shale ping\n")
+		_, _ = fmt.Fprint(stderr, "Usage: shale ping\n")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitGeneric
@@ -37,9 +37,9 @@ func runPing(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	defer cancel()
 
 	if err := cli.Ping(ctx); err != nil {
-		fmt.Fprintf(stderr, "shale ping: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale ping: %v\n", err)
 		return exitCodeForRPCError(err)
 	}
-	fmt.Fprintln(stdout, "ok")
+	_, _ = fmt.Fprintln(stdout, "ok")
 	return exitOK
 }

@@ -109,7 +109,7 @@ func TestPutReplicated_HungPeer_DeadlineCancelsDispatch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Open: %v", err)
 	}
-	defer c.Close()
+	defer func() { _ = c.Close() }()
 
 	if !waitForLocalInRing(c, 2*time.Second) {
 		t.Fatalf("local member never landed in ring")

@@ -18,7 +18,7 @@ func runStats(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, "Usage: shale stats\n")
+		_, _ = fmt.Fprint(stderr, "Usage: shale stats\n")
 	}
 	if err := fs.Parse(args); err != nil {
 		return exitGeneric
@@ -39,7 +39,7 @@ func runStats(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 
 	resp, err := cli.Stats(ctx)
 	if err != nil {
-		fmt.Fprintf(stderr, "shale stats: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale stats: %v\n", err)
 		return exitCodeForRPCError(err)
 	}
 
@@ -70,12 +70,12 @@ func runStats(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	}
 
 	// Aligned columns so eyeball-scanning works on a terminal.
-	fmt.Fprintf(stdout, "keys_held       %d\n", resp.GetKeysHeld())
-	fmt.Fprintf(stdout, "puts            %d\n", resp.GetPuts())
-	fmt.Fprintf(stdout, "gets            %d\n", resp.GetGets())
-	fmt.Fprintf(stdout, "deletes         %d\n", resp.GetDeletes())
-	fmt.Fprintf(stdout, "scans           %d\n", resp.GetScans())
-	fmt.Fprintf(stdout, "latency_ms_p50  %.3f\n", resp.GetLatencyMsP50())
-	fmt.Fprintf(stdout, "latency_ms_p99  %.3f\n", resp.GetLatencyMsP99())
+	_, _ = fmt.Fprintf(stdout, "keys_held       %d\n", resp.GetKeysHeld())
+	_, _ = fmt.Fprintf(stdout, "puts            %d\n", resp.GetPuts())
+	_, _ = fmt.Fprintf(stdout, "gets            %d\n", resp.GetGets())
+	_, _ = fmt.Fprintf(stdout, "deletes         %d\n", resp.GetDeletes())
+	_, _ = fmt.Fprintf(stdout, "scans           %d\n", resp.GetScans())
+	_, _ = fmt.Fprintf(stdout, "latency_ms_p50  %.3f\n", resp.GetLatencyMsP50())
+	_, _ = fmt.Fprintf(stdout, "latency_ms_p99  %.3f\n", resp.GetLatencyMsP99())
 	return exitOK
 }

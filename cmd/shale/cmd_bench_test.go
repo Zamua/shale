@@ -75,7 +75,7 @@ func TestKeyAtIsLexSortable(t *testing.T) {
 	if a != "bench:00000001" || b != "bench:00000002" || c != "bench:00000010" {
 		t.Fatalf("unexpected keys: %q %q %q", a, b, c)
 	}
-	if !(a < b && b < c) {
+	if a >= b || b >= c {
 		t.Fatalf("keys not lex sortable: %q %q %q", a, b, c)
 	}
 }

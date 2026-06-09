@@ -43,7 +43,7 @@ func TestScanPrefix(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 
 	got := map[string]string{}
 	for {

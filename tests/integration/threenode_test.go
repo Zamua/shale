@@ -221,7 +221,7 @@ func TestThreeNode_ScanPrefixSingleShard(t *testing.T) {
 	if err != nil {
 		t.Fatalf("ScanPrefix via %s: %v", scanner.NodeID(), err)
 	}
-	defer it.Close()
+	defer func() { _ = it.Close() }()
 
 	got := make(map[string]string)
 	for {
@@ -299,14 +299,14 @@ func TestThreeNode_LeaveSurvives(t *testing.T) {
 // findKeyNotOwnedBy returns a synthetic key whose ring owner (as c
 // sees it) is NOT the named node. Useful for tests that want to force
 // the remote-forwarding path on a specific node.
-func findKeyNotOwnedBy(t *testing.T, c *cluster.Cluster, avoid string, max int) string {
+func findKeyNotOwnedBy(t *testing.T, c *cluster.Cluster, avoid string, maxProbes int) string {
 	t.Helper()
-	for i := 0; i < max; i++ {
+	for i := 0; i < maxProbes; i++ {
 		k := fmt.Sprintf("probe-%d", i)
 		if ownerOf(c, k) != avoid {
 			return k
 		}
 	}
-	t.Fatalf("could not find a key NOT owned by %s in %d probes", avoid, max)
+	t.Fatalf("could not find a key NOT owned by %s in %d probes", avoid, maxProbes)
 	return ""
 }

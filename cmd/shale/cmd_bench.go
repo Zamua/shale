@@ -79,7 +79,7 @@ func runBench(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("bench", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	fs.Usage = func() {
-		fmt.Fprint(stderr, `Usage: shale bench [flags]
+		_, _ = fmt.Fprint(stderr, `Usage: shale bench [flags]
 
 Flags:
   --writes N                Put operations (default 10000)
@@ -109,19 +109,19 @@ Flags:
 		return exitGeneric
 	}
 	if *writes < 0 || *reads < 0 {
-		fmt.Fprintf(stderr, "shale bench: --writes and --reads must be >= 0\n")
+		_, _ = fmt.Fprintf(stderr, "shale bench: --writes and --reads must be >= 0\n")
 		return exitGeneric
 	}
 	if *valueSize < 0 {
-		fmt.Fprintf(stderr, "shale bench: --value-size must be >= 0\n")
+		_, _ = fmt.Fprintf(stderr, "shale bench: --value-size must be >= 0\n")
 		return exitGeneric
 	}
 	if *concurrency < 1 {
-		fmt.Fprintf(stderr, "shale bench: --concurrency must be >= 1\n")
+		_, _ = fmt.Fprintf(stderr, "shale bench: --concurrency must be >= 1\n")
 		return exitGeneric
 	}
 	if *replicationFactor < 0 {
-		fmt.Fprintf(stderr, "shale bench: --replication-factor must be >= 0\n")
+		_, _ = fmt.Fprintf(stderr, "shale bench: --replication-factor must be >= 0\n")
 		return exitGeneric
 	}
 	// --json on either the global or subcommand flag turns on JSON
@@ -137,7 +137,7 @@ Flags:
 
 	payload := make([]byte, *valueSize)
 	if _, err := rand.Read(payload); err != nil {
-		fmt.Fprintf(stderr, "shale bench: random fill: %v\n", err)
+		_, _ = fmt.Fprintf(stderr, "shale bench: random fill: %v\n", err)
 		return exitGeneric
 	}
 
@@ -146,7 +146,7 @@ Flags:
 	if *writes > 0 {
 		ws, err := runPhase("write", cli, *concurrency, *writes, *keysPrefix, payload, true)
 		if err != nil {
-			fmt.Fprintf(stderr, "shale bench (write): %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "shale bench (write): %v\n", err)
 			return exitCodeForRPCError(err)
 		}
 		phases = append(phases, ws)
@@ -155,7 +155,7 @@ Flags:
 	if *reads > 0 {
 		rs, err := runPhase("read", cli, *concurrency, *reads, *keysPrefix, nil, false)
 		if err != nil {
-			fmt.Fprintf(stderr, "shale bench (read): %v\n", err)
+			_, _ = fmt.Fprintf(stderr, "shale bench (read): %v\n", err)
 			return exitCodeForRPCError(err)
 		}
 		phases = append(phases, rs)
@@ -180,10 +180,10 @@ Flags:
 	}
 
 	if *replicationFactor > 0 {
-		fmt.Fprintf(stdout, "replication_factor=%d\n", *replicationFactor)
+		_, _ = fmt.Fprintf(stdout, "replication_factor=%d\n", *replicationFactor)
 	}
 	for _, p := range phases {
-		fmt.Fprintln(stdout, formatPhaseHuman(p))
+		_, _ = fmt.Fprintln(stdout, formatPhaseHuman(p))
 	}
 	return exitOK
 }
