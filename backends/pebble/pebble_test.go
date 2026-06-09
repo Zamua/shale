@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	pebbledb "github.com/cockroachdb/pebble"
+
 	pebblebe "github.com/Zamua/shale/backends/pebble"
 	"github.com/Zamua/shale/pkg/backend"
 )
@@ -325,5 +327,74 @@ func TestReopenSeesPersistedData(t *testing.T) {
 func TestNewRejectsMissingDir(t *testing.T) {
 	if _, err := pebblebe.New(pebblebe.Config{}); err == nil {
 		t.Fatalf("expected error for empty Dir")
+	}
+}
+
+// TestConfigOptions_NilUsesPebbleDefaults pins the "nil = defaults"
+// contract from the spec's Settings/Options pass-through section: a
+// caller leaving Config.Options unset gets a working backend with
+// pebble's own default behavior (writes succeed, etc.).
+func TestConfigOptions_NilUsesPebbleDefaults(t *testing.T) {
+	p, _ := openTemp(t) // openTemp passes Config{Dir: ...} only, Options nil.
+
+	if err := p.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("put with nil Options: %v", err)
+	}
+	got, err := p.Get([]byte("k"))
+	if err != nil {
+		t.Fatalf("get with nil Options: %v", err)
+	}
+	if !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("got %q want v", got)
+	}
+}
+
+// TestConfigOptions_PassThroughReachesEngine pins the pass-through
+// contract: a non-nil Config.Options is forwarded verbatim to
+// pebble.Open. We verify via observable behavior: ReadOnly=true makes
+// pebble reject Put calls (engine-level enforcement). If pass-through
+// were broken (e.g. shale defaulted to its own zero Options instead),
+// the Put would silently succeed.
+//
+// Two-phase: open a writable Pebble first to materialize the directory
+// (read-only Open fails on an empty dir), close, then reopen with
+// ReadOnly=true via the pass-through.
+func TestConfigOptions_PassThroughReachesEngine(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pebble-ro")
+
+	// Phase 1: create + close.
+	p, err := pebblebe.New(pebblebe.Config{Dir: dir})
+	if err != nil {
+		t.Fatalf("phase-1 open: %v", err)
+	}
+	if err := p.Put([]byte("seed"), []byte("v")); err != nil {
+		t.Fatalf("phase-1 put: %v", err)
+	}
+	if err := p.Close(); err != nil {
+		t.Fatalf("phase-1 close: %v", err)
+	}
+
+	// Phase 2: reopen with ReadOnly forwarded through.
+	roOpts := &pebbledb.Options{ReadOnly: true}
+	p2, err := pebblebe.New(pebblebe.Config{Dir: dir, Options: roOpts})
+	if err != nil {
+		t.Fatalf("phase-2 open with ReadOnly: %v", err)
+	}
+	t.Cleanup(func() { _ = p2.Close() })
+
+	// Reads still work in read-only mode.
+	got, err := p2.Get([]byte("seed"))
+	if err != nil {
+		t.Fatalf("phase-2 get: %v", err)
+	}
+	if !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("got %q want v", got)
+	}
+
+	// Writes must be rejected by pebble's read-only check. The exact
+	// error string is pebble-internal ("pebble: read-only"); we just
+	// assert non-nil to avoid coupling to pebble's wording.
+	if err := p2.Put([]byte("rejected"), []byte("x")); err == nil {
+		t.Fatalf("expected Put to fail in ReadOnly mode, got nil; Options pass-through is broken")
 	}
 }

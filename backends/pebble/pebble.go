@@ -50,6 +50,19 @@ type Config struct {
 	// missing parents) on first open and reuses it on subsequent
 	// opens. Required.
 	Dir string
+
+	// Options is forwarded verbatim to pebble.Open. Nil = pebble
+	// defaults (the same &pebble.Options{} pebble.New used pre-v0.5).
+	//
+	// The shale layer never reads, mutates, copies, or validates this
+	// value: operators get pebble's full knob surface (cache sizing,
+	// WAL configuration, compaction tuning, event listeners, ...) with
+	// type-checked field access. Any combination pebble rejects
+	// surfaces from pebble.Open before shale sees the backend.
+	//
+	// See https://pkg.go.dev/github.com/cockroachdb/pebble#Options for
+	// the field reference.
+	Options *pebbledb.Options
 }
 
 // Pebble is a Pebble-backed Backend. It owns the underlying *pebble.DB
@@ -60,11 +73,19 @@ type Pebble struct {
 
 // New opens a Pebble database at cfg.Dir. The caller must Close the
 // returned *Pebble to flush the WAL and release the directory lock.
+//
+// If cfg.Options is non-nil, it is forwarded to pebble.Open verbatim
+// (pass-through, no merging with shale defaults). Nil falls back to
+// pebble's own defaults via an empty &pebble.Options{}.
 func New(cfg Config) (*Pebble, error) {
 	if cfg.Dir == "" {
 		return nil, errors.New("pebble: Dir required")
 	}
-	db, err := pebbledb.Open(cfg.Dir, &pebbledb.Options{})
+	opts := cfg.Options
+	if opts == nil {
+		opts = &pebbledb.Options{}
+	}
+	db, err := pebbledb.Open(cfg.Dir, opts)
 	if err != nil {
 		return nil, fmt.Errorf("pebble: open %q: %w", cfg.Dir, err)
 	}
