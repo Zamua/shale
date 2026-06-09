@@ -64,8 +64,9 @@ type replicaResult struct {
 // Transient errors (per isTransientReplicaErr) count neither as ack
 // nor as failure budget; they flow through the channel for caller
 // visibility but the accounting goroutine waits for more replicas to
-// land before deciding. Migration-guard codes.Unavailable from a
-// replica that is mid-handoff is the canonical transient.
+// land before deciding. Migration-guard codes.ResourceExhausted from
+// a replica that is mid-handoff is the canonical transient (v0.4
+// distinguishes this from codes.Unavailable, which counts as failure).
 func fanout(
 	ctx context.Context,
 	replicas []ring.Member,
@@ -160,17 +161,29 @@ func fanout(
 
 // isTransientReplicaErr reports whether err is the kind of replica
 // outcome that should not count toward the success or failure budget.
-// In v0.4 that's the migration-guard codes.Unavailable returned by
-// Put / Delete when the receiving node's partition is mid-handoff;
-// the spec mandates these be treated as transient failures that don't
-// count toward acks (and shouldn't count toward the failure budget
-// either; another replica may still respond before the budget exhausts).
+// In v0.4 that's the migration-guard sentinel code (ResourceExhausted)
+// returned by Put / Delete when the receiving node's partition is mid-
+// handoff; the spec mandates these be treated as transient failures
+// that don't count toward acks (and shouldn't count toward the failure
+// budget either; another replica may still respond before the budget
+// exhausts).
+//
+// codes.Unavailable is NOT classified as transient here. It is the
+// canonical gRPC code for "the channel is gone" (server killed,
+// connection refused, deadline canceled the call) -- a genuinely-down
+// peer. Conflating the two breaks the failure-budget short-circuit:
+// a real down peer would loop until every other replica also
+// responded, instead of failing fast once (R - W + 1) such failures
+// land. The migration guard therefore uses a less-common code
+// (ResourceExhausted) so isTransientReplicaErr can distinguish "this
+// replica is mid-handoff, try another" from "this replica is dead,
+// count it as failure." See docs/SPEC.md "Cutover" for the rationale.
 func isTransientReplicaErr(err error) bool {
 	if err == nil {
 		return false
 	}
 	if st, ok := status.FromError(err); ok {
-		return st.Code() == codes.Unavailable
+		return st.Code() == codes.ResourceExhausted
 	}
 	return false
 }
@@ -233,6 +246,14 @@ func (c *Cluster) replicationFactor() int {
 // WriteConsistency). Migration-guard rejections from individual
 // replicas are transient + don't count toward the success or failure
 // budget per docs/SPEC.md "Fan-out + ack accounting".
+//
+// Each dispatch inherits a context.WithTimeout(WriteTimeout) deadline
+// so a hung peer (blackhole, half-open TCP, server stuck before
+// returning) cancels at deadline rather than blocking the call (and
+// the surplus drainer goroutine) forever. Without this, the
+// accounting goroutine never finalizes its sync.WaitGroup, the result
+// channel never closes, and every Put against a hung peer
+// permanently leaks two goroutines.
 func (c *Cluster) putReplicated(key, value []byte) error {
 	replicas := c.ring.LocateKeyN(c.shardKey(key), c.replicationFactor())
 	if len(replicas) == 0 {
@@ -245,16 +266,19 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 	envBytes := Encode(Envelope{Stamp: stamp, Payload: append([]byte(nil), value...)})
 	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))
 
-	acks, errs, resultsCh := fanout(context.Background(), replicas, w,
+	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
+	acks, errs, resultsCh := fanout(fanoutCtx, replicas, w,
 		func(ctx context.Context, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchReplicaPut(ctx, replica, key, envBytes)
 		})
 
 	// Drain surplus replicas in the background so the WaitGroup
-	// finalizes + no goroutine leaks. We don't care about their
-	// outcomes (v0.4 has no hinted handoff; lagging replicas catch
-	// up via the next read-repair or future anti-entropy).
+	// finalizes + no goroutine leaks. The drainer also cancels the
+	// fanout context once every replica reports (success, error, or
+	// deadline) so any in-flight gRPC call that survived past the
+	// decision point gets torn down rather than leaking.
 	go func() {
+		defer cancelFanout()
 		for range resultsCh {
 		}
 	}()
@@ -269,8 +293,9 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 
 // dispatchReplicaPut routes one replica's write to either the local
 // backend (with the migration guard) or a peer's gRPC ReplicaPut.
-// Returns the raw replica outcome; the migration-guard Unavailable is
-// surfaced verbatim so fanout's isTransientReplicaErr can classify it.
+// Returns the raw replica outcome; the migration-guard
+// ResourceExhausted is surfaced verbatim so fanout's
+// isTransientReplicaErr can classify it.
 func (c *Cluster) dispatchReplicaPut(ctx context.Context, replica ring.Member, key, envBytes []byte) error {
 	if replica.ID == c.cfg.NodeID {
 		if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
@@ -290,10 +315,23 @@ func (c *Cluster) dispatchReplicaPut(ctx context.Context, replica ring.Member, k
 // backend.ErrNotFound if the winner is a tombstone / no replica had
 // the key).
 //
+// Dispatch shape: we ALWAYS dispatch to all R replicas, not just the
+// first N. That gives ReadNearest a fallback when the primary is
+// down (a successor's response satisfies the n=1 target) and lets
+// ReadQuorum tolerate up to (R - N) replica failures per the spec
+// (docs/SPEC.md "Failure modes -> Replica down at Read time"). The
+// fanout returns once N successful responses land OR the entire ring
+// has reported. Surplus responses past N become read-repair feed.
+//
 // On Quorum / All, after the winner is determined any replica that
 // returned NotFound OR an older Stamp is read-repaired asynchronously
 // (best-effort, errors swallowed). Read-repair is skipped on Nearest
 // since there is nothing to compare against.
+//
+// Each dispatch inherits a context.WithTimeout(ReadTimeout) deadline
+// so a hung peer cancels its dispatched call instead of blocking the
+// surplus drainer + accounting goroutines forever (same shape as
+// putReplicated's WriteTimeout).
 func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 	allReplicas := c.ring.LocateKeyN(c.shardKey(key), c.replicationFactor())
 	if len(allReplicas) == 0 {
@@ -304,28 +342,30 @@ func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 	if n > len(allReplicas) {
 		n = len(allReplicas)
 	}
-	queried := allReplicas[:n]
+	// Dispatch to every replica, not just the first N. requiredAcks
+	// stays at n so the fanout signals "decided" once we have enough
+	// successful responses; surplus dispatches keep running so they
+	// fill in as fallbacks if some of the first N never reply (down
+	// primary, network drop, etc.). The failure-budget math
+	// (allReplicas - n) gives us (R - N) tolerated transport
+	// failures before the call gives up on collecting more.
+	queried := allReplicas
 
-	// requiredAcks for the read is "enough replicas to satisfy the
-	// consistency" which equals n itself: we want N responses (a
-	// response is success OR NotFound, both are first-class outcomes
-	// for LWW; only transport / migration errors are failures).
-	// Failure budget = (queried - n) = 0, so any non-transient error
-	// will trip the unreachable check. We forgive that by letting the
-	// caller still pick a winner from whatever DID land - read paths
-	// degrade more gracefully than writes since the surviving
-	// replicas can still serve consistent data.
-	_, _, resultsCh := fanout(context.Background(), queried, n,
+	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
+	_, _, resultsCh := fanout(fanoutCtx, queried, n,
 		func(ctx context.Context, replica ring.Member) ([]byte, error) {
 			return c.dispatchReplicaGet(ctx, replica, key)
 		})
 
-	// Collect first N usable responses (success or NotFound). For
-	// Nearest (n=1) this is one envelope; for Quorum / All it's the
-	// full set we asked for. Anything beyond N is surplus we read
-	// only for read-repair.
-	gathered := make([]collected, 0, n)
+	// Collect responses. Successes (including NotFound) up to N
+	// satisfy the consistency target; anything beyond N is surplus
+	// kept for read-repair classification. A transport / migration
+	// error contributes to nonTransientErr (surfaced if NO replica
+	// produces a usable response) but does NOT prevent us from
+	// considering a later-arriving successor as one of the N.
+	gathered := make([]collected, 0, len(queried))
 	var nonTransientErr error
+	usable := 0
 
 	for res := range resultsCh {
 		if res.Err != nil {
@@ -334,8 +374,9 @@ func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 				continue
 			}
 			if errors.Is(res.Err, backend.ErrNotFound) {
-				if len(gathered) < n {
+				if usable < n {
 					gathered = append(gathered, collected{member: res.Member, env: Envelope{}, hadValue: false})
+					usable++
 				}
 				continue
 			}
@@ -353,15 +394,18 @@ func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 			}
 			continue
 		}
-		if len(gathered) < n {
+		if usable < n {
 			gathered = append(gathered, collected{member: res.Member, env: env, hadValue: true})
+			usable++
 		} else if rc != ReadNearest {
 			// Past the consistency target: keep draining so read-
 			// repair below sees every replica that responded after
 			// we decided. fanout's resultsCh closes once every
 			// dispatched op finishes.
+			gathered = append(gathered, collected{member: res.Member, env: env, hadValue: true})
 		}
 	}
+	cancelFanout()
 
 	if len(gathered) == 0 {
 		if nonTransientErr != nil {
@@ -401,8 +445,8 @@ func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 // dispatchReplicaGet routes one replica's read. Returns the raw
 // envelope bytes (which the caller Decodes) on success, the canonical
 // backend.ErrNotFound when the replica has no entry, or the gRPC
-// status error otherwise. Migration-guard Unavailable is surfaced
-// verbatim so the caller's classifier can skip it.
+// status error otherwise. Migration-guard ResourceExhausted is
+// surfaced verbatim so the caller's classifier can skip it.
 func (c *Cluster) dispatchReplicaGet(ctx context.Context, replica ring.Member, key []byte) ([]byte, error) {
 	if replica.ID == c.cfg.NodeID {
 		v, err := c.backend.Get(key)
@@ -437,9 +481,25 @@ type collected struct {
 
 // scheduleReadRepair fires a best-effort async push of the winning
 // envelope to every queried replica that returned NotFound or a
-// strictly-older Stamp. Capped at len(queried) goroutines (one per
+// strictly-older Stamp. Bounded at len(queried) goroutines (one per
 // lagging replica); errors are swallowed.
+//
+// Lifecycle: each repair is registered against c.repairWG + uses
+// c.repairCtx so Close cancels the context (the in-flight gRPC call
+// returns) and waits for the goroutine to exit before tearing down
+// the cached peerClient map. Without this, a repair mid-PutForwarded
+// could race against c.clients teardown in Close, dialing through a
+// torn-down client. If c.repairCtx is already cancelled (Close has
+// already started), we drop the repair on the floor rather than
+// spawning a doomed goroutine: read-repair is best-effort and the
+// post-Close window has no consumer anyway.
 func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []collected, queried []ring.Member) {
+	if c.repairCtx == nil {
+		return
+	}
+	if c.repairCtx.Err() != nil {
+		return
+	}
 	winnerBytes := Encode(winnerEnv)
 	// Build a quick lookup: which gathered replicas saw an older or
 	// missing value. Members we queried but never heard back from
@@ -458,13 +518,12 @@ func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []
 	if len(laggers) == 0 {
 		return
 	}
-	// Detached context: read-repair MUST outlive the caller's Get
-	// (which has already returned by the time these fire), and we
-	// don't want a caller cancel to kill the repair mid-flight.
 	for _, m := range laggers {
 		m := m
+		c.repairWG.Add(1)
 		go func() {
-			_ = c.dispatchReplicaPut(context.Background(), m, key, winnerBytes)
+			defer c.repairWG.Done()
+			_ = c.dispatchReplicaPut(c.repairCtx, m, key, winnerBytes)
 		}()
 	}
 }
@@ -478,9 +537,9 @@ func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []
 // raw-bytes path the v0.3 forwarder used.
 //
 // The migration guard applies: if this node's partition is mid-
-// handoff, returns the transient Unavailable so the originator's
-// fanout classifies it as transient + doesn't count it against the
-// success or failure budget.
+// handoff, returns the transient ResourceExhausted so the
+// originator's fanout classifies it as transient + doesn't count it
+// against the success or failure budget.
 //
 // Caller (rpc.Server.Put) is responsible for the OwnsReplica check;
 // LocalReplicaPut trusts that gate.

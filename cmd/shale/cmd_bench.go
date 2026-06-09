@@ -58,11 +58,11 @@ type phaseStats struct {
 
 // benchOutput is the JSON envelope when --json is set.
 type benchOutput struct {
-	Writes      int          `json:"writes"`
-	Reads       int          `json:"reads"`
-	KeysPrefix  string       `json:"keys_prefix"`
-	ValueSize   int          `json:"value_size_bytes"`
-	Concurrency int          `json:"concurrency"`
+	Writes      int    `json:"writes"`
+	Reads       int    `json:"reads"`
+	KeysPrefix  string `json:"keys_prefix"`
+	ValueSize   int    `json:"value_size_bytes"`
+	Concurrency int    `json:"concurrency"`
 	// ReplicationFactor is the R the operator was driving the target
 	// cluster at; bench itself only talks to one node's gRPC + does
 	// not configure replication on the server side, so this is a

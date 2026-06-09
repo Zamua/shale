@@ -234,11 +234,18 @@ func TestReplicate_WriteAll_R3_FailsWhenOneDown(t *testing.T) {
 	}
 }
 
-// TestReplicate_ReadNearest_HitsPrimaryOnly pins ReadNearest: only the
-// primary's backend receives a Get; the (R-1) successors are NOT
-// touched. We seed every replica with WriteAll so the data is present
-// on all R; then a Nearest read MUST resolve from the primary alone.
-func TestReplicate_ReadNearest_HitsPrimaryOnly(t *testing.T) {
+// TestReplicate_ReadNearest_ReturnsAfterFirstSuccess pins ReadNearest:
+// the call returns the moment the first replica replies. v0.4 dispatches
+// to all R replicas (so a hung / down primary falls back to a successor
+// per docs/SPEC.md "Failure modes -> Replica down at Read time"), but the
+// consistency target is 1, so the call returns immediately on the first
+// success. The post-decision dispatches still run -- that's the spec's
+// "Fan-out + ack accounting" surplus contract -- but the Get does NOT
+// block on them. This test asserts the primary's backend was the one
+// satisfying the caller (the local fast-path serves before the network
+// dispatch lands) AND that the call returned the right value; the
+// surplus dispatches are best-effort + uninteresting to the contract.
+func TestReplicate_ReadNearest_ReturnsAfterFirstSuccess(t *testing.T) {
 	nodes := startCountingCluster(t, 3, 3, cluster.WriteAll, cluster.ReadNearest)
 
 	key := []byte("nearest-key")
@@ -266,24 +273,20 @@ func TestReplicate_ReadNearest_HitsPrimaryOnly(t *testing.T) {
 	}
 
 	// Read via the primary itself so the local-replica fast-path serves
-	// the result without further fan-out. ReadNearest with primary
-	// being the local node hits the local backend exactly once.
-	if _, err := byID[primary].Cluster.Get(key); err != nil {
+	// the result without further fan-out. The call returns "v" once
+	// the local hit lands; surplus dispatches to N2 + N3 continue in
+	// the background but they don't affect correctness.
+	got, err := byID[primary].Cluster.Get(key)
+	if err != nil {
 		t.Fatalf("Get: %v", err)
+	}
+	if string(got) != "v" {
+		t.Errorf("ReadNearest got %q want v", got)
 	}
 
 	deltaPrimary := byID[primary].Backend.gets.Load() - preGets[primary]
 	if deltaPrimary < 1 {
 		t.Errorf("primary %s saw no Get: delta=%d", primary, deltaPrimary)
-	}
-	for _, n := range nodes {
-		if n.ID == primary {
-			continue
-		}
-		delta := n.Backend.gets.Load() - preGets[n.ID]
-		if delta != 0 {
-			t.Errorf("ReadNearest unexpectedly touched non-primary %s: delta=%d", n.ID, delta)
-		}
 	}
 }
 

@@ -659,13 +659,15 @@ func openClusterNodeAt(t *testing.T, id, bindAddr, seedBindAddr string, mem *mem
 	}
 }
 
-// putWithMigrationRetry wraps Put with a bounded retry on the v0.3
-// transient codes: Unavailable from the migration-window write
+// putWithMigrationRetry wraps Put with a bounded retry on the v0.4
+// transient codes: ResourceExhausted from the migration-window write
 // rejection (docs/SPEC.md "Cutover") and FailedPrecondition from
 // the forwarding loop-guard. Per docs/SPEC.md the SDK is expected
 // to do this; tests do too so the assertion checks "rebalance
 // eventually succeeds" rather than "no transient rejection during
-// bootstrap."
+// bootstrap." Unavailable is intentionally NOT retried here: it
+// signals a real peer-down condition, distinct from a mid-handoff
+// transient (which uses ResourceExhausted as of v0.4).
 func putWithMigrationRetry(c *cluster.Cluster, key, value []byte) error {
 	var lastErr error
 	for i := 0; i < 50; i++ {
@@ -674,7 +676,7 @@ func putWithMigrationRetry(c *cluster.Cluster, key, value []byte) error {
 			return nil
 		}
 		if st, ok := status.FromError(err); ok {
-			if st.Code() == codes.Unavailable || st.Code() == codes.FailedPrecondition {
+			if st.Code() == codes.ResourceExhausted || st.Code() == codes.FailedPrecondition {
 				lastErr = err
 				time.Sleep(50 * time.Millisecond)
 				continue

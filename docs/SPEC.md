@@ -191,8 +191,10 @@ v0.1-v0.3 ship with R=1: each key has exactly one owner, no copies. v0.4 introdu
 Three knobs on `Config`, all per-cluster (not per-key):
 
   - **`ReplicationFactor int`** (default `1`). The number of nodes that hold a copy of each key. With R=1 the cluster behaves exactly as in v0.3: one owner per key, no replicas, no LWW envelope cost paid on the read path. With R>1 each write fans out to R nodes (primary + R-1 successors on the ring).
-  - **`WriteConsistency`** (`One | Quorum | All`, default `Quorum`). The number of replica acks required before `Put` / `Delete` returns success. `Quorum = floor(R/2) + 1`. `All` requires every replica to ack; any down replica fails the write. `One` returns as soon as the primary acks and is the loosest setting.
-  - **`ReadConsistency`** (`Nearest | Quorum | All`, default `Nearest`). `Nearest` reads from the primary only (one network hop in the common case, R=1 behavior). `Quorum` reads from floor(R/2)+1 replicas and returns the LWW winner. `All` reads from every replica.
+  - **`WriteConsistency`** (`One | Quorum | All`, default `Quorum`). The number of replica acks required before `Put` / `Delete` returns success. `Quorum = floor(R_live/2) + 1` where `R_live` is the number of replicas actually returned by `ring.LocateKeyN(key, R)` after the live-membership clamp (when the ring has fewer than R distinct members, `LocateKeyN` returns the available subset). The quorum tracks live R, not configured R: a configured R=5 cluster running on 2 live members yields W=2 for Quorum (a majority of live), not W=3 (unreachable, would block forever). `All` requires every live replica to ack; any down replica fails the write. `One` returns as soon as the primary acks and is the loosest setting.
+  - **`ReadConsistency`** (`Nearest | Quorum | All`, default `Nearest`). `Nearest` reads with consistency target 1 (the call returns on the first replica's reply); `Quorum` waits for floor(R_live/2)+1 successful responses and returns the LWW winner; `All` waits for every live replica. In every case the dispatch goes to all R replicas so a down primary falls back to the next ring successor (`Quorum` / `All` tolerate up to `R - N` such failures; `Nearest` tolerates `R - 1`). Surplus successful responses past the consistency target seed read-repair feedback on `Quorum` / `All`.
+  - **`WriteTimeout duration`** (default `5s`). Per-Put / per-Delete fan-out budget. The originator wraps the fanout context with this timeout so a blackholed peer (hung gRPC, half-open TCP) cancels at deadline instead of leaking goroutines indefinitely. A write that exhausts the timeout without reaching W acks returns `Unavailable`.
+  - **`ReadTimeout duration`** (default `5s`). Per-Get fan-out budget. Same shape as `WriteTimeout`: an unreachable peer doesn't block the read indefinitely.
 
 The default pairing (`Quorum` writes, `Nearest` reads) is the v0.4 baseline: writes are durable across a quorum loss, reads are cheap. Operators who want stronger read freshness flip `ReadConsistency` to `Quorum`. Operators willing to tolerate write loss for lower write latency flip `WriteConsistency` to `One`. The two knobs are independent.
 
@@ -233,20 +235,23 @@ With R>1, `ring.LocateKeyN(key, R)` returns the primary plus R-1 successors on t
 
 #### Read path
 
-`Get` issues read RPCs to N replicas per `ReadConsistency` (1 / quorum / R). Each replica returns its local envelope (or `NotFound`). The cluster layer:
+`Get` dispatches read RPCs to all R live replicas (so a hung / down primary falls back to a successor without losing the call) and waits for N successful responses per `ReadConsistency` (1 / quorum / R). Each replica returns its local envelope (or `NotFound`). The cluster layer:
 
   1. Collects responses up to the consistency target.
   2. Picks the LWW winner across the collected envelopes.
   3. Returns the winner's payload (or `NotFound` if the winner is a tombstone or no replica had the key).
 
+Surplus responses past the consistency target keep flowing onto the result channel until every dispatched op reports (or `ReadTimeout` fires), so read-repair below can classify replicas that disagreed with the winner.
+
 On `Quorum` / `All`, if the collected envelopes disagree (any replica returned an older Stamp than the winner, or `NotFound` while a peer has a value), the cluster issues **read-repair**: an async forwarded Put of the winner envelope to every lagging replica. Read-repair is best-effort: errors are swallowed, no retry. Read-repair is **skipped on `Nearest`** because a single-replica read has nothing to compare against; lagging replicas catch up via the next quorum/all read or via future anti-entropy (v0.4.1+).
 
 #### Failure modes
 
-  - **Replica down at Put time**: tolerated up to `R - W` simultaneous failures. With the default R=3 W=2, one replica down still completes writes. With `WriteConsistency=All`, any replica down fails the write.
+  - **Replica down at Put time**: tolerated up to `R - W` simultaneous failures. With the default R=3 W=2, one replica down still completes writes. With `WriteConsistency=All`, any replica down fails the write. A down replica returns `codes.Unavailable` (real peer-down), which counts against the failure budget so the fanout fails fast once `R - W + 1` such replies land instead of waiting on every remaining peer.
   - **Network partition**: both sides accept writes for keys they can reach a sufficient quorum on. Writes on either side carry the originator's Stamp. On heal, the LWW comparator reconciles deterministically: the higher-timestamp write wins, lower-timestamp writes are lost. This is the AP choice (see "Consistency model"); workloads that cannot tolerate write loss should use a CP system.
   - **All R replicas down**: `Put` and `Get` return `Unavailable`. No way to make progress without at least one replica.
   - **Replica down at Read time**: tolerated up to (R - N) where N is the consistency-target count. `Nearest` with primary down falls back to the next ring successor; `Quorum` / `All` collect from surviving replicas and fail if too few respond.
+  - **Replica mid-handoff (rebalance)**: the receiving node returns `codes.ResourceExhausted` (the migration-guard sentinel), distinct from `Unavailable`. The fanout classifies it as transient (skip this replica, wait for another) and does NOT count it against the failure budget. Without that distinction, a single mid-handoff replica during normal v0.3 rebalance would force every otherwise-quorum write to wait for the migration to complete.
 
 #### Out of scope for v0.4
 
@@ -319,7 +324,7 @@ Each range has a lifecycle:
 1. **Pre-migration**: source owns the range. Source serves reads and writes. Destination's ring already lists destination as the new owner, but `MigrateRange` has not started or is queued behind earlier ranges.
 2. **Migrating**: destination opens `MigrateRange`. Source marks the range as migrating-out, destination marks it as migrating-in. While in this state:
    - **Reads** for keys in the range are served by the **source**. The forwarding loop-guard ensures that a read landing on the destination via stale ring is forwarded back to the source.
-   - **Writes** for keys in the range are **rejected by the source** with a transient error (`Unavailable` with retry hint). The destination, if it receives a write via the new ring, also rejects with `Unavailable`. Clients retry with backoff; the SDK's client wrapper handles this transparently with a bounded retry budget.
+   - **Writes** for keys in the range are **rejected by the source** with a transient error (`ResourceExhausted` with retry hint). The destination, if it receives a write via the new ring, also rejects with `ResourceExhausted`. Clients retry with backoff; the SDK's client wrapper handles this transparently with a bounded retry budget. `ResourceExhausted` (not `Unavailable`) is the chosen code so the v0.4 replication fanout's failure budget can distinguish "this replica is mid-handoff, try another" from "this replica is dead, count it as failure"; conflating the two would force the fanout to wait on every peer instead of failing fast on real peer-down.
    - This is the chosen cutover semantics. Rejecting writes during the streaming copy is what avoids the "did this write make it across the cutover" problem without a WAL-tailing catch-up phase. The write-unavailability window per range is bounded by streaming time for that range's data.
 3. **Swap**: source completes the stream by sending the terminal `MigrationDone{total_keys, checksum}` chunk. The destination validates the checksum against its own running CRC32 and ack's implicitly by reading + draining the stream to a clean EOF (the gRPC stream return value IS the ack; there is no separate `MigrateAck` message). The source's `MigrateRange` handler returns successfully only after the destination has consumed `MigrationDone`. The coordinator observes that successful return and flips ownership state for the range from "owner" to "former owner, forwards reads". This flip is atomic per range.
 4. **Post-migration**: destination is authoritative for reads and writes. Source forwards any straggler read it receives for the range to the destination via the standard forwarding path. Once the source observes that all peers' rings agree the destination owns the range (or after a grace period of `T_drain`, default 30s), source deletes its local copy of the range's keys.

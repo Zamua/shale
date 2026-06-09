@@ -164,6 +164,22 @@ type Config struct {
 	// v0.3 single-replica read behavior). See ReadConsistency for the
 	// per-value semantics.
 	ReadConsistency ReadConsistency
+
+	// WriteTimeout bounds the wall-clock budget for a Put / Delete
+	// fanout. Each replica dispatch inherits this deadline through
+	// context.WithTimeout, so a blackholed peer (hung gRPC, half-open
+	// TCP) cancels at deadline rather than blocking forever. The
+	// fanout still returns deterministically when the deadline fires:
+	// any replica that hasn't replied is counted as a failure for the
+	// purposes of the success/failure budget. Zero falls back to 5s.
+	WriteTimeout time.Duration
+
+	// ReadTimeout bounds the wall-clock budget for a Get fanout.
+	// Same shape as WriteTimeout: per-dispatch deadline so a hung
+	// peer doesn't block the call beyond ReadTimeout, even if the
+	// configured consistency would otherwise wait for that replica.
+	// Zero falls back to 5s.
+	ReadTimeout time.Duration
 }
 
 // normalizeConfig fills in v0.4 default values for any zero-valued
@@ -181,6 +197,12 @@ func normalizeConfig(cfg *Config) {
 	}
 	if cfg.ReadConsistency == 0 {
 		cfg.ReadConsistency = ReadNearest
+	}
+	if cfg.WriteTimeout <= 0 {
+		cfg.WriteTimeout = 5 * time.Second
+	}
+	if cfg.ReadTimeout <= 0 {
+		cfg.ReadTimeout = 5 * time.Second
 	}
 }
 
@@ -227,6 +249,19 @@ type Cluster struct {
 	lastEvalRing    *ring.Ring
 	rebalanceCtx    context.Context
 	rebalanceCancel context.CancelFunc
+
+	// repairCtx / repairCancel govern the lifetime of async read-
+	// repair goroutines. Close cancels repairCtx so any in-flight
+	// repair sees a canceled gRPC context + bails out; repairWG
+	// blocks Close until every spawned repair has exited so a Close-
+	// concurrent repair cannot try to dial through a torn-down
+	// peerClient after Close has cleared c.clients. Initialized
+	// unconditionally (single-node mode is a degenerate case with
+	// no peers to repair against, so the goroutine count stays at 0
+	// but the context still exists for safe Close coordination).
+	repairCtx    context.Context
+	repairCancel context.CancelFunc
+	repairWG     sync.WaitGroup
 }
 
 // Open initializes a Cluster from cfg. In single-node mode it just
@@ -250,6 +285,7 @@ func Open(cfg Config) (*Cluster, error) {
 		clients: make(map[string]*peerClient),
 		closeCh: make(chan struct{}),
 	}
+	c.repairCtx, c.repairCancel = context.WithCancel(context.Background())
 
 	if cfg.BindAddr == "" {
 		// Single-node mode: no membership, no ring, every op is local.
@@ -514,6 +550,29 @@ func (c *Cluster) Close() error {
 		c.rebalanceCancel()
 	}
 
+	// Cancel any in-flight read-repair goroutines + wait for them to
+	// exit BEFORE tearing down the peer-client cache. A repair that's
+	// mid-PutForwarded against a cached peerClient would deadlock /
+	// race / segfault when we close the conn below; canceling the
+	// repair context first lets the gRPC call return cleanly, and the
+	// short wait drains them with a budget so a wedged peer doesn't
+	// stall Close indefinitely. 5s is enough for any in-flight repair
+	// to honor ctx.Done; past that we give up and proceed, accepting
+	// that the goroutine may log a "use of closed connection" error
+	// (which is swallowed by the repair path anyway).
+	if c.repairCancel != nil {
+		c.repairCancel()
+	}
+	repairDone := make(chan struct{})
+	go func() {
+		c.repairWG.Wait()
+		close(repairDone)
+	}()
+	select {
+	case <-repairDone:
+	case <-time.After(5 * time.Second):
+	}
+
 	// Signal the events + reconcile loops to exit + wait for them
 	// before tearing down membership so we don't race with a late
 	// ring.Add on closed ring. The sweep goroutine also drains via
@@ -643,14 +702,16 @@ func (c *Cluster) evictClient(addr string) {
 
 // Put stores value under key, routing to the owning node.
 //
-// v0.3 rebalancing: if the key's partition is mid-migration on this
-// node (either streaming out OR being received), the local Put is
-// rejected with codes.Unavailable + a retry-after hint (per
+// v0.3/v0.4 rebalancing: if the key's partition is mid-migration on
+// this node (either streaming out OR being received), the local Put
+// is rejected with codes.ResourceExhausted + a retry-after hint (per
 // docs/SPEC.md "Cutover"). Clients should retry with backoff per the
-// hint; the SDK wraps this transparently with a bounded retry
-// budget. codes.FailedPrecondition is reserved for the forwarding
-// loop-guard (docs/SPEC.md "Failure handling"); the two codes have
-// different retry semantics so they must not be conflated.
+// hint; the SDK wraps this transparently with a bounded retry budget.
+// codes.FailedPrecondition is reserved for the forwarding loop-guard
+// (docs/SPEC.md "Failure handling"); codes.Unavailable is reserved
+// for genuine peer-down failures (so the fanout's failure budget can
+// short-circuit on dead nodes). The three codes have different retry
+// semantics so they must not be conflated.
 //
 // v0.4 replication: when ReplicationFactor > 1 the originator stamps
 // the payload (time.Now().UnixNano() + NodeID) once, wraps it in an
@@ -740,9 +801,9 @@ func (c *Cluster) forwardGet(addr string, key []byte) ([]byte, error) {
 
 // Delete removes key, routing to the owning node.
 //
-// v0.3 rebalancing: same write-guard semantics as Put. Mid-migration
-// keys are rejected with Unavailable + retry-after; the client
-// retries once the range hands off cleanly.
+// v0.3/v0.4 rebalancing: same write-guard semantics as Put. Mid-
+// migration keys are rejected with ResourceExhausted + retry-after;
+// the client retries once the range hands off cleanly.
 //
 // v0.4 replication: Delete writes a tombstone (empty-payload
 // envelope) carrying the current Stamp + fans out to R replicas with

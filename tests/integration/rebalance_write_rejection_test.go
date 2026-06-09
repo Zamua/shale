@@ -2,7 +2,7 @@ package integration
 
 // Write-rejection scenario: per docs/SPEC.md "Cutover", a Put against
 // a key whose partition is currently being migrated MUST be rejected
-// by the source with Unavailable (plus a retry-after hint).
+// by the source with ResourceExhausted (plus a retry-after hint).
 // FailedPrecondition is reserved for the forwarding loop-guard
 // (docs/SPEC.md "Failure handling"). After the migration completes,
 // the same Put MUST succeed.
@@ -99,7 +99,7 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 	trio := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 
 	// Hammer target with Puts until either (a) we observe one
-	// returning Unavailable or (b) the time budget expires. The
+	// returning ResourceExhausted or (b) the time budget expires. The
 	// settle delay is 5s + stream is small; 20s budget is generous.
 	deadline := time.Now().Add(20 * time.Second)
 	observedRejection := false
@@ -111,9 +111,9 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 		if err != nil {
 			lastErr = err
 			if st, ok := status.FromError(err); ok {
-				if st.Code() == codes.Unavailable {
+				if st.Code() == codes.ResourceExhausted {
 					observedRejection = true
-					t.Logf("observed Unavailable after %d attempts: %v", attempts, err)
+					t.Logf("observed ResourceExhausted after %d attempts: %v", attempts, err)
 					break
 				}
 			}
@@ -130,11 +130,11 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 		// We require (a) to fail loudly. If membership did reach 3
 		// AND distribution is balanced, the most likely explanation
 		// is (b) or (c) and we still flag it because the SPEC is
-		// explicit about Unavailable.
+		// explicit about ResourceExhausted.
 		if err := waitForMembersAll(trio, 3, 10*time.Second); err != nil {
 			t.Fatalf("3-node convergence: %v (no rejection observed either; rebalance hook likely not wired)", err)
 		}
-		t.Fatalf("never observed Unavailable on target key during migration window (attempts=%d, last err=%v). per docs/SPEC.md \"Cutover\", the source MUST reject writes for a migrating key with codes.Unavailable. If the cluster v0.3 wiring lands without this rejection path, a write during the streaming copy is silently lost.",
+		t.Fatalf("never observed ResourceExhausted on target key during migration window (attempts=%d, last err=%v). per docs/SPEC.md \"Cutover\", the source MUST reject writes for a migrating key with codes.ResourceExhausted. If the cluster v0.3 wiring lands without this rejection path, a write during the streaming copy is silently lost.",
 			attempts, lastErr)
 	}
 
@@ -150,7 +150,7 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 	// Retry should succeed via any node (the new owner is wr-n3, but
 	// n1 forwards under the routing layer).
 	if err := n1.Cluster.Put([]byte(target), []byte("post-rebalance")); err != nil {
-		t.Fatalf("Put %s after rebalance idle: still rejected: %v (Unavailable leak: range never left the migrating state)", target, err)
+		t.Fatalf("Put %s after rebalance idle: still rejected: %v (ResourceExhausted leak: range never left the migrating state)", target, err)
 	}
 	got, err := n3.Cluster.Get([]byte(target))
 	if err != nil {
@@ -160,10 +160,10 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 		t.Fatalf("Get %s after rebalance: got %q want %q", target, got, "post-rebalance")
 	}
 
-	// Defensive: a final probe should NOT hit Unavailable.
+	// Defensive: a final probe should NOT hit ResourceExhausted.
 	if err := n2.Cluster.Put([]byte(target), []byte("post-rebalance-2")); err != nil {
-		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
-			t.Fatalf("Put via n2 after settle: still Unavailable: %v", err)
+		if st, ok := status.FromError(err); ok && st.Code() == codes.ResourceExhausted {
+			t.Fatalf("Put via n2 after settle: still ResourceExhausted: %v", err)
 		}
 		t.Fatalf("Put via n2 after settle: unexpected err: %v", err)
 	}

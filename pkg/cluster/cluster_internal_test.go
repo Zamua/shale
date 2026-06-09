@@ -318,24 +318,25 @@ func TestPut_DuringMigrationReturnsUnavailable(t *testing.T) {
 		t.Fatalf("no seeded key entered StateSending; coordinator snapshot=%+v", rb.Snapshot())
 	}
 
-	// Put against the migrating key MUST return Unavailable per
-	// docs/SPEC.md "Cutover" (FailedPrecondition is reserved for
-	// the forwarding loop-guard in "Failure handling"; conflating
-	// the two would make clients unable to distinguish "ring drift,
-	// refresh + retry" from "in-flight migration, retry after Nms").
+	// Put against the migrating key MUST return ResourceExhausted per
+	// docs/SPEC.md "Cutover" (FailedPrecondition is reserved for the
+	// forwarding loop-guard in "Failure handling"; Unavailable is
+	// reserved for genuine peer-down failures so the fanout's failure
+	// budget can short-circuit on dead nodes; conflating any of the
+	// three breaks the client's ability to distinguish them).
 	err = c.Put(movingKey, []byte("post"))
 	if err == nil {
-		t.Fatalf("Put for migrating key returned nil; want Unavailable")
+		t.Fatalf("Put for migrating key returned nil; want ResourceExhausted")
 	}
 	st, ok := status.FromError(err)
 	if !ok {
 		t.Fatalf("Put error is not a gRPC status: %v", err)
 	}
-	if st.Code() != codes.Unavailable {
-		t.Fatalf("Put for migrating key: want Unavailable, got %s (%v)", st.Code(), err)
+	if st.Code() != codes.ResourceExhausted {
+		t.Fatalf("Put for migrating key: want ResourceExhausted, got %s (%v)", st.Code(), err)
 	}
 	if !bytes.Contains([]byte(st.Message()), []byte("retry")) {
-		t.Fatalf("Unavailable message %q lacks a retry hint; SDK clients need it to back off", st.Message())
+		t.Fatalf("Migration-guard error %q lacks a retry hint; SDK clients need it to back off", st.Message())
 	}
 }
 

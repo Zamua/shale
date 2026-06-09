@@ -54,10 +54,17 @@ func TestFanout_FailureBudgetExhausted(t *testing.T) {
 	drain(ch)
 }
 
-// TestFanout_TransientDoesNotCount: a transient (codes.Unavailable)
+// TestFanout_TransientDoesNotCount: a transient (codes.ResourceExhausted)
 // reply must not count as an ack OR as a failure. With R=3 + W=2,
 // (1 success, 1 transient, 1 success) must yield 2 acks success even
 // though the failure budget would mark "1 down" as a real failure.
+//
+// ResourceExhausted is the migration-guard sentinel (see
+// migrationGuardError + isTransientReplicaErr); a replica mid-handoff
+// returns this so the originator skips it without counting it against
+// the failure budget. codes.Unavailable is reserved for genuine peer-
+// down (gRPC channel gone / deadline canceled) and DOES count as
+// failure -- TestFanout_UnavailableCountsAsFailure pins that.
 func TestFanout_TransientDoesNotCount(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var seq int32
@@ -65,7 +72,7 @@ func TestFanout_TransientDoesNotCount(t *testing.T) {
 		func(ctx context.Context, _ ring.Member) ([]byte, error) {
 			n := atomic.AddInt32(&seq, 1)
 			if n == 1 {
-				return nil, status.Error(codes.Unavailable, "transient")
+				return nil, status.Error(codes.ResourceExhausted, "transient")
 			}
 			return nil, nil
 		})
@@ -74,6 +81,32 @@ func TestFanout_TransientDoesNotCount(t *testing.T) {
 	}
 	if len(errs) != 0 {
 		t.Fatalf("transient should not be in errs: %v", errs)
+	}
+	drain(ch)
+}
+
+// TestFanout_UnavailableCountsAsFailure pins the distinguishing
+// behavior between Unavailable (real peer down) + ResourceExhausted
+// (migration-guard transient). With R=3 + W=2, two Unavailables MUST
+// exhaust the failure budget + return without 2 acks. A regression
+// that re-broadens isTransientReplicaErr to include Unavailable
+// would loop until every replica responded (the fail-fast path lost).
+func TestFanout_UnavailableCountsAsFailure(t *testing.T) {
+	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	var seq int32
+	acks, errs, ch := fanout(context.Background(), reps, 2,
+		func(ctx context.Context, _ ring.Member) ([]byte, error) {
+			n := atomic.AddInt32(&seq, 1)
+			if n <= 2 {
+				return nil, status.Error(codes.Unavailable, "peer down")
+			}
+			return nil, nil
+		})
+	if acks >= 2 {
+		t.Fatalf("acks: got %d want <2 (failure budget exhausted)", acks)
+	}
+	if len(errs) < 2 {
+		t.Fatalf("errs: got %v want >=2 (Unavailable must count as failure)", errs)
 	}
 	drain(ch)
 }

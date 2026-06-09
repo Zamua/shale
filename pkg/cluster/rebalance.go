@@ -290,15 +290,34 @@ func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
 
 // migrationGuardError builds the error returned to a Put/Delete that
 // lands on a key whose partition is currently sending out. Carries
-// codes.Unavailable + a retry-after-ms hint per docs/SPEC.md
+// codes.ResourceExhausted + a retry-after-ms hint per docs/SPEC.md
 // "Cutover" so clients know the failure is transient + how long to
-// back off. (Unavailable, not FailedPrecondition: FailedPrecondition
-// is reserved for the forwarding loop-guard per docs/SPEC.md
-// "Failure handling" -- conflating the two would make clients unable
-// to distinguish "ring drift, refresh + retry" from "in-flight
-// migration, retry-after-ms".)
+// back off.
+//
+// Three reserved codes carry distinct retry semantics in the v0.4+
+// model and must not be conflated:
+//
+//   - ResourceExhausted: in-flight migration. Retry after the
+//     hinted backoff; the partition is mid-handoff and the next
+//     attempt may land on a different owner.
+//   - FailedPrecondition: forwarding loop-guard (docs/SPEC.md
+//     "Failure handling"). The receiving node disagrees with the
+//     originator about ownership; client must refresh ring + retry.
+//   - Unavailable: a peer's gRPC channel is gone (server killed,
+//     connection refused, deadline canceled). The replica counts
+//     against the fanout's failure budget so a genuinely-down node
+//     short-circuits the call rather than blocking for every peer.
+//
+// Migration-guard rejections must be distinguishable from a real
+// down peer so isTransientReplicaErr can treat them differently:
+// migration-guard responses do NOT count against the failure budget,
+// so the fanout keeps waiting on other replicas instead of failing
+// the whole call when a single replica is mid-handoff. Conversely,
+// Unavailable from a dead peer MUST count, so (R - W + 1) such
+// failures fail-fast instead of waiting for every replica's
+// transport timeout.
 func migrationGuardError(retryAfterMs int) error {
-	return status.Errorf(codes.Unavailable,
+	return status.Errorf(codes.ResourceExhausted,
 		"shale: key is migrating out; retry after %dms", retryAfterMs)
 }
 

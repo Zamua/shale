@@ -154,11 +154,17 @@ func putN(t *testing.T, c *cluster.Cluster, prefix string, n int) []string {
 }
 
 // putWithRetry retries Put up to 50 times (~5s wall-clock at 100ms
-// backoff) on the v0.3 transient codes -- Unavailable for the
+// backoff) on the v0.4 transient codes -- ResourceExhausted for the
 // migration-window write rejection (docs/SPEC.md "Cutover") +
 // FailedPrecondition for the forwarding loop-guard (docs/SPEC.md
 // "Failure handling"). Any other error surfaces immediately.
 // Mirrors the bounded-retry behavior an SDK client would implement.
+//
+// Note: Unavailable is NOT retried here. It is reserved for genuine
+// peer-down failures in v0.4 (so the fanout's failure budget can
+// short-circuit on dead nodes). Migration-guard rejections moved to
+// ResourceExhausted so the fanout can distinguish "this replica is
+// mid-handoff" (skip) from "this replica is dead" (count as failure).
 func putWithRetry(c *cluster.Cluster, key, value []byte) error {
 	var lastErr error
 	for i := 0; i < 50; i++ {
@@ -167,7 +173,7 @@ func putWithRetry(c *cluster.Cluster, key, value []byte) error {
 			return nil
 		}
 		if st, ok := status.FromError(err); ok {
-			if st.Code() == codes.Unavailable || st.Code() == codes.FailedPrecondition {
+			if st.Code() == codes.ResourceExhausted || st.Code() == codes.FailedPrecondition {
 				lastErr = err
 				time.Sleep(100 * time.Millisecond)
 				continue

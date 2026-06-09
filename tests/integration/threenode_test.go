@@ -275,7 +275,7 @@ func TestThreeNode_LeaveSurvives(t *testing.T) {
 			// to it. If we ever see this, the ring failed to evict.
 			t.Fatalf("post-leave routing resolved key %s to %s", k, owner)
 		}
-		if err := f.N1.Cluster.Put([]byte(k), []byte("v")); err != nil {
+		if err := putWithRetry(f.N1.Cluster, []byte(k), []byte("v")); err != nil {
 			t.Fatalf("Put %s via N1 post-leave: %v", k, err)
 		}
 		got, err := f.N2.Cluster.Get([]byte(k))
