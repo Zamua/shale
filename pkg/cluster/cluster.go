@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
@@ -93,9 +94,15 @@ type Cluster struct {
 	clientsMu sync.RWMutex
 	clients   map[string]*peerClient // peer gRPC addr -> client
 
-	// closeCh is closed by Close to signal the events loop to exit.
-	closeCh chan struct{}
-	loopWG  sync.WaitGroup
+	// closeCh is closed by Close exactly once to signal the events
+	// loop (and any other lifecycle goroutines) to exit. closeOnce
+	// guards the close so concurrent / repeated Close calls don't
+	// panic on close-of-closed. closed mirrors the open/closed state
+	// for fast no-lock checks from the KV path.
+	closeCh   chan struct{}
+	closeOnce sync.Once
+	closed    atomic.Bool
+	loopWG    sync.WaitGroup
 }
 
 // Open initializes a Cluster from cfg. In single-node mode it just
@@ -179,7 +186,16 @@ func (c *Cluster) runEventsLoop() {
 			}
 			switch ev.Type {
 			case membership.EventJoin:
+				// If the addr changed (NotifyUpdate path - same ID,
+				// different Meta payload), evict the cached client
+				// for the OLD addr so the next dial picks up the
+				// new endpoint. Look up the prior addr via the ring
+				// snapshot before Add overwrites it.
+				oldAddr := c.priorAddrForID(ev.Member.ID)
 				c.ring.Add(ring.Member{ID: ev.Member.ID, Addr: ev.Member.Addr})
+				if oldAddr != "" && oldAddr != ev.Member.Addr {
+					c.evictClient(oldAddr)
+				}
 			case membership.EventLeave:
 				c.ring.Remove(ev.Member.ID)
 				// Drop any cached client for this departed peer so
@@ -290,32 +306,39 @@ func (c *Cluster) OwnsKey(key []byte) bool {
 // where the receiver explicitly wants to see what's physically on
 // this node's storage, not "what the ring says belongs here".
 func (c *Cluster) LocalScanPrefix(prefix []byte) (backend.Iterator, error) {
-	if c.backend == nil {
+	if c.closed.Load() || c.backend == nil {
 		return nil, backend.ErrClosed
 	}
 	return c.backend.ScanPrefix(prefix)
 }
 
 // Close releases all cluster resources. After Close, no other method
-// may be called. Idempotent.
+// may be called. Idempotent + safe to call concurrently with Put/Get/
+// Delete/ScanPrefix - in-flight KV ops still race-finish against the
+// pre-Close backend, but ops STARTING after closed=true return
+// backend.ErrClosed instead of panicking on a torn-down backend.
 func (c *Cluster) Close() error {
+	if !c.closed.CompareAndSwap(false, true) {
+		// Another Close already ran (or is running). Wait for the
+		// background loops to wind down before returning so callers
+		// see a fully-stopped cluster on Close return regardless of
+		// which call won the CAS.
+		c.loopWG.Wait()
+		return nil
+	}
+
 	var firstErr error
 
-	// Signal the events loop to exit + wait for it before tearing down
-	// membership so we don't race with a late ring.Add on closed ring.
-	select {
-	case <-c.closeCh:
-		// already closed
-	default:
-		close(c.closeCh)
-	}
+	// Signal the events + reconcile loops to exit + wait for them
+	// before tearing down membership so we don't race with a late
+	// ring.Add on closed ring.
+	c.closeOnce.Do(func() { close(c.closeCh) })
 	c.loopWG.Wait()
 
 	if c.membership != nil {
 		if err := c.membership.Close(); err != nil {
 			firstErr = err
 		}
-		c.membership = nil
 	}
 
 	// Tear down all cached peer clients.
@@ -326,11 +349,16 @@ func (c *Cluster) Close() error {
 	}
 	c.clientsMu.Unlock()
 
+	// Close the backend but DO NOT nil it out: a Put racing with
+	// Close could have already loaded c.backend before this point,
+	// and nil-ing it under their feet would either panic or trip
+	// the race detector. The backend's own Close marks it closed
+	// internally + subsequent ops return backend.ErrClosed cleanly.
+	// c.closed.Load() is the primary guard; this is the safety net.
 	if c.backend != nil {
 		if err := c.backend.Close(); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		c.backend = nil
 	}
 	return firstErr
 }
@@ -404,7 +432,7 @@ func (c *Cluster) evictClient(addr string) {
 
 // Put stores value under key, routing to the owning node.
 func (c *Cluster) Put(key, value []byte) error {
-	if c.backend == nil {
+	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
 	}
 	owner, local := c.ownerOf(key)
@@ -420,7 +448,7 @@ func (c *Cluster) Put(key, value []byte) error {
 
 // Get returns the value for key, routing to the owning node.
 func (c *Cluster) Get(key []byte) ([]byte, error) {
-	if c.backend == nil {
+	if c.closed.Load() || c.backend == nil {
 		return nil, backend.ErrClosed
 	}
 	owner, local := c.ownerOf(key)
@@ -443,7 +471,7 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 
 // Delete removes key, routing to the owning node.
 func (c *Cluster) Delete(key []byte) error {
-	if c.backend == nil {
+	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
 	}
 	owner, local := c.ownerOf(key)
@@ -462,7 +490,7 @@ func (c *Cluster) Delete(key []byte) error {
 // the owning node; the scan runs entirely on that node's backend. For
 // cross-shard scans, use Aggregate.
 func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
-	if c.backend == nil {
+	if c.closed.Load() || c.backend == nil {
 		return nil, backend.ErrClosed
 	}
 	owner, local := c.ownerOf(prefix)
@@ -493,7 +521,7 @@ func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 // at the call site rather than silently running against the wrong
 // backend.
 func (c *Cluster) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
-	if c.backend == nil {
+	if c.closed.Load() || c.backend == nil {
 		return nil, backend.ErrClosed
 	}
 	if c.ring == nil {
@@ -536,7 +564,7 @@ type AggregateResult struct {
 // routing) into a transient in-memory backend snapshot that fn sees.
 // The local node runs fn against its own backend directly.
 func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
-	if c.backend == nil {
+	if c.closed.Load() || c.backend == nil {
 		return nil
 	}
 	members := c.Members()

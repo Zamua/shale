@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"sync"
 	"testing"
 	"time"
 
@@ -290,6 +291,48 @@ func TestAggregate_SingleNode(t *testing.T) {
 	}
 	if got := results[0].Value.(int); got != 2 {
 		t.Fatalf("expected single-node aggregate count=2, got %d (%v)", got, results)
+	}
+}
+
+// TestCloseRace runs Close concurrently with Put + Get + Delete +
+// ScanPrefix in a tight loop. The contract: no panic, no deadlock,
+// no race-detector warning. Closed-after-start ops return
+// backend.ErrClosed; ops that landed before Close succeed.
+func TestCloseRace(t *testing.T) {
+	for iter := 0; iter < 100; iter++ {
+		c, err := cluster.Open(cluster.Config{NodeID: "n1", Backend: memory.New()})
+		if err != nil {
+			t.Fatalf("Open: %v", err)
+		}
+
+		var wg sync.WaitGroup
+		wg.Add(4)
+		go func() {
+			defer wg.Done()
+			_ = c.Put([]byte("a"), []byte("v"))
+		}()
+		go func() {
+			defer wg.Done()
+			_, _ = c.Get([]byte("a"))
+		}()
+		go func() {
+			defer wg.Done()
+			_ = c.Delete([]byte("a"))
+		}()
+		go func() {
+			defer wg.Done()
+			it, err := c.ScanPrefix(nil)
+			if err == nil && it != nil {
+				_, _, _ = it.Next()
+				_ = it.Close()
+			}
+		}()
+
+		// Race the operations against Close, and ALSO call Close
+		// twice concurrently to pin the sync.Once guard.
+		go func() { _ = c.Close() }()
+		_ = c.Close()
+		wg.Wait()
 	}
 }
 
