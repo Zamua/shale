@@ -24,6 +24,10 @@ shale is the third option: thin Go library, BYO backend, scales by adding proces
 
 Don't use in production yet.
 
+## CI
+
+[![test](https://github.com/Zamua/shale/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Zamua/shale/actions/workflows/test.yml)
+
 ## License
 
 Apache 2.0. See `LICENSE`.
