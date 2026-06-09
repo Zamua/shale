@@ -651,9 +651,21 @@ func (c *Cluster) evictClient(addr string) {
 // budget. codes.FailedPrecondition is reserved for the forwarding
 // loop-guard (docs/SPEC.md "Failure handling"); the two codes have
 // different retry semantics so they must not be conflated.
+//
+// v0.4 replication: when ReplicationFactor > 1 the originator stamps
+// the payload (time.Now().UnixNano() + NodeID) once, wraps it in an
+// LWW envelope, and fans out to R replicas. The call returns once W
+// acks land per WriteConsistency. Migration-guard rejections from
+// individual replicas are treated as transient (don't count toward
+// either ack or failure budget) so a single mid-handoff replica
+// doesn't fail an otherwise-quorum write. See docs/SPEC.md "Fan-out
+// + ack accounting".
 func (c *Cluster) Put(key, value []byte) error {
 	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
+	}
+	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
+		return c.putReplicated(key, value)
 	}
 	owner, local := c.ownerOf(key)
 	if local {
@@ -722,9 +734,18 @@ func (c *Cluster) forwardGet(addr string, key []byte) ([]byte, error) {
 // v0.3 rebalancing: same write-guard semantics as Put. Mid-migration
 // keys are rejected with Unavailable + retry-after; the client
 // retries once the range hands off cleanly.
+//
+// v0.4 replication: Delete writes a tombstone (empty-payload
+// envelope) carrying the current Stamp + fans out to R replicas with
+// the same Put accounting. The tombstone participates in LWW like
+// any other write, so a Delete that races with a concurrent Put
+// resolves by timestamp.
 func (c *Cluster) Delete(key []byte) error {
 	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
+	}
+	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
+		return c.putReplicated(key, nil)
 	}
 	owner, local := c.ownerOf(key)
 	if local {

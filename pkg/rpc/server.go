@@ -63,8 +63,21 @@ func errForwardLoop(reason string) error {
 
 func (s *Server) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	s.puts.Add(1)
-	if req.GetForwarded() && !s.c.OwnsKey(req.GetKey()) {
-		return nil, errForwardLoop("Put: this node does not own the key")
+	if req.GetForwarded() {
+		// Forwarded writes go straight to the local backend with the
+		// migration guard; calling s.c.Put would re-enter the routing
+		// + (at R>1) re-fan-out the same envelope, looping. The
+		// receiving node must be a legitimate replica owner; if it
+		// isn't, refuse with the loop-guard so the originator can
+		// refresh its ring view + retry. (At R=1 OwnsReplica reduces
+		// to OwnsKey, so the v0.3 single-owner check is preserved.)
+		if !s.c.OwnsReplica(req.GetKey()) {
+			return nil, errForwardLoop("Put: this node is not a replica for the key")
+		}
+		if err := s.c.LocalReplicaPut(req.GetKey(), req.GetValue()); err != nil {
+			return nil, err
+		}
+		return &pb.PutResponse{}, nil
 	}
 	if err := s.c.Put(req.GetKey(), req.GetValue()); err != nil {
 		return nil, err
@@ -114,8 +127,20 @@ func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 
 func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	s.deletes.Add(1)
-	if req.GetForwarded() && !s.c.OwnsKey(req.GetKey()) {
-		return nil, errForwardLoop("Delete: this node does not own the key")
+	if req.GetForwarded() {
+		// See Put above for the rationale. At R=1 the destination
+		// just clears its local copy; at R>1 the originator drove
+		// Delete through putReplicated (tombstone envelope) so the
+		// "Delete forwarded" path here only fires for the R=1 case +
+		// the single-owner local-clear it represents. The
+		// OwnsReplica check covers both (it reduces to OwnsKey at R=1).
+		if !s.c.OwnsReplica(req.GetKey()) {
+			return nil, errForwardLoop("Delete: this node is not a replica for the key")
+		}
+		if err := s.c.LocalReplicaDelete(req.GetKey()); err != nil {
+			return nil, err
+		}
+		return &pb.DeleteResponse{}, nil
 	}
 	if err := s.c.Delete(req.GetKey()); err != nil {
 		return nil, err
