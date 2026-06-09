@@ -1,5 +1,7 @@
 # shale
 
+[![test](https://github.com/Zamua/shale/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Zamua/shale/actions/workflows/test.yml)
+
 Horizontal-scale layer for embedded KV stores. Each instance you import is a cluster node; consistent hashing distributes keys across nodes; durability is whatever backend you plug in.
 
 ## Why it exists
@@ -23,10 +25,6 @@ shale is the third option: thin Go library, BYO backend, scales by adding proces
 - [ ] v0.6: hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend on production-shape data.
 
 Don't use in production yet.
-
-## CI
-
-[![test](https://github.com/Zamua/shale/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/Zamua/shale/actions/workflows/test.yml)
 
 ## License
 
