@@ -238,31 +238,27 @@ func TestRebalance_SourceDoesNotDeleteOnDestinationCrash(t *testing.T) {
 	}
 	_ = trio
 
-	// Close n3 IMMEDIATELY: its bootstrap Evaluate has already
-	// dispatched runReceive goroutines (initRebalance fires the
-	// bootstrap Evaluate synchronously inside Open), and those
-	// goroutines have started their MigrateRange streams against the
-	// source(s). Closing n3 here cancels those in-flight streams
-	// while the source's runSendWired is still waiting for the
-	// destination ack. The source-side gRPC handler's Send returns
-	// the cancelled-context error, SignalMigrateRangeComplete
-	// propagates that err to MarkSendComplete, and runSendWired
-	// transitions Done-handoff-err (NOT HandedOff).
+	// Sever n3's outgoing gRPC client connections WITHOUT touching
+	// membership: this kills the dest-to-source MigrateRange
+	// streams (which are dest-initiated, so dest is the gRPC
+	// client) while leaving the source's view of the cluster
+	// intact. n1 + n2 still see n3 as a ring member, so n1's
+	// settle-driven Evaluate still computes Sends to n3 + launches
+	// runSendWired -- those goroutines are exactly what the fix
+	// gates on the destination ack. With n3's outgoing conns gone,
+	// the source's handler stream.Send returns transport-closed,
+	// SignalMigrateRangeComplete delivers the error to
+	// MarkSendComplete, and runSendWired transitions
+	// Done-handoff-err (NOT HandedOff).
 	//
-	// For partitions where the source's runSendWired never sees a
-	// stream (n3 never asked, or n3 closed before reaching that
-	// partition's dial), the wired-handoff timeout
-	// (RebalanceHandoffTimeout, 4s in the integration fixture)
-	// also transitions Done-handoff-err. Either way, the partition
-	// stays out of HandedOff + the sweep can't delete the
-	// source's local copy.
-	//
-	// We use n3.Close() (cluster close) instead of n3.KillGRPC()
-	// (server-only stop) because the MigrateRange stream is
-	// destination-initiated: dest is the gRPC client. Killing the
-	// dest's server doesn't break the dest's outgoing connection;
-	// closing the dest's cluster does.
-	n3.Close()
+	// Going through TestingDropAllPeerClients instead of n3.Close()
+	// avoids the racy alternative where n3 broadcasts its leave
+	// before n1's settle fires: in that race, n1's plan recomputes
+	// against the 2-node ring + never registers any Sends, so the
+	// fix's wired path never runs + the regression check can't
+	// fire even though the underlying bug is still there.
+	time.Sleep(700 * time.Millisecond) // past n1's 500ms settle
+	n3.Cluster.TestingDropAllPeerClients()
 
 	// Hold long enough that:
 	//   - the source's MigrateRange handler observes the broken

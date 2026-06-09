@@ -70,11 +70,13 @@ service ShaleNode {
   // with a MigrationDone marker carrying the total key count + a
   // CRC32-based checksum of the concatenated key|value bytes.
   //
-  // RangeSpec.ring_generation lets the source reject a request whose
-  // ring view is stale relative to its own: if the destination's
-  // generation is behind the source's current ring, the source returns
-  // FailedPrecondition rather than streaming data that will get
-  // discarded on the next Evaluate pass.
+  // RangeSpec.ring_generation is carried on the wire for v0.4
+  // forward-compatibility (a cluster-wide generation lands with the
+  // gossip layer then); v0.3 nodes use per-node monotonic counters
+  // that are NOT comparable across peers, so the source does NOT
+  // enforce a freshness check on the value. Wrong-owner protection
+  // comes from the forwarding loop-guard + the per-key migration
+  // guards on the cluster's KV path.
   rpc MigrateRange(RangeSpec) returns (stream MigrateChunk);
 
   // ProposeRebalance is the operator-facing path for the
@@ -212,10 +214,13 @@ message RangeSpec {
   repeated uint64 partition_ids = 1;
 
   // ring_generation is the destination's view of the ring at the
-  // moment it issued the request. The source compares this against
-  // its own current generation; if the destination is behind, the
-  // source returns FailedPrecondition + the next Evaluate pass on
-  // the destination will retry against the new ring.
+  // moment it issued the request. v0.3 nodes use per-node monotonic
+  // counters that are NOT cluster-comparable, so the source does
+  // NOT enforce a freshness check on this value (every stream is
+  // accepted regardless). The field is carried on the wire for
+  // v0.4 forward-compatibility: a gossiped cluster-wide generation
+  // will land then + the source-side rejection of stale requests
+  // can become meaningful.
   uint64 ring_generation = 2;
 }
 

@@ -659,11 +659,13 @@ func openClusterNodeAt(t *testing.T, id, bindAddr, seedBindAddr string, mem *mem
 	}
 }
 
-// putWithMigrationRetry wraps Put with a bounded retry on
-// FailedPrecondition. Per docs/SPEC.md "Cutover" the SDK is
-// expected to do this; tests do too so the assertion checks
-// "rebalance eventually succeeds" rather than "no transient
-// rejection during bootstrap."
+// putWithMigrationRetry wraps Put with a bounded retry on the v0.3
+// transient codes: Unavailable from the migration-window write
+// rejection (docs/SPEC.md "Cutover") and FailedPrecondition from
+// the forwarding loop-guard. Per docs/SPEC.md the SDK is expected
+// to do this; tests do too so the assertion checks "rebalance
+// eventually succeeds" rather than "no transient rejection during
+// bootstrap."
 func putWithMigrationRetry(c *cluster.Cluster, key, value []byte) error {
 	var lastErr error
 	for i := 0; i < 50; i++ {
@@ -671,10 +673,12 @@ func putWithMigrationRetry(c *cluster.Cluster, key, value []byte) error {
 		if err == nil {
 			return nil
 		}
-		if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
-			lastErr = err
-			time.Sleep(50 * time.Millisecond)
-			continue
+		if st, ok := status.FromError(err); ok {
+			if st.Code() == codes.Unavailable || st.Code() == codes.FailedPrecondition {
+				lastErr = err
+				time.Sleep(50 * time.Millisecond)
+				continue
+			}
 		}
 		return err
 	}

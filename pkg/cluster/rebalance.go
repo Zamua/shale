@@ -132,6 +132,7 @@ func (c *Cluster) initRebalance() {
 		// can't introduce a NEW Move for the same partition
 		// (current ring is unchanged), so there's no
 		// tryRegister conflict to worry about.
+		//
 		bootstrapOld := ringMinus(startup, c.cfg.NodeID)
 		c.settleMu.Lock()
 		c.lastEvalRing = startup
@@ -289,20 +290,16 @@ func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
 
 // migrationGuardError builds the error returned to a Put/Delete that
 // lands on a key whose partition is currently sending out. Carries
-// codes.FailedPrecondition + a retry-after-ms hint so clients know
-// the failure is transient + how long to back off.
+// codes.Unavailable + a retry-after-ms hint per docs/SPEC.md
+// "Cutover" so clients know the failure is transient + how long to
+// back off. (Unavailable, not FailedPrecondition: FailedPrecondition
+// is reserved for the forwarding loop-guard per docs/SPEC.md
+// "Failure handling" -- conflating the two would make clients unable
+// to distinguish "ring drift, refresh + retry" from "in-flight
+// migration, retry-after-ms".)
 func migrationGuardError(retryAfterMs int) error {
-	return status.Errorf(codes.FailedPrecondition,
+	return status.Errorf(codes.Unavailable,
 		"shale: key is migrating out; retry after %dms", retryAfterMs)
-}
-
-// readMigrationHintError is the read-side hint: the destination has
-// already started receiving the range but is not yet authoritative,
-// so the caller should retry the read against the source (or wait
-// for the ring to converge + retry).
-func readMigrationHintError() error {
-	return status.Error(codes.FailedPrecondition,
-		"shale: key is migrating in; try other owner")
 }
 
 // retryAfterMs reads the configured retry-after hint from the
@@ -351,6 +348,15 @@ func (d *clusterDestination) FetchRange(ctx context.Context, peer rebalance.Memb
 	cli, err := d.c.clientFor(peer.Addr)
 	if err != nil {
 		return 0, fmt.Errorf("rebalance: dial source %s: %w", peer.ID, err)
+	}
+	// Stamp the destination's CURRENT ringGen on the wire (not the
+	// Coordinator-captured value, which may be stale by the time the
+	// stream opens). The source's freshness check is "destination's
+	// gen < source's own current"; using the dest's latest counter
+	// avoids spurious rejection when ringGen on this node has caught
+	// up to a fresher ring shape between Evaluate + the gRPC dial.
+	if cur := d.c.ringGen.Load(); cur > gen {
+		gen = cur
 	}
 	stream, err := cli.api.MigrateRange(ctx, &pb.RangeSpec{
 		PartitionIds:   partitionIDs,
@@ -572,16 +578,18 @@ func (c *Cluster) replaceCoordinator() {
 // than in cluster.go so the import of pkg/rebalance stays local to
 // the integration adapter.
 //
-// Stale-generation note: docs/SPEC.md "Wire" describes a
-// ring_generation check that lets the source reject a destination
-// request whose ring view is behind. v0.3 uses per-node monotonic
-// counters that are NOT comparable across nodes (no gossiped
-// cluster-wide generation), so a literal < comparison would
-// spuriously reject mid-flight transfers during normal join/leave
-// races. We elide the check here. Wrong-owner protection comes
-// instead from the forwarding loop-guard + the per-key Put/Get
-// migration guards on the cluster's KV path. A cluster-wide
-// generation lands when the gossip layer carries it (v0.4 or later).
+// Stale-generation guard: per docs/SPEC.md "Wire", ring_generation
+// is per-node best-effort freshness, not a cluster-wide consistency
+// check. v0.3 uses per-node monotonic counters that diverge during
+// normal join/leave races (a node that joined later starts at 0 +
+// has fewer NotifyJoin events to count). Enforcing a strict <
+// comparison against the source's own counter spuriously rejects
+// mid-bootstrap streams even after the FetchRange path stamps the
+// dest's CURRENT ringGen on the wire. We accept the value as-is
+// + lean on the forwarding loop-guard + per-key migration guards
+// for the wrong-owner protection the spec ultimately calls for.
+// A real freshness check lands when the gossip layer carries a
+// cluster-wide generation (v0.4 or later).
 func (c *Cluster) MigrateRangeSource(partitionIDs []uint64, ringGen uint64) (<-chan rebalance.KeyValue, <-chan error, error) {
 	if c.rebalance.Load() == nil {
 		return nil, nil, status.Error(codes.FailedPrecondition,

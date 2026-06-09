@@ -77,9 +77,9 @@ type Options struct {
 
 	// GraceDuration is how long a Sending range stays HandedOff
 	// before the sweep deletes its now-foreign keys. docs/SPEC.md
-	// specifies T_drain at the protocol level (30s in the v0.3 spec
-	// text); this package defaults to 60s to give peers extra time
-	// to converge on the new ring before the source drops the data.
+	// "Cutover" specifies T_drain at 30s; this package's default
+	// matches that value. Override per Coordinator if a deployment
+	// wants a wider window for stragglers.
 	GraceDuration time.Duration
 
 	// ChunkSize is the target number of KV pairs per outgoing
@@ -136,7 +136,7 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		SettleDelay:    5 * time.Second,
-		GraceDuration:  60 * time.Second,
+		GraceDuration:  30 * time.Second,
 		ChunkSize:      64,
 		RetryAfterMs:   50,
 		HandoffTimeout: 5 * time.Minute,
@@ -521,9 +521,9 @@ func (c *Coordinator) IsMigrating(key []byte) bool {
 
 // IsReceiving reports whether key's partition is mid-migration INTO
 // this node (StateReceiving). The cluster layer uses this on the
-// destination side to hint "try other owner" on reads + to reject
-// writes (the destination is not yet authoritative; the source is
-// still serving reads + the stream is still in flight).
+// destination side to forward reads back to the source (the
+// destination is not yet authoritative; the source is still serving
+// reads + the stream is still in flight) and to reject writes.
 //
 // Returns false for any other state (or unknown partition).
 func (c *Coordinator) IsReceiving(key []byte) bool {
@@ -538,6 +538,29 @@ func (c *Coordinator) IsReceiving(key []byte) bool {
 		return false
 	}
 	return r.state == StateReceiving
+}
+
+// ReceivingMove returns the in-flight Move whose destination is this
+// node + whose partition contains key, IFF the range is currently in
+// StateReceiving. ok=false means "no in-flight receive for this key";
+// callers should fall through to their normal lookup path.
+//
+// The Move.From field is the source the destination should forward
+// reads to during the receive window (per docs/SPEC.md "Cutover":
+// reads land on the source, which still owns the key until the
+// destination ack flips it to HandedOff).
+func (c *Coordinator) ReceivingMove(key []byte) (Move, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.partFn == nil {
+		return Move{}, false
+	}
+	pid := c.partFn(key)
+	r, ok := c.ranges[pid]
+	if !ok || r.state != StateReceiving {
+		return Move{}, false
+	}
+	return r.move, true
 }
 
 // WaitForIdle blocks until every tracked range is in a terminal

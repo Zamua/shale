@@ -318,20 +318,24 @@ func TestPut_DuringMigrationReturnsFailedPrecondition(t *testing.T) {
 		t.Fatalf("no seeded key entered StateSending; coordinator snapshot=%+v", rb.Snapshot())
 	}
 
-	// Put against the migrating key MUST return FailedPrecondition.
+	// Put against the migrating key MUST return Unavailable per
+	// docs/SPEC.md "Cutover" (FailedPrecondition is reserved for
+	// the forwarding loop-guard in "Failure handling"; conflating
+	// the two would make clients unable to distinguish "ring drift,
+	// refresh + retry" from "in-flight migration, retry after Nms").
 	err = c.Put(movingKey, []byte("post"))
 	if err == nil {
-		t.Fatalf("Put for migrating key returned nil; want FailedPrecondition")
+		t.Fatalf("Put for migrating key returned nil; want Unavailable")
 	}
 	st, ok := status.FromError(err)
 	if !ok {
 		t.Fatalf("Put error is not a gRPC status: %v", err)
 	}
-	if st.Code() != codes.FailedPrecondition {
-		t.Fatalf("Put for migrating key: want FailedPrecondition, got %s (%v)", st.Code(), err)
+	if st.Code() != codes.Unavailable {
+		t.Fatalf("Put for migrating key: want Unavailable, got %s (%v)", st.Code(), err)
 	}
 	if !bytes.Contains([]byte(st.Message()), []byte("retry")) {
-		t.Fatalf("FailedPrecondition message %q lacks a retry hint; SDK clients need it to back off", st.Message())
+		t.Fatalf("Unavailable message %q lacks a retry hint; SDK clients need it to back off", st.Message())
 	}
 }
 

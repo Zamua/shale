@@ -154,9 +154,11 @@ func putN(t *testing.T, c *cluster.Cluster, prefix string, n int) []string {
 }
 
 // putWithRetry retries Put up to 50 times (~5s wall-clock at 100ms
-// backoff) on FailedPrecondition, surfacing any other error
-// immediately. Mirrors the bounded-retry behavior an SDK client
-// would implement for the migration-window write rejections.
+// backoff) on the v0.3 transient codes -- Unavailable for the
+// migration-window write rejection (docs/SPEC.md "Cutover") +
+// FailedPrecondition for the forwarding loop-guard (docs/SPEC.md
+// "Failure handling"). Any other error surfaces immediately.
+// Mirrors the bounded-retry behavior an SDK client would implement.
 func putWithRetry(c *cluster.Cluster, key, value []byte) error {
 	var lastErr error
 	for i := 0; i < 50; i++ {
@@ -164,10 +166,12 @@ func putWithRetry(c *cluster.Cluster, key, value []byte) error {
 		if err == nil {
 			return nil
 		}
-		if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
-			lastErr = err
-			time.Sleep(100 * time.Millisecond)
-			continue
+		if st, ok := status.FromError(err); ok {
+			if st.Code() == codes.Unavailable || st.Code() == codes.FailedPrecondition {
+				lastErr = err
+				time.Sleep(100 * time.Millisecond)
+				continue
+			}
 		}
 		return err
 	}

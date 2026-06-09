@@ -17,6 +17,7 @@ import (
 	"net"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -296,10 +297,20 @@ func (m *Membership) Close() error {
 
 // nodeToMember converts memberlist's Node into our value object,
 // decoding the Meta payload as the gRPC address.
+//
+// memberlist mutates *Node fields (Name, Meta, Addr...) from its
+// own goroutines (aliveNode, deadNode, etc.) without exposing a
+// per-Node lock. Reading those fields concurrently with a write is
+// a data race the race detector catches. We defensively copy the
+// scalar Name + the Meta byte slice into our own Member value so
+// the returned struct can outlive any memberlist mutation. The copy
+// is cheap; the underlying Node may change immediately after.
 func nodeToMember(n *memberlist.Node) Member {
+	name := strings.Clone(n.Name)
+	meta := append([]byte(nil), n.Meta...)
 	return Member{
-		ID:   n.Name,
-		Addr: string(n.Meta),
+		ID:   name,
+		Addr: string(meta),
 	}
 }
 

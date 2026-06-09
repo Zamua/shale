@@ -75,6 +75,31 @@ func (s *Server) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	s.gets.Add(1)
 	if req.GetForwarded() && !s.c.OwnsKey(req.GetKey()) {
+		// The forwarded request landed on a node that no longer
+		// thinks it owns the key. Two possibilities:
+		//
+		//   1. Diverged-ring ping-pong: the destination's ring
+		//      pointed to us but ours has moved on; the classic
+		//      loop-guard refuses so we don't bounce back + forth.
+		//   2. Receive-window read forwarder (docs/SPEC.md
+		//      "Cutover"): the actual destination of an in-flight
+		//      migration forwards a read here because we, the
+		//      source, still hold the authoritative copy even
+		//      though the shared ring now says the destination
+		//      owns the partition.
+		//
+		// We distinguish the two by checking the LOCAL backend:
+		// if we have the key, case 2 applies and we serve. If we
+		// don't, case 1 applies and we refuse with the loop-guard
+		// (re-forwarding from here would be the ping-pong the
+		// guard exists to prevent).
+		v, err := s.c.LocalGet(req.GetKey())
+		if err == nil {
+			return &pb.GetResponse{Value: v}, nil
+		}
+		if !errors.Is(err, backend.ErrNotFound) {
+			return nil, err
+		}
 		return nil, errForwardLoop("Get: this node does not own the key")
 	}
 	v, err := s.c.Get(req.GetKey())

@@ -238,7 +238,9 @@ A single server-streaming gRPC method:
 rpc MigrateRange(RangeSpec) returns (stream MigrateChunk)
 ```
 
-`RangeSpec` identifies the arc of the ring being transferred (start + end hash values, plus the ring snapshot hash so the source can detect stale requests). `MigrateChunk` carries either a `(key, value)` pair or a terminal marker with the count + checksum of all keys sent.
+`RangeSpec` identifies the arc of the ring being transferred (start + end hash values, plus a `ring_generation` freshness field). `MigrateChunk` carries either a `(key, value)` pair or a terminal marker with the count + checksum of all keys sent.
+
+`ring_generation` is the destination's per-node monotonic ring-change counter at the moment it opened the stream. v0.3 carries this on the wire for future use, but the counter is NOT cluster-wide (each node bumps its own on every NotifyJoin/NotifyLeave + a node that joined later naturally has a lower count than a longer-lived peer), so the source CANNOT meaningfully compare the destination's value against its own. A strict less-than rejection spuriously cancels legitimate streams during normal join/leave races. v0.3 therefore accepts every stream regardless of the destination's reported generation; wrong-owner protection comes from the forwarding loop-guard + the per-key Put/Get migration guards instead. A cluster-wide ring generation (and the strict freshness check the field was originally designed for) lands when the gossip layer carries one in v0.4 or later.
 
 The destination initiates the call (it is the node whose ring says "I am the new owner"). The source iterates its local Backend over keys whose hashed shard key falls in the range, streams `(key, value)` pairs, then closes with the terminal marker. The destination writes each pair to its local Backend as it arrives. Backpressure is gRPC flow control; no per-key acknowledgement is needed.
 

@@ -96,8 +96,9 @@ type Config struct {
 
 	// RebalanceGraceDuration is how long a HandedOff range stays on
 	// the source before the sweep deletes its now-foreign keys. Zero
-	// falls back to rebalance.DefaultOptions (60s). Integration
-	// tests + faster-feedback fixtures pass small values.
+	// falls back to rebalance.DefaultOptions (30s, matching
+	// docs/SPEC.md "Cutover" T_drain). Integration tests + faster-
+	// feedback fixtures pass small values.
 	RebalanceGraceDuration time.Duration
 
 	// RebalanceHandoffTimeout bounds how long the source's runSend
@@ -385,6 +386,21 @@ func (c *Cluster) LocalScanPrefix(prefix []byte) (backend.Iterator, error) {
 	return c.backend.ScanPrefix(prefix)
 }
 
+// LocalGet returns the value for key directly from the local backend,
+// bypassing the cluster's owner routing. Used by the gRPC Get
+// handler in the v0.3 receive-window read forwarder: when the
+// destination forwards a read to us (the source) because we still
+// hold the authoritative copy mid-migration, we want to serve from
+// our local backend even though our own ring has moved the
+// partition off us. Returns backend.ErrNotFound if the key is
+// absent locally.
+func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
+	if c.closed.Load() || c.backend == nil {
+		return nil, backend.ErrClosed
+	}
+	return c.backend.Get(key)
+}
+
 // Close releases all cluster resources. After Close, no other method
 // may be called. Idempotent + safe to call concurrently with Put/Get/
 // Delete/ScanPrefix - in-flight KV ops still race-finish against the
@@ -505,6 +521,31 @@ func (c *Cluster) clientFor(addr string) (*peerClient, error) {
 	return cli, nil
 }
 
+// TestingDropAllPeerClients force-closes every cached peer-gRPC
+// client without touching membership / the Coordinator / the local
+// gRPC server. Used by the destination-crash failure tests to
+// SEVER outgoing connections (the dest-initiated MigrateRange
+// stream is a client connection; tearing down the client cancels
+// the stream + the source-side handler returns the
+// "transport-closed" error, which the wired-handoff path then
+// routes to Done-with-error). Membership stays intact so the
+// source's plan is not torn down before the rejection lands.
+//
+// Test-only; not exported in the public API surface. Name is
+// camelCase with the Testing prefix because Go's "Testing*"
+// convention earmarks white-box hooks that survive a Test-only
+// build constraint without the constraint itself (the cluster
+// package's tests live in the same package; integration tests
+// import + call this directly).
+func (c *Cluster) TestingDropAllPeerClients() {
+	c.clientsMu.Lock()
+	for addr, cli := range c.clients {
+		_ = cli.Close()
+		delete(c.clients, addr)
+	}
+	c.clientsMu.Unlock()
+}
+
 // evictClient closes + drops the cached client for addr, if present.
 // Called when a peer leaves the ring so a returning node on the same
 // address gets a fresh connection.
@@ -529,9 +570,12 @@ func (c *Cluster) evictClient(addr string) {
 //
 // v0.3 rebalancing: if the key's partition is mid-migration on this
 // node (either streaming out OR being received), the local Put is
-// rejected with codes.FailedPrecondition + a retry-after hint.
-// Clients should retry with backoff per the hint; the SDK wraps this
-// transparently with a bounded retry budget.
+// rejected with codes.Unavailable + a retry-after hint (per
+// docs/SPEC.md "Cutover"). Clients should retry with backoff per the
+// hint; the SDK wraps this transparently with a bounded retry
+// budget. codes.FailedPrecondition is reserved for the forwarding
+// loop-guard (docs/SPEC.md "Failure handling"); the two codes have
+// different retry semantics so they must not be conflated.
 func (c *Cluster) Put(key, value []byte) error {
 	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
@@ -554,9 +598,11 @@ func (c *Cluster) Put(key, value []byte) error {
 //
 // v0.3 rebalancing: if the key's partition is being received into
 // this node (StateReceiving), the local data is not yet authoritative
-// + the source still owns reads. We return a "try other owner"
-// FailedPrecondition so the client can retry against the previous
-// owner (or wait for the ring to converge + retry). Source-side
+// + the source still owns reads. Per docs/SPEC.md "Cutover" the
+// destination transparently forwards the read back to the source's
+// gRPC; the source still serves the key from its local copy until
+// the destination ack flips it HandedOff. Callers see a normal
+// successful Get rather than a transient error. Source-side
 // IsMigrating (StateSending / StateHandedOff) is fine: we still
 // have the data locally + serve the read normally.
 func (c *Cluster) Get(key []byte) ([]byte, error) {
@@ -565,12 +611,24 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 	}
 	owner, local := c.ownerOf(key)
 	if local {
-		if rb := c.rebalance.Load(); rb != nil && rb.IsReceiving(key) {
-			return nil, readMigrationHintError()
+		if rb := c.rebalance.Load(); rb != nil {
+			if mv, ok := rb.ReceivingMove(key); ok && mv.From.Addr != "" {
+				return c.forwardGet(mv.From.Addr, key)
+			}
 		}
 		return c.backend.Get(key)
 	}
-	cli, err := c.clientFor(owner.Addr)
+	return c.forwardGet(owner.Addr, key)
+}
+
+// forwardGet dials addr (a peer's gRPC address) + issues a Get with
+// the cluster-internal forwarded=true marker. Used by the routed-Get
+// path AND by the v0.3 receiving-window read forwarder: a read that
+// lands on the destination during its StateReceiving window is
+// transparently forwarded back to the source so the caller sees a
+// successful read rather than a transient error.
+func (c *Cluster) forwardGet(addr string, key []byte) ([]byte, error) {
+	cli, err := c.clientFor(addr)
 	if err != nil {
 		return nil, err
 	}
@@ -587,8 +645,8 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 // Delete removes key, routing to the owning node.
 //
 // v0.3 rebalancing: same write-guard semantics as Put. Mid-migration
-// keys are rejected with FailedPrecondition + retry-after; the
-// client retries once the range hands off cleanly.
+// keys are rejected with Unavailable + retry-after; the client
+// retries once the range hands off cleanly.
 func (c *Cluster) Delete(key []byte) error {
 	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
