@@ -7,4 +7,5 @@
 *.log
 /dist/
 /coverage.*
-shale
+/shale
+/shale-bench
