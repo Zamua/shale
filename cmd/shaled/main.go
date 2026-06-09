@@ -48,6 +48,16 @@ type config struct {
 
 	// slate-only; ignored when backend != "slate".
 	slate slateConfig
+
+	// pebble-only; ignored when backend != "pebble".
+	pebble pebbleConfig
+}
+
+// pebbleConfig mirrors the fields the pebble backend needs. Held in
+// its own struct so future flag additions are colocated and so the
+// constructor signature stays narrow.
+type pebbleConfig struct {
+	Dir string
 }
 
 // slateConfig mirrors the fields the slate backend will need. Held in
@@ -165,7 +175,9 @@ func parseFlags(argv []string) (config, error) {
 		grpcAddr = fs.String("grpc-addr", envOr("SHALE_GRPC_ADDR", ":7947"), "address the gRPC service binds to (host:port; host may be empty)")
 		bindAddr = fs.String("bind-addr", envOr("SHALE_BIND_ADDR", ":7946"), "memberlist bind address (placeholder for v0.2; unused in v0.1)")
 		seedsRaw = fs.String("seeds", envOr("SHALE_SEEDS", ""), "comma-separated peer addresses (placeholder for v0.2; unused in v0.1)")
-		backend  = fs.String("backend", envOr("SHALE_BACKEND", ""), "backend engine: memory|slate (required)")
+		backend  = fs.String("backend", envOr("SHALE_BACKEND", ""), "backend engine: memory|pebble|slate (required)")
+
+		pebbleDir = fs.String("pebble-dir", envOr("SHALE_PEBBLE_DIR", ""), "pebble: on-disk data directory")
 
 		slateBucket    = fs.String("slate-bucket", envOr("SHALE_SLATE_BUCKET", ""), "slate: object-storage bucket")
 		slateDbName    = fs.String("slate-db-name", envOr("SHALE_SLATE_DB_NAME", ""), "slate: logical database name")
@@ -184,12 +196,12 @@ func parseFlags(argv []string) (config, error) {
 		return config{}, errors.New("--node-id is required (or set SHALE_NODE_ID)")
 	}
 	if strings.TrimSpace(*backend) == "" {
-		return config{}, errors.New("--backend is required (memory|slate, or set SHALE_BACKEND)")
+		return config{}, errors.New("--backend is required (memory|pebble|slate, or set SHALE_BACKEND)")
 	}
 	switch *backend {
-	case "memory", "slate":
+	case "memory", "pebble", "slate":
 	default:
-		return config{}, fmt.Errorf("--backend %q: must be one of memory|slate", *backend)
+		return config{}, fmt.Errorf("--backend %q: must be one of memory|pebble|slate", *backend)
 	}
 
 	cfg := config{
@@ -207,6 +219,13 @@ func parseFlags(argv []string) (config, error) {
 			SecretKey: *slateSecretKey,
 			UseSSL:    strings.EqualFold(*slateUseSSL, "true"),
 		},
+		pebble: pebbleConfig{
+			Dir: *pebbleDir,
+		},
+	}
+
+	if cfg.backend == "pebble" && cfg.pebble.Dir == "" {
+		return config{}, errors.New("--pebble-dir is required when --backend=pebble")
 	}
 
 	if cfg.backend == "slate" {
@@ -237,6 +256,8 @@ func openBackend(cfg config, logger *log.Logger) (backend.Backend, func() error,
 	switch cfg.backend {
 	case "memory":
 		return openMemoryBackend(logger)
+	case "pebble":
+		return openPebbleBackend(cfg.pebble, logger)
 	case "slate":
 		return openSlateBackend(cfg.slate, logger)
 	default:

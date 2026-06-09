@@ -30,8 +30,30 @@ func TestParseFlags_RejectsUnknownBackend(t *testing.T) {
 	t.Setenv("SHALE_BACKEND", "")
 
 	_, err := parseFlags([]string{"--backend", "bogus"})
-	if err == nil || !strings.Contains(err.Error(), "must be one of memory|slate") {
+	if err == nil || !strings.Contains(err.Error(), "must be one of memory|pebble|slate") {
 		t.Fatalf("want unknown-backend error, got %v", err)
+	}
+}
+
+func TestParseFlags_PebbleRequiresDir(t *testing.T) {
+	t.Setenv("SHALE_NODE_ID", "n1")
+	t.Setenv("SHALE_BACKEND", "")
+	t.Setenv("SHALE_PEBBLE_DIR", "")
+
+	_, err := parseFlags([]string{"--backend", "pebble"})
+	if err == nil || !strings.Contains(err.Error(), "--pebble-dir") {
+		t.Fatalf("want pebble-dir required error, got %v", err)
+	}
+
+	cfg, err := parseFlags([]string{"--backend", "pebble", "--pebble-dir", "/tmp/shaled-pebble"})
+	if err != nil {
+		t.Fatalf("parseFlags with pebble-dir set: %v", err)
+	}
+	if cfg.backend != "pebble" {
+		t.Fatalf("backend: want pebble, got %q", cfg.backend)
+	}
+	if cfg.pebble.Dir != "/tmp/shaled-pebble" {
+		t.Fatalf("pebble.Dir: want /tmp/shaled-pebble, got %q", cfg.pebble.Dir)
 	}
 }
 
