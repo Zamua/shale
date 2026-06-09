@@ -1,0 +1,19 @@
+go 1.25.4
+
+use (
+	.
+	./backends/pebble
+	./backends/slate
+)
+
+// Workspace-level replace: cockroachdb/errors v1.11.3 (transitive
+// dep of pebble) requires the OLD monolithic google.golang.org/genproto
+// which embeds googleapis/rpc/status. The newer split-out
+// google.golang.org/genproto/googleapis/rpc module owns that import
+// path post-split. Under `go.work`, both modules coexist and the
+// grpc/status import is ambiguous. Force the old monolithic module
+// to a newer version that has the colliding subpackages stripped out
+// (per the split). Per-module builds (GOWORK=off) don't hit this
+// because each module's pruned graph picks the split-out module
+// unambiguously on its own.
+replace google.golang.org/genproto => google.golang.org/genproto v0.0.0-20260608224507-4308a22a1bab
