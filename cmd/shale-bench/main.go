@@ -394,7 +394,7 @@ var slateWriteOpts any
 // returns nil. This stub is only ever reached via --backend=slate,
 // which already errors out earlier without the slatedb tag, so the
 // no-tag branch is effectively unreachable.
-var makeSlateWriteOptions = func(awaitDurable bool) any { return nil }
+var makeSlateWriteOptions = func(_ bool) any { return nil }
 
 // builtCluster captures the state we have to tear down at end of run.
 type builtCluster struct {
