@@ -105,6 +105,15 @@ func (n *testNode) Close() {
 // loopback under a test process never hits a conflicting bind in
 // practice; the harness in pkg/cluster relies on the same pattern.
 func startTestNode(t *testing.T, id, seedAddr string) *testNode {
+	return startTestNodeWithReplication(t, id, seedAddr, 1, 0, 0)
+}
+
+// startTestNodeWithReplication is the replication-aware variant. R=1
+// + zero-valued consistency knobs reproduce startTestNode exactly (the
+// Cluster's normalizeConfig fills in WriteQuorum + ReadNearest at
+// Open). Used by tests/integration/replicate_*_test.go to stand up
+// clusters with R>1 + tunable W/R.
+func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replicationFactor int, wc cluster.WriteConsistency, rc cluster.ReadConsistency) *testNode {
 	t.Helper()
 
 	mem := memory.New()
@@ -141,6 +150,9 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 		RebalanceSettleDelay:    500 * time.Millisecond,
 		RebalanceGraceDuration:  3 * time.Second,
 		RebalanceHandoffTimeout: 4 * time.Second,
+		ReplicationFactor:       replicationFactor,
+		WriteConsistency:        wc,
+		ReadConsistency:         rc,
 	}
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}
@@ -244,4 +256,33 @@ func freePort(t *testing.T) int {
 
 func hostPort(port int) string {
 	return "127.0.0.1:" + strconv.Itoa(port)
+}
+
+// startReplicatedCluster brings up `count` nodes joined into one
+// cluster, each configured with the supplied replication factor +
+// consistency knobs. Waits for ring convergence on every node before
+// returning so tests can start writing immediately. Cleanup is wired
+// via t.Cleanup on each node.
+func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc cluster.WriteConsistency, rc cluster.ReadConsistency) []*testNode {
+	t.Helper()
+	if count < 1 {
+		t.Fatalf("startReplicatedCluster: count must be >= 1")
+	}
+	nodes := make([]*testNode, 0, count)
+	seed := ""
+	for i := 0; i < count; i++ {
+		n := startTestNodeWithReplication(t, fmt.Sprintf("rn%d", i+1), seed, replicationFactor, wc, rc)
+		if i == 0 {
+			seed = n.BindAddr
+		}
+		nodes = append(nodes, n)
+	}
+	cs := make([]*cluster.Cluster, len(nodes))
+	for i, n := range nodes {
+		cs[i] = n.Cluster
+	}
+	if err := waitForMembersAll(cs, count, 10*time.Second); err != nil {
+		t.Fatalf("replicated cluster (count=%d, R=%d) convergence: %v", count, replicationFactor, err)
+	}
+	return nodes
 }
