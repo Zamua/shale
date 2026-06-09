@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"sync"
+	"sync/atomic"
 
 	"github.com/hashicorp/memberlist"
 )
@@ -107,7 +108,11 @@ func (d *metaDelegate) MergeRemoteState([]byte, bool)   {}
 // eventDelegate forwards memberlist's join/leave/update callbacks
 // into the Membership's events channel as Event values. It uses a
 // non-blocking send: if no consumer is reading, the event is dropped.
-// Callers who care about every transition must keep up with Events().
+// Callers who care about every transition must keep up with Events()
+// OR call Snapshot()/Members() periodically to reconcile against the
+// authoritative current state. The dropCount counter (read via
+// Membership.DropCount) makes drops observable so reconcilers can
+// log + alert on backpressure.
 //
 // The mutex coordinates with Close: after Close has acquired the
 // write lock + set closed=true, send is guaranteed to skip the send
@@ -116,9 +121,10 @@ func (d *metaDelegate) MergeRemoteState([]byte, bool)   {}
 // so this guard is load-bearing - without it, a stray late callback
 // will panic on send-to-closed-channel.
 type eventDelegate struct {
-	mu     sync.RWMutex
-	out    chan Event
-	closed bool
+	mu        sync.RWMutex
+	out       chan Event
+	closed    bool
+	dropCount atomic.Uint64
 }
 
 func (e *eventDelegate) NotifyJoin(n *memberlist.Node) {
@@ -146,7 +152,9 @@ func (e *eventDelegate) send(t EventType, n *memberlist.Node) {
 	case e.out <- ev:
 	default:
 		// Drop on backpressure. Subscribers can always reconcile via
-		// Members() if they fall behind.
+		// Snapshot()/Members() if they fall behind; the dropCount
+		// counter (Membership.DropCount) lets observers detect this.
+		e.dropCount.Add(1)
 	}
 }
 
@@ -220,8 +228,17 @@ func Open(cfg Config) (*Membership, error) {
 }
 
 // Members returns a snapshot of currently known cluster members,
-// sorted by ID for deterministic iteration.
+// sorted by ID for deterministic iteration. Returns nil if the
+// Membership has been Closed (defensive: the underlying memberlist
+// would race with shutdown; nil is a safe sentinel callers can
+// already handle).
 func (m *Membership) Members() []Member {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
 	nodes := m.ml.Members()
 	out := make([]Member, 0, len(nodes))
 	for _, n := range nodes {
@@ -229,6 +246,21 @@ func (m *Membership) Members() []Member {
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
+}
+
+// Snapshot returns the authoritative current member list, identical
+// to Members(). Exposed as a distinct name so reconciliation call
+// sites (which use it to recover from event-channel drops) read
+// clearly at the call site: "fetch the truth, ignore what events
+// said." Same closed-aware semantics as Members.
+func (m *Membership) Snapshot() []Member { return m.Members() }
+
+// DropCount returns the cumulative number of join/leave events the
+// event channel has dropped under backpressure since Open. Useful for
+// observability + for tests verifying the reconciliation path covers
+// for drops.
+func (m *Membership) DropCount() uint64 {
+	return m.events.dropCount.Load()
 }
 
 // Events returns the channel join/leave events are published on. The
