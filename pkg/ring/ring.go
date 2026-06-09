@@ -138,6 +138,42 @@ func (r *Ring) LocateKey(key []byte) Member {
 	return r.members[m.String()]
 }
 
+// LocateKeyN returns the primary owner of key followed by up to (n-1)
+// successor Members on the ring, in primary-first order. Used by the
+// v0.4 replication layer to pick the R nodes that hold a copy of each
+// key.
+//
+// The hashed portion is the same ShardKey LocateKey uses, so hash
+// tags ("{tag}") group keys onto the same primary + the same successor
+// chain. n <= 0 returns an empty slice. n larger than the number of
+// distinct Members returns ALL distinct Members (no duplicates); this
+// keeps the caller from blocking on a phantom replica when the
+// configured ReplicationFactor exceeds the live membership.
+func (r *Ring) LocateKeyN(key []byte, n int) []Member {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if n <= 0 || len(r.members) == 0 {
+		return nil
+	}
+	want := n
+	if want > len(r.members) {
+		want = len(r.members)
+	}
+	raw, err := r.hash.GetClosestN(ShardKey(key), want)
+	if err != nil {
+		// GetClosestN's only documented failure is "count > members",
+		// which we just clamped against; treat any other error as
+		// "no replicas" so the caller falls through to its own
+		// no-replicas handling.
+		return nil
+	}
+	out := make([]Member, 0, len(raw))
+	for _, m := range raw {
+		out = append(out, r.members[m.String()])
+	}
+	return out
+}
+
 // PartitionID returns the partition id that key belongs to. This is
 // the same partition the LocateKey lookup goes through; exposing it
 // lets the rebalance layer talk about "which partition" without

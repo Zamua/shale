@@ -44,6 +44,43 @@ import (
 // state. Exposed as a var (not const) so tests can shrink it.
 var reconcileInterval = 5 * time.Second
 
+// WriteConsistency picks how many replica acks a Put / Delete waits
+// for before returning. iota+1 so the zero value is "unset" + Open
+// normalizes to the v0.4 default (WriteQuorum).
+type WriteConsistency int
+
+const (
+	// WriteOne returns success as soon as the primary acks. Loosest
+	// setting + lowest write latency; tolerates the most replica
+	// failures but offers the weakest durability.
+	WriteOne WriteConsistency = iota + 1
+	// WriteQuorum waits for floor(R/2)+1 acks. The v0.4 default:
+	// survives the loss of a minority of replicas without losing the
+	// write.
+	WriteQuorum
+	// WriteAll waits for every replica to ack. Any down replica fails
+	// the write.
+	WriteAll
+)
+
+// ReadConsistency picks how many replicas a Get reads from. iota+1
+// so the zero value is "unset" + Open normalizes to the v0.4 default
+// (ReadNearest).
+type ReadConsistency int
+
+const (
+	// ReadNearest reads from the primary only (one hop in the common
+	// case; matches v0.3 R=1 behavior). No read-repair fires on
+	// ReadNearest since there is nothing to compare against.
+	ReadNearest ReadConsistency = iota + 1
+	// ReadQuorum reads from floor(R/2)+1 replicas + returns the LWW
+	// winner. Triggers async read-repair on lagging replicas.
+	ReadQuorum
+	// ReadAll reads from every replica. Strongest read freshness;
+	// triggers read-repair on any disagreement.
+	ReadAll
+)
+
 // Config configures a Cluster. NodeID + Backend are always required.
 // The peer-discovery fields (BindAddr, Seeds, GRPCAddr) are required
 // only for multi-node mode; in single-node mode they may be empty.
@@ -108,6 +145,43 @@ type Config struct {
 	// (rebalance.DefaultOptions, 5 minutes). Integration tests
 	// shrink it so a "destination never asks" scenario fails fast.
 	RebalanceHandoffTimeout time.Duration
+
+	// ReplicationFactor is the number of nodes that hold a copy of
+	// each key. Zero is normalized to 1 by Open (v0.3 behavior:
+	// single owner per key, no replicas, no LWW envelope cost on the
+	// read path). Values > 1 are clamped at fan-out time to the
+	// number of distinct members in the ring (see ring.LocateKeyN).
+	// HA + LWW conflict resolution is opt-in via ReplicationFactor > 1.
+	ReplicationFactor int
+
+	// WriteConsistency picks how many replica acks a Put / Delete
+	// waits for. Zero is normalized to WriteQuorum by Open (the v0.4
+	// default). See WriteConsistency for the per-value semantics.
+	WriteConsistency WriteConsistency
+
+	// ReadConsistency picks how many replicas a Get reads from. Zero
+	// is normalized to ReadNearest by Open (the v0.4 default; matches
+	// v0.3 single-replica read behavior). See ReadConsistency for the
+	// per-value semantics.
+	ReadConsistency ReadConsistency
+}
+
+// normalizeConfig fills in v0.4 default values for any zero-valued
+// fields that have a defined default. Called once at the top of Open
+// so the rest of the package can rely on the normalized values
+// without re-checking zero everywhere. Mutates cfg in place via the
+// pointer; the caller's local Config value is left as supplied (Open
+// works against the normalized copy held in c.cfg).
+func normalizeConfig(cfg *Config) {
+	if cfg.ReplicationFactor == 0 {
+		cfg.ReplicationFactor = 1
+	}
+	if cfg.WriteConsistency == 0 {
+		cfg.WriteConsistency = WriteQuorum
+	}
+	if cfg.ReadConsistency == 0 {
+		cfg.ReadConsistency = ReadNearest
+	}
 }
 
 // Cluster is the public handle apps use. All operations are
@@ -168,6 +242,7 @@ func Open(cfg Config) (*Cluster, error) {
 	if cfg.Backend == nil {
 		return nil, errors.New("cluster: Backend is required")
 	}
+	normalizeConfig(&cfg)
 
 	c := &Cluster{
 		cfg:     cfg,

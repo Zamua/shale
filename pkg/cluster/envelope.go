@@ -1,0 +1,130 @@
+// LWW value envelope for replication (v0.4+).
+//
+// Every Backend value, when R>1, is wrapped in an Envelope before
+// storage: a (TimestampNanos, WriterNodeID) Stamp plus the raw payload.
+// The cluster layer encodes on Put + decodes on Get; the Backend never
+// sees the envelope. On a read fan-out (Quorum / All), the LWW
+// comparator picks the winner across replica responses, and async
+// read-repair pushes the winner back to lagging replicas.
+//
+// v0.3 compatibility: a value written before envelopes existed has no
+// magic byte. Decode treats such bytes as a payload with a zero Stamp,
+// so it loses every comparison against a real stamped write and gets
+// re-stamped on the next Put. No offline migration step.
+//
+// See docs/SPEC.md "Replication (v0.4+) -> Value envelope" + "LWW
+// comparator" for the full model.
+
+package cluster
+
+import (
+	"encoding/binary"
+	"errors"
+	"fmt"
+)
+
+// envelopeMagic is the leading byte that marks bytes as an LWW
+// Envelope. Picked arbitrarily; the only requirement is that v0.3
+// payloads almost never start with it. Decode treats a missing magic
+// as the v0.3 compatibility path.
+const envelopeMagic byte = 0xE0
+
+// Stamp is the LWW ordering key for a write: the originating node's
+// wall-clock at Put time + that node's stable ID. The cluster layer
+// stamps once on the originator before fan-out; every replica stores
+// the same Stamp for the same write.
+type Stamp struct {
+	// TimestampNanos is the originating node's time.Now().UnixNano()
+	// captured at the moment Put is called. uint64 so the binary
+	// encoding is unambiguous (negative pre-1970 timestamps cannot
+	// happen here).
+	TimestampNanos uint64
+
+	// WriterNodeID is the originator's Config.NodeID. Used as the
+	// lexicographic tiebreak when two writes carry identical
+	// nanosecond timestamps.
+	WriterNodeID string
+}
+
+// Greater reports whether a's stamp wins LWW against b's. The
+// comparator is:
+//
+//  1. a.TimestampNanos > b.TimestampNanos wins, OR
+//  2. timestamps equal AND a.WriterNodeID > b.WriterNodeID
+//     lexicographically.
+//
+// Self-comparison returns false (the relation is strict).
+func (a Stamp) Greater(b Stamp) bool {
+	if a.TimestampNanos != b.TimestampNanos {
+		return a.TimestampNanos > b.TimestampNanos
+	}
+	return a.WriterNodeID > b.WriterNodeID
+}
+
+// Envelope wraps a Backend value with its LWW Stamp + opaque payload.
+// Tombstones (Delete) are encoded as an Envelope with an empty
+// Payload; Get treats a winning empty-Payload envelope as NotFound.
+type Envelope struct {
+	Stamp   Stamp
+	Payload []byte
+}
+
+// Encode serializes env to its on-disk binary form:
+//
+//	magic(1) | timestamp_be(8) | nodeid_len_be(2) | nodeid_bytes | payload
+//
+// The payload runs to the end of the buffer (no length prefix needed:
+// the storage layer owns the value's total length).
+func Encode(env Envelope) []byte {
+	idLen := len(env.Stamp.WriterNodeID)
+	out := make([]byte, 0, 1+8+2+idLen+len(env.Payload))
+	out = append(out, envelopeMagic)
+	var tsBuf [8]byte
+	binary.BigEndian.PutUint64(tsBuf[:], env.Stamp.TimestampNanos)
+	out = append(out, tsBuf[:]...)
+	var lenBuf [2]byte
+	binary.BigEndian.PutUint16(lenBuf[:], uint16(idLen))
+	out = append(out, lenBuf[:]...)
+	out = append(out, env.Stamp.WriterNodeID...)
+	out = append(out, env.Payload...)
+	return out
+}
+
+// Decode parses an Envelope from its on-disk binary form. Bytes that
+// do not start with the magic byte are returned as a zero-Stamp
+// envelope carrying the input as Payload - the v0.3 compatibility
+// path that lets pre-envelope values participate in LWW (they always
+// lose, then get re-stamped on next Put).
+//
+// Returns an error only when the magic is present but the header is
+// truncated or self-inconsistent (e.g. claimed nodeID length runs
+// past the end of the buffer). A magic-prefixed buffer with an empty
+// payload is valid (that's the tombstone shape).
+func Decode(b []byte) (Envelope, error) {
+	if len(b) == 0 || b[0] != envelopeMagic {
+		// v0.3 compat: hand back the raw bytes as a zero-Stamp
+		// payload so the LWW comparator naturally prefers any
+		// stamped write. nil and empty both flow through unchanged.
+		return Envelope{Payload: b}, nil
+	}
+	// Magic present: header MUST parse cleanly. A truncated envelope
+	// is corruption, not v0.3 data.
+	if len(b) < 1+8+2 {
+		return Envelope{}, errors.New("cluster: envelope header truncated")
+	}
+	ts := binary.BigEndian.Uint64(b[1:9])
+	idLen := int(binary.BigEndian.Uint16(b[9:11]))
+	headerEnd := 11 + idLen
+	if headerEnd > len(b) {
+		return Envelope{}, fmt.Errorf("cluster: envelope nodeID length %d overruns buffer of %d bytes", idLen, len(b))
+	}
+	nodeID := string(b[11:headerEnd])
+	// Copy the payload so callers can mutate it without scribbling
+	// into the source buffer (typical Backend.Get contract is "the
+	// caller owns the returned slice").
+	payload := append([]byte(nil), b[headerEnd:]...)
+	return Envelope{
+		Stamp:   Stamp{TimestampNanos: ts, WriterNodeID: nodeID},
+		Payload: payload,
+	}, nil
+}

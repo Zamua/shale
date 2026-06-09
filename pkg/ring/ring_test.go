@@ -260,3 +260,107 @@ func TestDistribution_BoundedByLoadFactor(t *testing.T) {
 		}
 	}
 }
+
+func TestLocateKeyN_OneMatchesLocateKey(t *testing.T) {
+	r := ring.New()
+	r.Add(ring.Member{ID: "n1", Addr: "h:n1"})
+	r.Add(ring.Member{ID: "n2", Addr: "h:n2"})
+	r.Add(ring.Member{ID: "n3", Addr: "h:n3"})
+
+	for _, k := range [][]byte{
+		[]byte("alpha"), []byte("beta"), []byte("gamma"),
+		[]byte("user:42"), []byte("pastes/abc"),
+	} {
+		single := r.LocateKey(k)
+		multi := r.LocateKeyN(k, 1)
+		if len(multi) != 1 {
+			t.Fatalf("LocateKeyN(k, 1) length = %d, want 1", len(multi))
+		}
+		if multi[0] != single {
+			t.Errorf("LocateKeyN(k=%q, 1) primary %+v != LocateKey %+v", k, multi[0], single)
+		}
+	}
+}
+
+func TestLocateKeyN_AllMembersWhenNEqualsMembers(t *testing.T) {
+	r := ring.New()
+	r.Add(ring.Member{ID: "n1", Addr: "h:n1"})
+	r.Add(ring.Member{ID: "n2", Addr: "h:n2"})
+	r.Add(ring.Member{ID: "n3", Addr: "h:n3"})
+
+	got := r.LocateKeyN([]byte("any-key"), 3)
+	if len(got) != 3 {
+		t.Fatalf("LocateKeyN(_, 3) on 3-member ring should return 3, got %d", len(got))
+	}
+	seen := map[string]bool{}
+	for _, m := range got {
+		if m.Addr == "" {
+			t.Errorf("returned Member should carry Addr: %+v", m)
+		}
+		if seen[m.ID] {
+			t.Errorf("LocateKeyN returned duplicate member %q", m.ID)
+		}
+		seen[m.ID] = true
+	}
+	if len(seen) != 3 {
+		t.Errorf("expected 3 distinct members, got %d (%v)", len(seen), seen)
+	}
+}
+
+func TestLocateKeyN_NGreaterThanMembersReturnsAll(t *testing.T) {
+	r := ring.New()
+	r.Add(ring.Member{ID: "n1", Addr: "h:n1"})
+	r.Add(ring.Member{ID: "n2", Addr: "h:n2"})
+	r.Add(ring.Member{ID: "n3", Addr: "h:n3"})
+
+	// Caller asked for 5; ring has 3. No dupes, just every member.
+	got := r.LocateKeyN([]byte("user:alice"), 5)
+	if len(got) != 3 {
+		t.Fatalf("LocateKeyN(_, 5) on 3-member ring should clamp to 3 distinct, got %d", len(got))
+	}
+	seen := map[string]bool{}
+	for _, m := range got {
+		if seen[m.ID] {
+			t.Errorf("duplicate member %q in clamped result", m.ID)
+		}
+		seen[m.ID] = true
+	}
+}
+
+func TestLocateKeyN_HashTagsRespected(t *testing.T) {
+	// Per docs/SPEC.md, keys sharing a {tag} hash on the tag only +
+	// must land on the same primary AND the same successor chain.
+	r := ring.New()
+	r.Add(ring.Member{ID: "n1", Addr: "h:n1"})
+	r.Add(ring.Member{ID: "n2", Addr: "h:n2"})
+	r.Add(ring.Member{ID: "n3", Addr: "h:n3"})
+
+	a := r.LocateKeyN([]byte("{alice}/pastes/abc12345"), 3)
+	b := r.LocateKeyN([]byte("{alice}/versions/abc12345/v2"), 3)
+	if len(a) != len(b) {
+		t.Fatalf("hash-tagged keys returned different replica-set sizes: %d vs %d", len(a), len(b))
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			t.Errorf("hash-tagged keys must produce identical replica chains; position %d: %+v vs %+v", i, a[i], b[i])
+		}
+	}
+}
+
+func TestLocateKeyN_EmptyRing(t *testing.T) {
+	r := ring.New()
+	if got := r.LocateKeyN([]byte("anything"), 3); len(got) != 0 {
+		t.Errorf("LocateKeyN on empty ring should return nil/empty, got %v", got)
+	}
+}
+
+func TestLocateKeyN_NonPositiveN(t *testing.T) {
+	r := ring.New()
+	r.Add(ring.Member{ID: "n1", Addr: "h:n1"})
+	if got := r.LocateKeyN([]byte("k"), 0); len(got) != 0 {
+		t.Errorf("LocateKeyN(_, 0) should return empty, got %v", got)
+	}
+	if got := r.LocateKeyN([]byte("k"), -1); len(got) != 0 {
+		t.Errorf("LocateKeyN(_, -1) should return empty, got %v", got)
+	}
+}
