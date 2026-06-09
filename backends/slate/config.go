@@ -5,6 +5,8 @@ package slate
 import (
 	"errors"
 	"os"
+
+	slatedb "slatedb.io/slatedb-go/uniffi"
 )
 
 // Config captures the connection parameters for the SlateDB backend.
@@ -41,6 +43,27 @@ type Config struct {
 	// (suitable for MinIO at http://...). When true, the crate
 	// enforces TLS, matching real AWS S3.
 	UseSSL bool
+
+	// Settings is forwarded verbatim to slatedb. Nil = slatedb
+	// defaults (the same DbBuilder.Build() path slate.New used
+	// pre-v0.5).
+	//
+	// The shale layer never reads, mutates, copies, or validates this
+	// value. Operator owns the lifecycle: build the *slatedb.Settings
+	// (slatedb.SettingsDefault, SettingsFromFile, SettingsFromEnv,
+	// SettingsFromJsonString, ...), mutate via Settings.Set(path,
+	// jsonValue), pass it here. slate.New hands it to the DbBuilder
+	// before opening.
+	//
+	// CAVEAT (slatedb-go v0.13.1 binding): the Settings handle is an
+	// opaque uniffi object whose only mutation API is `Set(key
+	// string, valueJson string) error` using dotted JSON paths
+	// (e.g. `Set("flush_interval", "\"250ms\"")`). The Rust crate's
+	// per-field accessors are NOT yet exposed in Go. AwaitDurable in
+	// particular is a per-write knob on slatedb.WriteOptions and is
+	// NOT settable through Settings at all in this binding; shale
+	// always uses the default WriteOptions internally.
+	Settings *slatedb.Settings
 }
 
 func (c Config) validate() error {

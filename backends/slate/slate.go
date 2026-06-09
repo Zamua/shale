@@ -47,6 +47,10 @@ type Slate struct {
 // The caller must Close() the returned *Slate to flush + shut down
 // cleanly. See package doc for the env-var caveat around running two
 // Slate instances in one process.
+//
+// If cfg.Settings is non-nil, it is applied to the DbBuilder before
+// Build (pass-through, no merging with shale defaults). Nil falls
+// back to slatedb's own defaults.
 func New(cfg Config) (*Slate, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -59,9 +63,7 @@ func New(cfg Config) (*Slate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("slate: resolve object store %q: %w", url, err)
 	}
-	builder := slatedb.NewDbBuilder(cfg.DbName, store)
-	defer builder.Destroy()
-	db, err := builder.Build()
+	db, err := buildDb(cfg.DbName, store, cfg.Settings)
 	if err != nil {
 		store.Destroy()
 		return nil, fmt.Errorf("slate: open db %q: %w", cfg.DbName, err)
@@ -73,20 +75,46 @@ func New(cfg Config) (*Slate, error) {
 // ObjectStore. Useful for tests that want to point at a non-S3 store
 // (e.g. "memory:///") without touching the AWS_* env vars. The Slate
 // instance takes ownership of the store and will Destroy it on Close.
-func NewWithStore(dbName string, store *slatedb.ObjectStore) (*Slate, error) {
+//
+// settings, if non-nil, is forwarded verbatim to the DbBuilder before
+// Build (same pass-through semantics as Config.Settings in New).
+func NewWithStore(dbName string, store *slatedb.ObjectStore, settings ...*slatedb.Settings) (*Slate, error) {
 	if dbName == "" {
 		return nil, errors.New("slate: dbName required")
 	}
 	if store == nil {
 		return nil, errors.New("slate: store required")
 	}
-	builder := slatedb.NewDbBuilder(dbName, store)
-	defer builder.Destroy()
-	db, err := builder.Build()
+	if len(settings) > 1 {
+		return nil, errors.New("slate: at most one Settings may be passed")
+	}
+	var s *slatedb.Settings
+	if len(settings) == 1 {
+		s = settings[0]
+	}
+	db, err := buildDb(dbName, store, s)
 	if err != nil {
 		return nil, fmt.Errorf("slate: open db %q: %w", dbName, err)
 	}
 	return &Slate{db: db, store: store}, nil
+}
+
+// buildDb runs the DbBuilder pipeline shared by New + NewWithStore.
+// settings is forwarded verbatim to WithSettings if non-nil; absent
+// settings, slatedb's own defaults apply.
+func buildDb(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings) (*slatedb.Db, error) {
+	builder := slatedb.NewDbBuilder(dbName, store)
+	defer builder.Destroy()
+	if settings != nil {
+		if err := builder.WithSettings(settings); err != nil {
+			return nil, fmt.Errorf("apply settings: %w", err)
+		}
+	}
+	db, err := builder.Build()
+	if err != nil {
+		return nil, err
+	}
+	return db, nil
 }
 
 // Put stores value under key.
