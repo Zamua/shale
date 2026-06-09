@@ -12,6 +12,10 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend/memory"
+	"github.com/Zamua/shale/pkg/membership"
+	"github.com/Zamua/shale/pkg/ring"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
 )
 
 // freeTCPPort returns an OS-assigned ephemeral TCP port. Mirrors the
@@ -97,4 +101,120 @@ func TestReconcileRingFromMembership_RestoresMissingLocal(t *testing.T) {
 	if len(members) != 1 || members[0].ID != "solo" {
 		t.Fatalf("reconcile did not restore local member; ring=%v", members)
 	}
+}
+
+// TestEventsLoop_EvictsClientOnAddrChange pins issue 6: when a peer's
+// GRPCAddr changes (NotifyUpdate path - same node ID, different Meta
+// bytes), the events loop must (a) update the ring to point the ID at
+// the new Addr and (b) evict the cached gRPC client for the OLD addr,
+// so a stale connection to a defunct endpoint cannot serve subsequent
+// requests for that peer.
+//
+// Drives the path via membership.TestingInjectUpdate (the test-only
+// hook in pkg/membership), since memberlist exposes no public way to
+// force a Meta-rebroadcast with a different addr for an existing
+// node ID.
+//
+// Why this test would have caught a regression: if priorAddrForID or
+// the evictClient call in runEventsLoop is dropped, the old client
+// stays cached + a future forward dial returns the dead conn. The
+// assertion on clients[oldAddr] absence fires.
+func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
+	// Park the reconciler far in the future so the manual ring +
+	// clients state we set up below cannot be steamrolled by a
+	// reconcile tick between the inject + the assertion.
+	saved := reconcileInterval
+	reconcileInterval = time.Hour
+	t.Cleanup(func() { reconcileInterval = saved })
+
+	port := freeTCPPort(t)
+	c, err := Open(Config{
+		NodeID:    "solo",
+		Backend:   memory.New(),
+		BindAddr:  hp(port),
+		GRPCAddr:  "127.0.0.1:1",
+		LogOutput: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	if !waitForLocalInRing(c, 2*time.Second) {
+		t.Fatalf("local member never landed in ring")
+	}
+
+	// Stand up two throwaway gRPC listeners so dialing oldAddr +
+	// newAddr returns real connections (grpc.NewClient is lazy enough
+	// that even an unreachable addr "works", but a real listener
+	// keeps the test honest re: what evict closes).
+	oldLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("oldLis: %v", err)
+	}
+	defer oldLis.Close()
+	oldSrv := grpc.NewServer()
+	go func() { _ = oldSrv.Serve(oldLis) }()
+	defer oldSrv.Stop()
+	oldAddr := oldLis.Addr().String()
+
+	newLis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("newLis: %v", err)
+	}
+	defer newLis.Close()
+	newSrv := grpc.NewServer()
+	go func() { _ = newSrv.Serve(newLis) }()
+	defer newSrv.Stop()
+	newAddr := newLis.Addr().String()
+
+	// Seed the ring + client cache as if a peer "peer-1" had joined
+	// at oldAddr previously. Inject a NotifyUpdate that flips the
+	// same ID to newAddr; the events loop should rewrite the ring +
+	// evict the oldAddr client.
+	c.ring.Add(ring.Member{ID: "peer-1", Addr: oldAddr})
+
+	conn, err := grpc.NewClient(oldAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	if err != nil {
+		t.Fatalf("dial oldAddr: %v", err)
+	}
+	c.clientsMu.Lock()
+	c.clients[oldAddr] = &peerClient{conn: conn}
+	c.clientsMu.Unlock()
+
+	membership.TestingInjectUpdate(c.membership, "peer-1", newAddr)
+
+	// Let the events loop drain + react. Poll for both conditions
+	// (ring updated + client evicted) up to 2s; the actual reaction
+	// is sub-millisecond on a quiet machine.
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		c.clientsMu.RLock()
+		_, stillCached := c.clients[oldAddr]
+		c.clientsMu.RUnlock()
+		gotAddr := ""
+		for _, m := range c.ring.Members() {
+			if m.ID == "peer-1" {
+				gotAddr = m.Addr
+				break
+			}
+		}
+		if !stillCached && gotAddr == newAddr {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Failure: report what we observed.
+	c.clientsMu.RLock()
+	_, stillCached := c.clients[oldAddr]
+	c.clientsMu.RUnlock()
+	var gotAddr string
+	for _, m := range c.ring.Members() {
+		if m.ID == "peer-1" {
+			gotAddr = m.Addr
+		}
+	}
+	t.Fatalf("addr-change eviction did not happen: ring peer-1 addr=%q (want %q), oldAddr still cached=%v",
+		gotAddr, newAddr, stillCached)
 }
