@@ -37,7 +37,7 @@
 //
 // # Env-var collision caveat
 //
-// pkg/backend/slate.New writes AWS_* env vars before resolving the
+// backends/slate.New writes AWS_* env vars before resolving the
 // object store. That means all slate stores in this process must
 // point at the SAME bucket + endpoint + credentials (per the package
 // doc on slate.go). Picking different DbNames inside one bucket is
@@ -53,8 +53,8 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Zamua/shale/backends/slate"
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/backend/slate"
 )
 
 // slateEnvPrefix is the namespace for slate-bench env vars. Kept in

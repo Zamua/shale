@@ -34,8 +34,8 @@ import (
 	"github.com/minio/minio-go/v7/pkg/credentials"
 	tcminio "github.com/testcontainers/testcontainers-go/modules/minio"
 
+	"github.com/Zamua/shale/backends/slate"
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/backend/slate"
 )
 
 // minioFixture owns a running MinIO container + a freshly-created

@@ -32,7 +32,7 @@ test-slate:
 	CGO_LDFLAGS="-L$(SLATEDB_LIB_DIR)" \
 	DYLD_LIBRARY_PATH="$(SLATEDB_LIB_DIR):$$DYLD_LIBRARY_PATH" \
 	LD_LIBRARY_PATH="$(SLATEDB_LIB_DIR):$$LD_LIBRARY_PATH" \
-	go test -tags slatedb -count=1 -timeout 120s ./pkg/backend/slate/...
+	go test -tags slatedb -count=1 -timeout 120s ./backends/slate/...
 
 # End-to-end validation of the SlateDB backend against a real MinIO
 # instance, spun up via testcontainers-go. Requires Docker (colima,
@@ -61,7 +61,7 @@ test-slate-minio:
 	CGO_LDFLAGS="-L$(SLATEDB_LIB_DIR)" \
 	DYLD_LIBRARY_PATH="$(SLATEDB_LIB_DIR):$$DYLD_LIBRARY_PATH" \
 	LD_LIBRARY_PATH="$(SLATEDB_LIB_DIR):$$LD_LIBRARY_PATH" \
-	go test -tags 'slatedb integration' -count=1 -timeout 600s -v ./pkg/backend/slate/...
+	go test -tags 'slatedb integration' -count=1 -timeout 600s -v ./backends/slate/...
 
 # v0.5 comparative benchmark suite: drives cmd/shale-bench across every
 # scenario (raw pebble + memory baselines vs shale cluster at R=1 and

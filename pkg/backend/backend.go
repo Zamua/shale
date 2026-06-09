@@ -6,7 +6,8 @@
 //
 // Implementations shipped:
 //   - pkg/backend/memory   - in-process map; tests + local dev
-//   - pkg/backend/slate    - SlateDB-on-object-storage (planned)
+//   - backends/slate       - SlateDB-on-object-storage (separate Go module)
+//   - backends/pebble      - Pebble local-disk LSM (separate Go module)
 //
 // BYO: implement this interface for any KV-shaped engine. The contract
 // is deliberately minimal so it's hard to write a wrong implementation.

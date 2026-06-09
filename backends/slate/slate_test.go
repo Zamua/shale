@@ -9,8 +9,8 @@ import (
 
 	slatedb "slatedb.io/slatedb-go/uniffi"
 
+	"github.com/Zamua/shale/backends/slate"
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/backend/slate"
 )
 
 // openTestSlate opens a Slate backed by an in-memory object store

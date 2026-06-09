@@ -58,9 +58,9 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Zamua/shale/backends/pebble"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
-	"github.com/Zamua/shale/pkg/backend/pebble"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rpc"
 	"google.golang.org/grpc"

@@ -7,8 +7,8 @@ import (
 	"path/filepath"
 	"testing"
 
+	pebblebe "github.com/Zamua/shale/backends/pebble"
 	"github.com/Zamua/shale/pkg/backend"
-	pebblebe "github.com/Zamua/shale/pkg/backend/pebble"
 )
 
 // openTemp opens a Pebble backend under t.TempDir and registers cleanup

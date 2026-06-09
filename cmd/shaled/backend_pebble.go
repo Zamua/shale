@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"log"
 
+	pebblebe "github.com/Zamua/shale/backends/pebble"
 	"github.com/Zamua/shale/pkg/backend"
-	pebblebe "github.com/Zamua/shale/pkg/backend/pebble"
 )
 
 // openPebbleBackend opens a Pebble database at cfg.Dir. The returned
