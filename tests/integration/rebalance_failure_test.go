@@ -154,27 +154,39 @@ func TestRebalance_DestinationFailureMidMigration(t *testing.T) {
 //
 // Shape:
 //
-//  1. 2-node cluster, populate enough keys + values bulky enough
-//     that a 3-node growth migration takes meaningful wall-clock.
-//  2. Add a 3rd node, wait for membership convergence.
-//  3. Kill the 3rd node's gRPC server mid-rebalance (force-stop, not
-//     graceful, so in-flight MigrateRange streams break immediately).
-//  4. Wait long enough for: the source's settle delay to elapse,
-//     the source-side scan to "complete" (with the new code, the
-//     wired runSend would NOT transition to HandedOff until ack),
-//     and the grace window AFTER any potential (broken) HandedOff
-//     transition to expire so a buggy sweep would have already
-//     deleted.
-//  5. Assert: every key originally written before the kill is still
-//     gettable from one of the survivors. With the fix, the source
-//     never reached HandedOff for the partitions n3 was destined to
-//     own + the sweep never deleted them.
+//  1. 2-node cluster, populate a body of keys.
+//  2. Add a 3rd node that is permanently unable to dial any peer
+//     (Config.TestingBlockPeerDials = true). The source still sees n3
+//     in the ring + registers Sends to it, but n3's FetchRange goroutines
+//     fail immediately on clientFor, so the source's MigrateRange
+//     handler is never invoked. runSendWired waits for an ack that
+//     never arrives + trips the handoff timeout (4s in the fixture).
+//  3. Wait long enough for: the source's settle delay to elapse,
+//     the wired-handoff timeout to fire (4s), and the grace window
+//     AFTER any potential (broken) HandedOff transition to expire
+//     so a buggy sweep would have already deleted.
+//  4. Assert: doneWithHandoffErr > 0 (the wired-handoff path
+//     transitioned partitions to Done-with-error instead of
+//     HandedOff) AND every key originally written is still on its
+//     pre-failure source backend.
 //
 // Pre-fix failure mode: with runSend's local-scan-driven flip, the
 // source transitions HandedOff regardless of stream success; sweep
 // fires after grace; the keys disappear from the source AND the
-// destination never received them (it crashed) -- a Get returns
-// ErrNotFound for many keys.
+// destination never received them - a Get returns ErrNotFound for
+// many keys.
+//
+// Why blocking-from-startup instead of "kill mid-stream": the
+// bootstrap Evaluate runs synchronously inside cluster.Open for a
+// joiner with visible peers, and launches FetchRange goroutines
+// that grab clients immediately. Any post-Open setter (or sleep-
+// then-drop pattern) races those goroutines and lets some streams
+// complete cleanly before the block engages - the resulting
+// doneWithHandoffErr count varies from 0 to ~75 across runs, and
+// the assertion that it must be > 0 flakes on fast loopbacks.
+// Wiring the block in via Config.TestingBlockPeerDials puts it in
+// effect before n3 even starts gossiping, so EVERY Send to n3
+// reliably trips the handoff timeout.
 func TestRebalance_SourceDoesNotDeleteOnDestinationCrash(t *testing.T) {
 	t.Parallel()
 
@@ -185,16 +197,18 @@ func TestRebalance_SourceDoesNotDeleteOnDestinationCrash(t *testing.T) {
 		t.Fatalf("2-node convergence: %v", err)
 	}
 
-	// Populate enough bulky values that the rebalance streaming
-	// window comfortably spans the kill timing. Memory backend +
-	// loopback gRPC are very fast, so the values have to be big
-	// enough that streaming time outpaces any wakeup latency in
-	// the test's sleep + kill sequence. 600 keys * 256KB = ~150MB
-	// across the cluster, of which the n3-bound partitions are
-	// streaming for hundreds of milliseconds even over loopback +
-	// the race detector's serialization overhead.
-	const total = 600
-	const valueBytes = 256 * 1024
+	// Populate a modest body of keys so the post-failure assertion
+	// (every key originally on a survivor is still on its source
+	// backend) has real data to count. Value size doesn't have to
+	// outrun the rebalance streaming window: this test no longer
+	// relies on catching a stream mid-flight. n3 is brought up
+	// with TestingBlockPeerDials=true (see startBlockedDestTestNode
+	// below), so it can never reach any source and the source's
+	// runSendWired times out waiting for an ack it will never get.
+	// That makes the wired-handoff signal deterministic regardless
+	// of loopback speed.
+	const total = 200
+	const valueBytes = 1024
 	bigValue := make([]byte, valueBytes)
 	for i := range bigValue {
 		bigValue[i] = byte('A' + (i % 26))
@@ -230,53 +244,38 @@ func TestRebalance_SourceDoesNotDeleteOnDestinationCrash(t *testing.T) {
 		}
 	}
 
-	// Add n3 to trigger rebalance.
-	n3 := startTestNode(t, "crash-n3", n1.BindAddr)
+	// Add n3 to trigger rebalance, but bring it up with peer-dial
+	// blocking ENABLED FROM THE FIRST INSTANT. Block has to be in
+	// place before the bootstrap Evaluate (synchronous inside
+	// cluster.Open for a joiner with visible peers) launches
+	// FetchRange goroutines: a post-Open setter races those
+	// goroutines and some streams complete before the block
+	// engages. With the block wired into Config.TestingBlockPeerDials,
+	// n3's clientFor returns an error on its very first call, so
+	// every FetchRange fails immediately and the source's
+	// runSendWired times out (4s) on the missing destination ack -
+	// fully deterministic regardless of loopback speed.
+	n3 := startBlockedDestTestNode(t, "crash-n3", n1.BindAddr)
 	trio := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(trio, 3, 10*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)
 	}
 	_ = trio
 
-	// Sever n3's outgoing gRPC client connections WITHOUT touching
-	// membership: this kills the dest-to-source MigrateRange
-	// streams (which are dest-initiated, so dest is the gRPC
-	// client) while leaving the source's view of the cluster
-	// intact. n1 + n2 still see n3 as a ring member, so n1's
-	// settle-driven Evaluate still computes Sends to n3 + launches
-	// runSendWired -- those goroutines are exactly what the fix
-	// gates on the destination ack. With n3's outgoing conns gone,
-	// the source's handler stream.Send returns transport-closed,
-	// SignalMigrateRangeComplete delivers the error to
-	// MarkSendComplete, and runSendWired transitions
-	// Done-handoff-err (NOT HandedOff).
-	//
-	// Going through TestingDropAllPeerClients instead of n3.Close()
-	// avoids the racy alternative where n3 broadcasts its leave
-	// before n1's settle fires: in that race, n1's plan recomputes
-	// against the 2-node ring + never registers any Sends, so the
-	// fix's wired path never runs + the regression check can't
-	// fire even though the underlying bug is still there.
-	time.Sleep(700 * time.Millisecond) // past n1's 500ms settle
-	n3.Cluster.TestingDropAllPeerClients()
-
 	// Hold long enough that:
-	//   - the source's MigrateRange handler observes the broken
-	//     stream (gRPC Send returns immediately once the underlying
-	//     TCP conn dies), MarkSendComplete propagates the error,
-	//     runSendWired transitions Done-handoff-err.
-	//   - any partition whose stream WAS in-flight at kill time has
-	//     errored; the wired-handoff timeout (4s in the integration
-	//     fixture) is the upper bound on how long a partition the
-	//     destination never asked about waits before also going
-	//     Done-handoff-err.
+	//   - n1's settle (500ms) fires + Evaluate registers Sends to
+	//     n3 + launches runSendWired for each one.
+	//   - n3 is unable to dial any source, so every runSendWired
+	//     waits for an ack that will never arrive and trips the
+	//     wired-handoff timeout (4s in the integration fixture),
+	//     transitioning Done-with-handoff-err.
 	//   - the grace window (3s in the test fixture) has elapsed past
 	//     any HYPOTHETICAL HandedOff transition the buggy code would
 	//     have done; the sweep would have already fired.
 	//
-	// 7s past the kill covers all three: 4s for the wired timeout,
-	// 3s for grace + sweep + observation.
-	time.Sleep(7 * time.Second)
+	// 8s covers all three: 500ms settle + 4s wired timeout + 3s
+	// grace + a small margin for sweep observation.
+	time.Sleep(8 * time.Second)
 
 	// Core assertion: every key originally owned by a survivor is
 	// STILL on its source backend. If runSend had transitioned to

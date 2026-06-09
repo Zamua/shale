@@ -188,6 +188,19 @@ type Config struct {
 	// configured consistency would otherwise wait for that replica.
 	// Zero falls back to 5s.
 	ReadTimeout time.Duration
+
+	// TestingBlockPeerDials, when true, refuses every clientFor call
+	// from the moment Open returns. Must be set at construction time
+	// (not after) because the bootstrap Evaluate runs synchronously
+	// inside Open for a joiner with already-visible peers + launches
+	// FetchRange goroutines that grab clients immediately; a post-Open
+	// setter would race those goroutines and let some streams complete
+	// before the block engaged. Used by the destination-crash failure
+	// tests to make the wired-handoff assertion robust to fast
+	// loopbacks (the source's runSendWired times out waiting for an
+	// ack the destination cannot deliver). Test-only; no production
+	// code path reads this.
+	TestingBlockPeerDials bool
 }
 
 // normalizeConfig fills in v0.4 default values for any zero-valued
@@ -226,6 +239,14 @@ type Cluster struct {
 
 	clientsMu sync.RWMutex
 	clients   map[string]*peerClient // peer gRPC addr -> client
+
+	// peerClientsBlocked, when true, makes clientFor return an error
+	// instead of dialing. Test-only seam used by the destination-
+	// crash failure tests to guarantee a node cannot reach any peer
+	// regardless of loopback speed (see Config.TestingBlockPeerDials).
+	// Wired from Config at Open time so the block is in effect before
+	// the bootstrap Evaluate fires; runtime mutation isn't supported.
+	peerClientsBlocked bool
 
 	// closeCh is closed by Close exactly once to signal the events
 	// loop (and any other lifecycle goroutines) to exit. closeOnce
@@ -292,10 +313,11 @@ func Open(cfg Config) (*Cluster, error) {
 	normalizeConfig(&cfg)
 
 	c := &Cluster{
-		cfg:     cfg,
-		backend: cfg.Backend,
-		clients: make(map[string]*peerClient),
-		closeCh: make(chan struct{}),
+		cfg:                cfg,
+		backend:            cfg.Backend,
+		clients:            make(map[string]*peerClient),
+		closeCh:            make(chan struct{}),
+		peerClientsBlocked: cfg.TestingBlockPeerDials,
 	}
 	c.repairCtx, c.repairCancel = context.WithCancel(context.Background())
 
@@ -649,6 +671,10 @@ func (c *Cluster) clientFor(addr string) (*peerClient, error) {
 		return nil, fmt.Errorf("cluster: peer has empty gRPC address")
 	}
 	c.clientsMu.RLock()
+	if c.peerClientsBlocked {
+		c.clientsMu.RUnlock()
+		return nil, fmt.Errorf("cluster: peer clients blocked (test seam)")
+	}
 	cli, ok := c.clients[addr]
 	c.clientsMu.RUnlock()
 	if ok {
@@ -656,6 +682,9 @@ func (c *Cluster) clientFor(addr string) (*peerClient, error) {
 	}
 	c.clientsMu.Lock()
 	defer c.clientsMu.Unlock()
+	if c.peerClientsBlocked {
+		return nil, fmt.Errorf("cluster: peer clients blocked (test seam)")
+	}
 	if cli, ok := c.clients[addr]; ok {
 		return cli, nil
 	}

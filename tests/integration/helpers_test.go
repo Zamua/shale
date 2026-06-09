@@ -141,6 +141,73 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 	return startTestNodeWithReplication(t, id, seedAddr, 1, 0, 0)
 }
 
+// startBlockedDestTestNode brings up a node identical to startTestNode
+// but with TestingBlockPeerDials enabled BEFORE Open returns. The block
+// has to be in place before the bootstrap Evaluate (which runs inline
+// inside Open for any joiner with visible peers) so the destination's
+// FetchRange goroutines hit the closed-fd path on their very first
+// clientFor call. Used by the destination-crash failure tests to make
+// the wired-handoff assertion robust to fast loopbacks: post-Open
+// setters race the FetchRange goroutines and let some streams complete
+// before the block engages.
+func startBlockedDestTestNode(t *testing.T, id, seedAddr string) *testNode {
+	t.Helper()
+
+	mem := memory.New()
+	bindAddr := hostPort(freePort(t))
+
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("startBlockedDestTestNode %s: listen gRPC: %v", id, err)
+	}
+	grpcAddr := lis.Addr().String()
+	grpcSrv := grpc.NewServer()
+	serveDone := make(chan struct{})
+
+	cfg := cluster.Config{
+		NodeID:                  id,
+		Backend:                 mem,
+		BindAddr:                bindAddr,
+		GRPCAddr:                grpcAddr,
+		LogOutput:               io.Discard,
+		RebalanceSettleDelay:    500 * time.Millisecond,
+		RebalanceGraceDuration:  3 * time.Second,
+		RebalanceHandoffTimeout: 4 * time.Second,
+		ReplicationFactor:       1,
+		TestingBlockPeerDials:   true,
+	}
+	if seedAddr != "" {
+		cfg.Seeds = []string{seedAddr}
+	}
+
+	c, err := cluster.Open(cfg)
+	if err != nil {
+		_ = lis.Close()
+		t.Fatalf("startBlockedDestTestNode %s: cluster.Open: %v", id, err)
+	}
+
+	rpc.NewServer(c).Register(grpcSrv)
+	go func() {
+		defer close(serveDone)
+		_ = grpcSrv.Serve(lis)
+	}()
+
+	n := &testNode{
+		ID:         id,
+		Cluster:    c,
+		Backend:    mem,
+		BindAddr:   bindAddr,
+		GRPCAddr:   grpcAddr,
+		grpcServer: grpcSrv,
+		stop: func() {
+			grpcSrv.GracefulStop()
+			<-serveDone
+		},
+	}
+	t.Cleanup(n.Close)
+	return n
+}
+
 // startTestNodeWithReplication is the replication-aware variant. R=1
 // + zero-valued consistency knobs reproduce startTestNode exactly (the
 // Cluster's normalizeConfig fills in WriteQuorum + ReadNearest at
