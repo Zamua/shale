@@ -175,17 +175,29 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 	}
 }
 
-// freePort returns an OS-assigned ephemeral TCP port. The listener is
-// closed before return; the small race window is fine for loopback.
+// freePort returns an OS-assigned ephemeral port that's free on both
+// TCP and UDP. memberlist binds both protocols on the same port, so a
+// TCP-only probe can hand back a port already taken on UDP, causing
+// flaky bind failures under load (especially on CI). Probe both, retry
+// on collision.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freePort: %v", err)
+	for attempt := 0; attempt < 16; attempt++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			continue
+		}
+		port := l.Addr().(*net.TCPAddr).Port
+		udp, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
+		_ = l.Close()
+		if err != nil {
+			continue
+		}
+		_ = udp.Close()
+		return port
 	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
+	t.Fatalf("freePort: exhausted 16 attempts to find a port free on both TCP+UDP")
+	return 0
 }
 
 func hostPort(port int) string {
