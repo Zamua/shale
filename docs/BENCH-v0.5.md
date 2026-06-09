@@ -66,10 +66,51 @@ go build -o shale-bench ./cmd/shale-bench/
               --ops 100000 --value-size 4096 --concurrency 16 --json
 ```
 
+## Slate scenarios (run separately via `make bench-v0.5-slate`)
+
+Slate is gated behind its own target because the harness has to bring up a MinIO container, the binary needs `-tags slatedb` + the SlateDB cdylib + cgo, and every Put round-trips to object storage (so op counts are smaller to keep each scenario under 60s).
+
+| Scenario | Backend | Nodes | R | Put p50 (ms) | Put p99 (ms) | Get p50 (ms) | Get p99 (ms) | Put ops/s | Get ops/s |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| raw-slate | slate | 1 | 1 | 103 | 111 | 0.02 | 1.51 | 77.2 | 99,923 |
+| cluster-slate-n1-r1 | slate | 1 | 1 | 103 | 151 | 0.02 | 0.68 | 77.4 | 159,443 |
+| cluster-slate-n3-r1 | slate | 3 | 1 | 103 | 110 | 0.15 | 0.66 | 78.2 | 50,067 |
+| cluster-slate-n3-r3 | slate | 3 | 3 | 102 | 108 | 0.42 | 1.98 | 78.4 | 13,181 |
+
+Workload: 500 ops per phase, 1024-byte values, 8 concurrent clients. MinIO running locally in colima (single-node, no replication, plaintext HTTP on the loopback). SlateDB v0.13.1.
+
+### Where the cost goes (slate)
+
+**Writes are S3-RTT-bound, full stop.** Every shape pins at ~77 ops/s and p50 ~103ms. That's three S3 PUTs per SlateDB commit (WAL append, manifest update, durability sync to whatever object-store batching SlateDB does internally) against local-loopback MinIO. None of the shale-layer cost (envelope encode, ring lookup, gRPC fan-out) is visible against that backdrop: the cluster's `n3-r3` write is no slower than the raw single-store write because all three replicas' SlateDB commits overlap and the slowest one still finishes in ~100ms. The conclusion holds across every scenario including raw: throughput scales with concurrency rather than fan-out, because each concurrent client is mostly blocked on S3 PUT latency that other clients can overlap with.
+
+**Reads are served from the in-process blockcache.** Once the write phase finishes, SlateDB has the just-written SST blocks in memory; the read phase never round-trips to MinIO. So `raw-slate` reads come out at ~100K ops/s (just blockcache lookups + envelope decode), and the cluster scenarios drop to whatever the shale fan-out costs: ~50K/s at n3-r1 (one gRPC hop), ~13K/s at n3-r3 (ReadQuorum fan-out + LWW). Those last two numbers are the same shape as the pebble cluster scenarios because the underlying backend Get is essentially free in both cases (RAM hit either way). A workload with a working set larger than the SlateDB blockcache would tell a very different story; that's a v0.6 follow-up.
+
+**Multi-writer per store is fenced; the harness gives each node its own DbName.** SlateDB enforces single-writer-per-store via writer-epoch. Naively wiring N cluster nodes to the same SlateDB instance would have them fence each other within milliseconds of cluster startup. The harness gives each node its own DbName (= node id) inside the shared bucket, so the 3-node scenarios run as 3 independent SlateDB stores. That's not how a real shale-on-slate deploy would be shaped (in production, ONE SlateDB per cluster, with shale's replication providing HA on top), but it's the only multi-node story consistent with SlateDB's single-writer guarantee in a single-process bench.
+
+**Caveat: this is loopback MinIO with no replication, no TLS, no S3 throttling.** Real S3 / R2 / GCS RTTs from a US-East EC2 instance to the same-region bucket are typically 5-15ms one-way; cross-region or cross-cloud is 50-200ms. A real-world slate write at ~3x that RTT puts the floor at ~15-45ms p50 in the best case and ~150-600ms in the worst. The 103ms we see here is dominated by MinIO's own commit fsync inside colima (virtualized disk on Apple Silicon).
+
+### Reproducing the slate run
+
+```bash
+make bench-v0.5-slate                                    # canonical (500 ops, 1KB, conc 8)
+SHALE_BENCH_OPS=2000 make bench-v0.5-slate               # more samples; ~30-60s/scenario
+SHALE_BENCH_CONC=32 make bench-v0.5-slate                # squeeze peak throughput
+SLATEDB_LIB_DIR=/path/to/lib make bench-v0.5-slate       # custom SlateDB cdylib
+```
+
+Requirements:
+
+- Docker reachable (colima or Docker Desktop on macOS; native docker in CI).
+- The SlateDB cdylib (`libslatedb_uniffi.{dylib,so}`). Default lookup is `/private/tmp/slatedb-src/target/release`; override via `SLATEDB_LIB_DIR`.
+- cgo toolchain (`CGO_ENABLED=1`), same setup as `make test-slate`.
+
+The script brings up `shale-bench-minio` on host port 19000, creates the `shale-bench` bucket, runs the 4 scenarios (re-creating the bucket between each so the previous run's writer epochs don't fence the next open), prints the markdown table, and tears MinIO down on exit. To reuse an existing MinIO instead, export `SHALE_BENCH_S3_ENDPOINT` + `SHALE_BENCH_S3_BUCKET` + `SHALE_BENCH_S3_ACCESS_KEY` + `SHALE_BENCH_S3_SECRET_KEY` before invoking; the script will skip the docker dance.
+
 ## What this bench does NOT measure
 
 - **Cross-host network cost.** Loopback gRPC + loopback memberlist have no real RTT. Real-world R=3 numbers will be worse (~ +1 inter-host RTT per fan-out) but multi-host setups may also recover throughput because each pebble backend gets its own disk.
-- **Slate backend.** Excluded from the v0.5 suite because it requires MinIO + the slatedb build tag. Slate-specific benches can plug in once the MinIO CI fixture (added in v0.5) is reusable.
+- **Cross-region S3 RTT for the slate suite.** Local-MinIO numbers are a floor; real AWS S3 RTTs push slate write p50 into the 50-200ms range depending on placement.
 - **Topology change cost.** Membership churn (node add/leave/rebalance) is its own measurement; the v0.5 suite assumes a stable cluster.
 - **Large values.** 1KB is small; gRPC overhead dominates. A 64KB/256KB variant would tell a different story (backend cost rises, gRPC cost stays roughly fixed per call).
 - **Long-tail percentiles beyond p99.** p99.9 / max would surface GC pauses + scheduler stalls on the in-process model. Worth a follow-up.
+- **Slate reads against a cold blockcache.** The current slate bench writes then immediately reads the same keys, so every Get hits SlateDB's in-process blockcache and never round-trips to S3. A workload larger than the cache (or a fresh-process read phase) would surface object-storage read RTT in the Get column too.

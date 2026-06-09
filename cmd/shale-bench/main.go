@@ -73,7 +73,7 @@ func main() {
 // scenario captures the inputs that drive one bench run.
 type scenario struct {
 	Mode         string // "raw" or "cluster"
-	Backend      string // "memory" or "pebble"
+	Backend      string // "memory", "pebble", or "slate"
 	Nodes        int    // 1, 3, ...
 	R            int    // replication factor
 	Ops          int    // total ops per phase
@@ -132,7 +132,11 @@ Flags:
                             cluster wires a single-process N-node shale
                             cluster with the requested R and routes through
                             it. (default cluster)
-  --backend memory|pebble   storage engine to drive (default pebble)
+  --backend memory|pebble|slate
+                            storage engine to drive (default pebble).
+                            slate requires the binary built with
+                            -tags slatedb plus SHALE_BENCH_S3_* env vars
+                            (see cmd/shale-bench/slate.go for the list).
   --nodes N                 cluster node count (cluster mode only; default 1)
   --rf R                    replication factor (cluster mode only; default 1)
   --ops N                   operations per phase (default 10000)
@@ -143,7 +147,7 @@ Flags:
 `)
 	}
 	mode := fs.String("mode", "cluster", "raw|cluster")
-	backendName := fs.String("backend", "pebble", "memory|pebble")
+	backendName := fs.String("backend", "pebble", "memory|pebble|slate")
 	nodes := fs.Int("nodes", 1, "cluster node count")
 	rf := fs.Int("rf", 1, "replication factor")
 	ops := fs.Int("ops", 10000, "operations per phase")
@@ -162,8 +166,8 @@ Flags:
 		fmt.Fprintf(stderr, "shale-bench: --mode must be raw or cluster\n")
 		return 2
 	}
-	if *backendName != "memory" && *backendName != "pebble" {
-		fmt.Fprintf(stderr, "shale-bench: --backend must be memory or pebble\n")
+	if *backendName != "memory" && *backendName != "pebble" && *backendName != "slate" {
+		fmt.Fprintf(stderr, "shale-bench: --backend must be memory, pebble, or slate\n")
 		return 2
 	}
 	if *ops < 1 {
@@ -324,8 +328,9 @@ func (c *clusterAdapter) Get(key []byte) ([]byte, error) {
 }
 
 // openBackend builds one backend instance. id distinguishes pebble
-// data directories so a multi-node scenario doesn't collide on the
-// same DBA. memory ignores both args.
+// data directories AND (for slate) per-node DbName prefixes so a
+// multi-node scenario doesn't collide on the same store. memory
+// ignores both args.
 func openBackend(name, baseDir, id string) (backend.Backend, error) {
 	switch name {
 	case "memory":
@@ -336,9 +341,19 @@ func openBackend(name, baseDir, id string) (backend.Backend, error) {
 			return nil, fmt.Errorf("mkdir %s: %w", dir, err)
 		}
 		return pebble.New(pebble.Config{Dir: dir})
+	case "slate":
+		return openSlateBackend(id)
 	default:
 		return nil, fmt.Errorf("unknown backend %q", name)
 	}
+}
+
+// openSlateBackend is overridden by the slatedb-tagged build (see
+// slate.go). The default (no-tag) build returns a clear error so the
+// harness fails fast when an operator picks --backend=slate without
+// rebuilding with -tags slatedb.
+var openSlateBackend = func(id string) (backend.Backend, error) {
+	return nil, fmt.Errorf("slate backend requires -tags slatedb build (got id=%s)", id)
 }
 
 // builtCluster captures the state we have to tear down at end of run.

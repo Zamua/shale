@@ -80,6 +80,27 @@ func TestRun_ClusterMemory_JSONShape(t *testing.T) {
 	}
 }
 
+// TestRun_SlateBackend_AcceptedButFailsWithoutTag confirms the flag
+// validator no longer rejects --backend=slate up-front (so the slatedb-
+// tagged build can take over via init()), and that the default no-tag
+// build still surfaces a clear "requires -tags slatedb" error when an
+// operator picks slate without rebuilding the harness. Anchors the
+// "stub returns error" contract from openSlateBackend in main.go.
+func TestRun_SlateBackend_AcceptedButFailsWithoutTag(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := run([]string{
+		"--mode", "raw",
+		"--backend", "slate",
+		"--ops", "1",
+	}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("expected non-zero rc, got 0 (stdout=%q)", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "slatedb") {
+		t.Errorf("expected stderr to mention slatedb build tag; got %q", stderr.String())
+	}
+}
+
 // TestRun_InvalidFlags rejects the obviously wrong combinations.
 func TestRun_InvalidFlags(t *testing.T) {
 	cases := []struct {
