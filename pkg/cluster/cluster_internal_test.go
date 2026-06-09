@@ -5,6 +5,7 @@ package cluster
 // behavior the public-API tests cannot reach.
 
 import (
+	"bytes"
 	"io"
 	"net"
 	"strconv"
@@ -13,9 +14,12 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/membership"
+	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // freeTCPPort returns an OS-assigned ephemeral TCP port. Mirrors the
@@ -217,4 +221,134 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 	}
 	t.Fatalf("addr-change eviction did not happen: ring peer-1 addr=%q (want %q), oldAddr still cached=%v",
 		gotAddr, newAddr, stillCached)
+}
+
+// TestPut_DuringMigrationReturnsFailedPrecondition pins the v0.3
+// "Cutover" contract end-to-end on the cluster.Put guard: when the
+// local Coordinator says a key's partition is mid-migration
+// (StateSending), Put returns codes.FailedPrecondition with a
+// retry-after hint, so SDK clients can back off + retry instead of
+// silently dropping the write.
+//
+// White-box because the deterministic path goes through the
+// cluster's own Coordinator: directly invoking
+// c.rebalance.Evaluate (against a synthetic outgoing ring) puts
+// the partitions in StateSending without needing a second real
+// node or a timing-race against memberlist convergence. The
+// blockingMigrateSource holds the partitions there so the guard
+// window stays open long enough for the assertion to run.
+func TestPut_DuringMigrationReturnsFailedPrecondition(t *testing.T) {
+	port := freeTCPPort(t)
+	be := memory.New()
+	c, err := Open(Config{
+		NodeID:                 "rb-source",
+		Backend:                be,
+		BindAddr:               hp(port),
+		GRPCAddr:               "127.0.0.1:1",
+		LogOutput:              io.Discard,
+		RebalanceSettleDelay:   500 * time.Millisecond,
+		RebalanceGraceDuration: 10 * time.Second,
+		RebalanceRetryAfterMs:  77,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	if !waitForLocalInRing(c, 2*time.Second) {
+		t.Fatalf("local member never landed in ring")
+	}
+
+	// Seed enough keys that any randomly migrating partition holds
+	// at least one. 200 spreads across 271 partitions ~uniformly.
+	var keys [][]byte
+	for i := 0; i < 200; i++ {
+		k := []byte("rb-" + strconv.Itoa(i))
+		if err := c.Put(k, []byte("v")); err != nil {
+			t.Fatalf("seed put: %v", err)
+		}
+		keys = append(keys, k)
+	}
+
+	// Build the old + new ring shapes: old = current ring (only
+	// rb-source); new = current + a synthetic peer. ~half the
+	// partitions become Sends from us to the peer.
+	old := ring.New()
+	for _, m := range c.ring.Members() {
+		old.Add(m)
+	}
+	new := ring.New()
+	for _, m := range c.ring.Members() {
+		new.Add(m)
+	}
+	new.Add(ring.Member{ID: "rb-elsewhere", Addr: "127.0.0.1:65535"})
+
+	// Swap the cluster's Coordinator for one whose source blocks
+	// indefinitely. Every Send goroutine pins its partition in
+	// StateSending until we release the block, which keeps the
+	// guard window open across the assertion.
+	src := &blockingTestSource{released: make(chan struct{})}
+	opts := rebalance.DefaultOptions()
+	opts.GraceDuration = 10 * time.Second
+	opts.Source = src
+	opts.Destination = &clusterDestination{c: c}
+	c.rebalance.Stop()
+	c.rebalance = rebalance.New(rebalance.Member{ID: "rb-source"}, be, opts)
+	c.rebalance.Evaluate(old, new, c.ringGen.Load())
+	defer close(src.released)
+
+	// Wait until at least one of our seeded keys' partitions is
+	// reported migrating by the cluster's Coordinator.
+	var movingKey []byte
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, k := range keys {
+			if c.rebalance.IsMigrating(k) {
+				movingKey = k
+				break
+			}
+		}
+		if movingKey != nil {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if movingKey == nil {
+		t.Fatalf("no seeded key entered StateSending; coordinator snapshot=%+v", c.rebalance.Snapshot())
+	}
+
+	// Put against the migrating key MUST return FailedPrecondition.
+	err = c.Put(movingKey, []byte("post"))
+	if err == nil {
+		t.Fatalf("Put for migrating key returned nil; want FailedPrecondition")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("Put error is not a gRPC status: %v", err)
+	}
+	if st.Code() != codes.FailedPrecondition {
+		t.Fatalf("Put for migrating key: want FailedPrecondition, got %s (%v)", st.Code(), err)
+	}
+	if !bytes.Contains([]byte(st.Message()), []byte("retry")) {
+		t.Fatalf("FailedPrecondition message %q lacks a retry hint; SDK clients need it to back off", st.Message())
+	}
+}
+
+// blockingTestSource holds OpenRange's data channel open until
+// released is closed. Used to pin Coordinator partitions in
+// StateSending for the duration of an assertion.
+type blockingTestSource struct {
+	released chan struct{}
+}
+
+func (s *blockingTestSource) OpenRange(_ []uint64, _ uint64) (<-chan rebalance.KeyValue, <-chan error) {
+	out := make(chan rebalance.KeyValue)
+	errCh := make(chan error, 1)
+	go func() {
+		defer close(out)
+		defer close(errCh)
+		<-s.released
+		errCh <- nil
+	}()
+	return out, errCh
 }

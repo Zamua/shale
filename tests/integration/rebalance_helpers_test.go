@@ -20,6 +20,8 @@ import (
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/ring"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // perNodeKeyCount returns a map nodeID -> physical key count by
@@ -133,17 +135,43 @@ func waitForRebalanceIdle(t *testing.T, ref *cluster.Cluster, nodes []*testNode,
 // putN writes n keys via c with the given key/value prefix + returns
 // the list of keys written, in order. The value for key K is
 // expectedValue(K), which assertAllGettable inverts on reads.
+//
+// Retries on FailedPrecondition: per docs/SPEC.md "Cutover", that
+// code is the transient migration-window rejection + the SDK is
+// expected to retry. Bounded so a permanently-broken cluster fails
+// loudly instead of hanging.
 func putN(t *testing.T, c *cluster.Cluster, prefix string, n int) []string {
 	t.Helper()
 	keys := make([]string, n)
 	for i := 0; i < n; i++ {
 		k := fmt.Sprintf("%s-%04d", prefix, i)
-		if err := c.Put([]byte(k), []byte(expectedValue(k))); err != nil {
+		if err := putWithRetry(c, []byte(k), []byte(expectedValue(k))); err != nil {
 			t.Fatalf("Put %s: %v", k, err)
 		}
 		keys[i] = k
 	}
 	return keys
+}
+
+// putWithRetry retries Put up to 50 times (~5s wall-clock at 100ms
+// backoff) on FailedPrecondition, surfacing any other error
+// immediately. Mirrors the bounded-retry behavior an SDK client
+// would implement for the migration-window write rejections.
+func putWithRetry(c *cluster.Cluster, key, value []byte) error {
+	var lastErr error
+	for i := 0; i < 50; i++ {
+		err := c.Put(key, value)
+		if err == nil {
+			return nil
+		}
+		if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
+			lastErr = err
+			time.Sleep(100 * time.Millisecond)
+			continue
+		}
+		return err
+	}
+	return lastErr
 }
 
 // expectedValue is the canonical {key -> value} mapping used by every

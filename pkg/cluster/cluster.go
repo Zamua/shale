@@ -33,6 +33,7 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/membership"
+	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
 )
 
@@ -79,6 +80,25 @@ type Config struct {
 	// LogOutput is where membership's internal logger writes. nil
 	// means memberlist's default (stderr). Tests pass io.Discard.
 	LogOutput io.Writer
+
+	// RebalanceSettleDelay is how long the cluster waits after a
+	// membership event before kicking off Evaluate. Each subsequent
+	// event in the window resets the timer (debounce). Zero falls
+	// back to the package default (5s; matches docs/SPEC.md).
+	RebalanceSettleDelay time.Duration
+
+	// RebalanceRetryAfterMs is the hint returned in the
+	// FailedPrecondition error when a Put / Delete lands on a key
+	// whose partition is migrating out. Clients SHOULD wait this
+	// many ms before retrying. Zero falls back to 50ms (matches
+	// rebalance.DefaultOptions).
+	RebalanceRetryAfterMs int
+
+	// RebalanceGraceDuration is how long a HandedOff range stays on
+	// the source before the sweep deletes its now-foreign keys. Zero
+	// falls back to rebalance.DefaultOptions (60s). Integration
+	// tests + faster-feedback fixtures pass small values.
+	RebalanceGraceDuration time.Duration
 }
 
 // Cluster is the public handle apps use. All operations are
@@ -103,6 +123,23 @@ type Cluster struct {
 	closeOnce sync.Once
 	closed    atomic.Bool
 	loopWG    sync.WaitGroup
+
+	// Rebalance state (multi-node only; nil in single-node mode).
+	// rebalance is the per-range Coordinator. ringGen is the monotonic
+	// generation counter bumped on every membership-driven ring change
+	// (events loop + reconcile loop both call bumpRingGen). lastEvalRing
+	// is the ring snapshot from the most recent Evaluate, paired with
+	// the live ring on the next tick to compute the delta plan.
+	// settleMu + settleTimer drive the debounce: every ring change
+	// (re)arms the timer; when it fires, runEvaluate computes the plan.
+	// rebalanceCtx / rebalanceCancel drive the background sweep loop.
+	rebalance       *rebalance.Coordinator
+	ringGen         atomic.Uint64
+	settleMu        sync.Mutex
+	settleTimer     *time.Timer
+	lastEvalRing    *ring.Ring
+	rebalanceCtx    context.Context
+	rebalanceCancel context.CancelFunc
 }
 
 // Open initializes a Cluster from cfg. In single-node mode it just
@@ -168,6 +205,11 @@ func Open(cfg Config) (*Cluster, error) {
 	go c.runEventsLoop()
 	go c.runReconcileLoop()
 
+	// Rebalance machinery: Coordinator + settle-timer + sweep.
+	// initRebalance must come AFTER the ring has been seeded so
+	// snapshotRing() picks up the local + seed members.
+	c.initRebalance()
+
 	return c, nil
 }
 
@@ -196,12 +238,14 @@ func (c *Cluster) runEventsLoop() {
 				if oldAddr != "" && oldAddr != ev.Member.Addr {
 					c.evictClient(oldAddr)
 				}
+				c.bumpRingGen()
 			case membership.EventLeave:
 				c.ring.Remove(ev.Member.ID)
 				// Drop any cached client for this departed peer so
 				// the next dial picks up a fresh connection if the
 				// same node ever returns on a different address.
 				c.evictClient(ev.Member.Addr)
+				c.bumpRingGen()
 			}
 		case <-c.closeCh:
 			return
@@ -243,6 +287,7 @@ func (c *Cluster) reconcileRingFromMembership() {
 	for _, m := range snap {
 		want[m.ID] = ring.Member{ID: m.ID, Addr: m.Addr}
 	}
+	changed := false
 	// Add anyone missing from the ring (or with a stale Addr).
 	for id, m := range want {
 		oldAddr := c.priorAddrForID(id)
@@ -251,6 +296,7 @@ func (c *Cluster) reconcileRingFromMembership() {
 			if oldAddr != "" {
 				c.evictClient(oldAddr)
 			}
+			changed = true
 		}
 	}
 	// Remove anyone the ring still has but membership has dropped.
@@ -258,7 +304,15 @@ func (c *Cluster) reconcileRingFromMembership() {
 		if _, ok := want[m.ID]; !ok {
 			c.ring.Remove(m.ID)
 			c.evictClient(m.Addr)
+			changed = true
 		}
+	}
+	if changed {
+		// A reconcile-driven ring change is no different from an
+		// event-driven one as far as the rebalance protocol cares;
+		// arm the settle timer so the missed delta gets folded into
+		// the next Evaluate.
+		c.bumpRingGen()
 	}
 }
 
@@ -331,9 +385,31 @@ func (c *Cluster) Close() error {
 
 	var firstErr error
 
+	// Stop the settle timer so it can't fire a fresh Evaluate after
+	// the membership is torn down. Held in settleMu to coordinate
+	// with scheduleEvaluate.
+	c.settleMu.Lock()
+	if c.settleTimer != nil {
+		c.settleTimer.Stop()
+		c.settleTimer = nil
+	}
+	c.settleMu.Unlock()
+
+	// Stop the Coordinator + cancel the sweep context. Coordinator.Stop
+	// closes its internal stopCh which terminates in-flight FetchRange
+	// goroutines; cancel of rebalanceCtx terminates the sweep loop. Both
+	// are idempotent.
+	if c.rebalance != nil {
+		c.rebalance.Stop()
+	}
+	if c.rebalanceCancel != nil {
+		c.rebalanceCancel()
+	}
+
 	// Signal the events + reconcile loops to exit + wait for them
 	// before tearing down membership so we don't race with a late
-	// ring.Add on closed ring.
+	// ring.Add on closed ring. The sweep goroutine also drains via
+	// loopWG (initRebalance adds 1 to the wait group for it).
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	c.loopWG.Wait()
 
@@ -433,12 +509,21 @@ func (c *Cluster) evictClient(addr string) {
 // -- KV surface (mirrors backend.Backend) ----------------------------------
 
 // Put stores value under key, routing to the owning node.
+//
+// v0.3 rebalancing: if the key's partition is mid-migration on this
+// node (either streaming out OR being received), the local Put is
+// rejected with codes.FailedPrecondition + a retry-after hint.
+// Clients should retry with backoff per the hint; the SDK wraps this
+// transparently with a bounded retry budget.
 func (c *Cluster) Put(key, value []byte) error {
 	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
 	}
 	owner, local := c.ownerOf(key)
 	if local {
+		if c.rebalance != nil && (c.rebalance.IsMigrating(key) || c.rebalance.IsReceiving(key)) {
+			return migrationGuardError(c.retryAfterMs())
+		}
 		return c.backend.Put(key, value)
 	}
 	cli, err := c.clientFor(owner.Addr)
@@ -449,12 +534,23 @@ func (c *Cluster) Put(key, value []byte) error {
 }
 
 // Get returns the value for key, routing to the owning node.
+//
+// v0.3 rebalancing: if the key's partition is being received into
+// this node (StateReceiving), the local data is not yet authoritative
+// + the source still owns reads. We return a "try other owner"
+// FailedPrecondition so the client can retry against the previous
+// owner (or wait for the ring to converge + retry). Source-side
+// IsMigrating (StateSending / StateHandedOff) is fine: we still
+// have the data locally + serve the read normally.
 func (c *Cluster) Get(key []byte) ([]byte, error) {
 	if c.closed.Load() || c.backend == nil {
 		return nil, backend.ErrClosed
 	}
 	owner, local := c.ownerOf(key)
 	if local {
+		if c.rebalance != nil && c.rebalance.IsReceiving(key) {
+			return nil, readMigrationHintError()
+		}
 		return c.backend.Get(key)
 	}
 	cli, err := c.clientFor(owner.Addr)
@@ -472,12 +568,19 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 }
 
 // Delete removes key, routing to the owning node.
+//
+// v0.3 rebalancing: same write-guard semantics as Put. Mid-migration
+// keys are rejected with FailedPrecondition + retry-after; the
+// client retries once the range hands off cleanly.
 func (c *Cluster) Delete(key []byte) error {
 	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
 	}
 	owner, local := c.ownerOf(key)
 	if local {
+		if c.rebalance != nil && (c.rebalance.IsMigrating(key) || c.rebalance.IsReceiving(key)) {
+			return migrationGuardError(c.retryAfterMs())
+		}
 		return c.backend.Delete(key)
 	}
 	cli, err := c.clientFor(owner.Addr)

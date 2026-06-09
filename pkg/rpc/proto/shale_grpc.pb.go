@@ -34,14 +34,16 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	ShaleNode_Put_FullMethodName        = "/shale.v1.ShaleNode/Put"
-	ShaleNode_Get_FullMethodName        = "/shale.v1.ShaleNode/Get"
-	ShaleNode_Delete_FullMethodName     = "/shale.v1.ShaleNode/Delete"
-	ShaleNode_ScanPrefix_FullMethodName = "/shale.v1.ShaleNode/ScanPrefix"
-	ShaleNode_LocalScan_FullMethodName  = "/shale.v1.ShaleNode/LocalScan"
-	ShaleNode_Topology_FullMethodName   = "/shale.v1.ShaleNode/Topology"
-	ShaleNode_Stats_FullMethodName      = "/shale.v1.ShaleNode/Stats"
-	ShaleNode_Ping_FullMethodName       = "/shale.v1.ShaleNode/Ping"
+	ShaleNode_Put_FullMethodName              = "/shale.v1.ShaleNode/Put"
+	ShaleNode_Get_FullMethodName              = "/shale.v1.ShaleNode/Get"
+	ShaleNode_Delete_FullMethodName           = "/shale.v1.ShaleNode/Delete"
+	ShaleNode_ScanPrefix_FullMethodName       = "/shale.v1.ShaleNode/ScanPrefix"
+	ShaleNode_LocalScan_FullMethodName        = "/shale.v1.ShaleNode/LocalScan"
+	ShaleNode_Topology_FullMethodName         = "/shale.v1.ShaleNode/Topology"
+	ShaleNode_Stats_FullMethodName            = "/shale.v1.ShaleNode/Stats"
+	ShaleNode_Ping_FullMethodName             = "/shale.v1.ShaleNode/Ping"
+	ShaleNode_MigrateRange_FullMethodName     = "/shale.v1.ShaleNode/MigrateRange"
+	ShaleNode_ProposeRebalance_FullMethodName = "/shale.v1.ShaleNode/ProposeRebalance"
 )
 
 // ShaleNodeClient is the client API for ShaleNode service.
@@ -85,6 +87,26 @@ type ShaleNodeClient interface {
 	// Ping is a no-op round trip for liveness checks. Useful for the CLI
 	// `shale ping` subcommand + for inter-node health probes later.
 	Ping(ctx context.Context, in *PingRequest, opts ...grpc.CallOption) (*PingResponse, error)
+	// MigrateRange is the v0.3 rebalancing transport. The destination
+	// (the node whose ring now lists it as owner of the given partitions)
+	// initiates the call; the source streams every key/value pair whose
+	// shard key falls in any of the requested partitions, then closes
+	// with a MigrationDone marker carrying the total key count + a
+	// CRC32-based checksum of the concatenated key|value bytes.
+	//
+	// RangeSpec.ring_generation lets the source reject a request whose
+	// ring view is stale relative to its own: if the destination's
+	// generation is behind the source's current ring, the source returns
+	// FailedPrecondition rather than streaming data that will get
+	// discarded on the next Evaluate pass.
+	MigrateRange(ctx context.Context, in *RangeSpec, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateChunk], error)
+	// ProposeRebalance is the operator-facing path for the
+	// `shale rebalance --dry-run | --apply | --cancel` subcommand. It
+	// returns the per-partition plan the local node would execute against
+	// the current ring (or the in-flight plan, if one is running). Exactly
+	// one of dry_run / apply / cancel must be true; the server returns
+	// InvalidArgument otherwise.
+	ProposeRebalance(ctx context.Context, in *ProposeRebalanceRequest, opts ...grpc.CallOption) (*ProposeRebalanceResponse, error)
 }
 
 type shaleNodeClient struct {
@@ -193,6 +215,35 @@ func (c *shaleNodeClient) Ping(ctx context.Context, in *PingRequest, opts ...grp
 	return out, nil
 }
 
+func (c *shaleNodeClient) MigrateRange(ctx context.Context, in *RangeSpec, opts ...grpc.CallOption) (grpc.ServerStreamingClient[MigrateChunk], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &ShaleNode_ServiceDesc.Streams[2], ShaleNode_MigrateRange_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[RangeSpec, MigrateChunk]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShaleNode_MigrateRangeClient = grpc.ServerStreamingClient[MigrateChunk]
+
+func (c *shaleNodeClient) ProposeRebalance(ctx context.Context, in *ProposeRebalanceRequest, opts ...grpc.CallOption) (*ProposeRebalanceResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ProposeRebalanceResponse)
+	err := c.cc.Invoke(ctx, ShaleNode_ProposeRebalance_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ShaleNodeServer is the server API for ShaleNode service.
 // All implementations must embed UnimplementedShaleNodeServer
 // for forward compatibility.
@@ -234,6 +285,26 @@ type ShaleNodeServer interface {
 	// Ping is a no-op round trip for liveness checks. Useful for the CLI
 	// `shale ping` subcommand + for inter-node health probes later.
 	Ping(context.Context, *PingRequest) (*PingResponse, error)
+	// MigrateRange is the v0.3 rebalancing transport. The destination
+	// (the node whose ring now lists it as owner of the given partitions)
+	// initiates the call; the source streams every key/value pair whose
+	// shard key falls in any of the requested partitions, then closes
+	// with a MigrationDone marker carrying the total key count + a
+	// CRC32-based checksum of the concatenated key|value bytes.
+	//
+	// RangeSpec.ring_generation lets the source reject a request whose
+	// ring view is stale relative to its own: if the destination's
+	// generation is behind the source's current ring, the source returns
+	// FailedPrecondition rather than streaming data that will get
+	// discarded on the next Evaluate pass.
+	MigrateRange(*RangeSpec, grpc.ServerStreamingServer[MigrateChunk]) error
+	// ProposeRebalance is the operator-facing path for the
+	// `shale rebalance --dry-run | --apply | --cancel` subcommand. It
+	// returns the per-partition plan the local node would execute against
+	// the current ring (or the in-flight plan, if one is running). Exactly
+	// one of dry_run / apply / cancel must be true; the server returns
+	// InvalidArgument otherwise.
+	ProposeRebalance(context.Context, *ProposeRebalanceRequest) (*ProposeRebalanceResponse, error)
 	mustEmbedUnimplementedShaleNodeServer()
 }
 
@@ -267,6 +338,12 @@ func (UnimplementedShaleNodeServer) Stats(context.Context, *StatsRequest) (*Stat
 }
 func (UnimplementedShaleNodeServer) Ping(context.Context, *PingRequest) (*PingResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Ping not implemented")
+}
+func (UnimplementedShaleNodeServer) MigrateRange(*RangeSpec, grpc.ServerStreamingServer[MigrateChunk]) error {
+	return status.Error(codes.Unimplemented, "method MigrateRange not implemented")
+}
+func (UnimplementedShaleNodeServer) ProposeRebalance(context.Context, *ProposeRebalanceRequest) (*ProposeRebalanceResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ProposeRebalance not implemented")
 }
 func (UnimplementedShaleNodeServer) mustEmbedUnimplementedShaleNodeServer() {}
 func (UnimplementedShaleNodeServer) testEmbeddedByValue()                   {}
@@ -419,6 +496,35 @@ func _ShaleNode_Ping_Handler(srv interface{}, ctx context.Context, dec func(inte
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ShaleNode_MigrateRange_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(RangeSpec)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(ShaleNodeServer).MigrateRange(m, &grpc.GenericServerStream[RangeSpec, MigrateChunk]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type ShaleNode_MigrateRangeServer = grpc.ServerStreamingServer[MigrateChunk]
+
+func _ShaleNode_ProposeRebalance_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ProposeRebalanceRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShaleNodeServer).ProposeRebalance(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ShaleNode_ProposeRebalance_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShaleNodeServer).ProposeRebalance(ctx, req.(*ProposeRebalanceRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ShaleNode_ServiceDesc is the grpc.ServiceDesc for ShaleNode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -450,6 +556,10 @@ var ShaleNode_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "Ping",
 			Handler:    _ShaleNode_Ping_Handler,
 		},
+		{
+			MethodName: "ProposeRebalance",
+			Handler:    _ShaleNode_ProposeRebalance_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
 		{
@@ -460,6 +570,11 @@ var ShaleNode_ServiceDesc = grpc.ServiceDesc{
 		{
 			StreamName:    "LocalScan",
 			Handler:       _ShaleNode_LocalScan_Handler,
+			ServerStreams: true,
+		},
+		{
+			StreamName:    "MigrateRange",
+			Handler:       _ShaleNode_MigrateRange_Handler,
 			ServerStreams: true,
 		},
 	},

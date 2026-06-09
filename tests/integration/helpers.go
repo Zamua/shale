@@ -15,16 +15,28 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
 	"strconv"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"google.golang.org/grpc"
 )
+
+// TestMain shrinks the rebalance package's sweep tick + grace
+// duration once for the whole integration test binary. Production
+// stays at the package defaults (10s sweep, 60s grace); the
+// integration tests need sub-second feedback so the sweep can fire
+// within the per-test wall-clock budgets.
+func TestMain(m *testing.M) {
+	rebalance.SetSweepInterval(50 * time.Millisecond)
+	os.Exit(m.Run())
+}
 
 // testNode is the bundle of state behind one node in an integration
 // fixture: the cluster handle the test drives, the in-memory backend
@@ -87,6 +99,15 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 		BindAddr:  bindAddr,
 		GRPCAddr:  grpcAddr,
 		LogOutput: io.Discard,
+		// Shrunken rebalance tunables: keep integration tests
+		// snappy without changing protocol semantics. Settle delay
+		// is short so the eval kicks fast on membership changes;
+		// grace is long enough for the destination's pull to
+		// complete (a few hundred keys over loopback gRPC), then
+		// the sweep fires + the post-test assertions see clean
+		// per-node ownership.
+		RebalanceSettleDelay:   500 * time.Millisecond,
+		RebalanceGraceDuration: 3 * time.Second,
 	}
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}

@@ -83,3 +83,34 @@ func (c *Client) Ping(ctx context.Context) error {
 	_, err := c.api.Ping(ctx, &pb.PingRequest{})
 	return err
 }
+
+// -- Rebalancing ops (v0.3 scaffold) ---------------------------------
+
+// MigrateRange opens the source-to-destination stream for the v0.3
+// rebalancing protocol. The destination (this caller) sends the set
+// of partition IDs it claims ownership of plus its ring generation;
+// the source replies with a stream of MigrateChunk messages
+// (KeyValue pairs followed by exactly one MigrationDone marker).
+//
+// Callers iterate the stream via Recv until io.EOF, branching on the
+// oneof body to distinguish payload chunks from the terminal marker.
+// Kept thin so callers don't pay for an intermediate buffer when
+// streaming large ranges.
+func (c *Client) MigrateRange(ctx context.Context, partitionIDs []uint64, ringGeneration uint64) (grpc.ServerStreamingClient[pb.MigrateChunk], error) {
+	return c.api.MigrateRange(ctx, &pb.RangeSpec{
+		PartitionIds:   partitionIDs,
+		RingGeneration: ringGeneration,
+	})
+}
+
+// ProposeRebalance is the CLI-side caller for
+// `shale rebalance --dry-run | --apply | --cancel`. Exactly one of
+// dryRun / apply / cancel must be true; the server returns
+// InvalidArgument otherwise.
+func (c *Client) ProposeRebalance(ctx context.Context, dryRun, apply, cancel bool) (*pb.ProposeRebalanceResponse, error) {
+	return c.api.ProposeRebalance(ctx, &pb.ProposeRebalanceRequest{
+		DryRun: dryRun,
+		Apply:  apply,
+		Cancel: cancel,
+	})
+}

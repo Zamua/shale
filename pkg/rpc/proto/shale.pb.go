@@ -884,6 +884,449 @@ func (*PingResponse) Descriptor() ([]byte, []int) {
 	return file_shale_proto_rawDescGZIP(), []int{16}
 }
 
+// RangeSpec identifies which partitions the destination claims it now
+// owns + the ring generation the destination is reasoning from. The
+// generation is monotonic + incremented per ring change so the source
+// can detect stale requests during the brief windows when peers
+// disagree about ownership.
+type RangeSpec struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// partition_ids the destination claims ownership of. The source
+	// iterates its local Backend over keys whose shard key falls into
+	// any of these partitions.
+	PartitionIds []uint64 `protobuf:"varint,1,rep,packed,name=partition_ids,json=partitionIds,proto3" json:"partition_ids,omitempty"`
+	// ring_generation is the destination's view of the ring at the
+	// moment it issued the request. The source compares this against
+	// its own current generation; if the destination is behind, the
+	// source returns FailedPrecondition + the next Evaluate pass on
+	// the destination will retry against the new ring.
+	RingGeneration uint64 `protobuf:"varint,2,opt,name=ring_generation,json=ringGeneration,proto3" json:"ring_generation,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *RangeSpec) Reset() {
+	*x = RangeSpec{}
+	mi := &file_shale_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RangeSpec) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RangeSpec) ProtoMessage() {}
+
+func (x *RangeSpec) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RangeSpec.ProtoReflect.Descriptor instead.
+func (*RangeSpec) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *RangeSpec) GetPartitionIds() []uint64 {
+	if x != nil {
+		return x.PartitionIds
+	}
+	return nil
+}
+
+func (x *RangeSpec) GetRingGeneration() uint64 {
+	if x != nil {
+		return x.RingGeneration
+	}
+	return 0
+}
+
+// MigrateChunk is one message in the server-streaming response. Each
+// message is either a key/value pair or, exactly once at the end, a
+// MigrationDone marker. Receivers MUST treat the stream as finished
+// when they see a done body, even if more messages appear after.
+type MigrateChunk struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	// Types that are valid to be assigned to Body:
+	//
+	//	*MigrateChunk_Kv
+	//	*MigrateChunk_Done
+	Body          isMigrateChunk_Body `protobuf_oneof:"body"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MigrateChunk) Reset() {
+	*x = MigrateChunk{}
+	mi := &file_shale_proto_msgTypes[18]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MigrateChunk) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MigrateChunk) ProtoMessage() {}
+
+func (x *MigrateChunk) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[18]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MigrateChunk.ProtoReflect.Descriptor instead.
+func (*MigrateChunk) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{18}
+}
+
+func (x *MigrateChunk) GetBody() isMigrateChunk_Body {
+	if x != nil {
+		return x.Body
+	}
+	return nil
+}
+
+func (x *MigrateChunk) GetKv() *KeyValue {
+	if x != nil {
+		if x, ok := x.Body.(*MigrateChunk_Kv); ok {
+			return x.Kv
+		}
+	}
+	return nil
+}
+
+func (x *MigrateChunk) GetDone() *MigrationDone {
+	if x != nil {
+		if x, ok := x.Body.(*MigrateChunk_Done); ok {
+			return x.Done
+		}
+	}
+	return nil
+}
+
+type isMigrateChunk_Body interface {
+	isMigrateChunk_Body()
+}
+
+type MigrateChunk_Kv struct {
+	Kv *KeyValue `protobuf:"bytes,1,opt,name=kv,proto3,oneof"`
+}
+
+type MigrateChunk_Done struct {
+	Done *MigrationDone `protobuf:"bytes,2,opt,name=done,proto3,oneof"`
+}
+
+func (*MigrateChunk_Kv) isMigrateChunk_Body() {}
+
+func (*MigrateChunk_Done) isMigrateChunk_Body() {}
+
+// KeyValue carries one migrated pair. Keys are raw bytes as stored in
+// the source Backend; the destination writes them through its own
+// Backend.Put unchanged.
+type KeyValue struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *KeyValue) Reset() {
+	*x = KeyValue{}
+	mi := &file_shale_proto_msgTypes[19]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *KeyValue) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*KeyValue) ProtoMessage() {}
+
+func (x *KeyValue) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[19]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use KeyValue.ProtoReflect.Descriptor instead.
+func (*KeyValue) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{19}
+}
+
+func (x *KeyValue) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *KeyValue) GetValue() []byte {
+	if x != nil {
+		return x.Value
+	}
+	return nil
+}
+
+// MigrationDone is the terminal marker. total_keys is the number of
+// KeyValue messages that preceded it on the stream; checksum is the
+// CRC32 (IEEE polynomial) of the concatenated key|value bytes in the
+// order they were sent. The destination recomputes the checksum as it
+// receives and rolls back the range on mismatch.
+type MigrationDone struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	TotalKeys     uint64                 `protobuf:"varint,1,opt,name=total_keys,json=totalKeys,proto3" json:"total_keys,omitempty"`
+	Checksum      []byte                 `protobuf:"bytes,2,opt,name=checksum,proto3" json:"checksum,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *MigrationDone) Reset() {
+	*x = MigrationDone{}
+	mi := &file_shale_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MigrationDone) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MigrationDone) ProtoMessage() {}
+
+func (x *MigrationDone) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MigrationDone.ProtoReflect.Descriptor instead.
+func (*MigrationDone) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *MigrationDone) GetTotalKeys() uint64 {
+	if x != nil {
+		return x.TotalKeys
+	}
+	return 0
+}
+
+func (x *MigrationDone) GetChecksum() []byte {
+	if x != nil {
+		return x.Checksum
+	}
+	return nil
+}
+
+// ProposeRebalanceRequest carries the operator's intent. Exactly one
+// of dry_run / apply / cancel must be true; the server returns
+// InvalidArgument otherwise.
+type ProposeRebalanceRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	DryRun        bool                   `protobuf:"varint,1,opt,name=dry_run,json=dryRun,proto3" json:"dry_run,omitempty"`
+	Apply         bool                   `protobuf:"varint,2,opt,name=apply,proto3" json:"apply,omitempty"`
+	Cancel        bool                   `protobuf:"varint,3,opt,name=cancel,proto3" json:"cancel,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProposeRebalanceRequest) Reset() {
+	*x = ProposeRebalanceRequest{}
+	mi := &file_shale_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProposeRebalanceRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProposeRebalanceRequest) ProtoMessage() {}
+
+func (x *ProposeRebalanceRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProposeRebalanceRequest.ProtoReflect.Descriptor instead.
+func (*ProposeRebalanceRequest) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *ProposeRebalanceRequest) GetDryRun() bool {
+	if x != nil {
+		return x.DryRun
+	}
+	return false
+}
+
+func (x *ProposeRebalanceRequest) GetApply() bool {
+	if x != nil {
+		return x.Apply
+	}
+	return false
+}
+
+func (x *ProposeRebalanceRequest) GetCancel() bool {
+	if x != nil {
+		return x.Cancel
+	}
+	return false
+}
+
+// ProposeRebalanceResponse returns the per-partition plan the local
+// node would execute (dry_run / apply) or has just cancelled (cancel).
+type ProposeRebalanceResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Ranges        []*RangePlanItem       `protobuf:"bytes,1,rep,name=ranges,proto3" json:"ranges,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProposeRebalanceResponse) Reset() {
+	*x = ProposeRebalanceResponse{}
+	mi := &file_shale_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProposeRebalanceResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProposeRebalanceResponse) ProtoMessage() {}
+
+func (x *ProposeRebalanceResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProposeRebalanceResponse.ProtoReflect.Descriptor instead.
+func (*ProposeRebalanceResponse) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ProposeRebalanceResponse) GetRanges() []*RangePlanItem {
+	if x != nil {
+		return x.Ranges
+	}
+	return nil
+}
+
+// RangePlanItem is one row of the rebalance plan: which partition,
+// who owns it now, who would own it after the plan applies, and a
+// rough size hint for operators eyeballing cost.
+type RangePlanItem struct {
+	state             protoimpl.MessageState `protogen:"open.v1"`
+	PartitionId       uint64                 `protobuf:"varint,1,opt,name=partition_id,json=partitionId,proto3" json:"partition_id,omitempty"`
+	CurrentOwner      string                 `protobuf:"bytes,2,opt,name=current_owner,json=currentOwner,proto3" json:"current_owner,omitempty"`
+	ProposedOwner     string                 `protobuf:"bytes,3,opt,name=proposed_owner,json=proposedOwner,proto3" json:"proposed_owner,omitempty"`
+	EstimatedKeyCount uint64                 `protobuf:"varint,4,opt,name=estimated_key_count,json=estimatedKeyCount,proto3" json:"estimated_key_count,omitempty"`
+	unknownFields     protoimpl.UnknownFields
+	sizeCache         protoimpl.SizeCache
+}
+
+func (x *RangePlanItem) Reset() {
+	*x = RangePlanItem{}
+	mi := &file_shale_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *RangePlanItem) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*RangePlanItem) ProtoMessage() {}
+
+func (x *RangePlanItem) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use RangePlanItem.ProtoReflect.Descriptor instead.
+func (*RangePlanItem) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *RangePlanItem) GetPartitionId() uint64 {
+	if x != nil {
+		return x.PartitionId
+	}
+	return 0
+}
+
+func (x *RangePlanItem) GetCurrentOwner() string {
+	if x != nil {
+		return x.CurrentOwner
+	}
+	return ""
+}
+
+func (x *RangePlanItem) GetProposedOwner() string {
+	if x != nil {
+		return x.ProposedOwner
+	}
+	return ""
+}
+
+func (x *RangePlanItem) GetEstimatedKeyCount() uint64 {
+	if x != nil {
+		return x.EstimatedKeyCount
+	}
+	return 0
+}
+
 var File_shale_proto protoreflect.FileDescriptor
 
 const file_shale_proto_rawDesc = "" +
@@ -936,7 +1379,32 @@ const file_shale_proto_rawDesc = "" +
 	"\x0elatency_ms_p50\x18\x06 \x01(\x01R\flatencyMsP50\x12$\n" +
 	"\x0elatency_ms_p99\x18\a \x01(\x01R\flatencyMsP99\"\r\n" +
 	"\vPingRequest\"\x0e\n" +
-	"\fPingResponse2\xf7\x03\n" +
+	"\fPingResponse\"Y\n" +
+	"\tRangeSpec\x12#\n" +
+	"\rpartition_ids\x18\x01 \x03(\x04R\fpartitionIds\x12'\n" +
+	"\x0fring_generation\x18\x02 \x01(\x04R\x0eringGeneration\"k\n" +
+	"\fMigrateChunk\x12$\n" +
+	"\x02kv\x18\x01 \x01(\v2\x12.shale.v1.KeyValueH\x00R\x02kv\x12-\n" +
+	"\x04done\x18\x02 \x01(\v2\x17.shale.v1.MigrationDoneH\x00R\x04doneB\x06\n" +
+	"\x04body\"2\n" +
+	"\bKeyValue\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
+	"\x05value\x18\x02 \x01(\fR\x05value\"J\n" +
+	"\rMigrationDone\x12\x1d\n" +
+	"\n" +
+	"total_keys\x18\x01 \x01(\x04R\ttotalKeys\x12\x1a\n" +
+	"\bchecksum\x18\x02 \x01(\fR\bchecksum\"`\n" +
+	"\x17ProposeRebalanceRequest\x12\x17\n" +
+	"\adry_run\x18\x01 \x01(\bR\x06dryRun\x12\x14\n" +
+	"\x05apply\x18\x02 \x01(\bR\x05apply\x12\x16\n" +
+	"\x06cancel\x18\x03 \x01(\bR\x06cancel\"K\n" +
+	"\x18ProposeRebalanceResponse\x12/\n" +
+	"\x06ranges\x18\x01 \x03(\v2\x17.shale.v1.RangePlanItemR\x06ranges\"\xae\x01\n" +
+	"\rRangePlanItem\x12!\n" +
+	"\fpartition_id\x18\x01 \x01(\x04R\vpartitionId\x12#\n" +
+	"\rcurrent_owner\x18\x02 \x01(\tR\fcurrentOwner\x12%\n" +
+	"\x0eproposed_owner\x18\x03 \x01(\tR\rproposedOwner\x12.\n" +
+	"\x13estimated_key_count\x18\x04 \x01(\x04R\x11estimatedKeyCount2\x91\x05\n" +
 	"\tShaleNode\x122\n" +
 	"\x03Put\x12\x14.shale.v1.PutRequest\x1a\x15.shale.v1.PutResponse\x122\n" +
 	"\x03Get\x12\x14.shale.v1.GetRequest\x1a\x15.shale.v1.GetResponse\x12;\n" +
@@ -946,7 +1414,9 @@ const file_shale_proto_rawDesc = "" +
 	"\tLocalScan\x12\x1a.shale.v1.LocalScanRequest\x1a\x1b.shale.v1.LocalScanResponse0\x01\x12A\n" +
 	"\bTopology\x12\x19.shale.v1.TopologyRequest\x1a\x1a.shale.v1.TopologyResponse\x128\n" +
 	"\x05Stats\x12\x16.shale.v1.StatsRequest\x1a\x17.shale.v1.StatsResponse\x125\n" +
-	"\x04Ping\x12\x15.shale.v1.PingRequest\x1a\x16.shale.v1.PingResponseB.Z,github.com/Zamua/shale/pkg/rpc/proto;shalepbb\x06proto3"
+	"\x04Ping\x12\x15.shale.v1.PingRequest\x1a\x16.shale.v1.PingResponse\x12=\n" +
+	"\fMigrateRange\x12\x13.shale.v1.RangeSpec\x1a\x16.shale.v1.MigrateChunk0\x01\x12Y\n" +
+	"\x10ProposeRebalance\x12!.shale.v1.ProposeRebalanceRequest\x1a\".shale.v1.ProposeRebalanceResponseB.Z,github.com/Zamua/shale/pkg/rpc/proto;shalepbb\x06proto3"
 
 var (
 	file_shale_proto_rawDescOnce sync.Once
@@ -960,49 +1430,63 @@ func file_shale_proto_rawDescGZIP() []byte {
 	return file_shale_proto_rawDescData
 }
 
-var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 17)
+var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 24)
 var file_shale_proto_goTypes = []any{
-	(*PutRequest)(nil),         // 0: shale.v1.PutRequest
-	(*PutResponse)(nil),        // 1: shale.v1.PutResponse
-	(*GetRequest)(nil),         // 2: shale.v1.GetRequest
-	(*GetResponse)(nil),        // 3: shale.v1.GetResponse
-	(*DeleteRequest)(nil),      // 4: shale.v1.DeleteRequest
-	(*DeleteResponse)(nil),     // 5: shale.v1.DeleteResponse
-	(*ScanPrefixRequest)(nil),  // 6: shale.v1.ScanPrefixRequest
-	(*ScanPrefixResponse)(nil), // 7: shale.v1.ScanPrefixResponse
-	(*LocalScanRequest)(nil),   // 8: shale.v1.LocalScanRequest
-	(*LocalScanResponse)(nil),  // 9: shale.v1.LocalScanResponse
-	(*TopologyRequest)(nil),    // 10: shale.v1.TopologyRequest
-	(*TopologyResponse)(nil),   // 11: shale.v1.TopologyResponse
-	(*NodeInfo)(nil),           // 12: shale.v1.NodeInfo
-	(*StatsRequest)(nil),       // 13: shale.v1.StatsRequest
-	(*StatsResponse)(nil),      // 14: shale.v1.StatsResponse
-	(*PingRequest)(nil),        // 15: shale.v1.PingRequest
-	(*PingResponse)(nil),       // 16: shale.v1.PingResponse
+	(*PutRequest)(nil),               // 0: shale.v1.PutRequest
+	(*PutResponse)(nil),              // 1: shale.v1.PutResponse
+	(*GetRequest)(nil),               // 2: shale.v1.GetRequest
+	(*GetResponse)(nil),              // 3: shale.v1.GetResponse
+	(*DeleteRequest)(nil),            // 4: shale.v1.DeleteRequest
+	(*DeleteResponse)(nil),           // 5: shale.v1.DeleteResponse
+	(*ScanPrefixRequest)(nil),        // 6: shale.v1.ScanPrefixRequest
+	(*ScanPrefixResponse)(nil),       // 7: shale.v1.ScanPrefixResponse
+	(*LocalScanRequest)(nil),         // 8: shale.v1.LocalScanRequest
+	(*LocalScanResponse)(nil),        // 9: shale.v1.LocalScanResponse
+	(*TopologyRequest)(nil),          // 10: shale.v1.TopologyRequest
+	(*TopologyResponse)(nil),         // 11: shale.v1.TopologyResponse
+	(*NodeInfo)(nil),                 // 12: shale.v1.NodeInfo
+	(*StatsRequest)(nil),             // 13: shale.v1.StatsRequest
+	(*StatsResponse)(nil),            // 14: shale.v1.StatsResponse
+	(*PingRequest)(nil),              // 15: shale.v1.PingRequest
+	(*PingResponse)(nil),             // 16: shale.v1.PingResponse
+	(*RangeSpec)(nil),                // 17: shale.v1.RangeSpec
+	(*MigrateChunk)(nil),             // 18: shale.v1.MigrateChunk
+	(*KeyValue)(nil),                 // 19: shale.v1.KeyValue
+	(*MigrationDone)(nil),            // 20: shale.v1.MigrationDone
+	(*ProposeRebalanceRequest)(nil),  // 21: shale.v1.ProposeRebalanceRequest
+	(*ProposeRebalanceResponse)(nil), // 22: shale.v1.ProposeRebalanceResponse
+	(*RangePlanItem)(nil),            // 23: shale.v1.RangePlanItem
 }
 var file_shale_proto_depIdxs = []int32{
 	12, // 0: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
-	0,  // 1: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
-	2,  // 2: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
-	4,  // 3: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
-	6,  // 4: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
-	8,  // 5: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
-	10, // 6: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
-	13, // 7: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
-	15, // 8: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
-	1,  // 9: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
-	3,  // 10: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
-	5,  // 11: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
-	7,  // 12: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
-	9,  // 13: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
-	11, // 14: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
-	14, // 15: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
-	16, // 16: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
-	9,  // [9:17] is the sub-list for method output_type
-	1,  // [1:9] is the sub-list for method input_type
-	1,  // [1:1] is the sub-list for extension type_name
-	1,  // [1:1] is the sub-list for extension extendee
-	0,  // [0:1] is the sub-list for field type_name
+	19, // 1: shale.v1.MigrateChunk.kv:type_name -> shale.v1.KeyValue
+	20, // 2: shale.v1.MigrateChunk.done:type_name -> shale.v1.MigrationDone
+	23, // 3: shale.v1.ProposeRebalanceResponse.ranges:type_name -> shale.v1.RangePlanItem
+	0,  // 4: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
+	2,  // 5: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
+	4,  // 6: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
+	6,  // 7: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
+	8,  // 8: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
+	10, // 9: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
+	13, // 10: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
+	15, // 11: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
+	17, // 12: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
+	21, // 13: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
+	1,  // 14: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
+	3,  // 15: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
+	5,  // 16: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
+	7,  // 17: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
+	9,  // 18: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
+	11, // 19: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
+	14, // 20: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
+	16, // 21: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
+	18, // 22: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
+	22, // 23: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
+	14, // [14:24] is the sub-list for method output_type
+	4,  // [4:14] is the sub-list for method input_type
+	4,  // [4:4] is the sub-list for extension type_name
+	4,  // [4:4] is the sub-list for extension extendee
+	0,  // [0:4] is the sub-list for field type_name
 }
 
 func init() { file_shale_proto_init() }
@@ -1010,13 +1494,17 @@ func file_shale_proto_init() {
 	if File_shale_proto != nil {
 		return
 	}
+	file_shale_proto_msgTypes[18].OneofWrappers = []any{
+		(*MigrateChunk_Kv)(nil),
+		(*MigrateChunk_Done)(nil),
+	}
 	type x struct{}
 	out := protoimpl.TypeBuilder{
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_shale_proto_rawDesc), len(file_shale_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   17,
+			NumMessages:   24,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

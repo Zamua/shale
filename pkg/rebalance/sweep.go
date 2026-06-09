@@ -26,8 +26,22 @@ import (
 // starve cleanup of ranges that have multiple expiries within the
 // window. 10s is a balance between "responsive enough that operators
 // don't notice stale state" and "cheap enough that the sweep itself
-// is invisible in profiles."
-const sweepInterval = 10 * time.Second
+// is invisible in profiles." Exposed as a var so the cluster layer
+// (and tests) can override it for faster feedback in integration
+// fixtures; production stays at the package default.
+var sweepInterval = 10 * time.Second
+
+// SetSweepInterval overrides the package-wide sweep tick interval.
+// Used by the cluster layer to keep integration tests under a few
+// seconds of wall clock. Not goroutine-safe relative to RunSweep;
+// call before any Coordinator starts its sweep loop, or call from
+// tests where you control the lifecycle.
+func SetSweepInterval(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	sweepInterval = d
+}
 
 // RunSweep starts the background cleanup loop. It runs until ctx is
 // canceled or the Coordinator is Stop()ped. Callers (the cluster

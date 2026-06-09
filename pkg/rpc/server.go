@@ -12,6 +12,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"hash/crc32"
 	"sync/atomic"
 
 	"github.com/Zamua/shale/pkg/backend"
@@ -182,6 +183,95 @@ func (s *Server) Stats(_ context.Context, _ *pb.StatsRequest) (*pb.StatsResponse
 
 func (s *Server) Ping(_ context.Context, _ *pb.PingRequest) (*pb.PingResponse, error) {
 	return &pb.PingResponse{}, nil
+}
+
+// -- Rebalancing RPCs (v0.3 scaffold) --------------------------------
+//
+// MigrateRange and ProposeRebalance carry the wire surface for the
+// v0.3 rebalancing protocol described in docs/SPEC.md. The handlers
+// here are intentional stubs: they return Unimplemented so the proto
+// registration is exercised by the existing build + test surface, and
+// so the cluster + rebalance packages can dial these methods once the
+// Core phase wires them up to real logic. Returning Unimplemented (not
+// a panic, not a silent no-op) keeps any premature caller honest:
+// they get the standard gRPC "this is registered but the body is not
+// yet provided" signal and can fall through to the not-yet-rebalanced
+// behavior path until the real implementation lands.
+
+// MigrateRange is the source-side handler of the v0.3 range-transfer
+// stream. The destination has sent a RangeSpec listing the partitions
+// it claims ownership of + the ring generation it computed against;
+// the source iterates its local Backend, streams every key whose
+// shard key falls in any of those partitions, and ends with a
+// MigrationDone marker carrying the CRC32-IEEE checksum + count.
+//
+// Stale-generation guard: if the destination's ring view is behind
+// ours, we return FailedPrecondition so the destination's next
+// Evaluate pass re-issues against the new ring rather than us
+// streaming data that will be discarded.
+func (s *Server) MigrateRange(req *pb.RangeSpec, stream grpc.ServerStreamingServer[pb.MigrateChunk]) error {
+	kvCh, errCh, err := s.c.MigrateRangeSource(req.GetPartitionIds(), req.GetRingGeneration())
+	if err != nil {
+		return err
+	}
+	hasher := crc32.NewIEEE()
+	var count uint64
+	for kv := range kvCh {
+		if err := stream.Send(&pb.MigrateChunk{
+			Body: &pb.MigrateChunk_Kv{
+				Kv: &pb.KeyValue{Key: kv.Key, Value: kv.Value},
+			},
+		}); err != nil {
+			// Drain the source channel so the goroutine in
+			// localSource exits cleanly instead of blocking on
+			// an un-read send. errCh below will produce its
+			// terminal value regardless.
+			for range kvCh {
+			}
+			<-errCh
+			return err
+		}
+		hasher.Write(kv.Key)
+		hasher.Write(kv.Value)
+		count++
+	}
+	if scanErr := <-errCh; scanErr != nil {
+		return status.Errorf(codes.Internal, "shale: MigrateRange scan: %v", scanErr)
+	}
+	return stream.Send(&pb.MigrateChunk{
+		Body: &pb.MigrateChunk_Done{
+			Done: &pb.MigrationDone{
+				TotalKeys: count,
+				Checksum:  hasher.Sum(nil),
+			},
+		},
+	})
+}
+
+// ProposeRebalance is the operator-facing planner / applier / canceller.
+// Exactly one of dry_run / apply / cancel must be set; otherwise the
+// server returns InvalidArgument.
+//
+//   - dry_run: returns the plan the local node would execute against
+//     the current ring, without doing anything.
+//   - apply:   bypass the settle delay + Evaluate immediately; returns
+//     the queued plan.
+//   - cancel:  stop in-flight migrations; returns what was in flight.
+func (s *Server) ProposeRebalance(_ context.Context, req *pb.ProposeRebalanceRequest) (*pb.ProposeRebalanceResponse, error) {
+	items, err := s.c.ProposeRebalance(req.GetDryRun(), req.GetApply(), req.GetCancel())
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "shale: %v", err)
+	}
+	resp := &pb.ProposeRebalanceResponse{Ranges: make([]*pb.RangePlanItem, 0, len(items))}
+	for _, it := range items {
+		resp.Ranges = append(resp.Ranges, &pb.RangePlanItem{
+			PartitionId:       it.PartitionID,
+			CurrentOwner:      it.CurrentOwner,
+			ProposedOwner:     it.ProposedOwner,
+			EstimatedKeyCount: it.EstimatedKeyCount,
+		})
+	}
+	return resp, nil
 }
 
 // keysHeld counts via an empty-prefix scan of the LOCAL backend

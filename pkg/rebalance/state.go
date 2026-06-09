@@ -339,11 +339,11 @@ func (c *Coordinator) currentGen() uint64 {
 	return c.gen
 }
 
-// IsMigrating reports whether key's partition is in StateSending or
-// StateHandedOff on THIS node. The cluster layer uses this to:
-//
-//   - reject writes for the key (source side)
-//   - hint try-other-owner on reads (destination side)
+// IsMigrating reports whether key's partition is mid-migration OUT
+// of this node (StateSending or StateHandedOff). The cluster layer
+// uses this on the source side to reject writes for the key (the
+// data is being streamed out; accepting a write here would either
+// be lost or arrive at the destination out of order).
 //
 // Returns false for any other state (or unknown partition).
 func (c *Coordinator) IsMigrating(key []byte) bool {
@@ -358,6 +358,27 @@ func (c *Coordinator) IsMigrating(key []byte) bool {
 		return false
 	}
 	return r.state == StateSending || r.state == StateHandedOff
+}
+
+// IsReceiving reports whether key's partition is mid-migration INTO
+// this node (StateReceiving). The cluster layer uses this on the
+// destination side to hint "try other owner" on reads + to reject
+// writes (the destination is not yet authoritative; the source is
+// still serving reads + the stream is still in flight).
+//
+// Returns false for any other state (or unknown partition).
+func (c *Coordinator) IsReceiving(key []byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.partFn == nil {
+		return false
+	}
+	pid := c.partFn(key)
+	r, ok := c.ranges[pid]
+	if !ok {
+		return false
+	}
+	return r.state == StateReceiving
 }
 
 // WaitForIdle blocks until every tracked range is in a terminal

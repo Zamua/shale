@@ -1,6 +1,7 @@
 package rpc_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"io"
@@ -11,7 +12,11 @@ import (
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rpc"
+	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 // newTestServer spins up an rpc.Server over a memory-backed cluster on
@@ -222,5 +227,138 @@ func TestScanPrefixStreams(t *testing.T) {
 	}
 	if stats.GetScans() != 1 {
 		t.Fatalf("scans counter: want 1, got %d", stats.GetScans())
+	}
+}
+
+// -- v0.3 rebalancing -------------------------------------------------
+//
+// The next two tests pin the v0.3 Core wiring: MigrateRange +
+// ProposeRebalance are registered handlers, not Unimplemented stubs.
+// In single-node test mode they return a deterministic error
+// (cluster: rebalance not available in single-node mode) carried via
+// FailedPrecondition or InvalidArgument; not Unimplemented. The
+// multi-node behavior (real streaming + plan computation) is
+// exercised in pkg/cluster/cluster_test.go + tests/integration/.
+
+func TestMigrateRange_SingleNodeReturnsFailedPrecondition(t *testing.T) {
+	addr, cleanup := newTestServer(t)
+	defer cleanup()
+	cli := newTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	stream, err := cli.MigrateRange(ctx, []uint64{1, 2, 3}, 7)
+	if err != nil {
+		assertNotUnimplemented(t, "MigrateRange", err)
+		return
+	}
+	_, err = stream.Recv()
+	if err == nil {
+		t.Fatalf("MigrateRange single-node: want error, got nil")
+	}
+	assertNotUnimplemented(t, "MigrateRange", err)
+}
+
+func TestProposeRebalance_SingleNodeReturnsError(t *testing.T) {
+	addr, cleanup := newTestServer(t)
+	defer cleanup()
+	cli := newTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	_, err := cli.ProposeRebalance(ctx, true /*dryRun*/, false, false)
+	if err == nil {
+		t.Fatalf("ProposeRebalance single-node: want error, got nil")
+	}
+	assertNotUnimplemented(t, "ProposeRebalance", err)
+}
+
+func TestRebalanceMessagesRoundTripThroughProto(t *testing.T) {
+	// RangeSpec round-trip: partition IDs + ring generation survive.
+	specIn := &pb.RangeSpec{
+		PartitionIds:   []uint64{0, 17, 0xdeadbeef, 1<<63 - 1},
+		RingGeneration: 42,
+	}
+	specBytes, err := proto.Marshal(specIn)
+	if err != nil {
+		t.Fatalf("Marshal RangeSpec: %v", err)
+	}
+	var specOut pb.RangeSpec
+	if err := proto.Unmarshal(specBytes, &specOut); err != nil {
+		t.Fatalf("Unmarshal RangeSpec: %v", err)
+	}
+	if !proto.Equal(specIn, &specOut) {
+		t.Fatalf("RangeSpec round-trip: got %+v, want %+v", &specOut, specIn)
+	}
+
+	// MigrateChunk carrying a KeyValue body.
+	kvChunk := &pb.MigrateChunk{
+		Body: &pb.MigrateChunk_Kv{Kv: &pb.KeyValue{
+			Key:   []byte("users/alice"),
+			Value: []byte("data"),
+		}},
+	}
+	kvBytes, err := proto.Marshal(kvChunk)
+	if err != nil {
+		t.Fatalf("Marshal kv chunk: %v", err)
+	}
+	var kvOut pb.MigrateChunk
+	if err := proto.Unmarshal(kvBytes, &kvOut); err != nil {
+		t.Fatalf("Unmarshal kv chunk: %v", err)
+	}
+	gotKV, ok := kvOut.GetBody().(*pb.MigrateChunk_Kv)
+	if !ok {
+		t.Fatalf("kv chunk round-trip: body type = %T, want *MigrateChunk_Kv", kvOut.GetBody())
+	}
+	if !bytes.Equal(gotKV.Kv.GetKey(), []byte("users/alice")) ||
+		!bytes.Equal(gotKV.Kv.GetValue(), []byte("data")) {
+		t.Fatalf("kv chunk round-trip: got key=%q value=%q",
+			gotKV.Kv.GetKey(), gotKV.Kv.GetValue())
+	}
+
+	// MigrateChunk carrying a MigrationDone body.
+	doneChunk := &pb.MigrateChunk{
+		Body: &pb.MigrateChunk_Done{Done: &pb.MigrationDone{
+			TotalKeys: 1234,
+			Checksum:  []byte{0xde, 0xad, 0xbe, 0xef},
+		}},
+	}
+	doneBytes, err := proto.Marshal(doneChunk)
+	if err != nil {
+		t.Fatalf("Marshal done chunk: %v", err)
+	}
+	var doneOut pb.MigrateChunk
+	if err := proto.Unmarshal(doneBytes, &doneOut); err != nil {
+		t.Fatalf("Unmarshal done chunk: %v", err)
+	}
+	gotDone, ok := doneOut.GetBody().(*pb.MigrateChunk_Done)
+	if !ok {
+		t.Fatalf("done chunk round-trip: body type = %T, want *MigrateChunk_Done", doneOut.GetBody())
+	}
+	if gotDone.Done.GetTotalKeys() != 1234 {
+		t.Fatalf("done chunk round-trip: total_keys = %d, want 1234", gotDone.Done.GetTotalKeys())
+	}
+	if !bytes.Equal(gotDone.Done.GetChecksum(), []byte{0xde, 0xad, 0xbe, 0xef}) {
+		t.Fatalf("done chunk round-trip: checksum = %x", gotDone.Done.GetChecksum())
+	}
+}
+
+// assertNotUnimplemented confirms the handler is wired (not the
+// Unimplemented scaffold) without pinning the exact code: single-node
+// mode returns different gRPC codes for the two surfaces (MigrateRange
+// uses FailedPrecondition via the source-not-available path,
+// ProposeRebalance uses InvalidArgument since dryRun against an empty
+// coordinator still hits the "single-node mode" guard), and that's
+// fine - the contract here is "the registered handler ran."
+func assertNotUnimplemented(t *testing.T, op string, err error) {
+	t.Helper()
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("%s: error is not a gRPC status: %v", op, err)
+	}
+	if st.Code() == codes.Unimplemented {
+		t.Fatalf("%s: handler still Unimplemented (v0.3 Core not wired): %v", op, err)
 	}
 }

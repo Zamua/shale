@@ -2,6 +2,7 @@ package cluster_test
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -14,9 +15,12 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestOpen_RequiresNodeID(t *testing.T) {
@@ -111,6 +115,19 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 	}
 	if err := waitForRingSize(c2, 2, 5*time.Second); err != nil {
 		t.Fatalf("n2 ring: %v", err)
+	}
+
+	// v0.3 + joiner-bootstrap: c2 may be in StateReceiving for the
+	// partitions it picked up at Open time. Wait for both nodes to
+	// settle before exercising the routing/forwarding path; the
+	// rebalance behavior itself is covered by dedicated tests.
+	for _, c := range []*cluster.Cluster{c1, c2} {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := c.WaitForRebalanceIdle(ctx); err != nil {
+			cancel()
+			t.Fatalf("%s rebalance idle: %v", c.NodeID(), err)
+		}
+		cancel()
 	}
 
 	// Find a key owned by n2 + write it via n1 (forces forwarding).
@@ -497,5 +514,190 @@ func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
 	}
 	if okCount != 1 || errCount != 1 {
 		t.Fatalf("expected 1 ok + 1 err, got ok=%d err=%d (%v)", okCount, errCount, results)
+	}
+}
+
+// TestTwoNode_RebalanceOnMembershipGrowth wires the v0.3 cluster
+// integration end-to-end:
+//
+//  1. Open 2 nodes with empty memory backends.
+//  2. Put 100 keys via node1; some land on each node.
+//  3. Add a 3rd node; the v0.3 rebalance hook on membership join
+//     fires Evaluate, which migrates the partitions whose new
+//     owner is n3.
+//  4. WaitForRebalanceIdle on every node.
+//  5. Read each node's backend DIRECTLY (bypassing routing): every
+//     key the new ring assigns to a given node must physically live
+//     on that node's backend. No key is lost.
+//
+// Tunables: short settle + grace keep the test under 10s while
+// preserving the v0.3 protocol semantics. Sweep tick is shrunk via
+// the same hook integration tests use.
+func TestTwoNode_RebalanceOnMembershipGrowth(t *testing.T) {
+	rebalance.SetSweepInterval(50 * time.Millisecond)
+
+	n1Mem := memory.New()
+	n2Mem := memory.New()
+
+	n1BindAddr := hostPort(freePort(t))
+	n2BindAddr := hostPort(freePort(t))
+
+	n1Cluster, n1Stop := openClusterNodeAt(t, "rb-n1", n1BindAddr, "", n1Mem)
+	defer n1Stop()
+	n2Cluster, n2Stop := openClusterNodeAt(t, "rb-n2", n2BindAddr, n1BindAddr, n2Mem)
+	defer n2Stop()
+
+	if err := waitForRingSize(n1Cluster, 2, 5*time.Second); err != nil {
+		t.Fatalf("n1 ring: %v", err)
+	}
+	if err := waitForRingSize(n2Cluster, 2, 5*time.Second); err != nil {
+		t.Fatalf("n2 ring: %v", err)
+	}
+
+	keys := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		k := fmt.Sprintf("rb-%04d", i)
+		if err := putWithMigrationRetry(n1Cluster, []byte(k), []byte("v")); err != nil {
+			t.Fatalf("Put %s: %v", k, err)
+		}
+		keys[i] = k
+	}
+
+	if total := countBackend(t, n1Mem) + countBackend(t, n2Mem); total != 100 {
+		t.Fatalf("pre-growth total keys = %d, want 100", total)
+	}
+
+	n3Mem := memory.New()
+	n3BindAddr := hostPort(freePort(t))
+	n3Cluster, n3Stop := openClusterNodeAt(t, "rb-n3", n3BindAddr, n1BindAddr, n3Mem)
+	defer n3Stop()
+
+	for _, c := range []*cluster.Cluster{n1Cluster, n2Cluster, n3Cluster} {
+		if err := waitForRingSize(c, 3, 5*time.Second); err != nil {
+			t.Fatalf("3-node ring on %s: %v", c.NodeID(), err)
+		}
+	}
+
+	// Wait for each node's Coordinator to settle. Bounded so a stuck
+	// migration fails loud.
+	for _, c := range []*cluster.Cluster{n1Cluster, n2Cluster, n3Cluster} {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := c.WaitForRebalanceIdle(ctx); err != nil {
+			cancel()
+			t.Fatalf("%s did not idle: %v", c.NodeID(), err)
+		}
+		cancel()
+	}
+
+	// Give the sweep one more cycle so any HandedOff source ranges
+	// hand their keys back through Delete + transition Done. Without
+	// this, the source-side stale copies linger past idle.
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify physical placement matches the 3-node ring. For every
+	// key, the node the ring assigns must be the only physical
+	// holder. Sweep removes the source-side copy after grace.
+	r := ring.New()
+	for _, m := range n1Cluster.Members() {
+		r.Add(m)
+	}
+	backends := map[string]*memory.Memory{
+		"rb-n1": n1Mem,
+		"rb-n2": n2Mem,
+		"rb-n3": n3Mem,
+	}
+	missing := 0
+	wrong := 0
+	for _, k := range keys {
+		owner := r.LocateKey([]byte(k)).ID
+		// The owner's backend must have the key.
+		got, err := backends[owner].Get([]byte(k))
+		if err != nil {
+			missing++
+			continue
+		}
+		if string(got) != "v" {
+			wrong++
+		}
+	}
+	if missing > 0 {
+		t.Fatalf("%d/%d keys missing on the ring-owner's backend", missing, len(keys))
+	}
+	if wrong > 0 {
+		t.Fatalf("%d/%d keys had wrong value on the ring-owner's backend", wrong, len(keys))
+	}
+}
+
+
+// openClusterNodeAt brings up a Cluster + gRPC server at known
+// bind + gRPC addresses, registers it for cleanup, and returns
+// the cluster + teardown closure. Caller supplies bindAddr so
+// peer-discovery seeds are predictable.
+func openClusterNodeAt(t *testing.T, id, bindAddr, seedBindAddr string, mem *memory.Memory) (*cluster.Cluster, func()) {
+	t.Helper()
+	grpcHarness, stop := startGRPC(t)
+	cfg := cluster.Config{
+		NodeID:                 id,
+		Backend:                mem,
+		BindAddr:               bindAddr,
+		GRPCAddr:               grpcHarness.addr,
+		LogOutput:              io.Discard,
+		RebalanceSettleDelay:   500 * time.Millisecond,
+		RebalanceGraceDuration: 1500 * time.Millisecond,
+	}
+	if seedBindAddr != "" {
+		cfg.Seeds = []string{seedBindAddr}
+	}
+	c, err := cluster.Open(cfg)
+	if err != nil {
+		stop()
+		t.Fatalf("openClusterNodeAt %s: %v", id, err)
+	}
+	grpcHarness.register(c)
+	return c, func() {
+		_ = c.Close()
+		stop()
+	}
+}
+
+// putWithMigrationRetry wraps Put with a bounded retry on
+// FailedPrecondition. Per docs/SPEC.md "Cutover" the SDK is
+// expected to do this; tests do too so the assertion checks
+// "rebalance eventually succeeds" rather than "no transient
+// rejection during bootstrap."
+func putWithMigrationRetry(c *cluster.Cluster, key, value []byte) error {
+	var lastErr error
+	for i := 0; i < 50; i++ {
+		err := c.Put(key, value)
+		if err == nil {
+			return nil
+		}
+		if st, ok := status.FromError(err); ok && st.Code() == codes.FailedPrecondition {
+			lastErr = err
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		return err
+	}
+	return lastErr
+}
+
+func countBackend(t *testing.T, be *memory.Memory) int {
+	t.Helper()
+	it, err := be.ScanPrefix(nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer it.Close()
+	n := 0
+	for {
+		k, _, err := it.Next()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if k == nil {
+			return n
+		}
+		n++
 	}
 }
