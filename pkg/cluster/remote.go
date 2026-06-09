@@ -7,11 +7,14 @@ import (
 	"io"
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/Zamua/shale/pkg/backend"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 // peerClient is the cluster-internal gRPC client used for inter-node
@@ -228,11 +231,19 @@ func (t *clusterTx) Rollback() error {
 // remote. The wrapped stream is drained lazily on each Next() call;
 // Close cancels the underlying context (which closes the stream) and
 // is safe to call any number of times.
+//
+// End-of-stream contract normalization: when Close has been called
+// locally, a subsequent Next that sees a gRPC Canceled error is the
+// expected close path - we surface (nil, nil, nil), matching the
+// memory backend's natural end-of-iteration. A Canceled error WITHOUT
+// a local Close is a real failure (the remote side dropped the
+// stream) + propagates up.
 type remoteIterator struct {
 	stream grpc.ServerStreamingClient[pb.ScanPrefixResponse]
 	cancel context.CancelFunc
 
 	closeOnce sync.Once
+	closing   atomic.Bool // set by Close before cancel()
 	done      bool
 }
 
@@ -246,6 +257,11 @@ func (it *remoteIterator) Next() (key, value []byte, err error) {
 			it.done = true
 			return nil, nil, nil
 		}
+		// If the cancel came from a local Close, treat as natural EOI.
+		if it.closing.Load() && isContextCanceled(err) {
+			it.done = true
+			return nil, nil, nil
+		}
 		return nil, nil, err
 	}
 	return msg.GetKey(), msg.GetValue(), nil
@@ -253,9 +269,27 @@ func (it *remoteIterator) Next() (key, value []byte, err error) {
 
 func (it *remoteIterator) Close() error {
 	it.closeOnce.Do(func() {
+		// Set closing BEFORE cancel so a Next racing on the stream
+		// observes "we're closing" and turns Canceled into clean EOI.
+		it.closing.Store(true)
 		it.cancel()
 	})
 	return nil
+}
+
+// isContextCanceled reports whether err originated from a context
+// cancellation (either context.Canceled or gRPC's Canceled status
+// code wrapping the same). Used by remoteIterator.Next to decide
+// whether a post-Close Recv error is benign end-of-stream or a real
+// failure on the remote side.
+func isContextCanceled(err error) bool {
+	if errors.Is(err, context.Canceled) {
+		return true
+	}
+	if s, ok := status.FromError(err); ok {
+		return s.Code() == codes.Canceled
+	}
+	return false
 }
 
 // snapshotBackend is the in-memory backend used by Aggregate to give
