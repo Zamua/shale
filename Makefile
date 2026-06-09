@@ -1,6 +1,10 @@
 # shale - developer Makefile
 #
-# Most day-to-day work is just `go test ./...` and `go build ./...`.
+# Most day-to-day work is just `make test` and `make build`. Those fan
+# out across every module in go.work (core + backends/pebble +
+# backends/slate) under workspace mode, so cross-module changes are
+# tested in one pass without needing to bump versions between them.
+#
 # The targets below cover the cases where build tags + cgo + a
 # locally-built SlateDB shared library need to line up just so.
 #
@@ -13,26 +17,41 @@
 
 SLATEDB_LIB_DIR ?= /private/tmp/slatedb-src/target/release
 
-# Default test target - no cgo, no Docker, no build tags. Fast.
+# Canonical list of go.work members. Append a new backend module here
+# (and to .github/workflows/{test,lint}.yml) when one lands.
+MODULES := . backends/pebble backends/slate
+
+# Default test target - workspace mode, no cgo, no Docker, no build
+# tags. Fast. `go test ./...` only walks the current module, so each
+# module gets its own invocation; go.work resolves cross-module deps
+# transparently.
 .PHONY: test
 test:
-	go test ./...
+	@set -e; for m in $(MODULES); do \
+		echo "==> go test $$m"; \
+		(cd $$m && go test ./...); \
+	done
 
-# Build target - same shape; the slate package is tag-gated so this
-# does not require cgo or the SlateDB lib.
+# Build target - same shape as test. The slate package itself is
+# tag-gated (no cgo / no SlateDB lib needed for the no-tag build);
+# only backends/slate/cmd/shaled-slate compiles here.
 .PHONY: build
 build:
-	go build ./...
+	@set -e; for m in $(MODULES); do \
+		echo "==> go build $$m"; \
+		(cd $$m && go build ./...); \
+	done
 
 # Run the slate-backend unit tests (memory-only, no MinIO). Requires
 # CGO + the SlateDB shared library.
 .PHONY: test-slate
 test-slate:
+	cd backends/slate && \
 	CGO_ENABLED=1 \
 	CGO_LDFLAGS="-L$(SLATEDB_LIB_DIR)" \
 	DYLD_LIBRARY_PATH="$(SLATEDB_LIB_DIR):$$DYLD_LIBRARY_PATH" \
 	LD_LIBRARY_PATH="$(SLATEDB_LIB_DIR):$$LD_LIBRARY_PATH" \
-	go test -tags slatedb -count=1 -timeout 120s ./backends/slate/...
+	go test -tags slatedb -count=1 -timeout 120s ./...
 
 # End-to-end validation of the SlateDB backend against a real MinIO
 # instance, spun up via testcontainers-go. Requires Docker (colima,
@@ -57,11 +76,12 @@ test-slate:
 # MinIO even comes up. Docker Desktop users don't need either var.
 .PHONY: test-slate-minio
 test-slate-minio:
+	cd backends/slate && \
 	CGO_ENABLED=1 \
 	CGO_LDFLAGS="-L$(SLATEDB_LIB_DIR)" \
 	DYLD_LIBRARY_PATH="$(SLATEDB_LIB_DIR):$$DYLD_LIBRARY_PATH" \
 	LD_LIBRARY_PATH="$(SLATEDB_LIB_DIR):$$LD_LIBRARY_PATH" \
-	go test -tags 'slatedb integration' -count=1 -timeout 600s -v ./backends/slate/...
+	go test -tags 'slatedb integration' -count=1 -timeout 600s -v ./...
 
 # v0.5 comparative benchmark suite: drives cmd/shale-bench across every
 # scenario (raw pebble + memory baselines vs shale cluster at R=1 and
