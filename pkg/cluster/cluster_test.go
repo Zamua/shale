@@ -628,7 +628,6 @@ func TestTwoNode_RebalanceOnMembershipGrowth(t *testing.T) {
 	}
 }
 
-
 // openClusterNodeAt brings up a Cluster + gRPC server at known
 // bind + gRPC addresses, registers it for cleanup, and returns
 // the cluster + teardown closure. Caller supplies bindAddr so

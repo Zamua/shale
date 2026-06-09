@@ -87,7 +87,8 @@ func (c *Cluster) initRebalance() {
 	// to come from the same ring snapshot the plan was computed
 	// against).
 	opts.Destination = &clusterDestination{c: c}
-	c.rebalance = rebalance.New(self, c.backend, opts)
+	rb := rebalance.New(self, c.backend, opts)
+	c.rebalance.Store(rb)
 
 	startup := c.snapshotRing()
 
@@ -97,9 +98,15 @@ func (c *Cluster) initRebalance() {
 	c.rebalanceCtx, c.rebalanceCancel = context.WithCancel(context.Background())
 	go func() {
 		defer c.loopWG.Done()
-		c.rebalance.RunSweep(c.rebalanceCtx)
+		rb.RunSweep(c.rebalanceCtx)
 	}()
 
+	// settleMu publishes c.lastEvalRing to the runEvaluate reader. We
+	// hold it for the assignment even though Open hasn't spawned the
+	// reader goroutine yet, so any future code that grows another
+	// reader path can't trip the race detector on a now-unguarded
+	// write. The bootstrap Evaluate below is fine to run outside the
+	// lock: it touches Coordinator state only.
 	if len(c.cfg.Seeds) > 0 && len(startup.Members()) > 1 {
 		// Joiner: synthesize "ring before I joined" baseline +
 		// fire the bootstrap Evaluate inline so the pull is
@@ -117,15 +124,19 @@ func (c *Cluster) initRebalance() {
 		// (current ring is unchanged), so there's no
 		// tryRegister conflict to worry about.
 		bootstrapOld := ringMinus(startup, c.cfg.NodeID)
+		c.settleMu.Lock()
 		c.lastEvalRing = startup
-		c.rebalance.Evaluate(bootstrapOld, startup, c.ringGen.Load())
+		c.settleMu.Unlock()
+		rb.Evaluate(bootstrapOld, startup, c.ringGen.Load())
 	} else {
 		// Founder (or joiner with no peers yet visible): pin
 		// lastEvalRing to the init-time snapshot. Subsequent
 		// membership events diff against this baseline; if peers
 		// only become visible later, that diff produces the
 		// correct Sends.
+		c.settleMu.Lock()
 		c.lastEvalRing = startup
+		c.settleMu.Unlock()
 	}
 }
 
@@ -152,7 +163,7 @@ func (c *Cluster) bumpRingGen() {
 // scheduleEvaluate (re)arms the settle timer. Holds settleMu only
 // long enough to swap the timer reference.
 func (c *Cluster) scheduleEvaluate() {
-	if c.rebalance == nil {
+	if c.rebalance.Load() == nil {
 		return
 	}
 	c.settleMu.Lock()
@@ -174,6 +185,10 @@ func (c *Cluster) runEvaluate() {
 	if c.closed.Load() {
 		return
 	}
+	rb := c.rebalance.Load()
+	if rb == nil {
+		return
+	}
 	current := c.snapshotRing()
 	gen := c.ringGen.Load()
 
@@ -182,7 +197,7 @@ func (c *Cluster) runEvaluate() {
 	c.lastEvalRing = current
 	c.settleMu.Unlock()
 
-	c.rebalance.Evaluate(old, current, gen)
+	rb.Evaluate(old, current, gen)
 }
 
 // ringMinus returns a fresh ring containing every member of src
@@ -243,10 +258,11 @@ func (c *Cluster) snapshotRing() *ring.Ring {
 // In single-node mode there is no Coordinator; the call returns
 // immediately with nil.
 func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
-	if c.rebalance == nil {
+	rb := c.rebalance.Load()
+	if rb == nil {
 		return nil
 	}
-	return c.rebalance.WaitForIdle(ctx)
+	return rb.WaitForIdle(ctx)
 }
 
 // migrationGuardError builds the error returned to a Put/Delete that
@@ -284,10 +300,11 @@ func (c *Cluster) retryAfterMs() int {
 //
 // Safe in single-node mode: returns false (no Coordinator).
 func (c *Cluster) IsMigrating(key []byte) bool {
-	if c.rebalance == nil {
+	rb := c.rebalance.Load()
+	if rb == nil {
 		return false
 	}
-	return c.rebalance.IsMigrating(key)
+	return rb.IsMigrating(key)
 }
 
 // -- clusterDestination ----------------------------------------------
@@ -398,7 +415,7 @@ func (c *Cluster) ProposeRebalance(dryRun, apply, cancel bool) ([]RebalanceItem,
 	if c.closed.Load() {
 		return nil, errors.New("cluster: closed")
 	}
-	if c.rebalance == nil {
+	if c.rebalance.Load() == nil {
 		return nil, errors.New("cluster: rebalance not available in single-node mode")
 	}
 	flags := 0
@@ -417,7 +434,9 @@ func (c *Cluster) ProposeRebalance(dryRun, apply, cancel bool) ([]RebalanceItem,
 
 	switch {
 	case cancel:
-		c.rebalance.Stop()
+		if rb := c.rebalance.Load(); rb != nil {
+			rb.Stop()
+		}
 		// Replace the Coordinator so a subsequent ring change picks
 		// up a fresh state machine. The cancel call is a "stop
 		// everything in flight"; if the operator changes their mind
@@ -479,7 +498,11 @@ func (c *Cluster) computeRebalanceItems() []RebalanceItem {
 // --cancel (both want to surface "this is what was queued / what was
 // in flight"). Sorted by partition id for stable iteration.
 func (c *Cluster) snapshotRebalanceItems() []RebalanceItem {
-	snap := c.rebalance.Snapshot()
+	rb := c.rebalance.Load()
+	if rb == nil {
+		return nil
+	}
+	snap := rb.Snapshot()
 	out := make([]RebalanceItem, 0, len(snap))
 	for _, s := range snap {
 		out = append(out, RebalanceItem{
@@ -507,7 +530,7 @@ func (c *Cluster) replaceCoordinator() {
 		opts.RetryAfterMs = c.cfg.RebalanceRetryAfterMs
 	}
 	opts.Destination = &clusterDestination{c: c}
-	c.rebalance = rebalance.New(self, c.backend, opts)
+	c.rebalance.Store(rebalance.New(self, c.backend, opts))
 
 	// Reset the lastEvalRing baseline to the current ring so the
 	// next Evaluate sees the current shape as the steady state. The
@@ -536,7 +559,7 @@ func (c *Cluster) replaceCoordinator() {
 // migration guards on the cluster's KV path. A cluster-wide
 // generation lands when the gossip layer carries it (v0.4 or later).
 func (c *Cluster) MigrateRangeSource(partitionIDs []uint64, ringGen uint64) (<-chan rebalance.KeyValue, <-chan error, error) {
-	if c.rebalance == nil {
+	if c.rebalance.Load() == nil {
 		return nil, nil, status.Error(codes.FailedPrecondition,
 			"shale: rebalance not available in single-node mode")
 	}
@@ -568,8 +591,9 @@ func (c *Cluster) RingGeneration() uint64 { return c.ringGen.Load() }
 // current State). Exposed for observability tooling + tests.
 // Returns nil in single-node mode.
 func (c *Cluster) RebalanceSnapshot() []rebalance.RangeStatus {
-	if c.rebalance == nil {
+	rb := c.rebalance.Load()
+	if rb == nil {
 		return nil
 	}
-	return c.rebalance.Snapshot()
+	return rb.Snapshot()
 }

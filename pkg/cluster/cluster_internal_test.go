@@ -292,9 +292,10 @@ func TestPut_DuringMigrationReturnsFailedPrecondition(t *testing.T) {
 	opts.GraceDuration = 10 * time.Second
 	opts.Source = src
 	opts.Destination = &clusterDestination{c: c}
-	c.rebalance.Stop()
-	c.rebalance = rebalance.New(rebalance.Member{ID: "rb-source"}, be, opts)
-	c.rebalance.Evaluate(old, new, c.ringGen.Load())
+	c.rebalance.Load().Stop()
+	rb := rebalance.New(rebalance.Member{ID: "rb-source"}, be, opts)
+	c.rebalance.Store(rb)
+	rb.Evaluate(old, new, c.ringGen.Load())
 	defer close(src.released)
 
 	// Wait until at least one of our seeded keys' partitions is
@@ -303,7 +304,7 @@ func TestPut_DuringMigrationReturnsFailedPrecondition(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		for _, k := range keys {
-			if c.rebalance.IsMigrating(k) {
+			if rb.IsMigrating(k) {
 				movingKey = k
 				break
 			}
@@ -314,7 +315,7 @@ func TestPut_DuringMigrationReturnsFailedPrecondition(t *testing.T) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if movingKey == nil {
-		t.Fatalf("no seeded key entered StateSending; coordinator snapshot=%+v", c.rebalance.Snapshot())
+		t.Fatalf("no seeded key entered StateSending; coordinator snapshot=%+v", rb.Snapshot())
 	}
 
 	// Put against the migrating key MUST return FailedPrecondition.
@@ -331,6 +332,94 @@ func TestPut_DuringMigrationReturnsFailedPrecondition(t *testing.T) {
 	}
 	if !bytes.Contains([]byte(st.Message()), []byte("retry")) {
 		t.Fatalf("FailedPrecondition message %q lacks a retry hint; SDK clients need it to back off", st.Message())
+	}
+}
+
+// TestOpen_RebalanceInitBeforeEventsLoop pins the v0.3 race fix:
+// Open() must finish initRebalance() (which publishes c.rebalance +
+// c.lastEvalRing) BEFORE spawning the events / reconcile goroutines.
+// The earlier ordering started the goroutines first; the first
+// membership join would call bumpRingGen -> scheduleEvaluate -> read
+// c.rebalance while initRebalance was concurrently writing it.
+//
+// With the race detector enabled (this binary always runs -race in
+// CI), the regression would surface as a "data race on c.rebalance"
+// failure when the first NotifyJoin arrives. The test drives the
+// same shape: open a multi-node-mode Cluster, immediately inject a
+// stream of membership-shaped activity (additional joiners + a
+// reconcile tick) so the events/reconcile loops are doing real work
+// the moment they start, and verify the cluster reaches a coherent
+// post-Open state without -race complaining.
+func TestOpen_RebalanceInitBeforeEventsLoop(t *testing.T) {
+	// Force the reconcile loop to fire fast so the test is sure to
+	// race a tick against Open. Keep the global setting restored on
+	// exit so other tests in the same binary see the default.
+	saved := reconcileInterval
+	reconcileInterval = 5 * time.Millisecond
+	t.Cleanup(func() { reconcileInterval = saved })
+
+	// Spin up a seed first so the second Open has a real peer to
+	// gossip with on bootstrap, generating events into runEventsLoop
+	// concurrently with the Coordinator publish path.
+	seed := startInternalNode(t, "race-seed", "")
+	t.Cleanup(seed.close)
+
+	// Hammer Open a few times in a row. With the bug, even one of
+	// these is enough for -race to fire; the loop just shortens the
+	// odds when run on a quiet machine.
+	for i := 0; i < 3; i++ {
+		joiner := startInternalNode(t, "race-joiner-"+strconv.Itoa(i), seed.bindAddr)
+		// Wait for the joiner to converge on the seed's membership so
+		// any race in the bootstrap Evaluate has a fair chance to fire.
+		deadline := time.Now().Add(3 * time.Second)
+		for time.Now().Before(deadline) {
+			if len(joiner.cluster.Members()) >= 2 {
+				break
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		if got := len(joiner.cluster.Members()); got < 2 {
+			t.Fatalf("joiner %d never saw the seed: members=%d", i, got)
+		}
+		joiner.close()
+	}
+}
+
+// internalTestNode is the local mirror of integration/testNode kept
+// in this package so cluster_internal_test.go can spin up real
+// multi-node-mode Clusters without dragging in the integration
+// package's gRPC scaffolding.
+type internalTestNode struct {
+	cluster  *Cluster
+	bindAddr string
+	close    func()
+}
+
+func startInternalNode(t *testing.T, id, seedAddr string) *internalTestNode {
+	t.Helper()
+	bindAddr := hp(freeTCPPort(t))
+	cfg := Config{
+		NodeID:                 id,
+		Backend:                memory.New(),
+		BindAddr:               bindAddr,
+		GRPCAddr:               "127.0.0.1:1", // never dialed in this test
+		LogOutput:              io.Discard,
+		RebalanceSettleDelay:   50 * time.Millisecond,
+		RebalanceGraceDuration: 1 * time.Second,
+	}
+	if seedAddr != "" {
+		cfg.Seeds = []string{seedAddr}
+	}
+	c, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("startInternalNode %s: Open: %v", id, err)
+	}
+	return &internalTestNode{
+		cluster:  c,
+		bindAddr: bindAddr,
+		close: func() {
+			_ = c.Close()
+		},
 	}
 }
 

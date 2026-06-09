@@ -124,16 +124,20 @@ type Cluster struct {
 	closed    atomic.Bool
 	loopWG    sync.WaitGroup
 
-	// Rebalance state (multi-node only; nil in single-node mode).
-	// rebalance is the per-range Coordinator. ringGen is the monotonic
-	// generation counter bumped on every membership-driven ring change
-	// (events loop + reconcile loop both call bumpRingGen). lastEvalRing
-	// is the ring snapshot from the most recent Evaluate, paired with
-	// the live ring on the next tick to compute the delta plan.
-	// settleMu + settleTimer drive the debounce: every ring change
-	// (re)arms the timer; when it fires, runEvaluate computes the plan.
-	// rebalanceCtx / rebalanceCancel drive the background sweep loop.
-	rebalance       *rebalance.Coordinator
+	// Rebalance state (multi-node only; rebalance is empty in
+	// single-node mode). rebalance is the per-range Coordinator, held
+	// behind an atomic.Pointer so the events / reconcile loops can
+	// observe a coherent value without serializing against the rare
+	// replaceCoordinator path (--cancel). ringGen is the monotonic
+	// generation counter bumped on every membership-driven ring
+	// change (events loop + reconcile loop both call bumpRingGen).
+	// lastEvalRing is the ring snapshot from the most recent
+	// Evaluate, paired with the live ring on the next tick to compute
+	// the delta plan. settleMu + settleTimer drive the debounce:
+	// every ring change (re)arms the timer; when it fires,
+	// runEvaluate computes the plan. rebalanceCtx / rebalanceCancel
+	// drive the background sweep loop.
+	rebalance       atomic.Pointer[rebalance.Coordinator]
 	ringGen         atomic.Uint64
 	settleMu        sync.Mutex
 	settleTimer     *time.Timer
@@ -193,6 +197,16 @@ func Open(cfg Config) (*Cluster, error) {
 		c.ring.Add(ring.Member{ID: m.ID, Addr: m.Addr})
 	}
 
+	// Rebalance machinery: Coordinator + settle-timer + sweep.
+	// initRebalance MUST run BEFORE the events / reconcile goroutines
+	// spawn. Both of those call bumpRingGen -> scheduleEvaluate, which
+	// reads c.rebalance + (under settleMu) c.lastEvalRing. Initializing
+	// after the spawn races on those fields the very first time a
+	// membership event arrives. initRebalance only touches local fields
+	// from the calling goroutine, so doing it here is the safest
+	// publish point.
+	c.initRebalance()
+
 	// Run the events loop so future joins / leaves keep the ring in
 	// sync with membership. Also run a slower reconciliation loop
 	// that re-syncs the ring against the authoritative membership
@@ -204,11 +218,6 @@ func Open(cfg Config) (*Cluster, error) {
 	c.loopWG.Add(2)
 	go c.runEventsLoop()
 	go c.runReconcileLoop()
-
-	// Rebalance machinery: Coordinator + settle-timer + sweep.
-	// initRebalance must come AFTER the ring has been seeded so
-	// snapshotRing() picks up the local + seed members.
-	c.initRebalance()
 
 	return c, nil
 }
@@ -399,8 +408,8 @@ func (c *Cluster) Close() error {
 	// closes its internal stopCh which terminates in-flight FetchRange
 	// goroutines; cancel of rebalanceCtx terminates the sweep loop. Both
 	// are idempotent.
-	if c.rebalance != nil {
-		c.rebalance.Stop()
+	if rb := c.rebalance.Load(); rb != nil {
+		rb.Stop()
 	}
 	if c.rebalanceCancel != nil {
 		c.rebalanceCancel()
@@ -521,7 +530,7 @@ func (c *Cluster) Put(key, value []byte) error {
 	}
 	owner, local := c.ownerOf(key)
 	if local {
-		if c.rebalance != nil && (c.rebalance.IsMigrating(key) || c.rebalance.IsReceiving(key)) {
+		if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 			return migrationGuardError(c.retryAfterMs())
 		}
 		return c.backend.Put(key, value)
@@ -548,7 +557,7 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 	}
 	owner, local := c.ownerOf(key)
 	if local {
-		if c.rebalance != nil && c.rebalance.IsReceiving(key) {
+		if rb := c.rebalance.Load(); rb != nil && rb.IsReceiving(key) {
 			return nil, readMigrationHintError()
 		}
 		return c.backend.Get(key)
@@ -578,7 +587,7 @@ func (c *Cluster) Delete(key []byte) error {
 	}
 	owner, local := c.ownerOf(key)
 	if local {
-		if c.rebalance != nil && (c.rebalance.IsMigrating(key) || c.rebalance.IsReceiving(key)) {
+		if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 			return migrationGuardError(c.retryAfterMs())
 		}
 		return c.backend.Delete(key)
