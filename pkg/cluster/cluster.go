@@ -44,6 +44,14 @@ import (
 // state. Exposed as a var (not const) so tests can shrink it.
 var reconcileInterval = 5 * time.Second
 
+// ErrEmptyValue is returned by Put when value is nil or zero-length.
+// Use Delete to remove a key; the envelope's empty-payload shape is
+// reserved for Delete tombstones and storing one via Put would surface
+// as NotFound on subsequent Get calls (R>1) or empty bytes (R=1),
+// silently splitting Put-with-empty into two different semantics by
+// replication factor.
+var ErrEmptyValue = errors.New("cluster: Put with empty value; use Delete to remove a key")
+
 // WriteConsistency picks how many replica acks a Put / Delete waits
 // for before returning. iota+1 so the zero value is "unset" + Open
 // normalizes to the v0.4 default (WriteQuorum).
@@ -721,9 +729,20 @@ func (c *Cluster) evictClient(addr string) {
 // either ack or failure budget) so a single mid-handoff replica
 // doesn't fail an otherwise-quorum write. See docs/SPEC.md "Fan-out
 // + ack accounting".
+//
+// Empty-value rejection: Put refuses nil + zero-length value with
+// ErrEmptyValue. The envelope's empty-payload shape is reserved for
+// Delete tombstones; allowing Put(key, nil) would silently store a
+// tombstone at R>1 (looking like a Delete on subsequent reads) while
+// at R=1 the same call would store an empty value (looking like a
+// successful Put). The asymmetry is a foot-gun. Apps that want to
+// remove a key must call Delete explicitly.
 func (c *Cluster) Put(key, value []byte) error {
 	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
+	}
+	if len(value) == 0 {
+		return ErrEmptyValue
 	}
 	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
 		return c.putReplicated(key, value)
