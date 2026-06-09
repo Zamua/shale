@@ -5,7 +5,7 @@ package integration
 // Per docs/SPEC.md "LWW comparator":
 //
 //	1. higher TimestampNanos wins, OR
-//	2. timestamps equal AND higher (lex) WriterNodeID wins.
+//	2. timestamps equal AND higher (lex) NodeID wins.
 //
 // The cleanest way to pin the math without faking the system clock is
 // to plant the two competing envelopes directly into two replicas'
@@ -63,14 +63,14 @@ func TestReplicate_LWW_HigherTimestampWins(t *testing.T) {
 	earlyEnv := cluster.Encode(cluster.Envelope{
 		Stamp: cluster.Stamp{
 			TimestampNanos: 50,
-			WriterNodeID:   "writerA",
+			NodeID:   "writerA",
 		},
 		Payload: []byte("older"),
 	})
 	lateEnv := cluster.Encode(cluster.Envelope{
 		Stamp: cluster.Stamp{
 			TimestampNanos: 100,
-			WriterNodeID:   "writerB",
+			NodeID:   "writerB",
 		},
 		Payload: []byte("newer"),
 	})
@@ -97,7 +97,7 @@ func TestReplicate_LWW_HigherTimestampWins(t *testing.T) {
 
 // TestReplicate_LWW_NodeIDTiebreak pins the tiebreak rule: when two
 // envelopes carry IDENTICAL timestamps, the lexicographically greater
-// WriterNodeID wins. Same plant-the-envelopes pattern as above.
+// NodeID wins. Same plant-the-envelopes pattern as above.
 func TestReplicate_LWW_NodeIDTiebreak(t *testing.T) {
 	nodes := startReplicatedCluster(t, 2, 2, cluster.WriteAll, cluster.ReadAll)
 
@@ -113,13 +113,13 @@ func TestReplicate_LWW_NodeIDTiebreak(t *testing.T) {
 	}
 
 	// Plant two envelopes with identical TimestampNanos but different
-	// WriterNodeIDs. Lex tiebreak: "z" > "a", so "z" wins.
+	// NodeIDs. Lex tiebreak: "z" > "a", so "z" wins.
 	aEnv := cluster.Encode(cluster.Envelope{
-		Stamp:   cluster.Stamp{TimestampNanos: 42, WriterNodeID: "a"},
+		Stamp:   cluster.Stamp{TimestampNanos: 42, NodeID: "a"},
 		Payload: []byte("from-a"),
 	})
 	zEnv := cluster.Encode(cluster.Envelope{
-		Stamp:   cluster.Stamp{TimestampNanos: 42, WriterNodeID: "z"},
+		Stamp:   cluster.Stamp{TimestampNanos: 42, NodeID: "z"},
 		Payload: []byte("from-z"),
 	})
 

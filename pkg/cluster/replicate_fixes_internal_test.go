@@ -231,7 +231,7 @@ func TestReadRepair_BoundedByClose(t *testing.T) {
 	// so the hung peer's eventual "envelope at zero stamp" looks
 	// older than the winner.
 	envFresh := Encode(Envelope{
-		Stamp:   Stamp{TimestampNanos: 1_000_000, WriterNodeID: "writer"},
+		Stamp:   Stamp{TimestampNanos: 1_000_000, NodeID: "writer"},
 		Payload: []byte("fresh"),
 	})
 	if err := be.Put([]byte("rrc-key"), envFresh); err != nil {

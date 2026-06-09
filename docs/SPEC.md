@@ -204,10 +204,12 @@ When R>1, every Backend value is wrapped in an LWW envelope before storage:
 
 ```
 Envelope {
-  Stamp { TimestampNanos int64; NodeID string }
+  Stamp { TimestampNanos uint64; NodeID string }
   Payload []byte
 }
 ```
+
+`Stamp.NodeID` is bounded by `MaxNodeIDLen` (256 bytes) so the envelope's 2-byte length prefix can never silently truncate. `Open` rejects any `Config.NodeID` longer than the bound.
 
 The envelope is opaque to `Backend`: the cluster layer encodes on `Put` and decodes on `Get`, so backend implementations are unchanged. A value written in v0.3 (no envelope) decodes as `Stamp{0, ""}`: it loses every comparison against a stamped write and is re-stamped on the next `Put`. This is the migration path; no offline conversion step is required.
 

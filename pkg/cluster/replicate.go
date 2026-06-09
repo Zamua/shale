@@ -261,7 +261,7 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 	}
 	stamp := Stamp{
 		TimestampNanos: uint64(time.Now().UnixNano()),
-		WriterNodeID:   c.cfg.NodeID,
+		NodeID:   c.cfg.NodeID,
 	}
 	envBytes := Encode(Envelope{Stamp: stamp, Payload: append([]byte(nil), value...)})
 	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))

@@ -1,7 +1,7 @@
 // LWW value envelope for replication (v0.4+).
 //
 // Every Backend value, when R>1, is wrapped in an Envelope before
-// storage: a (TimestampNanos, WriterNodeID) Stamp plus the raw payload.
+// storage: a (TimestampNanos, NodeID) Stamp plus the raw payload.
 // The cluster layer encodes on Put + decodes on Get; the Backend never
 // sees the envelope. On a read fan-out (Quorum / All), the LWW
 // comparator picks the winner across replica responses, and async
@@ -29,6 +29,15 @@ import (
 // as the v0.3 compatibility path.
 const envelopeMagic byte = 0xE0
 
+// MaxNodeIDLen bounds Stamp.NodeID so the 2-byte wire-format length
+// prefix (uint16, max 65535) can never silently truncate. The limit
+// (256 bytes) is the same de-facto max most KV systems use for an
+// identifier and leaves enormous headroom for human-readable node IDs
+// (DNS-style hostnames, UUIDs, etc.). Cluster.Open rejects
+// Config.NodeID longer than this so a never-fits-in-uint16 ID can't
+// reach Encode.
+const MaxNodeIDLen = 256
+
 // Stamp is the LWW ordering key for a write: the originating node's
 // wall-clock at Put time + that node's stable ID. The cluster layer
 // stamps once on the originator before fan-out; every replica stores
@@ -40,17 +49,20 @@ type Stamp struct {
 	// happen here).
 	TimestampNanos uint64
 
-	// WriterNodeID is the originator's Config.NodeID. Used as the
+	// NodeID is the originator's Config.NodeID. Used as the
 	// lexicographic tiebreak when two writes carry identical
-	// nanosecond timestamps.
-	WriterNodeID string
+	// nanosecond timestamps. The "originator" qualifier is implicit
+	// from the surrounding Stamp model (every replica stores the same
+	// Stamp for the same write); the field name matches
+	// docs/SPEC.md's "Value envelope" section.
+	NodeID string
 }
 
 // Greater reports whether a's stamp wins LWW against b's. The
 // comparator is:
 //
 //  1. a.TimestampNanos > b.TimestampNanos wins, OR
-//  2. timestamps equal AND a.WriterNodeID > b.WriterNodeID
+//  2. timestamps equal AND a.NodeID > b.NodeID
 //     lexicographically.
 //
 // Self-comparison returns false (the relation is strict).
@@ -58,7 +70,7 @@ func (a Stamp) Greater(b Stamp) bool {
 	if a.TimestampNanos != b.TimestampNanos {
 		return a.TimestampNanos > b.TimestampNanos
 	}
-	return a.WriterNodeID > b.WriterNodeID
+	return a.NodeID > b.NodeID
 }
 
 // Envelope wraps a Backend value with its LWW Stamp + opaque payload.
@@ -74,9 +86,11 @@ type Envelope struct {
 //	magic(1) | timestamp_be(8) | nodeid_len_be(2) | nodeid_bytes | payload
 //
 // The payload runs to the end of the buffer (no length prefix needed:
-// the storage layer owns the value's total length).
+// the storage layer owns the value's total length). Callers must
+// ensure Stamp.NodeID is within MaxNodeIDLen; Open enforces this for
+// the originator's configured ID.
 func Encode(env Envelope) []byte {
-	idLen := len(env.Stamp.WriterNodeID)
+	idLen := len(env.Stamp.NodeID)
 	out := make([]byte, 0, 1+8+2+idLen+len(env.Payload))
 	out = append(out, envelopeMagic)
 	var tsBuf [8]byte
@@ -85,7 +99,7 @@ func Encode(env Envelope) []byte {
 	var lenBuf [2]byte
 	binary.BigEndian.PutUint16(lenBuf[:], uint16(idLen))
 	out = append(out, lenBuf[:]...)
-	out = append(out, env.Stamp.WriterNodeID...)
+	out = append(out, env.Stamp.NodeID...)
 	out = append(out, env.Payload...)
 	return out
 }
@@ -124,7 +138,7 @@ func Decode(b []byte) (Envelope, error) {
 	// caller owns the returned slice").
 	payload := append([]byte(nil), b[headerEnd:]...)
 	return Envelope{
-		Stamp:   Stamp{TimestampNanos: ts, WriterNodeID: nodeID},
+		Stamp:   Stamp{TimestampNanos: ts, NodeID: nodeID},
 		Payload: payload,
 	}, nil
 }

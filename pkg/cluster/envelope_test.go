@@ -11,7 +11,7 @@ func TestEnvelope_RoundTrip(t *testing.T) {
 	want := cluster.Envelope{
 		Stamp: cluster.Stamp{
 			TimestampNanos: 1_717_000_000_000_000_000,
-			WriterNodeID:   "node-2",
+			NodeID:   "node-2",
 		},
 		Payload: []byte("hello, world"),
 	}
@@ -32,7 +32,7 @@ func TestEnvelope_RoundTrip_EmptyPayload(t *testing.T) {
 	// Tombstone shape: stamp set, payload empty. Must round-trip
 	// without colliding with the v0.3-compat zero-stamp path.
 	want := cluster.Envelope{
-		Stamp:   cluster.Stamp{TimestampNanos: 42, WriterNodeID: "n1"},
+		Stamp:   cluster.Stamp{TimestampNanos: 42, NodeID: "n1"},
 		Payload: nil,
 	}
 	got, err := cluster.Decode(cluster.Encode(want))
@@ -50,7 +50,7 @@ func TestEnvelope_RoundTrip_EmptyPayload(t *testing.T) {
 func TestEnvelope_RoundTrip_EmptyNodeID(t *testing.T) {
 	// Edge case: nodeID-length-prefix 0 must encode + decode cleanly.
 	want := cluster.Envelope{
-		Stamp:   cluster.Stamp{TimestampNanos: 1, WriterNodeID: ""},
+		Stamp:   cluster.Stamp{TimestampNanos: 1, NodeID: ""},
 		Payload: []byte("v"),
 	}
 	got, err := cluster.Decode(cluster.Encode(want))
@@ -115,8 +115,8 @@ func TestDecode_NodeIDOverrunsBuffer(t *testing.T) {
 }
 
 func TestStamp_Greater_TimestampWins(t *testing.T) {
-	older := cluster.Stamp{TimestampNanos: 100, WriterNodeID: "z"}
-	newer := cluster.Stamp{TimestampNanos: 200, WriterNodeID: "a"}
+	older := cluster.Stamp{TimestampNanos: 100, NodeID: "z"}
+	newer := cluster.Stamp{TimestampNanos: 200, NodeID: "a"}
 	if !newer.Greater(older) {
 		t.Errorf("newer.Greater(older) should be true regardless of nodeID")
 	}
@@ -126,8 +126,8 @@ func TestStamp_Greater_TimestampWins(t *testing.T) {
 }
 
 func TestStamp_Greater_NodeIDTiebreak(t *testing.T) {
-	a := cluster.Stamp{TimestampNanos: 100, WriterNodeID: "node-b"}
-	b := cluster.Stamp{TimestampNanos: 100, WriterNodeID: "node-a"}
+	a := cluster.Stamp{TimestampNanos: 100, NodeID: "node-b"}
+	b := cluster.Stamp{TimestampNanos: 100, NodeID: "node-a"}
 	if !a.Greater(b) {
 		t.Errorf("equal-ts: lex-greater nodeID should win (node-b > node-a)")
 	}
@@ -138,7 +138,7 @@ func TestStamp_Greater_NodeIDTiebreak(t *testing.T) {
 
 func TestStamp_Greater_SelfNotGreater(t *testing.T) {
 	// Strict comparison: a stamp is not Greater than itself.
-	s := cluster.Stamp{TimestampNanos: 100, WriterNodeID: "n1"}
+	s := cluster.Stamp{TimestampNanos: 100, NodeID: "n1"}
 	if s.Greater(s) {
 		t.Errorf("Greater is strict: s.Greater(s) must be false")
 	}
@@ -148,7 +148,7 @@ func TestStamp_Greater_ZeroStampLoses(t *testing.T) {
 	// The v0.3-compat path produces a zero Stamp; any real stamp
 	// must beat it.
 	zero := cluster.Stamp{}
-	real_ := cluster.Stamp{TimestampNanos: 1, WriterNodeID: ""}
+	real_ := cluster.Stamp{TimestampNanos: 1, NodeID: ""}
 	if !real_.Greater(zero) {
 		t.Errorf("real stamp should beat zero stamp")
 	}

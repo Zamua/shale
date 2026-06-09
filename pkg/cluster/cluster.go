@@ -282,6 +282,10 @@ func Open(cfg Config) (*Cluster, error) {
 	if cfg.NodeID == "" {
 		return nil, errors.New("cluster: NodeID is required")
 	}
+	if len(cfg.NodeID) > MaxNodeIDLen {
+		return nil, fmt.Errorf("cluster: NodeID length %d exceeds MaxNodeIDLen %d; the envelope's uint16 length prefix would silently truncate",
+			len(cfg.NodeID), MaxNodeIDLen)
+	}
 	if cfg.Backend == nil {
 		return nil, errors.New("cluster: Backend is required")
 	}
