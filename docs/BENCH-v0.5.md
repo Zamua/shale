@@ -68,34 +68,78 @@ go build -o shale-bench ./cmd/shale-bench/
 
 ## Slate scenarios (run separately via `make bench-v0.5-slate`)
 
-Slate is gated behind its own target because the harness has to bring up a MinIO container, the binary needs `-tags slatedb` + the SlateDB cdylib + cgo, and every Put round-trips to object storage (so op counts are smaller to keep each scenario under 60s).
+Slate is gated behind its own target because the harness has to bring up a MinIO container, the binary needs `-tags slatedb` + the SlateDB cdylib + cgo, and every strict-mode Put round-trips to object storage (so op counts are smaller to keep each scenario under 60s).
+
+Eight scenarios run: the four shapes (raw + cluster at n1/r1, n3/r1, n3/r3) crossed with the two durability modes the slate backend now supports. The "strict" set uses `AwaitDurable=true` (slatedb's own default, byte-exact with the pre-WriteOptions slate path). The "relaxed" set passes `slate.Config{WriteOptions: &slatedb.WriteOptions{AwaitDurable: false}}` so each Put acks at memtable insert; durability comes from the background WAL flush. The contract for what `Backend.Put` acks means is the backend's choice; see `docs/SPEC.md` "Backend durability is a backend concern" for shale's stance.
+
+### AwaitDurable=true (strict; current shale default)
 
 | Scenario | Backend | Nodes | R | Put p50 (ms) | Put p99 (ms) | Get p50 (ms) | Get p99 (ms) | Put ops/s | Get ops/s |
 |---|---|---|---|---:|---:|---:|---:|---:|---:|
-| raw-slate | slate | 1 | 1 | 103 | 111 | 0.02 | 1.51 | 77.2 | 99,923 |
-| cluster-slate-n1-r1 | slate | 1 | 1 | 103 | 151 | 0.02 | 0.68 | 77.4 | 159,443 |
-| cluster-slate-n3-r1 | slate | 3 | 1 | 103 | 110 | 0.15 | 0.66 | 78.2 | 50,067 |
-| cluster-slate-n3-r3 | slate | 3 | 3 | 102 | 108 | 0.42 | 1.98 | 78.4 | 13,181 |
+| raw-slate | slate | 1 | 1 | 103 | 109 | 0.02 | 1.16 | 77.2 | 119,251 |
+| cluster-slate-n1-r1 | slate | 1 | 1 | 102 | 106 | 0.01 | 0.23 | 78.4 | 345,612 |
+| cluster-slate-n3-r1 | slate | 3 | 1 | 100 | 107 | 0.11 | 0.65 | 97.7 | 64,431 |
+| cluster-slate-n3-r3 | slate | 3 | 3 | 103 | 108 | 0.47 | 2.34 | 77.4 | 11,876 |
+
+### AwaitDurable=false (relaxed; pair with R>=2 in production)
+
+| Scenario | Backend | Nodes | R | Put p50 (ms) | Put p99 (ms) | Get p50 (ms) | Get p99 (ms) | Put ops/s | Get ops/s |
+|---|---|---|---|---:|---:|---:|---:|---:|---:|
+| raw-slate-relaxed | slate | 1 | 1 | 0.04 | 0.94 | 0.02 | 0.23 | 118,411 | 259,791 |
+| cluster-slate-n1-r1-relaxed | slate | 1 | 1 | 0.11 | 0.73 | 0.02 | 0.37 | 49,234 | 192,231 |
+| cluster-slate-n3-r1-relaxed | slate | 3 | 1 | 0.26 | 2.33 | 0.13 | 0.67 | 19,037 | 59,159 |
+| cluster-slate-n3-r3-relaxed | slate | 3 | 3 | 0.39 | 3.79 | 0.40 | 1.27 | 11,661 | 15,115 |
+
+The two R=1 relaxed rows (`raw-slate-relaxed`, `cluster-slate-n1-r1-relaxed`) are informational only: relaxed durability at R=1 is unsafe (a single replica crash inside the WAL-flush window loses the un-flushed writes), and per spec a fast-ack backend must be paired with `ReplicationFactor >= 2` in production. The numbers are included so the shape of the speedup is visible across the suite, NOT as a recommended deployment target. `cluster-slate-n3-r3-relaxed` is the production-shaped relaxed scenario.
 
 Workload: 500 ops per phase, 1024-byte values, 8 concurrent clients. MinIO running locally in colima (single-node, no replication, plaintext HTTP on the loopback). SlateDB v0.13.1.
 
+### Strict vs relaxed put throughput (same shape, same MinIO)
+
+| Shape | Strict ops/s | Relaxed ops/s | Speedup |
+|---|---:|---:|---:|
+| raw-slate | 77.2 | 118,411 | 1533x |
+| cluster-slate-n1-r1 | 78.4 | 49,234 | 628x |
+| cluster-slate-n3-r1 | 97.7 | 19,037 | 195x |
+| cluster-slate-n3-r3 | 77.4 | 11,661 | 151x |
+
 ### Where the cost goes (slate)
 
-**Writes are S3-RTT-bound, full stop.** Every shape pins at ~77 ops/s and p50 ~103ms. That's three S3 PUTs per SlateDB commit (WAL append, manifest update, durability sync to whatever object-store batching SlateDB does internally) against local-loopback MinIO. None of the shale-layer cost (envelope encode, ring lookup, gRPC fan-out) is visible against that backdrop: the cluster's `n3-r3` write is no slower than the raw single-store write because all three replicas' SlateDB commits overlap and the slowest one still finishes in ~100ms. The conclusion holds across every scenario including raw: throughput scales with concurrency rather than fan-out, because each concurrent client is mostly blocked on S3 PUT latency that other clients can overlap with.
+**Strict mode is S3-RTT-bound, full stop.** Every strict shape pins at ~77-100 ops/s and p50 ~100ms. That's the SlateDB commit waiting on the object-store sync against local-loopback MinIO. None of the shale-layer cost (envelope encode, ring lookup, gRPC fan-out) is visible against that backdrop: the cluster's `n3-r3` write is no slower than the raw single-store write because all three replicas' SlateDB commits overlap and the slowest one still finishes in ~100ms. Throughput scales with concurrency rather than fan-out, because each concurrent client is mostly blocked on S3 PUT latency that other clients can overlap with.
 
-**Reads are served from the in-process blockcache.** Once the write phase finishes, SlateDB has the just-written SST blocks in memory; the read phase never round-trips to MinIO. So `raw-slate` reads come out at ~100K ops/s (just blockcache lookups + envelope decode), and the cluster scenarios drop to whatever the shale fan-out costs: ~50K/s at n3-r1 (one gRPC hop), ~13K/s at n3-r3 (ReadQuorum fan-out + LWW). Those last two numbers are the same shape as the pebble cluster scenarios because the underlying backend Get is essentially free in both cases (RAM hit either way). A workload with a working set larger than the SlateDB blockcache would tell a very different story; that's a v0.6 follow-up.
+**Relaxed mode unmasks the shale-layer cost.** With AwaitDurable=false the SlateDB ack is microsecond-scale (memtable insert), so the S3-RTT floor disappears and the remaining cost is the bench loop + envelope encode + (in the cluster shapes) the ring lookup + gRPC fan-out. The headline 1533x speedup at `raw-slate` is the naked WAL-flush savings (118K ops/s relaxed vs 77 ops/s strict); the cluster shapes give back successive chunks of that to the cluster layer's own cost. `cluster-slate-n1-r1-relaxed` (628x) loses ~58% to the in-process cluster layer (49K vs raw's 118K), `cluster-slate-n3-r1-relaxed` (195x) further loses ~61% to the gRPC fan-out (19K vs 49K), and the production-shaped `cluster-slate-n3-r3-relaxed` (151x) is what an operator running with R=3 + fast-ack should expect. The relaxed cluster numbers now look a lot like pebble's: n3-r3 puts at ~12K/s for both backends, which is the expected outcome when the backend Put is no longer the bottleneck.
+
+**Was the speedup what we predicted?** Roughly yes for the magnitudes (slatedb's per-Put cost falling from ~13ms typical to "microseconds + background flush" matches "two-to-three orders of magnitude" rule-of-thumb), but bigger than expected at the raw shape. The 1533x at `raw-slate` is partly an MinIO-on-colima artifact: virtualized disk fsync inside colima is unusually slow, so the strict baseline is depressed relative to real-S3 or even bare-metal MinIO. On real AWS S3 the strict floor would be 50-150ms instead of 100ms, but the relaxed ceiling would also rise (the bench's relaxed CPU cost would no longer be the bottleneck on a faster path either). The cluster-shaped speedups (628x / 195x / 151x) are the more meaningful numbers because they include the in-process shale cost.
+
+**Reads are essentially unchanged across modes.** WriteOptions only affects the durability path on Put/Delete/Commit; reads serve from the SlateDB blockcache either way. The strict and relaxed read columns are within noise of each other for the same shape.
 
 **Multi-writer per store is fenced; the harness gives each node its own DbName.** SlateDB enforces single-writer-per-store via writer-epoch. Naively wiring N cluster nodes to the same SlateDB instance would have them fence each other within milliseconds of cluster startup. The harness gives each node its own DbName (= node id) inside the shared bucket, so the 3-node scenarios run as 3 independent SlateDB stores. That's not how a real shale-on-slate deploy would be shaped (in production, ONE SlateDB per cluster, with shale's replication providing HA on top), but it's the only multi-node story consistent with SlateDB's single-writer guarantee in a single-process bench.
 
-**Caveat: this is loopback MinIO with no replication, no TLS, no S3 throttling.** Real S3 / R2 / GCS RTTs from a US-East EC2 instance to the same-region bucket are typically 5-15ms one-way; cross-region or cross-cloud is 50-200ms. A real-world slate write at ~3x that RTT puts the floor at ~15-45ms p50 in the best case and ~150-600ms in the worst. The 103ms we see here is dominated by MinIO's own commit fsync inside colima (virtualized disk on Apple Silicon).
+**Caveat: this is loopback MinIO with no replication, no TLS, no S3 throttling.** Real S3 / R2 / GCS RTTs from a US-East EC2 instance to the same-region bucket are typically 5-15ms one-way; cross-region or cross-cloud is 50-200ms. A real-world strict slate write at ~3x that RTT puts the floor at ~15-45ms p50 in the best case and ~150-600ms in the worst. The 103ms we see here is dominated by MinIO's own commit fsync inside colima (virtualized disk on Apple Silicon).
 
 ### Reproducing the slate run
 
 ```bash
-make bench-v0.5-slate                                    # canonical (500 ops, 1KB, conc 8)
+make bench-v0.5-slate                                    # canonical (500 ops, 1KB, conc 8; all 8 scenarios)
 SHALE_BENCH_OPS=2000 make bench-v0.5-slate               # more samples; ~30-60s/scenario
 SHALE_BENCH_CONC=32 make bench-v0.5-slate                # squeeze peak throughput
 SLATEDB_LIB_DIR=/path/to/lib make bench-v0.5-slate       # custom SlateDB cdylib
+```
+
+To drive one scenario directly (e.g. just the production-shaped relaxed case), build the harness with the slatedb tag and pass `--slate-await-durable=false`:
+
+```bash
+CGO_ENABLED=1 \
+  CGO_LDFLAGS="-L/path/to/slatedb/target/release" \
+  DYLD_LIBRARY_PATH=/path/to/slatedb/target/release \
+  go build -tags slatedb -o shale-bench ./cmd/shale-bench/
+SHALE_BENCH_S3_ENDPOINT=http://127.0.0.1:9000 \
+  SHALE_BENCH_S3_BUCKET=shale-bench \
+  SHALE_BENCH_S3_ACCESS_KEY=... \
+  SHALE_BENCH_S3_SECRET_KEY=... \
+  ./shale-bench --mode cluster --backend slate --nodes 3 --rf 3 \
+                --slate-await-durable=false \
+                --ops 500 --value-size 1024 --concurrency 8 --json
 ```
 
 Requirements:

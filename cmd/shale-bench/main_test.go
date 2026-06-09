@@ -101,6 +101,61 @@ func TestRun_SlateBackend_AcceptedButFailsWithoutTag(t *testing.T) {
 	}
 }
 
+// TestRun_SlateAwaitDurable_FlagAccepted pins that --slate-await-durable
+// parses cleanly under the no-tag build (which is what 99% of
+// contributors will be running unit tests against). The actual slate
+// open still fails because there is no slatedb runtime; we only assert
+// the flag itself doesn't break flag parsing and that the cross-tag
+// handoff plumbing (slateWriteOpts + makeSlateWriteOptions) is wired
+// without panic. Anchors the "operator can opt into relaxed mode via
+// CLI" contract that scripts/run-bench-slate.sh depends on.
+func TestRun_SlateAwaitDurable_FlagAccepted(t *testing.T) {
+	for _, awaitDurable := range []string{"true", "false"} {
+		t.Run("await-durable="+awaitDurable, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			code := run([]string{
+				"--mode", "raw",
+				"--backend", "slate",
+				"--slate-await-durable=" + awaitDurable,
+				"--ops", "1",
+			}, &stdout, &stderr)
+			// Slate without the slatedb tag must still fail (the
+			// existing contract). The flag itself must not have
+			// caused a parse error (rc=2) - we expect rc=1, the
+			// "backend open failed" code, which carries the
+			// slatedb-tag message.
+			if code != 1 {
+				t.Fatalf("rc=%d want 1 (open failure). stderr=%q", code, stderr.String())
+			}
+			if !strings.Contains(stderr.String(), "slatedb") {
+				t.Errorf("expected slatedb-tag message in stderr, got %q", stderr.String())
+			}
+		})
+	}
+}
+
+// TestRun_SlateAwaitDurable_HandoffResetsAcrossRuns pins that the
+// package-level slateWriteOpts var is cleared on exit so a relaxed-mode
+// run does NOT leak into a subsequent strict run. Without the deferred
+// reset in run(), a test suite (or a script invoking the harness
+// multiple times in-process) could see the second case silently inherit
+// the first case's WriteOptions. Anchors that defer.
+func TestRun_SlateAwaitDurable_HandoffResetsAcrossRuns(t *testing.T) {
+	if slateWriteOpts != nil {
+		t.Fatalf("precondition: slateWriteOpts must be nil; got %v", slateWriteOpts)
+	}
+	var stdout, stderr bytes.Buffer
+	_ = run([]string{
+		"--mode", "raw",
+		"--backend", "slate",
+		"--slate-await-durable=false",
+		"--ops", "1",
+	}, &stdout, &stderr)
+	if slateWriteOpts != nil {
+		t.Errorf("slateWriteOpts must be cleared on exit; still %v", slateWriteOpts)
+	}
+}
+
 // TestRun_InvalidFlags rejects the obviously wrong combinations.
 func TestRun_InvalidFlags(t *testing.T) {
 	cases := []struct {

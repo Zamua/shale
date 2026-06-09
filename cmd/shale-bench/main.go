@@ -143,6 +143,15 @@ Flags:
   --value-size BYTES        payload bytes per put (default 1024)
   --concurrency N           parallel client goroutines (default 4)
   --scenario NAME           label used in JSON output (default auto)
+  --slate-await-durable B   (slate only) when false, opens the slate
+                            backend with WriteOptions{AwaitDurable:false}
+                            for relaxed-durability mode. Defaults true
+                            (slatedb's own default), which is byte-exact
+                            with the pre-flag behavior. Pair relaxed mode
+                            with --rf >= 2 in production; R=1 relaxed is
+                            unsafe (single replica crash loses un-flushed
+                            writes). See docs/SPEC.md "Backend durability
+                            is a backend concern".
   --json                    emit one JSON object instead of text
 `)
 	}
@@ -154,6 +163,7 @@ Flags:
 	valueSize := fs.Int("value-size", 1024, "payload bytes per put")
 	concurrency := fs.Int("concurrency", 4, "parallel goroutines")
 	scenarioLabel := fs.String("scenario", "", "label for JSON output (default auto)")
+	slateAwaitDurable := fs.Bool("slate-await-durable", true, "(slate only) AwaitDurable on per-write WriteOptions")
 	jsonOut := fs.Bool("json", false, "emit a JSON object")
 	if err := fs.Parse(argv); err != nil {
 		return 2
@@ -210,6 +220,16 @@ Flags:
 		pebbleBaseDir = dir
 		defer func() { _ = os.RemoveAll(pebbleBaseDir) }()
 	}
+
+	// Plumb --slate-await-durable through the cross-tag handoff. Only
+	// meaningful for --backend=slate; the no-tag stub returns nil so
+	// builds without -tags slatedb still compile. We reset on exit so
+	// tests that share the package-level var across cases don't leak
+	// one case's choice into the next.
+	if *backendName == "slate" && !*slateAwaitDurable {
+		slateWriteOpts = makeSlateWriteOptions(false)
+	}
+	defer func() { slateWriteOpts = nil }()
 
 	sc := scenario{
 		Mode:        *mode,
@@ -355,6 +375,26 @@ func openBackend(name, baseDir, id string) (backend.Backend, error) {
 var openSlateBackend = func(id string) (backend.Backend, error) {
 	return nil, fmt.Errorf("slate backend requires -tags slatedb build (got id=%s)", id)
 }
+
+// slateWriteOpts is the cross-build-tag handoff for the
+// --slate-await-durable flag. Holds an opaque *slatedb.WriteOptions
+// when set; the slate-tagged newSlateBackend constructor (slate.go)
+// reads it back and threads it through slate.Config.WriteOptions. Nil
+// means "no WriteOptions on the slate config" which leaves slatedb on
+// its own default of AwaitDurable=true.
+//
+// Stored as `any` because this file (main.go) compiles without the
+// slatedb build tag and cannot import the slatedb package. The slate.go
+// file owns the type and the construction.
+var slateWriteOpts any
+
+// makeSlateWriteOptions is the type-erased factory for slateWriteOpts.
+// Overridden by the slatedb-tagged build to return a typed
+// *slatedb.WriteOptions{AwaitDurable: <flag>}; the default no-tag stub
+// returns nil. This stub is only ever reached via --backend=slate,
+// which already errors out earlier without the slatedb tag, so the
+// no-tag branch is effectively unreachable.
+var makeSlateWriteOptions = func(awaitDurable bool) any { return nil }
 
 // builtCluster captures the state we have to tear down at end of run.
 type builtCluster struct {

@@ -103,17 +103,20 @@ test-slate-minio:
 bench-v0.5:
 	bash scripts/run-bench.sh
 
-# v0.5 slate-backend bench suite: runs the 4 slate scenarios (raw +
-# cluster at R=1/R=3, single-node + 3-node) against a local MinIO
-# spun up by the script via Docker. Requires:
+# v0.5 slate-backend bench suite: runs 8 slate scenarios (raw +
+# cluster at R=1/R=3, single-node + 3-node, each in both
+# AwaitDurable=true "strict" mode and AwaitDurable=false "relaxed"
+# mode via --slate-await-durable) against a local MinIO spun up by
+# the script via Docker. Requires:
 #   - Docker reachable (colima on dev box; any daemon in CI)
 #   - SlateDB cdylib at SLATEDB_LIB_DIR (inherited from this Makefile;
 #     same path test-slate already uses)
 #   - cgo toolchain (matches test-slate's expectations)
 #
-# Smaller op count than bench-v0.5 because each Put round-trips to
+# Smaller op count than bench-v0.5 because strict Puts round-trip to
 # object storage (~80-100ms on local MinIO); scenarios are sized to
-# stay under 60s wall-clock each.
+# stay under 60s wall-clock each. The relaxed scenarios finish in
+# under a second because they ack at the SlateDB memtable.
 #
 # Reuse an external MinIO instead of letting the script bring one
 # up by exporting SHALE_BENCH_S3_ENDPOINT (+ bucket/credentials)

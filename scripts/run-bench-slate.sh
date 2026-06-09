@@ -135,12 +135,23 @@ fi
 # Each slate node uses its own DbName (= node id) so the per-node
 # writer epochs don't fence each other. Scenarios cover the same
 # shape as the pebble/memory suite: raw baseline, 1-node cluster,
-# 3-node cluster at R=1 and R=3.
+# 3-node cluster at R=1 and R=3. The "-relaxed" variants open slate
+# with WriteOptions{AwaitDurable=false} via --slate-await-durable=false
+# so we can measure the throughput delta of fast-ack mode.
+#
+# Per spec: relaxed + R=1 is unsafe (single replica crash loses
+# un-flushed writes). Included here for measurement / parity with the
+# strict suite; the markdown the docs render labels those rows
+# "informational only, do not run in production without replication".
 SCENARIOS=(
-  "raw-slate,raw,slate,1,1"
-  "cluster-slate-n1-r1,cluster,slate,1,1"
-  "cluster-slate-n3-r1,cluster,slate,3,1"
-  "cluster-slate-n3-r3,cluster,slate,3,3"
+  "raw-slate,raw,slate,1,1,true"
+  "cluster-slate-n1-r1,cluster,slate,1,1,true"
+  "cluster-slate-n3-r1,cluster,slate,3,1,true"
+  "cluster-slate-n3-r3,cluster,slate,3,3,true"
+  "raw-slate-relaxed,raw,slate,1,1,false"
+  "cluster-slate-n1-r1-relaxed,cluster,slate,1,1,false"
+  "cluster-slate-n3-r1-relaxed,cluster,slate,3,1,false"
+  "cluster-slate-n3-r3-relaxed,cluster,slate,3,3,false"
 )
 
 RESULTS_FILE="$WORK_DIR/results.jsonl"
@@ -170,9 +181,9 @@ export DYLD_LIBRARY_PATH="${SLATEDB_LIB_DIR}:${DYLD_LIBRARY_PATH:-}"
 export LD_LIBRARY_PATH="${SLATEDB_LIB_DIR}:${LD_LIBRARY_PATH:-}"
 
 for entry in "${SCENARIOS[@]}"; do
-  IFS=',' read -r label mode backend nodes rf <<< "$entry"
+  IFS=',' read -r label mode backend nodes rf await_durable <<< "$entry"
   reset_bucket
-  echo "Running $label (mode=$mode backend=$backend nodes=$nodes rf=$rf ops=$OPS conc=$CONC)..." >&2
+  echo "Running $label (mode=$mode backend=$backend nodes=$nodes rf=$rf await_durable=$await_durable ops=$OPS conc=$CONC)..." >&2
   set +e
   out=$("$BIN" \
     --mode "$mode" \
@@ -183,18 +194,22 @@ for entry in "${SCENARIOS[@]}"; do
     --value-size "$VALUE_SIZE" \
     --concurrency "$CONC" \
     --scenario "$label" \
+    --slate-await-durable="$await_durable" \
     --json 2>"$WORK_DIR/$label.stderr")
   rc=$?
   set -e
   if [[ $rc -ne 0 ]]; then
     echo "$label FAILED (rc=$rc). stderr:" >&2
     cat "$WORK_DIR/$label.stderr" >&2
-    printf '{"scenario":"%s","mode":"%s","backend":"%s","nodes":%d,"replication_factor":%d,"failed":true}\n' \
-      "$label" "$mode" "$backend" "$nodes" "$rf" >> "$RESULTS_FILE"
+    printf '{"scenario":"%s","mode":"%s","backend":"%s","nodes":%d,"replication_factor":%d,"await_durable":%s,"failed":true}\n' \
+      "$label" "$mode" "$backend" "$nodes" "$rf" "$await_durable" >> "$RESULTS_FILE"
     continue
   fi
-  printf '%s\n' "$out" | tr -d '\n' >> "$RESULTS_FILE"
-  printf '\n' >> "$RESULTS_FILE"
+  # Tag the JSON row with await_durable before persisting so the table
+  # renderer can split strict vs relaxed without re-parsing the label.
+  printf '%s\n' "$out" \
+    | python3 -c 'import json, sys; row=json.loads(sys.stdin.read()); row["await_durable"]=(sys.argv[1]=="true"); print(json.dumps(row))' "$await_durable" \
+    >> "$RESULTS_FILE"
 done
 
 python3 - "$RESULTS_FILE" "$OPS" "$VALUE_SIZE" "$CONC" <<'PY'
@@ -231,24 +246,64 @@ def cell(row, phase, field):
             return fmt(p.get(field))
     return "-"
 
+def put_tput(row):
+    if row.get("failed"):
+        return None
+    for p in row.get("phases", []):
+        if p.get("phase") == "write":
+            return p.get("throughput_ops_per_sec")
+    return None
+
 print("# shale v0.5 slate benchmark results")
 print()
 print(f"Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}  ")
 print(f"Workload: {ops} ops per phase (write then read), {value_size}-byte values, {conc} concurrent clients.  ")
 print()
-print("| Scenario | Backend | Nodes | R | Put p50 (ms) | Put p99 (ms) | Get p50 (ms) | Get p99 (ms) | Put ops/s | Get ops/s |")
-print("|---|---|---|---|---:|---:|---:|---:|---:|---:|")
-for row in rows:
-    print("| {scenario} | {backend} | {nodes} | {r} | {wp50} | {wp99} | {rp50} | {rp99} | {wtput} | {rtput} |".format(
-        scenario=row.get("scenario", "-"),
-        backend=row.get("backend", "-"),
-        nodes=row.get("nodes", "-"),
-        r=row.get("replication_factor", "-"),
-        wp50=cell(row, "write", "p50_ms"),
-        wp99=cell(row, "write", "p99_ms"),
-        rp50=cell(row, "read", "p50_ms"),
-        rp99=cell(row, "read", "p99_ms"),
-        wtput=cell(row, "write", "throughput_ops_per_sec"),
-        rtput=cell(row, "read", "throughput_ops_per_sec"),
-    ))
+
+strict  = [r for r in rows if r.get("await_durable") is True]
+relaxed = [r for r in rows if r.get("await_durable") is False]
+
+def render(title, subset):
+    print(f"## {title}")
+    print()
+    print("| Scenario | Backend | Nodes | R | Put p50 (ms) | Put p99 (ms) | Get p50 (ms) | Get p99 (ms) | Put ops/s | Get ops/s |")
+    print("|---|---|---|---|---:|---:|---:|---:|---:|---:|")
+    for row in subset:
+        print("| {scenario} | {backend} | {nodes} | {r} | {wp50} | {wp99} | {rp50} | {rp99} | {wtput} | {rtput} |".format(
+            scenario=row.get("scenario", "-"),
+            backend=row.get("backend", "-"),
+            nodes=row.get("nodes", "-"),
+            r=row.get("replication_factor", "-"),
+            wp50=cell(row, "write", "p50_ms"),
+            wp99=cell(row, "write", "p99_ms"),
+            rp50=cell(row, "read", "p50_ms"),
+            rp99=cell(row, "read", "p99_ms"),
+            wtput=cell(row, "write", "throughput_ops_per_sec"),
+            rtput=cell(row, "read", "throughput_ops_per_sec"),
+        ))
+    print()
+
+render("AwaitDurable=true (strict; current shale default)", strict)
+render("AwaitDurable=false (relaxed; pair with R>=2 in production)", relaxed)
+
+# Side-by-side put-throughput comparison, strict vs relaxed, same shape.
+def shape_key(r):
+    return (r.get("mode"), r.get("nodes"), r.get("replication_factor"))
+strict_by_shape  = {shape_key(r): r for r in strict}
+relaxed_by_shape = {shape_key(r): r for r in relaxed}
+print("## Strict vs relaxed put throughput")
+print()
+print("| Shape | Strict ops/s | Relaxed ops/s | Speedup |")
+print("|---|---:|---:|---:|")
+for shape in strict_by_shape:
+    s_row = strict_by_shape[shape]
+    r_row = relaxed_by_shape.get(shape)
+    s_t = put_tput(s_row)
+    r_t = put_tput(r_row) if r_row else None
+    label = s_row.get("scenario", "-").replace("-relaxed", "")
+    if s_t and r_t:
+        speedup = f"{r_t / s_t:.1f}x"
+    else:
+        speedup = "-"
+    print(f"| {label} | {fmt(s_t)} | {fmt(r_t)} | {speedup} |")
 PY

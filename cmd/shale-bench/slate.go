@@ -55,6 +55,7 @@ import (
 
 	"github.com/Zamua/shale/backends/slate"
 	"github.com/Zamua/shale/pkg/backend"
+	slatedb "slatedb.io/slatedb-go/uniffi"
 )
 
 // slateEnvPrefix is the namespace for slate-bench env vars. Kept in
@@ -66,6 +67,22 @@ func init() {
 	// at package init so the dispatch from openBackend in main.go is
 	// in place before any --backend=slate scenario fires.
 	openSlateBackend = newSlateBackend
+}
+
+// buildSlateWriteOptions returns a *slatedb.WriteOptions for the given
+// awaitDurable flag, or nil for the slatedb-default path (which is
+// itself AwaitDurable=true). Surfaced as a package-level helper so
+// main.go's --slate-await-durable flag can plumb the choice through
+// slateWriteOpts without main.go having to import slatedb directly
+// (that import is gated behind the slatedb build tag).
+func buildSlateWriteOptions(awaitDurable bool) any {
+	return &slatedb.WriteOptions{AwaitDurable: awaitDurable}
+}
+
+func init() {
+	// Bind the typed-nil helper to the untyped factory in main.go so the
+	// no-tag build doesn't need to know slatedb exists.
+	makeSlateWriteOptions = buildSlateWriteOptions
 }
 
 // newSlateBackend opens one SlateDB instance against the configured
@@ -93,7 +110,7 @@ func newSlateBackend(id string) (backend.Backend, error) {
 	// recognize when poking at the bucket directly.
 	dbName := "shale-bench-" + id
 
-	return slate.New(slate.Config{
+	cfg := slate.Config{
 		Bucket:    bucket,
 		DbName:    dbName,
 		Endpoint:  endpoint,
@@ -101,5 +118,17 @@ func newSlateBackend(id string) (backend.Backend, error) {
 		AccessKey: accessKey,
 		SecretKey: secretKey,
 		UseSSL:    useSSL,
-	})
+	}
+	// slateWriteOpts is the cross-build-tag handoff from main.go's
+	// --slate-await-durable flag. Nil means "stick with slatedb's
+	// default (AwaitDurable=true)"; non-nil is a *slatedb.WriteOptions
+	// constructed via buildSlateWriteOptions above.
+	if slateWriteOpts != nil {
+		if wo, ok := slateWriteOpts.(*slatedb.WriteOptions); ok {
+			cfg.WriteOptions = wo
+		} else {
+			return nil, fmt.Errorf("slate: internal bench wiring error, slateWriteOpts has wrong type %T", slateWriteOpts)
+		}
+	}
+	return slate.New(cfg)
 }
