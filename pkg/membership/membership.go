@@ -85,6 +85,18 @@ type Membership struct {
 
 	mu     sync.Mutex
 	closed bool
+
+	// cache holds the authoritative Member snapshot keyed by node ID.
+	// Reads (Members, Snapshot) consult this map under cacheMu instead
+	// of dereferencing memberlist.Node pointers, whose Name + Meta
+	// fields memberlist mutates from its own goroutines without a
+	// per-Node lock. The cache is populated from inside memberlist's
+	// NotifyJoin / NotifyLeave / NotifyUpdate callbacks (which run
+	// serialized vs the alive/dead transitions, so reading Node fields
+	// THERE is safe), plus a single seeding pass at Open time before
+	// any external goroutine can observe Membership.
+	cacheMu sync.RWMutex
+	cache   map[string]Member
 }
 
 // metaDelegate is the minimal memberlist.Delegate that publishes our
@@ -126,29 +138,88 @@ type eventDelegate struct {
 	out       chan Event
 	closed    bool
 	dropCount atomic.Uint64
+
+	// parent is the Membership whose cache the callbacks update. Set
+	// once during Open before memberlist.Create can fire any callback,
+	// then read-only for the lifetime of the delegate. Stays nil only
+	// in the TestDropCountObservable case where the delegate is poked
+	// directly without a parent (the test bypasses the public path).
+	parent *Membership
+}
+
+// nodeToMember derives our Member value object from a memberlist.Node.
+// MUST ONLY be called either (a) at Open() during the single-writer
+// seeding window before goroutines spawn, or (b) inside a memberlist
+// event callback (NotifyJoin/Leave/Update), where memberlist serializes
+// the call against its own alive/dead transitions and Node-field
+// mutation. Calling this from a reconcile / Members / Snapshot path
+// races with memberlist's internal aliveNode writes; the cache exists
+// precisely to avoid that.
+func nodeToMember(n *memberlist.Node) Member {
+	name := strings.Clone(n.Name)
+	meta := append([]byte(nil), n.Meta...)
+	return Member{
+		ID:   name,
+		Addr: string(meta),
+	}
 }
 
 func (e *eventDelegate) NotifyJoin(n *memberlist.Node) {
-	e.send(EventJoin, n)
+	m := nodeToMember(n)
+	e.upsertCache(m)
+	e.send(EventJoin, m)
 }
 
 func (e *eventDelegate) NotifyLeave(n *memberlist.Node) {
-	e.send(EventLeave, n)
+	m := nodeToMember(n)
+	e.removeCache(m.ID)
+	e.send(EventLeave, m)
 }
 
 func (e *eventDelegate) NotifyUpdate(n *memberlist.Node) {
 	// Treat metadata updates as a join refresh: the addressing info
 	// for the node may have changed (e.g. GRPCAddr migrated).
-	e.send(EventJoin, n)
+	m := nodeToMember(n)
+	e.upsertCache(m)
+	e.send(EventJoin, m)
 }
 
-func (e *eventDelegate) send(t EventType, n *memberlist.Node) {
+// upsertCache writes the given Member into the parent Membership's
+// cache. No-op if no parent is attached (the synthetic-delegate test
+// path). Late stray callbacks after Close are harmless: Members()
+// already returns nil once the parent's closed flag is set, so the
+// post-Close cache state is unobservable.
+func (e *eventDelegate) upsertCache(m Member) {
+	if e.parent == nil {
+		return
+	}
+	e.parent.cacheMu.Lock()
+	if e.parent.cache == nil {
+		e.parent.cache = make(map[string]Member, 4)
+	}
+	e.parent.cache[m.ID] = m
+	e.parent.cacheMu.Unlock()
+}
+
+// removeCache deletes the given ID from the parent Membership's cache.
+// No-op if no parent is attached. See upsertCache for the post-Close
+// rationale.
+func (e *eventDelegate) removeCache(id string) {
+	if e.parent == nil {
+		return
+	}
+	e.parent.cacheMu.Lock()
+	delete(e.parent.cache, id)
+	e.parent.cacheMu.Unlock()
+}
+
+func (e *eventDelegate) send(t EventType, m Member) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	if e.closed {
 		return
 	}
-	ev := Event{Type: t, Member: nodeToMember(n)}
+	ev := Event{Type: t, Member: m}
 	select {
 	case e.out <- ev:
 	default:
@@ -190,6 +261,17 @@ func Open(cfg Config) (*Membership, error) {
 
 	events := &eventDelegate{out: make(chan Event, 64)}
 
+	// Construct the Membership shell first so events.parent points at
+	// a real cache before memberlist.Create can fire NotifyJoin for
+	// the local node. cache is non-nil so the first callback never
+	// has to allocate under cacheMu.
+	m := &Membership{
+		cfg:    cfg,
+		events: events,
+		cache:  make(map[string]Member, 4),
+	}
+	events.parent = m
+
 	mlCfg := memberlist.DefaultLANConfig()
 	mlCfg.Name = cfg.NodeID
 	if bindHost != "" {
@@ -220,19 +302,43 @@ func Open(cfg Config) (*Membership, error) {
 			return nil, fmt.Errorf("membership: join: no seeds reachable (seeds=%v)", cfg.Seeds)
 		}
 	}
+	m.ml = ml
 
-	return &Membership{
-		cfg:    cfg,
-		ml:     ml,
-		events: events,
-	}, nil
+	// Belt-and-suspenders cache seed. The NotifyJoin path SHOULD have
+	// inserted every currently-known node already (memberlist fires
+	// it during Create + Join for the local node and each peer), but
+	// pulling from memberlist.Members() once here covers the
+	// theoretical window between Join returning and the final
+	// NotifyJoin draining through. This is the ONE call site outside
+	// the event callbacks that reads Node fields directly: it is
+	// safe only because no other Membership consumer has a handle
+	// yet (Open has not returned), so memberlist's gossip goroutines
+	// are the only writers and their NotifyJoin/Leave is what we are
+	// reconciling against.
+	for _, n := range ml.Members() {
+		mem := nodeToMember(n)
+		m.cacheMu.Lock()
+		if _, ok := m.cache[mem.ID]; !ok {
+			m.cache[mem.ID] = mem
+		}
+		m.cacheMu.Unlock()
+	}
+
+	return m, nil
 }
 
 // Members returns a snapshot of currently known cluster members,
 // sorted by ID for deterministic iteration. Returns nil if the
-// Membership has been Closed (defensive: the underlying memberlist
-// would race with shutdown; nil is a safe sentinel callers can
-// already handle).
+// Membership has been Closed (defensive: callers may still hold a
+// reference; nil is a safe sentinel they can already handle).
+//
+// Reads from the internal cache populated by NotifyJoin / NotifyLeave
+// / NotifyUpdate, NOT from memberlist.Members(). memberlist's
+// *Node fields mutate from its own goroutines without a per-Node
+// lock, so dereferencing them concurrently is a data race the race
+// detector catches. The event callbacks are serialized vs those
+// internal mutations, so the cache is consistent with the
+// authoritative view memberlist publishes via events.
 func (m *Membership) Members() []Member {
 	m.mu.Lock()
 	if m.closed {
@@ -240,11 +346,12 @@ func (m *Membership) Members() []Member {
 		return nil
 	}
 	m.mu.Unlock()
-	nodes := m.ml.Members()
-	out := make([]Member, 0, len(nodes))
-	for _, n := range nodes {
-		out = append(out, nodeToMember(n))
+	m.cacheMu.RLock()
+	out := make([]Member, 0, len(m.cache))
+	for _, mem := range m.cache {
+		out = append(out, mem)
 	}
+	m.cacheMu.RUnlock()
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
@@ -293,25 +400,6 @@ func (m *Membership) Close() error {
 	err := m.ml.Shutdown()
 	m.events.shutdown()
 	return err
-}
-
-// nodeToMember converts memberlist's Node into our value object,
-// decoding the Meta payload as the gRPC address.
-//
-// memberlist mutates *Node fields (Name, Meta, Addr...) from its
-// own goroutines (aliveNode, deadNode, etc.) without exposing a
-// per-Node lock. Reading those fields concurrently with a write is
-// a data race the race detector catches. We defensively copy the
-// scalar Name + the Meta byte slice into our own Member value so
-// the returned struct can outlive any memberlist mutation. The copy
-// is cheap; the underlying Node may change immediately after.
-func nodeToMember(n *memberlist.Node) Member {
-	name := strings.Clone(n.Name)
-	meta := append([]byte(nil), n.Meta...)
-	return Member{
-		ID:   name,
-		Addr: string(meta),
-	}
 }
 
 // splitHostPort parses a "host:port" or ":port" string into its
