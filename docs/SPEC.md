@@ -97,6 +97,22 @@ Shipped impls:
 
 BYO: implement the interface, register the impl, done.
 
+### Backend durability is a backend concern
+
+Shale's contract is "Put returns when Backend.Put returns." What that ack MEANS (in-memory only? local fsync? round-trip to object storage?) is up to the backend. Shale doesn't translate, doesn't enforce, doesn't expose a Durability enum at the cluster level.
+
+This means a backend can ship a "fast-ack, eventually-durable" mode if it wants to. Slate, for instance, supports `await_durable=false` which acks at memtable insert (microseconds) rather than waiting for the WAL flush to S3 (~100ms). The slate backend constructor exposes this as `slate.WithAwaitDurable(false)`; operator picks it at backend construction, shale neither knows nor cares.
+
+CAVEAT FOR FAST-ACK BACKENDS WITH SHALE REPLICATION
+
+If your Backend's Put can return BEFORE durable persistence, you should pair it with `ReplicationFactor >= 2`. The reason: a single replica crash inside the backend's loss window would otherwise destroy un-flushed writes. With R = 2 or more, loss requires every ack'd replica to crash inside the same window, which is much rarer for independent failures.
+
+This is a NOTE, not enforcement. Shale doesn't refuse R = 1 with a fast-ack backend; the operator's responsibility.
+
+For correlated failures (whole-DC outage, same-software-bug crash cascade), even R >= 2 doesn't fully protect a fast-ack backend. Spreading replicas across failure domains helps; documenting that the loss window exists is essential.
+
+See `pkg/backend/slate/README.md` for slate's specific durability options.
+
 ---
 
 ## Cluster model
