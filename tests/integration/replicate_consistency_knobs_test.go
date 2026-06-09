@@ -171,9 +171,11 @@ func startCountingCluster(t *testing.T, count, r int, wc cluster.WriteConsistenc
 	for i, n := range nodes {
 		cs[i] = n.Cluster
 	}
-	if err := waitForMembersAll(cs, count, 10*time.Second); err != nil {
-		t.Fatalf("counting cluster convergence: %v", err)
-	}
+	// Full settle before writes: ReadAll fan-out tests count
+	// per-backend Gets after the call, which is corrupted if a
+	// bootstrap migration is still routing through the source's
+	// runSend / sweep window.
+	waitForClusterReady(t, cs, 15*time.Second)
 	return nodes
 }
 

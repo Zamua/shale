@@ -32,13 +32,17 @@ import (
 func TestRebalance_ReadDuringReceiveForwardsToSource(t *testing.T) {
 	t.Parallel()
 
-	// 2-node baseline.
+	// 2-node baseline. Wait for full settle (ring + bootstrap
+	// rebalance) before seeding keys: if we start putWithRetry while
+	// n2's bootstrap migration is in flight, some Puts hit the
+	// migration-guard ResourceExhausted + the retry loop exhausts
+	// before the cluster quiesces, surfacing as a flake. The test's
+	// real subject is rf-n3's later receive window, not the n1/n2
+	// bootstrap.
 	n1 := startTestNode(t, "rf-n1", "")
 	n2 := startTestNode(t, "rf-n2", n1.BindAddr)
 	pair := []*cluster.Cluster{n1.Cluster, n2.Cluster}
-	if err := waitForMembersAll(pair, 2, 10*time.Second); err != nil {
-		t.Fatalf("2-node convergence: %v", err)
-	}
+	waitForClusterReady(t, pair, 15*time.Second)
 
 	// Pick a hash-tag prefix whose owner moves to rf-n3 on join +
 	// seed MANY keys under that tag so they all hash to the same

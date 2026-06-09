@@ -12,6 +12,7 @@
 package integration
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
@@ -292,9 +293,21 @@ func hostPort(port int) string {
 
 // startReplicatedCluster brings up `count` nodes joined into one
 // cluster, each configured with the supplied replication factor +
-// consistency knobs. Waits for ring convergence on every node before
-// returning so tests can start writing immediately. Cleanup is wired
-// via t.Cleanup on each node.
+// consistency knobs. Waits for ring convergence AND bootstrap-rebalance
+// quiescence on every node before returning, so tests can start writing
+// against a fully-settled cluster. Cleanup is wired via t.Cleanup on
+// each node.
+//
+// The two-phase wait matters: ring convergence (every node sees N
+// members) happens quickly under SWIM gossip, but the rebalance
+// Coordinator on each node debounces membership events for
+// RebalanceSettleDelay (500ms in the integration fixture) before
+// evaluating + dispatching the migrations the joins triggered. If we
+// return after only ring convergence, the first Put in a test can land
+// on a partition whose ownership is mid-move - the source sends back
+// ResourceExhausted ("key is migrating out") + the test logs as a
+// flake. Waiting for WaitForRebalanceIdle on every node closes that
+// window.
 func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc cluster.WriteConsistency, rc cluster.ReadConsistency) []*testNode {
 	t.Helper()
 	if count < 1 {
@@ -313,8 +326,66 @@ func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc clust
 	for i, n := range nodes {
 		cs[i] = n.Cluster
 	}
-	if err := waitForMembersAll(cs, count, 10*time.Second); err != nil {
-		t.Fatalf("replicated cluster (count=%d, R=%d) convergence: %v", count, replicationFactor, err)
-	}
+	waitForClusterReady(t, cs, 15*time.Second)
 	return nodes
+}
+
+// waitForClusterReady is the canonical "the fixture is done settling"
+// gate. Tests call this right after spinning up + joining all nodes,
+// before issuing any Put/Get that depends on stable ownership. It
+// guards against the integration-suite flake class where the first
+// write into a freshly-joined cluster hits a partition mid-migration
+// or a node that hasn't yet noticed its new peers.
+//
+// Three-phase wait:
+//
+//  1. Ring convergence: every node's Members() reports len(clusters)
+//     entries. Under SWIM gossip this is sub-second on loopback but
+//     not synchronous, so a multi-node assertion that fires before
+//     convergence races.
+//  2. Rebalance quiescence: every Coordinator's WaitForRebalanceIdle
+//     returns. This closes the debounced-Evaluate -> Send -> Receive
+//     -> sweep cycle that fires on each Notify*Join, so the in-flight
+//     bootstrap migrations + their grace-window sweeps are all
+//     complete before the test starts writing.
+//  3. A small belt-and-suspenders sleep to let any async events
+//     (delete-after-send sweep ticks, cache invalidation, etc.) drain.
+//
+// The deadline argument is the wall-clock budget for ALL three steps;
+// each phase consumes part of it. On timeout we fail with a clear
+// per-phase diagnostic so a real cluster bug is easy to spot vs a
+// transient slow-CI hiccup.
+func waitForClusterReady(t *testing.T, clusters []*cluster.Cluster, deadline time.Duration) {
+	t.Helper()
+	start := time.Now()
+	if err := waitForMembersAll(clusters, len(clusters), deadline); err != nil {
+		t.Fatalf("waitForClusterReady: ring convergence: %v", err)
+	}
+	// Pre-WaitForIdle sleep: the seed node's Coordinator debounces
+	// each NotifyJoin behind RebalanceSettleDelay (500ms in the
+	// integration fixture). If we call WaitForIdle before that timer
+	// fires, the Coordinator has nothing pending + returns "idle"
+	// immediately - then the Evaluate fires while the test is already
+	// putting, and we are back to the original flake. Sleeping past
+	// the settle window ensures Evaluate has run and the post-Evaluate
+	// Sending/Receiving entries exist for WaitForIdle to actually
+	// observe.
+	time.Sleep(700 * time.Millisecond)
+	remaining := deadline - time.Since(start)
+	if remaining <= 0 {
+		t.Fatalf("waitForClusterReady: pre-idle waits consumed the entire %s budget", deadline)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), remaining)
+	defer cancel()
+	for i, c := range clusters {
+		if err := c.WaitForRebalanceIdle(ctx); err != nil {
+			t.Fatalf("waitForClusterReady: rebalance idle wait on cluster %d (%s): %v", i, c.NodeID(), err)
+		}
+	}
+	// Small drain window after Coordinator-reported idle so any async
+	// side effects (grace-window sweep ticks, ring-rebuild fan-outs,
+	// peer client cache invalidations) settle before the test starts
+	// writing. 50ms is well under any test's per-step budget but is
+	// long enough to consistently clear the post-idle backlog.
+	time.Sleep(50 * time.Millisecond)
 }

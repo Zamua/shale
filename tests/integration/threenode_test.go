@@ -33,9 +33,13 @@ func newThreeNodeFixture(t *testing.T) *threeNodeFixture {
 	n2 := startTestNode(t, "n2", n1.BindAddr)
 	n3 := startTestNode(t, "n3", n1.BindAddr)
 	f := &threeNodeFixture{N1: n1, N2: n2, N3: n3}
-	if err := waitForMembersAll(f.Clusters(), 3, 10*time.Second); err != nil {
-		t.Fatalf("3-node convergence: %v", err)
-	}
+	// Full settle (ring convergence + rebalance quiescence) before
+	// tests start writing. Plain ring convergence isn't enough: when
+	// N2/N3 join, N1's Coordinator dispatches a bootstrap migration of
+	// some partitions across to them, and any Put that races the
+	// migration window hits ResourceExhausted. See helpers_test.go
+	// waitForClusterReady for the full rationale.
+	waitForClusterReady(t, f.Clusters(), 15*time.Second)
 	return f
 }
 
