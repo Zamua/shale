@@ -23,6 +23,7 @@ shale is the third option: thin Go library, BYO backend, scales by adding proces
 - [x] v0.3: shard rebalancing on membership changes (settle-delay, streaming MigrateRange RPC, write rejection during cutover, in-flight read forwarding, cleanup sweep); `shale rebalance` CLI. (v0.3.1 followed with 7 fixes including a P0 data-loss path on real backends.)
 - [x] v0.4: replication factor R + tunable read/write consistency (Nearest / Quorum / All) + LWW conflict resolution + read-repair + Delete-as-tombstone. (v0.4.1 fixed 8 review concerns; v0.4.2 eliminated a membership data race; v0.4.3 stabilizing test fixtures.)
 - [ ] v0.5: observability (Prometheus metrics, tracing hooks) + real benchmarks vs single-node backends.
+- [ ] v0.5.x: multi-module monorepo split (`backends/slate` + `backends/pebble` each get their own `go.mod`); backend-specific `Settings` pass-through for engine knobs (e.g. slate's `await_durable`); thin-shell `cmd/shaled` with per-backend builds. Lands before v0.6 freezes the API.
 - [ ] v0.6: hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend on production-shape data.
 
 Don't use in production yet.

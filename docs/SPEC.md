@@ -92,10 +92,11 @@ type Transaction interface {
 Minimum surface that lets the cluster layer do its job. No backend-specific options leak through.
 
 Shipped impls:
-- `pkg/backend/memory` - in-process map; tests + dev
-- `pkg/backend/slate` - SlateDB-on-object-storage (planned for v0.1)
+- `pkg/backend/memory` - in-process map; tests + dev. Lives in the core shale module; tests + dev workflows depend on it.
+- `backends/slate` - SlateDB-on-object-storage (separate Go module; see "Repo layout" below).
+- `backends/pebble` - Pebble local-disk LSM (separate Go module; see "Repo layout" below).
 
-BYO: implement the interface, register the impl, done.
+BYO: implement the interface in your own Go module (the interface is small + stable), import shale's core, register the impl, done. The `backends/` subdirectories in this repo are reference impls; nothing about them is privileged.
 
 ### Backend durability is a backend concern
 
@@ -111,7 +112,238 @@ This is a NOTE, not enforcement. Shale doesn't refuse R = 1 with a fast-ack back
 
 For correlated failures (whole-DC outage, same-software-bug crash cascade), even R >= 2 doesn't fully protect a fast-ack backend. Spreading replicas across failure domains helps; documenting that the loss window exists is essential.
 
-See `pkg/backend/slate/README.md` for slate's specific durability options.
+See `backends/slate/README.md` for slate's specific durability options.
+
+### Backend-specific Settings pass-through
+
+Each backend's `Config` struct optionally carries a `Settings` (or `Options`) field whose type is owned by the underlying engine, not by shale. The constructor forwards it untouched. Shale never reads, mutates, or wraps it; it never knows what's in it.
+
+Concrete shapes:
+
+```go
+// backends/slate
+type Config struct {
+    Bucket    string
+    DbName    string
+    Endpoint  string
+    Region    string
+    AccessKey string
+    SecretKey string
+    UseSSL    bool
+
+    // Settings is forwarded verbatim to slatedb. Nil = slatedb defaults.
+    // Operator owns the lifecycle: build the *slatedb.Settings, pass it
+    // here, slate.New hands it to NewDbBuilder. Shale neither inspects
+    // nor copies it.
+    Settings *slatedb.Settings
+}
+
+// backends/pebble
+type Config struct {
+    Dir string
+
+    // Options is forwarded verbatim to pebble.Open. Nil = pebble defaults.
+    Options *pebble.Options
+}
+
+// pkg/backend/memory
+type Config struct{} // nothing to pass through; no underlying engine.
+```
+
+Example: an operator who wants slate's `await_durable=false` mode (acks at memtable insert, ~microseconds, instead of waiting for the WAL flush to object storage, ~100ms) builds the slatedb-side Settings before opening the backend:
+
+```go
+settings := slatedb.NewSettings()
+settings.AwaitDurable = false        // backend-specific knob, slatedb-owned
+
+be, _ := slate.New(slate.Config{
+    Bucket:   "my-bucket",
+    DbName:   "my-db",
+    Settings: settings,
+})
+
+c, _ := cluster.Open(cluster.Config{
+    NodeID:            "n1",
+    Backend:           be,
+    ReplicationFactor: 2,  // recommended pairing for fast-ack; see "durability" above
+    ...
+})
+```
+
+Equivalent for pebble: build a `*pebble.Options{DisableWAL: true}` (or whatever pebble exposes), drop it into `pebble.Config.Options`, hand the backend to shale.
+
+Design choices:
+
+  - **Pass-through, not enum.** A `cluster.Config.Durability` enum would force shale to translate "what the operator wanted" into "what the backend supports," fragmenting on every backend's quirks. The pass-through keeps the per-backend control surface intact + keeps shale ignorant.
+  - **Backend-specific type, not `interface{}`.** Each backend exposes the upstream engine's actual Settings type. Operators get the engine's full knob surface + documentation, plus type-checked field access. The alternative (an opaque `any` blob) loses both.
+  - **No shale-level validation.** If the operator wires a Settings combo the engine rejects, the engine's constructor surfaces the error at backend Open time, before shale ever sees the backend. Shale would have nothing useful to add.
+  - **No shipping defaults via shale.** Shale's only opinion is "if you pass nil, the backend picks its own default." The backend ships its own defaults independently of shale's release cycle.
+
+The CAVEAT FOR FAST-ACK BACKENDS WITH SHALE REPLICATION above still applies: a backend in a fast-ack mode (whether reached via Settings or otherwise) should pair with `ReplicationFactor >= 2`. Shale notes the recommendation; it doesn't enforce.
+
+---
+
+## Repo layout (multi-module)
+
+shale's repo is a Go **multi-module monorepo** as of v0.5. The core module lives at the repo root; each non-trivial backend is its own module inside `backends/<name>/`. Operators import only the modules they need; CGO + heavy dep weight stay with the backends that actually use them.
+
+### Module boundaries
+
+```
+github.com/Zamua/shale                       core module (go.mod at repo root)
+  pkg/backend/                               the Backend interface + sentinels (memory)
+  pkg/backend/memory/                        in-process map; stays in core for tests + dev
+  pkg/cluster/                               public Cluster surface
+  pkg/ring/                                  consistent hash ring
+  pkg/membership/                            memberlist wrapper
+  pkg/rpc/                                   gRPC server/client for inter-node ops
+  pkg/rebalance/                             v0.3 handoff protocol
+  cmd/shale/                                 the CLI
+  cmd/shaled/                                the standalone-node binary (thin shell; see below)
+
+github.com/Zamua/shale/backends/slate        separate module (go.mod inside backends/slate/)
+  config.go, slate.go, ...                   pulls in slatedb.io/slatedb-go (cgo)
+
+github.com/Zamua/shale/backends/pebble       separate module (go.mod inside backends/pebble/)
+  pebble.go, ...                             pulls in github.com/cockroachdb/pebble
+```
+
+### Why split
+
+  - **Dep weight + CGO isolation.** The slate backend transitively pulls slatedb-go (cgo, native shared library, OpenDAL transitive deps). Operators who only want pebble (or memory) shouldn't pay that cost. A user importing `github.com/Zamua/shale/pkg/cluster` + `backends/pebble` resolves zero slate transitives.
+  - **Independent versioning.** Backend impls can release on their own cadence. A bug fix in `backends/slate` ships as `backends/slate/v0.5.3` without bumping the core module. Conversely, an unrelated cluster bug fix bumps only the core.
+  - **Lower friction for third-party backends.** Anyone can publish `github.com/foo/shale-rocksdb` (or similar) as a single-module repo that imports `github.com/Zamua/shale/pkg/backend` for the interface. The in-repo `backends/*` are reference impls; nothing in the layout privileges them.
+  - **Memory stays in core.** The memory backend has zero external deps + is what every cluster-layer test uses; pulling it out would require every internal test target to take a module dependency on itself. The cost / benefit doesn't warrant it.
+
+### `shaled` as a thin shell
+
+Pre-v0.5, `cmd/shaled` hardcoded the backend choice with a `--backend=memory|pebble|slate` flag and switched into one of three constructor files (with `slate` gated behind a `slatedb` build tag). That shape doesn't compose with the multi-module split: shaled-in-core can't import `backends/slate` without dragging slate's deps back into the core module.
+
+The v0.5 shape:
+
+  - **`cmd/shaled` in the core module ships only the memory backend.** It serves the cluster + gRPC stack against an in-process memory store. This is enough for integration tests, smoke tests, and demos.
+  - **Backend-specific builds use build tags + a per-backend constructor file**, where the constructor lives in the backend module's own `cmd/shaled-<backend>/` directory (or operators clone shaled + add their own constructor). Building a slate-aware shaled is:
+
+    ```
+    cd backends/slate
+    CGO_ENABLED=1 go build -tags slatedb -o shaled-slate ./cmd/shaled-slate
+    ```
+
+    Equivalent for pebble (no cgo, no tag needed). Each backend module owns its own thin shaled main that wires its constructor into the core's `shaled` run loop (which exports the necessary helpers).
+  - **Operators with a custom mix** (e.g. a private backend, or multiple backends in one binary) clone the relevant `cmd/shaled-*` as a template + customize. This is explicit + small (the main is ~30 lines once the wiring helper is factored out).
+
+The core `cmd/shaled` thus becomes the minimal, dependency-free reference; per-backend shaleds are the artifacts operators actually ship. Distributing a single "fat" binary that supports every backend would re-create the dep-weight problem the split was designed to solve.
+
+### `go.work` for development
+
+A repo-root `go.work` file unifies the core module + every `backends/*` module:
+
+```
+go 1.25.4
+
+use (
+    .
+    ./backends/slate
+    ./backends/pebble
+)
+```
+
+With workspace mode active (Go 1.18+), `go test ./...` from the repo root traverses every module; cross-module changes (e.g. a Backend interface tweak) test against in-tree backend impls without a publish + bump cycle. CI runs in workspace mode for the full matrix; release builds disable workspace mode (`GOWORK=off`) so each module's `go.mod` is the source of truth for its own deps.
+
+### Migration path for existing imports
+
+Today: `import "github.com/Zamua/shale/pkg/backend/slate"` and `import "github.com/Zamua/shale/pkg/backend/pebble"`.
+
+v0.5 introduces: `import "github.com/Zamua/shale/backends/slate"` + a separate `require github.com/Zamua/shale/backends/slate v0.5.0` line in the consumer's `go.mod`.
+
+The recommended path is **break + bump**:
+
+  - v0.4.x is the last release with `pkg/backend/{slate,pebble}` import paths.
+  - v0.5.0 ships the new layout. The CHANGELOG documents the import-path change as a one-line `gofmt -r`-able rewrite; consumers update + bump.
+  - The old paths are deleted, not deprecated-with-forwarders. The pre-v1 contract says API breaks are allowed at minor versions; forwarders would either (a) pull slate's deps back into the core module (defeating the split) or (b) live as build-tag-gated empty stubs that confuse more than they help.
+
+Operators who can't rewrite immediately stay on the v0.4 line until they're ready. The v0.4 line gets bug fixes for the v0.4.x window only; new development moves to v0.5.
+
+The split happens NOW (the v0.5.x window) rather than later because v0.6's hostthis migration locks in the API; landing the module restructure before v0.6 means consumers do one rewrite, not two.
+
+---
+
+## External backends and the FooDB pattern
+
+Shale's contract assumes one Backend instance per shaled. For **embedded** backends (slate, pebble, memory) this is automatic: each shaled embeds its own `*Slate` / `*Pebble` / memory map; no two shaleds share storage. For **external** backends (Redis, a standalone KV server, a HTTP KV service; call this "FooDB" generically), it requires explicit per-shaled provisioning. Get this wrong and shale's correctness model collapses.
+
+### The pattern (code sketch)
+
+A FooDB-backed Backend is a thin client wrapper. Each shaled holds a client to **its own** FooDB instance, not a shared one:
+
+```
+shaled-1  -- backend.Backend --> FooDB instance A   (only shaled-1 reads/writes this)
+shaled-2  -- backend.Backend --> FooDB instance B   (only shaled-2 reads/writes this)
+shaled-3  -- backend.Backend --> FooDB instance C   (only shaled-3 reads/writes this)
+```
+
+Shale's hash ring routes each key to one shaled; that shaled does the Put/Get against ITS FooDB. Replication (R>1) and rebalance (v0.3+) work unchanged: replicated writes fan out to R shaleds, each of which writes to its own FooDB; rebalance streams keys from one shaled-and-its-FooDB pair to another.
+
+The Backend impl:
+
+```go
+// backends/foodb (hypothetical third-party module)
+package foodb
+
+import (
+    "github.com/Zamua/shale/pkg/backend"
+    "github.com/example/foodb-client-go"
+)
+
+type Config struct {
+    Addr     string             // address of THIS shaled's dedicated FooDB
+    Settings *foodb.ClientOpts  // pass-through, same pattern as slate/pebble
+}
+
+type FooDB struct{ c *foodb.Client }
+
+func New(cfg Config) (*FooDB, error) {
+    c, err := foodb.Dial(cfg.Addr, cfg.Settings)
+    if err != nil { return nil, err }
+    return &FooDB{c: c}, nil
+}
+
+func (f *FooDB) Put(k, v []byte) error           { return f.c.Set(k, v) }
+func (f *FooDB) Get(k []byte) ([]byte, error)    { /* translate not-found */ }
+func (f *FooDB) Delete(k []byte) error           { return f.c.Del(k) }
+func (f *FooDB) ScanPrefix(p []byte) (backend.Iterator, error) { /* ... */ }
+func (f *FooDB) Begin(level backend.IsolationLevel) (backend.Transaction, error) { /* ... */ }
+func (f *FooDB) Close() error                    { return f.c.Close() }
+```
+
+Reads + writes pay an extra hop (shaled → FooDB) on top of shale's normal routing. Transactions need a FooDB that exposes the equivalent shape; if the engine doesn't have transactions, the Backend impl can return a "not supported" error on Begin and shale's transaction proxy surfaces that to the caller.
+
+### When this helps, when it doesn't
+
+**Wrong tool: shale in front of a single shared FooDB.** If every shaled connects to the same FooDB instance, shale adds a network hop on every operation with zero shard or replication benefit (the underlying FooDB is the only durability + only point of failure). Just use FooDB directly.
+
+**Wrong tool, dangerously: many shaleds writing to one shared FooDB.** This breaks shale's per-shaled isolation model. Two scenarios fail:
+
+  - **Routing assumes ownership.** Shale's ring says "shaled-2 owns this key." Shaled-2 writes it to the shared FooDB. Shaled-1 (for the same key, after a rebalance) reads it from the same shared FooDB and gets shaled-2's write. So far so good. Now membership changes; shaled-3 becomes the owner. Shale's rebalancer streams the key from shaled-2 to shaled-3 (a copy through both of their Backends), but in the shared-FooDB world both reads + writes land at the same place: the key gets written twice with potentially different envelopes (different LWW stamps from the two shaleds), and the rebalance's per-range write-rejection window doesn't apply because both shaleds are talking to the same store.
+  - **Replication writes collide.** Under R>=2, shaled-2 and shaled-3 both write the same key (one as primary, one as replica). If they share a FooDB, the second write overwrites the first; LWW reconciliation cannot run because there's only ONE physical copy.
+
+The rule: **one FooDB instance per shaled. Period.** If you can't provision one FooDB per shaled (whether physical instances, separate logical databases, or keyspace-scoped client credentials that hard-prevent cross-shaled writes), shale isn't the right tool for your FooDB.
+
+**Right tool: future-proofing at N=1.** A common use is "I'm on one FooDB today + I want to scale by adding more later without changing app code." Run shale at N=1 in front of FooDB instance A:
+
+  - Cost: every op pays an extra hop (shaled → FooDB). At N=1 there's no sharding payoff to amortize.
+  - Win: when you scale to N=3, you provision FooDB instances B + C, stand up shaled-2 + shaled-3 each pointing at their own FooDB, and the ring rebalances automatically. App code didn't change; the cutover is the same join + rebalance flow shale uses for embedded backends.
+
+Whether the flexibility win is worth the per-op hop depends on the workload. For apps that genuinely expect to scale horizontally and value not rewriting later, it's the right trade. For apps that will never outgrow one FooDB, skip shale and use FooDB directly.
+
+### Reference
+
+A hypothetical `github.com/foo/shale-redis` would be a single-module repo:
+  - `go.mod` requires `github.com/Zamua/shale/pkg/backend` for the interface + the redis-go client.
+  - One `redis.go` implementing `backend.Backend` against a single Redis instance.
+  - A `cmd/shaled-redis/` thin wrapper using the same pattern as `backends/slate/cmd/shaled-slate/`.
+
+The shale repo doesn't ship this; the external-backend story is "publish your own module + import shale's interface." Nothing about a third-party backend is second-class.
 
 ---
 
@@ -416,22 +648,34 @@ shale ships two binaries from v0.1, separate from the library import path. Their
 
 ### `shaled` (standalone node)
 
-Runs a shale node as its own process, without an app embedding it. Backend chosen via flag. Useful for:
+Runs a shale node as its own process, without an app embedding it. Useful for:
   - Integration tests (shell scripts spin up N nodes on ephemeral ports)
   - Local multi-node dev clusters
   - Operators who want a managed shale process per host (instead of embedding inside their app)
 
+As of v0.5, shaled is a thin shell + the backend choice is the binary you build, not a flag (see "Repo layout / `shaled` as a thin shell" above). The core `cmd/shaled` ships memory-only. Per-backend builds live in each backend module:
+
 ```
-shaled \
-  --node-id node-1 \
-  --bind-addr :7946 \
-  --grpc-addr :7947 \
-  --seeds node-2:7946,node-3:7946 \
-  --backend memory|slate \
-  --slate-bucket my-bucket           # if --backend=slate
+shaled                      # core build: memory backend, no external deps
+shaled-pebble               # built from backends/pebble/cmd/shaled-pebble/
+shaled-slate                # built from backends/slate/cmd/shaled-slate/ with -tags slatedb
+
+# Memory shaled (the default; used by integration tests):
+shaled --node-id node-1 --bind-addr :7946 --grpc-addr :7947 --seeds node-2:7946
+
+# Pebble shaled (durable, pure Go):
+shaled-pebble --node-id node-1 --bind-addr :7946 --grpc-addr :7947 \
+  --seeds node-2:7946 --pebble-dir /var/lib/shale/node-1
+
+# Slate shaled (S3-compatible object storage; cgo build):
+shaled-slate --node-id node-1 --bind-addr :7946 --grpc-addr :7947 \
+  --seeds node-2:7946 \
+  --slate-bucket my-bucket --slate-db-name node-1 \
+  --slate-endpoint http://minio:9000 \
+  --slate-access-key X --slate-secret-key Y
 ```
 
-shaled exposes the same gRPC service the inter-node forwarding layer uses. The CLI talks to it via that gRPC. For v0.1 (single-node), shaled is functional standalone: one node, one Backend, gRPC up so the CLI can hit it.
+shaled exposes the same gRPC service the inter-node forwarding layer uses. The CLI talks to it via that gRPC.
 
 ### `shale` (CLI)
 
@@ -495,15 +739,15 @@ Each node uses a distinct bucket prefix in shared object storage so their SlateD
 #   shale-test/node-2/
 #   shale-test/node-3/
 
-shaled --node-id n1 --grpc-addr :7947 --bind-addr :7946 \
-       --backend slate --slate-bucket shale-test --slate-db-name node-1 \
+shaled-slate --node-id n1 --grpc-addr :7947 --bind-addr :7946 \
+       --slate-bucket shale-test --slate-db-name node-1 \
        --slate-endpoint http://localhost:9000 ...
 
-shaled --node-id n2 --grpc-addr :7949 --bind-addr :7948 --seeds 127.0.0.1:7946 \
-       --backend slate --slate-bucket shale-test --slate-db-name node-2 ...
+shaled-slate --node-id n2 --grpc-addr :7949 --bind-addr :7948 --seeds 127.0.0.1:7946 \
+       --slate-bucket shale-test --slate-db-name node-2 ...
 
-shaled --node-id n3 --grpc-addr :7951 --bind-addr :7950 --seeds 127.0.0.1:7946 \
-       --backend slate --slate-bucket shale-test --slate-db-name node-3 ...
+shaled-slate --node-id n3 --grpc-addr :7951 --bind-addr :7950 --seeds 127.0.0.1:7946 \
+       --slate-bucket shale-test --slate-db-name node-3 ...
 
 # inspect + load test
 shale topology --addr 127.0.0.1:7947   # all 3 nodes + ring assignments
@@ -570,7 +814,7 @@ The CI matrix runs the integration tests on every PR; the scaling tests run on d
 
 ### SlateDB backend end-to-end coverage
 
-`pkg/backend/slate` ships two test layers:
+`backends/slate` ships two test layers (run from inside that module, or via `go test` in workspace mode from the repo root):
 
   - **Default** (`slatedb` build tag): drives the binding against an in-process `memory:///` object store. Fast, no Docker, no S3.
   - **End-to-end** (`slatedb integration` build tags): spins up a real MinIO container via testcontainers-go, creates a fresh bucket, and runs the Slate type against it. Covers 1k small keys, 10x 1MB blobs, durability across writer reopen, and the writer-epoch fencing guarantee (two writers against the same DB → second fences the first). Operator entry point: `make test-slate-minio`. v0.6 (the hostthis migration) gates on this passing against the deployment's chosen object store.
@@ -596,6 +840,7 @@ Default `go test ./...` skips both layers (no cgo, no Docker), so the regular de
   - [ ] Failure handling: tolerate down replicas up to (R - W) / (R - N); Unavailable when all R down
 - [ ] **v0.4.1** - hinted handoff for replicas down at Put time; foundations for anti-entropy.
 - [ ] **v0.5** - Prometheus metrics, tracing hooks, real benchmarks vs single-node SlateDB. `shale bench` subcommand.
+- [ ] **v0.5.x** - multi-module monorepo split: `backends/slate` + `backends/pebble` move out of `pkg/backend/` into their own Go modules; backend-specific `Settings` pass-through (`Config.Settings *engine.Settings` on each backend); `cmd/shaled` becomes a thin core shell with per-backend builds living alongside each backend module. Import-path break-and-bump (no deprecation forwarders). Done before v0.6 stabilizes the API.
 - [ ] **v0.6** - hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Validate on production-like data.
 
 Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly, plus the CLI for daily ergonomics) and grow into v0.2+ when their workload demands it.
