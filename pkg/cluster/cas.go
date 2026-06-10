@@ -93,13 +93,23 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 
 	// Serialize the validate-and-apply against other CAS commits on this
 	// node so the read-set check + write-set apply are atomic (no lost
-	// update; see Cluster.casCommitMu). Held for the whole sequence,
-	// including the post-commit fan-out at R>1: the local-tx window has no
-	// network round-trip inside it, and serializing the fan-out too keeps
-	// each commit's shared-stamp write-set landing on replicas as a unit
-	// relative to other commits' stamps.
+	// update; see Cluster.casCommitMu). The lock covers ONLY validate +
+	// the owner-local Commit, NOT the post-commit fan-out at R>1: the
+	// owner-local commit establishes OCC order, and once a replica apply
+	// is apply-if-newer (ApplyBatchLocal), a reordered fan-out
+	// self-resolves on each replica (an older batch is a no-op). So the
+	// fan-out no longer needs the lock to keep competing commits' write-
+	// sets in order. Releasing before replicateCASBatch restores the "no
+	// lock held across the network" property CAS was chosen for. We
+	// unlock explicitly right after the local commit rather than via
+	// defer so the network fan-out runs lock-free.
 	c.casCommitMu.Lock()
-	defer c.casCommitMu.Unlock()
+	casMuHeld := true
+	defer func() {
+		if casMuHeld {
+			c.casCommitMu.Unlock()
+		}
+	}()
 
 	tx, err := c.LocalBegin(level)
 	if err != nil {
@@ -198,6 +208,17 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 		return backend.CASResult{Err: err}
 	}
 	committed = true
+
+	// The owner-local commit is done and has established this commit's OCC
+	// order under casCommitMu. Release the lock NOW, before the network
+	// fan-out: the fan-out is order-independent because each replica's
+	// ApplyBatchLocal is apply-if-newer (a reordered older batch is a
+	// no-op there), so holding casCommitMu across the network is no longer
+	// needed. This restores the "no lock held across the network"
+	// property. Concurrent CAS commits on this node can now validate +
+	// commit locally while this one's fan-out is in flight.
+	c.casCommitMu.Unlock()
+	casMuHeld = false
 
 	// At R>1, the write-set is now durable on the owner. Fan the SAME
 	// encoded envelopes out to the R-1 other replicas, waiting for W total
