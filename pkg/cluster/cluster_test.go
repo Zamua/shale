@@ -771,6 +771,114 @@ func TestTwoNode_RebalanceOnMembershipGrowth(t *testing.T) {
 	}
 }
 
+// TestFounderGrows_RebalanceReachesEveryKey exercises the founder-grows
+// (1 -> 2) topology that the v0.3 ring-vs-ring plan was blind to:
+//
+//  1. Open a SINGLE founder node and load 100 keys into it while it is
+//     the only member (it owns every partition).
+//  2. Join a 2nd node. The converged ring advances ownership of ~half
+//     the partitions to the joiner. Under the old code, a partition the
+//     joiner owns in both its (possibly self-only) bootstrap snapshot
+//     and the converged ring produced NO Receive -- the keys stayed on
+//     the founder, unreachable from the new owner.
+//  3. WaitForRebalanceIdle on both nodes, then let the reconcile pass +
+//     sweep settle.
+//  4. Read every key directly off the ring-owner's backend: no key may
+//     be orphaned on the founder while the ring routes to the joiner.
+//
+// This is the cluster-level companion to the rebalance package's
+// TestReconcile_RepairsOwnedButMissing: the reconcile pass keyed on
+// physical placement must pull every owned-but-missing partition so
+// physical placement matches ring assignment.
+func TestFounderGrows_RebalanceReachesEveryKey(t *testing.T) {
+	rebalance.SetSweepInterval(50 * time.Millisecond)
+
+	founderMem := memory.New()
+	joinerMem := memory.New()
+
+	founderBind := hostPort(freePort(t))
+	joinerBind := hostPort(freePort(t))
+
+	// Founder comes up ALONE and takes all 100 keys before any peer
+	// exists. This is the load-then-grow ordering the 2 -> 3 test never
+	// hits (that test joins every node before writing).
+	founder, founderStop := openClusterNodeAt(t, "fg-founder", founderBind, "", founderMem)
+	defer founderStop()
+
+	if err := waitForRingSize(founder, 1, 5*time.Second); err != nil {
+		t.Fatalf("founder solo ring: %v", err)
+	}
+
+	keys := make([]string, 100)
+	for i := 0; i < 100; i++ {
+		k := fmt.Sprintf("fg-%04d", i)
+		if err := putWithMigrationRetry(founder, []byte(k), []byte("v")); err != nil {
+			t.Fatalf("Put %s: %v", k, err)
+		}
+		keys[i] = k
+	}
+	if got := countBackend(t, founderMem); got != 100 {
+		t.Fatalf("founder pre-growth key count = %d, want 100", got)
+	}
+
+	// Now grow: a 2nd node joins the founder.
+	joiner, joinerStop := openClusterNodeAt(t, "fg-joiner", joinerBind, founderBind, joinerMem)
+	defer joinerStop()
+
+	for _, c := range []*cluster.Cluster{founder, joiner} {
+		if err := waitForRingSize(c, 2, 5*time.Second); err != nil {
+			t.Fatalf("2-node ring on %s: %v", c.NodeID(), err)
+		}
+	}
+
+	// Drive a couple of settle-timer Evaluates worth of wall clock so
+	// the reconcile pass (folded into Evaluate) runs against the
+	// converged ring on the joiner and pulls every owned-but-missing
+	// partition. WaitForRebalanceIdle bounds the wait per node.
+	for _, c := range []*cluster.Cluster{founder, joiner} {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := c.WaitForRebalanceIdle(ctx); err != nil {
+			cancel()
+			t.Fatalf("%s did not idle: %v", c.NodeID(), err)
+		}
+		cancel()
+	}
+
+	// The reconcile pass + the ring-vs-ring plan can both be re-armed
+	// by the ~membership reconcile loop; give one extra settle window so
+	// any owned-but-missing partition detected on a later tick lands +
+	// the source-side sweep drops stale copies.
+	time.Sleep(1500 * time.Millisecond)
+
+	// Verify physical placement matches the 2-node ring: every key must
+	// be physically present on the backend of the node the ring routes
+	// it to. A key the ring sends to the joiner that still lives only on
+	// the founder is the founder-grows orphan this fix closes.
+	r := ring.New()
+	for _, m := range founder.Members() {
+		r.Add(m)
+	}
+	backends := map[string]*memory.Memory{
+		"fg-founder": founderMem,
+		"fg-joiner":  joinerMem,
+	}
+	missing := 0
+	var firstMissing string
+	for _, k := range keys {
+		owner := r.LocateKey([]byte(k)).ID
+		if _, err := backends[owner].Get([]byte(k)); err != nil {
+			if missing == 0 {
+				firstMissing = fmt.Sprintf("%s -> owner %s", k, owner)
+			}
+			missing++
+		}
+	}
+	if missing > 0 {
+		t.Fatalf("%d/%d keys missing on the ring-owner's backend (first: %s); founder-grows orphan not repaired",
+			missing, len(keys), firstMissing)
+	}
+}
+
 // openClusterNodeAt brings up a Cluster + gRPC server at known
 // bind + gRPC addresses, registers it for cleanup, and returns
 // the cluster + teardown closure. Caller supplies bindAddr so
