@@ -2,6 +2,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
@@ -21,12 +22,26 @@ type EnvelopeWrite struct {
 }
 
 // ApplyBatchLocal applies a CAS write-set fan-out to the LOCAL backend in
-// ONE transaction: it Puts each (key, envelope) verbatim (apply-only, no
-// decode, no re-validation, no re-stamp) and commits, rolling the whole
-// batch back on any error. It is the replica side of the v0.6.x CAS
-// write-set replication: the owner has already validated + committed
-// these envelopes locally, so the replica trusts the fan-out the same
-// way LocalReplicaPut trusts OwnsReplica (no ownership re-check).
+// ONE transaction, APPLY-IF-NEWER per key: for each (key, envelope) it
+// decodes the stored value's stamp and writes the incoming envelope only
+// if the incoming stamp strictly beats it (or there is no stored value).
+// An older-or-equal entry is skipped, leaving the newer stored value
+// intact. The whole batch commits together (rolling back on any error)
+// so a mid-handoff key can't leave a partial batch. It is the replica
+// side of the CAS write-set replication: the owner has already validated
+// + committed these envelopes locally, so the replica trusts the fan-out
+// the same way LocalReplicaPut trusts OwnsReplica (no ownership
+// re-check), but it does NOT trust the ARRIVAL ORDER of competing
+// commits: a reordered older batch self-resolves to a no-op via the
+// apply-if-newer check. This is what lets CommitCASApply release
+// casCommitMu before fanning out (the fan-out is now order-independent).
+//
+// Atomicity: the whole get-compare-put sequence runs under c.applyMu (the
+// same node-wide lock the single-key replica paths take) AND inside one
+// transaction, so two concurrent batches touching the same key cannot
+// both read the old stamp and race. The memory backend's tx has
+// snapshot-isolation reads but no write-write conflict detection, so the
+// lock - not the tx - is what makes this correct.
 //
 // The migration guard applies per key the same way dispatchReplicaPut
 // does: if any key in the batch is migrating out of or being received
@@ -37,7 +52,8 @@ type EnvelopeWrite struct {
 // opening the tx so a mid-handoff key can't leave a partial batch.
 //
 // Caller (rpc.Server.ApplyBatch) is responsible for any wire decoding;
-// ApplyBatchLocal trusts the bytes it is handed.
+// ApplyBatchLocal trusts the bytes it is handed (an incoming envelope
+// that fails to Decode is a hard error, not v0.3 compat data).
 func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 	if c.closed.Load() || c.backend == nil {
 		return backend.ErrClosed
@@ -50,6 +66,9 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 		}
 	}
 
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+
 	tx, err := c.backend.Begin(backend.SnapshotIsolation)
 	if err != nil {
 		return err
@@ -61,6 +80,17 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 		}
 	}()
 	for _, w := range writes {
+		incoming, derr := Decode(w.Envelope)
+		if derr != nil {
+			return derr
+		}
+		apply, aerr := txApplyIfNewer(tx, w.Key, incoming.Stamp)
+		if aerr != nil {
+			return aerr
+		}
+		if !apply {
+			continue
+		}
 		if err := tx.Put(w.Key, w.Envelope); err != nil {
 			return err
 		}
@@ -70,6 +100,28 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 	}
 	committed = true
 	return nil
+}
+
+// txApplyIfNewer reports whether an incoming envelope carrying
+// incomingStamp should be written for key, given what tx currently holds:
+// true if there is no stored value OR incomingStamp strictly beats the
+// stored value's stamp; false otherwise (older-or-equal => no-op). A
+// stored value that fails to Decode is treated as a zero-Stamp legacy
+// value (any real incoming stamp wins). Callers hold c.applyMu so the
+// read here and the subsequent Put are atomic per key.
+func txApplyIfNewer(tx backend.Transaction, key []byte, incomingStamp Stamp) (bool, error) {
+	stored, gerr := tx.Get(key)
+	if gerr != nil {
+		if errors.Is(gerr, backend.ErrNotFound) {
+			return true, nil
+		}
+		return false, gerr
+	}
+	storedEnv, derr := Decode(stored)
+	if derr != nil {
+		storedEnv = Envelope{}
+	}
+	return incomingStamp.Greater(storedEnv.Stamp), nil
 }
 
 // replicateCASBatch fans the already-encoded write-set envelopes out to

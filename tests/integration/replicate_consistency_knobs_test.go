@@ -64,9 +64,43 @@ func (b *countingBackend) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	return b.inner.ScanPrefix(prefix)
 }
 func (b *countingBackend) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
-	return b.inner.Begin(level)
+	tx, err := b.inner.Begin(level)
+	if err != nil {
+		return nil, err
+	}
+	// Count writes that go through a transaction too: at R>1 the replica-
+	// receiving write path (apply-if-newer) persists via Begin -> tx.Put ->
+	// Commit rather than a bare backend.Put, so a test asserting "the local
+	// replica path wrote the value" must see tx.Puts in the same tally.
+	return &countingTx{inner: tx, puts: &b.puts, dels: &b.dels}, nil
 }
 func (b *countingBackend) Close() error { return b.inner.Close() }
+
+// countingTx wraps an inner Transaction so buffered writes increment the
+// backend's Put/Delete tallies. It exists because the apply-if-newer
+// replica path (v0.7+) writes through a transaction, not a bare
+// backend.Put, and the consistency-knob suite tallies "did the local
+// replica receive the write" by Put count.
+type countingTx struct {
+	inner backend.Transaction
+	puts  *atomic.Int64
+	dels  *atomic.Int64
+}
+
+func (t *countingTx) Get(key []byte) ([]byte, error) { return t.inner.Get(key) }
+func (t *countingTx) Put(key, value []byte) error {
+	t.puts.Add(1)
+	return t.inner.Put(key, value)
+}
+func (t *countingTx) Delete(key []byte) error {
+	t.dels.Add(1)
+	return t.inner.Delete(key)
+}
+func (t *countingTx) ScanPrefix(prefix []byte) (backend.Iterator, error) {
+	return t.inner.ScanPrefix(prefix)
+}
+func (t *countingTx) Commit() error   { return t.inner.Commit() }
+func (t *countingTx) Rollback() error { return t.inner.Rollback() }
 
 // countingTestNode is the per-node bundle for the consistency-knob
 // suite. We can't reuse startTestNode because it pins memory.New()

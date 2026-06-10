@@ -40,19 +40,17 @@ func decodeReplica(t *testing.T, n *replicatedNode, key []byte) (cluster.Envelop
 // seedConverged Puts key=value via the cluster and then waits until EVERY
 // replica's backend holds an envelope with that payload, polling the RAW
 // backends directly (NOT cluster Gets). The single-key Put fan-out is
-// surplus-in-background past W, and replica-side writes are verbatim (LWW
-// is resolved at READ time, not write time), so a seed Put can still be in
-// flight to a lagging replica when the next op runs. Waiting for the seed
-// to land on every backend first makes the subsequent stamped-envelope
-// assertions on raw backends deterministic.
+// surplus-in-background past W, so a seed Put can still be in flight to a
+// lagging replica when the next op runs. Waiting for the seed to land on
+// every backend first makes the subsequent stamped-envelope assertions on
+// raw backends deterministic.
 //
-// Polling raw backends (rather than cluster Gets) is deliberate: a cluster
-// Get under ReadAll / ReadQuorum schedules read-repair, which pushes the
-// seed envelope to replicas asynchronously and could re-fire AFTER a later
-// mutation, clobbering the new stamped value at the storage layer (benign
-// in production: the next quorum read resolves LWW and re-repairs toward
-// the winner, but it would race a raw-backend test assertion). By reading
-// backends directly we never schedule a repair on the seed.
+// Polling raw backends (rather than cluster Gets) avoids scheduling read-
+// repair on the seed: a cluster Get under ReadAll / ReadQuorum schedules a
+// repair, and while apply-if-newer (v0.7+) means a stale repair can no
+// longer CLOBBER a newer value, the repair traffic would still add non-
+// determinism to a raw-backend timing assertion. Reading backends directly
+// keeps the trace clean.
 func seedConverged(t *testing.T, nodes []*replicatedNode, from int, key, value []byte) {
 	t.Helper()
 	if err := nodes[from].cluster.Put(key, value); err != nil {
@@ -80,13 +78,13 @@ func seedConverged(t *testing.T, nodes []*replicatedNode, from int, key, value [
 
 // eachReplicaEventually polls every replica's RAW backend until check
 // holds on the decoded envelope for key on all of them, or the deadline
-// passes. It exists because a CAS commit's write-set is the LWW winner but
-// can be transiently clobbered on a single replica at the storage layer by
-// an async read-repair of the pre-commit value (read-repair writes are
-// verbatim, LWW resolves on the NEXT read, see seedConverged's note). The
-// committed envelope re-converges as repairs settle; this poll pins the
-// eventual state without flaking on the transient window. The check on the
-// owner-local copy is immediate, but the remote replicas may lag a beat.
+// passes. It exists because a single-key Put fan-out is surplus-in-
+// background past W, so a remote replica may lag the owner-local commit by
+// a beat before the committed envelope lands everywhere. This poll pins
+// the eventual state without flaking on that propagation window. (Apply-
+// if-newer, v0.7+, removed the older flake source where a stale read-
+// repair could transiently clobber the committed envelope on a replica;
+// the only remaining lag is plain fan-out propagation.)
 func eachReplicaEventually(t *testing.T, nodes []*replicatedNode, key []byte, check func(env cluster.Envelope, present bool) bool) {
 	t.Helper()
 	deadline := time.Now().Add(3 * time.Second)

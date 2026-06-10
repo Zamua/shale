@@ -370,21 +370,16 @@ func TestCASReplicate_R1_StoresRawNotEnvelope(t *testing.T) {
 // with the R>1 write-set fan-out engaged (WriteAll -> every increment fans
 // its envelope to all 3 replicas before the Transact returns).
 //
-// Read mode is ReadNearest BY DESIGN. The OCC read-modify-write reads the
-// counter through the cluster read path; under ReadQuorum / ReadAll that
-// read schedules an ASYNC read-repair which writes the read's winning
-// envelope back to replicas verbatim. A repair scheduled with value V can
-// fire AFTER a later CAS commit has landed V+1 on the owner-local backend,
-// transiently clobbering it back to V at the storage layer (LWW re-resolves
-// on the NEXT quorum read, but the CAS validate-and-apply reads the owner's
-// LOCAL copy, so a clobbered owner copy can let a stale-based increment
-// commit). That read-repair-vs-storage-layer race is the SAME one
-// documented on seedConverged; it is orthogonal to write-set replication
-// (it is a property of read-repair clobbering, present since v0.4) and is
-// not what this requirement is about. ReadNearest skips read-repair, so the
-// owner-local copy every commit validates against is never clobbered by a
-// stale repair, isolating the OCC + fan-out behavior under test. The write
-// path is still full R=3 replication; only the orthogonal repair is off.
+// Read mode is ReadNearest here to isolate the OCC + fan-out behavior
+// under test, but the apply-if-newer write rule (v0.7+) means the test
+// would now ALSO pass under ReadQuorum / ReadAll: a stale async read-
+// repair can no longer clobber a newer owner-local value, because the
+// replica-receiving write paths reject any envelope carrying an older-or-
+// equal stamp. TestCASReplicate_R3_NoLostUpdate_ReadQuorum pins that
+// stronger guarantee directly. Keeping this variant on ReadNearest is
+// purely for isolation (no repair traffic in the trace) and determinism;
+// it is no longer REQUIRED for correctness the way it was pre-v0.7. The
+// write path is full R=3 replication in both variants.
 func TestCASReplicate_R3_NoLostUpdate(t *testing.T) {
 	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadNearest)
 
@@ -440,6 +435,77 @@ func TestCASReplicate_R3_NoLostUpdate(t *testing.T) {
 
 	// Durability: the final total must (eventually) land on every replica as
 	// a stamped envelope carrying the counter value.
+	want := []byte(fmt.Sprintf("%d", workers))
+	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
+		return present && bytes.Equal(env.Payload, want)
+	})
+}
+
+// TestCASReplicate_R3_NoLostUpdate_ReadQuorum is the regression test for
+// the apply-if-newer (LWW-on-write) fix. It runs the EXACT same N-worker
+// concurrent-increment workload as TestCASReplicate_R3_NoLostUpdate, but
+// under ReadQuorum (not ReadNearest). Under ReadQuorum the OCC read-
+// modify-write read schedules an async read-repair on every Get.
+//
+// Pre-v0.7 (replica writes verbatim), a read-repair scheduled with the
+// counter at value V could fire AFTER a later commit had landed V+1 on
+// the owner-local backend, clobbering it back to V; the next CAS
+// validate-and-apply would then read the stale V on the owner's LOCAL
+// copy and MISS the conflict, committing a stale-based increment. The
+// observed symptom was a final count of 17-19 instead of 20.
+//
+// With apply-if-newer on the replica-receiving write paths, the stale
+// repair carries an older stamp than the V+1 the owner already holds, so
+// it is rejected (a no-op). The owner-local copy is never clobbered, the
+// conflict is always seen, and the final count is exactly N.
+func TestCASReplicate_R3_NoLostUpdate_ReadQuorum(t *testing.T) {
+	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadQuorum)
+
+	key := []byte("counter")
+	owner := ownerIndex(nodes, key)
+	if owner < 0 {
+		t.Fatalf("no owner for %q", key)
+	}
+	oc := nodes[owner].cluster
+	if err := transactPut(nodes, key, []byte("0")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+
+	const workers = 20
+	var wg sync.WaitGroup
+	wg.Add(workers)
+	errs := make(chan error, workers)
+	for i := 0; i < workers; i++ {
+		go func() {
+			defer wg.Done()
+			err := oc.Transact(key, func(tx backend.Transaction) error {
+				cur, err := tx.Get(key)
+				if err != nil {
+					return err
+				}
+				var n int
+				_, _ = fmt.Sscanf(string(cur), "%d", &n)
+				return tx.Put(key, []byte(fmt.Sprintf("%d", n+1)))
+			})
+			if err != nil {
+				errs <- err
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Errorf("Transact increment: %v", err)
+	}
+
+	got, err := oc.Get(key)
+	if err != nil {
+		t.Fatalf("final Get: %v", err)
+	}
+	if string(got) != fmt.Sprintf("%d", workers) {
+		t.Fatalf("counter: got %q want %d (lost update: a stale read-repair clobbered the owner-local copy and a CAS commit missed the conflict)", got, workers)
+	}
+
 	want := []byte(fmt.Sprintf("%d", workers))
 	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
 		return present && bytes.Equal(env.Payload, want)

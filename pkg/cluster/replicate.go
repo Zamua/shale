@@ -299,12 +299,20 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 // Returns the raw replica outcome; the migration-guard
 // ResourceExhausted is surfaced verbatim so fanout's
 // isTransientReplicaErr can classify it.
+//
+// dispatchReplicaPut is only reached at R>1 (putReplicated and
+// scheduleReadRepair are the only callers; both are R>1-only), so
+// envBytes is always an LWW Envelope. Both the local-self branch and
+// the remote branch (peer's PutForwarded -> LocalReplicaPut) apply the
+// envelope APPLY-IF-NEWER: a replica never overwrites a value it holds
+// with one carrying an older-or-equal stamp. This is what makes a stale
+// read-repair (which rides this path) a no-op instead of a clobber.
 func (c *Cluster) dispatchReplicaPut(ctx context.Context, replica ring.Member, key, envBytes []byte) error {
 	if replica.ID == c.cfg.NodeID {
 		if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 			return migrationGuardError(c.retryAfterMs())
 		}
-		return c.backend.Put(key, envBytes)
+		return c.applyEnvelopeIfNewer(key, envBytes)
 	}
 	cli, err := c.clientFor(replica.Addr)
 	if err != nil {
@@ -536,8 +544,16 @@ func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []
 // Forwarded=true. At R>1 this node may be one of the R replicas
 // (possibly NOT the primary - replication's whole point); the
 // originator stamped + envelope-encoded the value once before the
-// fan-out, so we just persist what arrived. At R=1 this is the same
-// raw-bytes path the v0.3 forwarder used.
+// fan-out. At R=1 this is the same raw-bytes path the v0.3 forwarder
+// used.
+//
+// At R>1 the incoming bytes are an LWW Envelope and are applied
+// APPLY-IF-NEWER: persist only if the incoming stamp strictly beats the
+// stored stamp (or there is no stored value). An older-or-equal
+// forwarded write (e.g. a reordered fan-out or a stale read-repair that
+// reached this node over the wire) becomes a no-op, so a replica never
+// clobbers a value it already holds with a staler one. At R=1 there are
+// no envelopes: the bytes are written verbatim, exactly as v0.3 did.
 //
 // The migration guard applies: if this node's partition is mid-
 // handoff, returns the transient ResourceExhausted so the
@@ -553,6 +569,11 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 	if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 		return migrationGuardError(c.retryAfterMs())
 	}
+	if c.casReplicated() {
+		// R>1: envelope bytes, LWW-on-write.
+		return c.applyEnvelopeIfNewer(key, bytesToWrite)
+	}
+	// R=1: raw bytes, no envelope, no LWW (unchanged v0.3 path).
 	return c.backend.Put(key, bytesToWrite)
 }
 

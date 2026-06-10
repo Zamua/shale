@@ -253,6 +253,26 @@ type Cluster struct {
 	// could stripe it per shard / per partition.
 	casCommitMu sync.Mutex
 
+	// applyMu serializes the apply-if-newer LWW-on-write check on every
+	// REPLICA-RECEIVING write path (dispatchReplicaPut's local-self
+	// branch, LocalReplicaPut for a forwarded single-key Put, and
+	// ApplyBatchLocal for a CAS write-set fan-out) at R>1. Each of those
+	// paths reads the stored envelope's stamp, compares it against the
+	// incoming stamp, and Puts the incoming bytes only if strictly newer
+	// (or no stored value). That get-compare-put MUST be atomic per key:
+	// the memory backend's transaction has snapshot-isolation reads but
+	// NO write-write conflict detection, so two concurrent applies on the
+	// same key could both read the old stamp and one could lose. This
+	// node-wide lock serializes the window (one local backend op, no
+	// network inside it, so contention is bounded). It is DISTINCT from
+	// casCommitMu: the owner's OWN CAS local commit is authoritative by
+	// construction (validated under casCommitMu) and writes the freshest
+	// stamp directly without the apply-if-newer check; only the replica-
+	// receiving paths take applyMu. A future refinement could stripe it
+	// per key. The R=1 path never takes this lock (raw values, no
+	// envelopes, no LWW).
+	applyMu sync.Mutex
+
 	// peerClientsBlocked, when true, makes clientFor return an error
 	// instead of dialing. Test-only seam used by the destination-
 	// crash failure tests to guarantee a node cannot reach any peer
