@@ -133,3 +133,15 @@ func (c *Client) ProposeRebalance(ctx context.Context, dryRun, apply, cancel boo
 func (c *Client) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*pb.CommitCASResponse, error) {
 	return c.api.CommitCAS(ctx, req)
 }
+
+// ApplyBatch ships an owner-committed CAS write-set to a replica for
+// apply-only fan-out (cluster-internal owner-to-replica RPC). The
+// envelopes are already Encode()d by the owner; the replica writes them
+// verbatim in one local transaction. A non-empty response error means the
+// replica rolled back; a migration-guard rejection arrives as a gRPC
+// codes.ResourceExhausted error. Exposed for symmetry with the inter-node
+// peerClient; the cluster layer drives ApplyBatch through its own private
+// client.
+func (c *Client) ApplyBatch(ctx context.Context, req *pb.ApplyBatchRequest) (*pb.ApplyBatchResponse, error) {
+	return c.api.ApplyBatch(ctx, req)
+}

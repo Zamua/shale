@@ -401,6 +401,65 @@ func TestRebalanceMessagesRoundTripThroughProto(t *testing.T) {
 	}
 }
 
+// TestApplyBatch_WireAppliesVerbatim pins the v0.6.x replica-side handler:
+// ApplyBatch writes each (key, envelope) verbatim to the local backend in
+// one transaction. On a single-node (R=1) server the stored bytes are
+// exactly the envelope the owner shipped (a plain Get returns raw stored
+// bytes at R=1), so we can assert the verbatim apply by decoding what we
+// read back. A tombstone envelope (empty payload) is written verbatim too.
+func TestApplyBatch_WireAppliesVerbatim(t *testing.T) {
+	addr, cleanup := newTestServer(t)
+	defer cleanup()
+	cli := newTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Build two already-encoded envelopes under one shared stamp (the
+	// shape the owner ships): a value and a tombstone.
+	stamp := cluster.Stamp{TimestampNanos: 42, NodeID: "owner-x"}
+	valEnv := cluster.Encode(cluster.Envelope{Stamp: stamp, Payload: []byte("hello")})
+	tombEnv := cluster.Encode(cluster.Envelope{Stamp: stamp, Payload: nil})
+
+	resp, err := cli.ApplyBatch(ctx, &pb.ApplyBatchRequest{
+		Writes: []*pb.EnvelopeWrite{
+			{Key: []byte("a"), Envelope: valEnv},
+			{Key: []byte("b"), Envelope: tombEnv},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplyBatch: %v", err)
+	}
+	if resp.GetError() != "" {
+		t.Fatalf("ApplyBatch: unexpected error string %q", resp.GetError())
+	}
+
+	// At R=1 a Get returns the raw stored bytes; they must be the exact
+	// envelope bytes the handler was handed (verbatim, no re-stamp).
+	gotA, found, err := cli.Get(ctx, []byte("a"))
+	if err != nil || !found {
+		t.Fatalf("Get a: found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(gotA, valEnv) {
+		t.Fatalf("Get a: stored bytes are not the verbatim envelope")
+	}
+	envA, err := cluster.Decode(gotA)
+	if err != nil {
+		t.Fatalf("Decode a: %v", err)
+	}
+	if !bytes.Equal(envA.Payload, []byte("hello")) || envA.Stamp != stamp {
+		t.Fatalf("Decode a: got payload=%q stamp=%+v", envA.Payload, envA.Stamp)
+	}
+
+	gotB, found, err := cli.Get(ctx, []byte("b"))
+	if err != nil || !found {
+		t.Fatalf("Get b (tombstone envelope is a present key at R=1): found=%v err=%v", found, err)
+	}
+	if !bytes.Equal(gotB, tombEnv) {
+		t.Fatalf("Get b: tombstone envelope not stored verbatim")
+	}
+}
+
 // assertNotUnimplemented confirms the handler is wired (not the
 // Unimplemented scaffold) without pinning the exact code: single-node
 // mode returns different gRPC codes for the two surfaces (MigrateRange

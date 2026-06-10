@@ -210,6 +210,40 @@ func (s *Server) LocalScan(req *pb.LocalScanRequest, stream grpc.ServerStreaming
 	}
 }
 
+// ApplyBatch is the replica-side handler for the v0.6.x CAS write-set
+// fan-out (docs/SPEC.md "ApplyBatch wire protocol"). The owner has already
+// validated + stamped + committed these envelopes locally; this replica
+// applies the whole batch (all writes) verbatim in ONE local backend
+// transaction (apply-only, no decode, no re-validation, no re-stamp) and
+// commits, rolling back on any error. It is cluster-internal: never called
+// from outside the cluster.
+//
+// Outcome shape: a backend / apply failure travels as the response error
+// string (non-empty => the replica rolled back), the same wire convention
+// CommitCAS uses for backend failures. The migration-guard rejection is
+// the exception: it travels as a gRPC codes.ResourceExhausted status error
+// (NOT the response field) so the owner's fanout classifies it transient
+// (mid-handoff replica, try another) rather than a hard failure. There is
+// no ownership re-check beyond that guard: ApplyBatchLocal trusts the
+// fan-out the same way LocalReplicaPut trusts OwnsReplica.
+func (s *Server) ApplyBatch(_ context.Context, req *pb.ApplyBatchRequest) (*pb.ApplyBatchResponse, error) {
+	writes := make([]cluster.EnvelopeWrite, len(req.GetWrites()))
+	for i, w := range req.GetWrites() {
+		writes[i] = cluster.EnvelopeWrite{Key: w.GetKey(), Envelope: w.GetEnvelope()}
+	}
+	if err := s.c.ApplyBatchLocal(writes); err != nil {
+		// A migration-guard rejection must reach the owner as a gRPC
+		// status code so its fanout sees ResourceExhausted and treats the
+		// replica as transient; a non-status error is a hard apply failure
+		// reported in the response string (the replica rolled back).
+		if _, ok := status.FromError(err); ok {
+			return nil, err
+		}
+		return &pb.ApplyBatchResponse{Error: err.Error()}, nil
+	}
+	return &pb.ApplyBatchResponse{}, nil
+}
+
 // -- Cluster RPCs ----------------------------------------------------
 
 // Topology returns this node's current view of cluster membership.
