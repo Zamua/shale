@@ -119,6 +119,29 @@ func (c *peerClient) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*
 	return c.api.CommitCAS(ctx, req)
 }
 
+// ApplyBatch ships an owner-committed CAS write-set to a replica peer for
+// apply-only fan-out. The envelopes are already Encode()d by the owner;
+// the replica writes them verbatim in one local transaction. A non-empty
+// response error means the replica rolled the batch back; a migration-
+// guard rejection arrives as a gRPC codes.ResourceExhausted error (the
+// caller's fanout classifies it transient). Mirrors PutForwarded: a
+// cluster-internal owner-to-replica call, never made from outside the
+// cluster.
+func (c *peerClient) ApplyBatch(ctx context.Context, writes []EnvelopeWrite) error {
+	req := &pb.ApplyBatchRequest{Writes: make([]*pb.EnvelopeWrite, len(writes))}
+	for i, w := range writes {
+		req.Writes[i] = &pb.EnvelopeWrite{Key: w.Key, Envelope: w.Envelope}
+	}
+	resp, err := c.api.ApplyBatch(ctx, req)
+	if err != nil {
+		return err
+	}
+	if e := resp.GetError(); e != "" {
+		return errors.New("cluster: ApplyBatch replica error: " + e)
+	}
+	return nil
+}
+
 // txRoutedGet performs the normal single-key routed Get the CAS read-set
 // records against. It reuses Cluster.Get so a read inside a transaction
 // sees exactly what a standalone Get would (same local/remote routing,
@@ -143,7 +166,7 @@ func (c *Cluster) commitCAS(pinKey []byte, level backend.IsolationLevel, reads [
 	// call the peer's CommitCAS RPC.
 	curOwner, isLocal := c.ownerOf(pinKey)
 	if isLocal {
-		res := c.CommitCASApply(context.Background(), level, reads, writes)
+		res := c.CommitCASApply(context.Background(), level, pinKey, reads, writes)
 		return casResultToError(res)
 	}
 	cli, err := c.clientFor(curOwner.Addr)

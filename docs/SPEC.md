@@ -1027,12 +1027,12 @@ Default `go test ./...` skips both layers (no cgo, no Docker), so the regular de
   - [ ] `Begin` re-shaped to uniform OCC (one transaction model local + remote; pre-1.0 contract change documented)
   - [ ] ABA caveat documented (value-based read-checks; benign for shale usage); version/seqno read-checks noted as the future option
   - [ ] hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Default config: `slate.Config{WriteOptions: &slatedb.WriteOptions{AwaitDurable: false}}` paired with `cluster.Config{ReplicationFactor: 3}`. The v0.5 bench measured this at 11,661 puts/s on the cluster-n3-r3 production shape, ~150x the strict baseline of 77 puts/s, with the durability budget covered by 3-way replication during the ~100ms per-replica WAL-flush window. Validate on production-like data.
-- [~] **v0.6.x** (in progress) - replicate the committed OCC write-set to R replicas, closing the R=1 transactional-write durability gap left by v0.6. Sub-tasks:
-  - [ ] `ApplyBatch` unary RPC (`repeated EnvelopeWrite`; key + already-encoded envelope) on `ShaleNode`; replica handler applies the whole batch in ONE local transaction, apply-only, no re-validation, migration-guard respected, rolls back on any error
-  - [ ] `CommitCASApply` envelope-aware at R>1: decode-on-validate (tombstone counts as not-found), shared `Stamp{now, owner NodeID}` for the whole commit, encode-on-apply (Delete written as a tombstone-envelope Put), local commit then fan out the same envelopes
-  - [ ] R=1 path byte-for-byte unchanged (raw values, no envelopes, no fan-out)
-  - [ ] Fan-out reuses `fanout` + `requiredWriteAcks`, owner's local commit counts as 1 ack, W-ack target, migration-guard transient handling; under-W returns `codes.Unavailable` (write already durable on owner + acked replicas, same best-effort-to-W model as single-key Put)
-  - [ ] Owner-local validation soundness documented (owner is always a replica + the write target); quorum-read validation noted as the deferred heavier alternative
+- [x] **v0.6.x** - replicate the committed OCC write-set to R replicas, closing the R=1 transactional-write durability gap left by v0.6. Sub-tasks:
+  - [x] `ApplyBatch` unary RPC (`repeated EnvelopeWrite`; key + already-encoded envelope) on `ShaleNode`; replica handler applies the whole batch in ONE local transaction, apply-only, no re-validation, migration-guard respected, rolls back on any error
+  - [x] `CommitCASApply` envelope-aware at R>1: decode-on-validate (tombstone counts as not-found), shared `Stamp{now, owner NodeID}` for the whole commit, encode-on-apply (Delete written as a tombstone-envelope Put), local commit then fan out the same envelopes
+  - [x] R=1 path byte-for-byte unchanged (raw values, no envelopes, no fan-out)
+  - [x] Fan-out reuses `fanout` + `requiredWriteAcks`, owner's local commit counts as 1 ack, W-ack target, migration-guard transient handling; under-W returns `codes.Unavailable` (write already durable on owner + acked replicas, same best-effort-to-W model as single-key Put)
+  - [x] Owner-local validation soundness documented (owner is always a replica + the write target); quorum-read validation noted as the deferred heavier alternative
 
 Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly, plus the CLI for daily ergonomics) and grow into v0.2+ when their workload demands it.
 

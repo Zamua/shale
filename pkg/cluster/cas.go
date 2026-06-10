@@ -10,6 +10,17 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 )
 
+// casReplicated reports whether this cluster stores CAS write-sets as LWW
+// envelopes and fans them out (R>1), versus the raw-value single-owner
+// path (R=1). It is the SAME condition Put / Get / Delete use to choose
+// the replicated path (replicationFactor > 1 with a populated ring), so a
+// CAS commit and a single-key write agree on the storage format for the
+// same shard. At R=1 the whole envelope / fan-out machinery is bypassed
+// and CommitCASApply behaves exactly as v0.6 did.
+func (c *Cluster) casReplicated() bool {
+	return c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty()
+}
+
 // CASMaxAttempts bounds how many times Transact re-runs its closure on a
 // CAS conflict before giving up. A converging workload finishes in 1-2
 // attempts; a key under sustained contention may need a handful. Exposed
@@ -51,18 +62,42 @@ var casBaseBackoff = 2 * time.Millisecond
 //     deferred Rollback) and return {Committed}.
 //
 // A cancelled ctx (client disconnect, deadline) propagates: the deferred
-// Rollback runs and the transaction did not happen. The whole sequence
-// is one goroutine against one (non-goroutine-safe) backend.Transaction,
-// so there is no concurrency to coordinate.
-func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLevel, reads []backend.ReadCheck, writes []backend.WriteOp) backend.CASResult {
+// Rollback runs and the transaction did not happen. The validate-and-
+// apply is one goroutine against one (non-goroutine-safe)
+// backend.Transaction, so there is no concurrency to coordinate.
+//
+// Replication (v0.6.x, R>1). At ReplicationFactor > 1 the Backend stores
+// LWW Envelope bytes, not raw values (the same split single-key Put / Get
+// use). CommitCASApply then differs from the R=1 path two ways: it
+// DECODES the stored envelope before each read-check compare (the
+// client's ExpectedVal is a decoded payload; a tombstone counts as not-
+// found), and it ENCODES each write-op into an Envelope under ONE shared
+// Stamp{now, owner NodeID} before tx.Put (Delete becomes an empty-payload
+// tombstone Put, NOT tx.Delete, so the LWW comparator on a replica sees a
+// stamped removal). After the local commit succeeds it fans the SAME
+// encoded envelopes out to the R-1 other replicas via ApplyBatch, waiting
+// for W total acks (the owner's local commit is one of them). An under-W
+// fan-out returns {Err: codes.Unavailable} but the write is ALREADY
+// durable on the owner + any replica that acked: same best-effort-to-W
+// shape single-key Put has. See docs/SPEC.md "Write-set replication".
+//
+// pinKey anchors the replica-set lookup; every key in the commit co-
+// shards with it (the client's cross-shard guard guarantees this), so one
+// replica set covers the whole write-set. It is unused at R=1.
+func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLevel, pinKey []byte, reads []backend.ReadCheck, writes []backend.WriteOp) backend.CASResult {
 	if c.closed.Load() || c.backend == nil {
 		return backend.CASResult{Err: backend.ErrClosed}
 	}
 
+	replicated := c.casReplicated()
+
 	// Serialize the validate-and-apply against other CAS commits on this
 	// node so the read-set check + write-set apply are atomic (no lost
-	// update; see Cluster.casCommitMu). Held for the whole sequence: the
-	// window is one local tx with no network round-trip inside it.
+	// update; see Cluster.casCommitMu). Held for the whole sequence,
+	// including the post-commit fan-out at R>1: the local-tx window has no
+	// network round-trip inside it, and serializing the fan-out too keeps
+	// each commit's shared-stamp write-set landing on replicas as a unit
+	// relative to other commits' stamps.
 	c.casCommitMu.Lock()
 	defer c.casCommitMu.Unlock()
 
@@ -85,48 +120,128 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 		return backend.CASResult{Err: err}
 	}
 
-	// Validate the read-set.
+	// Validate the read-set. At R>1 the stored value is an Envelope; the
+	// client's ExpectedVal is the DECODED payload it saw via getReplicated,
+	// so we decode before comparing and treat a tombstone (empty payload)
+	// as not-found. At R=1 readPayload returns the raw bytes unchanged, so
+	// this loop is byte-for-byte the v0.6 behavior.
 	for _, r := range reads {
-		got, err := tx.Get(r.Key)
+		got, found, err := c.casReadPayload(tx, r.Key, replicated)
 		if r.ExpectAbsent {
-			if err == nil {
-				return backend.CASResult{Conflict: true}
-			}
-			if !errors.Is(err, backend.ErrNotFound) {
+			if err != nil {
 				return backend.CASResult{Err: err}
+			}
+			if found {
+				return backend.CASResult{Conflict: true}
 			}
 			continue
 		}
 		if err != nil {
-			if errors.Is(err, backend.ErrNotFound) {
-				// Client observed a value; key is now absent: conflict.
-				return backend.CASResult{Conflict: true}
-			}
 			return backend.CASResult{Err: err}
+		}
+		if !found {
+			// Client observed a value; key is now absent (or a tombstone):
+			// conflict.
+			return backend.CASResult{Conflict: true}
 		}
 		if !bytesEqual(got, r.ExpectedVal) {
 			return backend.CASResult{Conflict: true}
 		}
 	}
 
-	// Apply the write-set in order.
+	// Apply the write-set in order. At R>1 each op is encoded into an
+	// Envelope under ONE shared commit stamp and written as a tx.Put (a
+	// Delete becomes an empty-payload tombstone Put). At R=1 the raw
+	// tx.Put / tx.Delete path is unchanged. encodedWrites is the batch
+	// fanned out after the commit (nil at R=1).
+	var stamp Stamp
+	var encodedWrites []EnvelopeWrite
+	if replicated {
+		stamp = Stamp{
+			TimestampNanos: uint64(time.Now().UnixNano()),
+			NodeID:         c.cfg.NodeID,
+		}
+		encodedWrites = make([]EnvelopeWrite, 0, len(writes))
+	}
 	for _, w := range writes {
-		if w.Del {
-			if err := tx.Delete(w.Key); err != nil {
+		if !replicated {
+			if w.Del {
+				if err := tx.Delete(w.Key); err != nil {
+					return backend.CASResult{Err: err}
+				}
+				continue
+			}
+			if err := tx.Put(w.Key, w.Value); err != nil {
 				return backend.CASResult{Err: err}
 			}
 			continue
 		}
-		if err := tx.Put(w.Key, w.Value); err != nil {
+		// R>1: encode an envelope (Put => payload=value, Delete => empty-
+		// payload tombstone) under the shared stamp and Put it. A Delete is
+		// NOT tx.Delete: a bare key-removal would lose LWW to a stale
+		// stamped value on another replica.
+		var payload []byte
+		if !w.Del {
+			payload = append([]byte(nil), w.Value...)
+		}
+		envBytes := Encode(Envelope{Stamp: stamp, Payload: payload})
+		if err := tx.Put(w.Key, envBytes); err != nil {
 			return backend.CASResult{Err: err}
 		}
+		encodedWrites = append(encodedWrites, EnvelopeWrite{
+			Key:      append([]byte(nil), w.Key...),
+			Envelope: envBytes,
+		})
 	}
 
 	if err := tx.Commit(); err != nil {
 		return backend.CASResult{Err: err}
 	}
 	committed = true
+
+	// At R>1, the write-set is now durable on the owner. Fan the SAME
+	// encoded envelopes out to the R-1 other replicas, waiting for W total
+	// acks (owner's local commit pre-counted as 1). An under-W result is
+	// {Err: codes.Unavailable}: the write is already durable on the owner
+	// + any replica that acked, the same best-effort-to-W model single-key
+	// Put has. A read-only commit (no writes) has nothing to replicate.
+	if replicated && len(encodedWrites) > 0 {
+		if err := c.replicateCASBatch(pinKey, encodedWrites); err != nil {
+			return backend.CASResult{Err: err}
+		}
+	}
 	return backend.CASResult{Committed: true}
+}
+
+// casReadPayload reads key from the owner-local tx for a CAS read-check.
+// At R>1 it decodes the stored Envelope and returns the payload, with
+// found=false for both a missing key AND a winning tombstone (empty
+// payload), so a tombstone satisfies ExpectAbsent and conflicts a value-
+// match check. At R=1 it returns the raw stored bytes unchanged (found is
+// simply "the key exists"), preserving the v0.6 byte-for-byte semantics.
+// A corrupt envelope at R>1 surfaces as a backend error (the commit
+// reports {Err}, not a silent conflict).
+func (c *Cluster) casReadPayload(tx backend.Transaction, key []byte, replicated bool) (payload []byte, found bool, err error) {
+	got, err := tx.Get(key)
+	if err != nil {
+		if errors.Is(err, backend.ErrNotFound) {
+			return nil, false, nil
+		}
+		return nil, false, err
+	}
+	if !replicated {
+		return got, true, nil
+	}
+	env, derr := Decode(got)
+	if derr != nil {
+		return nil, false, derr
+	}
+	if len(env.Payload) == 0 {
+		// Winning tombstone: the key the client saw is gone. Treat as
+		// not-found for both ExpectAbsent and value-match checks.
+		return nil, false, nil
+	}
+	return env.Payload, true, nil
 }
 
 // bytesEqual reports byte-for-byte equality, treating nil and empty as

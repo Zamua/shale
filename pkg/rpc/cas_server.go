@@ -54,7 +54,7 @@ func (s *Server) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*pb.C
 		}
 	}
 
-	res := s.c.CommitCASApply(ctx, backend.IsolationLevel(req.GetIsolationLevel()), reads, writes)
+	res := s.c.CommitCASApply(ctx, backend.IsolationLevel(req.GetIsolationLevel()), req.GetPinKey(), reads, writes)
 	resp := &pb.CommitCASResponse{}
 	switch {
 	case res.Conflict:
