@@ -52,6 +52,13 @@ type KeyValue struct {
 // PartitionID method; tests inject a deterministic stub.
 type PartitionFn func(key []byte) uint64
 
+// ShardKeyFn extracts the routing shard key from a raw key. It mirrors
+// cluster.Config.ShardKeyFn: related keys returning the same shard key
+// co-locate on one ring owner. The Coordinator applies it before
+// PartitionID so rebalance buckets keys into the same partitions the
+// cluster routes them to. Nil means identity (hash the whole key).
+type ShardKeyFn func(key []byte) []byte
+
 // MigrateSource is the source-side surface: hand it the partitions
 // to migrate + the ring generation, get back a channel of pairs +
 // an error channel that fires (at most once, then closes) when the
@@ -285,6 +292,24 @@ func SourceChecksum(be backend.Backend, partitionIDs []uint64, partitionFn Parti
 // PartitionFn type. Kept here (not in plan.go) because plan.go is
 // the pure-domain layer and this adapter only matters when there is
 // a real Backend to scan against.
-func ringPartitionFn(r *ring.Ring) PartitionFn {
-	return func(key []byte) uint64 { return r.PartitionID(key) }
+//
+// shardKeyFn, when non-nil, is applied to the RAW key first so the
+// partition is computed on the same shard key the cluster routes reads
+// with (cluster.shardKey -> ring.LocateKey). This MUST match the
+// routing extraction: a node owns partition p iff ring.Owner(p) == self,
+// and a routed Get for raw key k lands on ring.LocateKey(shardKeyFn(k))
+// == ring.Owner(ring.PartitionID(shardKeyFn(k))). If rebalance computed
+// the partition on the raw key while routing computed it on the shard
+// key, the two disagree for any app with a non-identity ShardKeyFn:
+// related keys (one logical subject spanning many raw keys) scatter
+// across partitions, the reconcile/handoff scan buckets them by the
+// wrong partition, and a subject's keys strand on the wrong node while
+// the ring routes its reads elsewhere. That is the founder-grows
+// multi-key loss. A nil shardKeyFn is identity (hash whole key), which
+// preserves the no-ShardKeyFn path exactly.
+func ringPartitionFn(r *ring.Ring, shardKeyFn ShardKeyFn) PartitionFn {
+	if shardKeyFn == nil {
+		return func(key []byte) uint64 { return r.PartitionID(key) }
+	}
+	return func(key []byte) uint64 { return r.PartitionID(shardKeyFn(key)) }
 }

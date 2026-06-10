@@ -87,6 +87,14 @@ func (c *Cluster) initRebalance() {
 	// to come from the same ring snapshot the plan was computed
 	// against).
 	opts.Destination = &clusterDestination{c: c}
+	// ShardKeyFn makes the auto-wired partition function compute
+	// partitions on the same shard key the cluster routes reads with.
+	// Without it, an app with a custom ShardKeyFn scatters one logical
+	// subject's keys across partitions and the founder-grows handoff
+	// strands them (see rebalance.ringPartitionFn). Nil when the app
+	// uses no ShardKeyFn, which keeps the default (whole-key, hash-tag)
+	// path identical.
+	opts.ShardKeyFn = c.cfg.ShardKeyFn
 	// AwaitHandoffSignal gates the source's Sending -> HandedOff flip
 	// on the destination acknowledging the stream. Without it, the
 	// source's local scan independently triggers the flip + the
@@ -577,6 +585,7 @@ func (c *Cluster) replaceCoordinator() {
 		opts.RetryAfterMs = c.cfg.RebalanceRetryAfterMs
 	}
 	opts.Destination = &clusterDestination{c: c}
+	opts.ShardKeyFn = c.cfg.ShardKeyFn
 	opts.AwaitHandoffSignal = true
 	opts.HandoffTimeout = c.handoffTimeout()
 	c.rebalance.Store(rebalance.New(self, c.backend, opts))
@@ -621,7 +630,16 @@ func (c *Cluster) MigrateRangeSource(partitionIDs []uint64, ringGen uint64) (<-c
 	// partition function is pinned to the ring snapshot used at
 	// Evaluate time; the destination-asked partitions are talking
 	// about THIS source's current ring view.
-	partFn := func(k []byte) uint64 { return c.ring.PartitionID(k) }
+	//
+	// The partition function MUST apply c.shardKey first, so the keys
+	// this source streams for partition P are exactly the keys the ring
+	// routes to P (the destination asked for P because the ring assigns
+	// it; P's keys are those whose shardKey hashes into P). Computing on
+	// the raw key here would stream a different key set than the one the
+	// reconcile/handoff destination expects for P, stranding a
+	// multi-key subject's keys whenever the app uses a ShardKeyFn. This
+	// is the source-side half of the founder-grows multi-key fix.
+	partFn := func(k []byte) uint64 { return c.ring.PartitionID(c.shardKey(k)) }
 	source := rebalance.NewLocalSource(c.backend, partFn)
 	kvCh, errCh := source.OpenRange(partitionIDs, ringGen)
 	return kvCh, errCh, nil

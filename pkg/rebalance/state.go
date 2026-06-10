@@ -94,6 +94,17 @@ type Options struct {
 	// mid-migration. Clients SHOULD retry after this many ms.
 	RetryAfterMs int
 
+	// ShardKeyFn extracts the routing shard key from a raw key before
+	// the partition is computed. It MUST be the same function the
+	// cluster routes reads with (cluster.Config.ShardKeyFn). When set,
+	// the auto-wired partition function computes PartitionID on the
+	// shard key so rebalance/reconcile bucket keys into the same
+	// partitions the ring routes them to; without it, an app with a
+	// non-identity ShardKeyFn scatters one logical subject's keys across
+	// partitions and the founder-grows handoff strands them on the wrong
+	// node. Nil is identity (hash whole key), the no-ShardKeyFn default.
+	ShardKeyFn ShardKeyFn
+
 	// Source builds outgoing streams. If nil, the Coordinator
 	// auto-constructs a NewLocalSource(local, ringPartitionFn).
 	Source MigrateSource
@@ -258,10 +269,10 @@ func (c *Coordinator) Evaluate(oldRing, newRing *ring.Ring, gen uint64) {
 	// inject one. We use newRing for the partition function so the
 	// scan filter matches the ring the plan was computed against.
 	if c.source == nil {
-		c.partFn = ringPartitionFn(newRing)
+		c.partFn = ringPartitionFn(newRing, c.opts.ShardKeyFn)
 		c.source = NewLocalSource(c.local, c.partFn)
 	} else if c.partFn == nil {
-		c.partFn = ringPartitionFn(newRing)
+		c.partFn = ringPartitionFn(newRing, c.opts.ShardKeyFn)
 	}
 	source := c.source
 	dest := c.dest
