@@ -102,6 +102,62 @@ func TestRoundTripPutGetDelete(t *testing.T) {
 	}
 }
 
+// TestCommitCAS_WireRoundTrip exercises the CommitCAS handler directly
+// over gRPC: a commit that applies a write-set, then a stale-read commit
+// that the owner reports as a conflict (typed bool, NOT a gRPC error).
+func TestCommitCAS_WireRoundTrip(t *testing.T) {
+	addr, cleanup := newTestServer(t)
+	defer cleanup()
+	cli := newTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Seed via a CAS commit with an expect-absent read-check + a Put.
+	resp, err := cli.CommitCAS(ctx, &pb.CommitCASRequest{
+		PinKey: []byte("k"),
+		Reads:  []*pb.ReadCheck{{Key: []byte("k"), ExpectAbsent: true}},
+		Writes: []*pb.WriteOp{{Key: []byte("k"), Value: []byte("v1")}},
+	})
+	if err != nil {
+		t.Fatalf("CommitCAS (seed): %v", err)
+	}
+	if !resp.GetCommitted() || resp.GetConflict() || resp.GetError() != "" {
+		t.Fatalf("seed: want committed, got %+v", resp)
+	}
+
+	// A commit whose read-check expects the OLD absence now conflicts
+	// (the key exists), and the write-set is not applied.
+	resp, err = cli.CommitCAS(ctx, &pb.CommitCASRequest{
+		PinKey: []byte("k"),
+		Reads:  []*pb.ReadCheck{{Key: []byte("k"), ExpectAbsent: true}},
+		Writes: []*pb.WriteOp{{Key: []byte("k"), Value: []byte("v2")}},
+	})
+	if err != nil {
+		t.Fatalf("CommitCAS (conflict): unexpected gRPC error %v", err)
+	}
+	if resp.GetConflict() != true || resp.GetCommitted() || resp.GetError() != "" {
+		t.Fatalf("conflict: want conflict=true, got %+v", resp)
+	}
+
+	// A commit whose read-check matches the current value commits + the
+	// write-set (a delete) applies.
+	resp, err = cli.CommitCAS(ctx, &pb.CommitCASRequest{
+		PinKey: []byte("k"),
+		Reads:  []*pb.ReadCheck{{Key: []byte("k"), ExpectedValue: []byte("v1")}},
+		Writes: []*pb.WriteOp{{Key: []byte("k"), Delete: true}},
+	})
+	if err != nil {
+		t.Fatalf("CommitCAS (delete): %v", err)
+	}
+	if !resp.GetCommitted() {
+		t.Fatalf("delete commit: want committed, got %+v", resp)
+	}
+	if _, found, _ := cli.Get(ctx, []byte("k")); found {
+		t.Fatalf("after delete commit: key should be absent")
+	}
+}
+
 func TestPing(t *testing.T) {
 	addr, cleanup := newTestServer(t)
 	defer cleanup()

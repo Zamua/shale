@@ -121,3 +121,15 @@ func (c *Client) ProposeRebalance(ctx context.Context, dryRun, apply, cancel boo
 		Cancel: cancel,
 	})
 }
+
+// -- CAS transaction (v0.6) ------------------------------------------
+
+// CommitCAS ships an optimistic-concurrency commit (read-set + write-set)
+// to the owning node. The response carries the outcome as typed booleans
+// (committed / conflict) plus an error string for backend / ownership
+// failures; a conflict is the expected OCC retry signal, not a gRPC
+// error. Exposed for symmetry with the inter-node peerClient; the cluster
+// layer drives CommitCAS through its own private client.
+func (c *Client) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*pb.CommitCASResponse, error) {
+	return c.api.CommitCAS(ctx, req)
+}
