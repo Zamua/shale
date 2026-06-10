@@ -243,7 +243,7 @@ func TestTransact_NonConflictErrorAborts(t *testing.T) {
 	c := newSingleNode(t)
 	sentinel := errors.New("boom")
 	calls := 0
-	err := c.Transact([]byte("k"), func(tx backend.Transaction) error {
+	err := c.Transact([]byte("k"), func(_ backend.Transaction) error {
 		calls++
 		return sentinel
 	})
