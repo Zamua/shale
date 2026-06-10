@@ -3,7 +3,7 @@ module github.com/Zamua/shale/backends/slate
 go 1.25.4
 
 require (
-	github.com/Zamua/shale v0.0.0
+	github.com/Zamua/shale v0.6.2
 	github.com/minio/minio-go/v7 v7.2.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
 	slatedb.io/slatedb-go v0.13.1
@@ -100,7 +100,6 @@ require (
 // core (and the sibling backend module the core's cmd/* transitively
 // references) through the in-repo paths. Removed once both are tagged.
 replace (
-	github.com/Zamua/shale => ../..
 	github.com/Zamua/shale/backends/pebble => ../pebble
 )
 
