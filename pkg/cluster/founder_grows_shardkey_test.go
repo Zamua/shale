@@ -197,7 +197,7 @@ func TestFounderGrows_MultiKeyShard_ReachesEveryKey(t *testing.T) {
 	splitOrStranded := 0
 	var firstBad string
 	for _, s := range all {
-		owner := r.LocateKey(slugShardKey([]byte("pastes/"+s.slug))).ID
+		owner := r.LocateKey(slugShardKey([]byte("pastes/" + s.slug))).ID
 		for _, k := range s.keys {
 			if _, err := backends[owner].Get(k); err != nil {
 				if firstBad == "" {
