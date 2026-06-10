@@ -742,18 +742,61 @@ If a future consumer needs strict ABA-safety (a use case where "was this touched
 
 #### Replication scope (v0.6 vs v0.6.x)
 
-Single-key `Put` already replicates to R replicas when `ReplicationFactor > 1` (primary + R-1 successors, ack-counted per `WriteConsistency`). The OCC commit does NOT yet replicate: a committed write-set lands only on the **owner's local Backend**.
+Single-key `Put` replicates to R replicas when `ReplicationFactor > 1` (primary + R-1 successors, ack-counted per `WriteConsistency`). The OCC commit followed the same R-replica model one minor version later: v0.6 shipped the commit at R=1 (write-set on the owner's local Backend only), and v0.6.x replicates the committed write-set to R replicas (this change).
 
-**Decision for v0.6: the OCC commit executes at R=1 on the owner.** The validate-and-apply path is the foundational primitive; it is cleanly testable on its own (validation, conflict detection, read-your-writes, cross-shard guard, retry loop) without dragging in fan-out / ack accounting / LWW reconciliation. Write-set replication composes cleanly ON TOP and does not change the `CommitCAS` protocol: it is a separate additive step after the owner's `tx.Commit()` succeeds.
+**Decision for v0.6: the OCC commit executed at R=1 on the owner.** The validate-and-apply path is the foundational primitive; it is cleanly testable on its own (validation, conflict detection, read-your-writes, cross-shard guard, retry loop) without dragging in fan-out / ack accounting / LWW reconciliation. Write-set replication composes cleanly ON TOP and does not change the `CommitCAS` protocol: it is a separate additive step after the owner's `tx.Commit()` succeeds. v0.6.x adds exactly that step.
 
-**Known gap and its closure in v0.6.x.** With a fast-ack Backend (slate `AwaitDurable=false`, the hostthis default) and the R=1 commit path, a committed write-set sits in the owner's loss window with no replica copy until v0.6.x. Operators running transactions against a fast-ack backend should know that, unlike single-key Puts, transactional writes are not yet replicated in v0.6. The closure:
+**Known gap.** With a fast-ack Backend (slate `AwaitDurable=false`, the hostthis default) and the R=1 commit path, a committed write-set sits in the owner's loss window with no replica copy. Operators running transactions against a fast-ack backend should know that, unlike single-key Puts, transactional writes were not replicated in v0.6 proper. v0.6.x closes this.
 
-  - **`ApplyBatch` unary RPC.** After the owner's `tx.Commit()` returns nil, the owner replicates the **committed write-set** (the exact ordered puts + delete tombstones from that transaction, nothing re-validated) to the shard's R-1 other replicas via `ApplyBatch`. Each replica applies the whole batch atomically through its OWN local `backend.Transaction` (begin, apply all entries, commit), so a replica holds either the entire write-set or none of it.
-  - **No re-validation on replicas.** The owner already validated the read-set; replicas just apply. This is what makes the write-set "exactly what gets replicated" and composes more cleanly than an interactive proxy would.
-  - **Ack accounting reuses `WriteConsistency`.** `ApplyBatch` fan-out waits for W acks per `One | Quorum | All`, mirroring single-key Put accounting, with the same failure budget and migration-guard handling (a mid-handoff replica is transient, not a failure).
-  - **Stamping.** Each entry carries an LWW envelope stamped by the owner at commit time (single-sourced; replicas do not re-stamp), so the batch reconciles against single-key writes under the existing LWW comparator.
+#### Write-set replication (v0.6.x)
 
-This is **specified now, implemented in v0.6.x.** v0.6 ships the OCC commit with full tests; v0.6.x adds `ApplyBatch` write-set replication so transactional writes get the same R-replica durability single-key writes already have.
+v0.6.x makes a CAS commit replicate its write-set to the shard's R replicas so transactional writes survive a single-replica loss, the "R for durability" property that pairs with a fast-ack backend. It does NOT change the `CommitCAS` protocol: it changes how `CommitCASApply` runs on the owner, and adds one new RPC (`ApplyBatch`) for the owner-to-replica fan-out.
+
+The crux is the **envelope split** already in place for single-key writes (see "Replication (v0.4+) -> Value envelope"): at `ReplicationFactor > 1` the Backend stores ENCODED `Envelope` bytes (stamp + payload), not raw values; at `R == 1` it stores raw values. The v0.6 CAS path did raw `tx.Get` / `tx.Put`, which is correct only at R=1. At R>1 it was wrong two ways: (a) `tx.Get` returns the stored envelope bytes, but a `ReadCheck`'s `expected_value` is the DECODED payload the client saw (the client read path, `getReplicated`, already returns decoded payloads), so a byte-for-byte compare always mismatches; (b) `tx.Put` of a raw value corrupts reads, since `getReplicated` expects an envelope. v0.6.x makes `CommitCASApply` envelope-aware at R>1 while leaving R=1 byte-for-byte unchanged.
+
+**R == 1 (no ring, or `ReplicationFactor` 1): UNCHANGED.** Raw values, no envelopes, no fan-out, exactly the v0.6 path. This is the contract for every existing single-node deploy: a regression here would corrupt or fail every non-replicated transaction. The decode-on-validate / encode-on-apply / fan-out logic is gated entirely behind R>1.
+
+**R > 1: envelope-aware validate-and-apply, then fan out.** Under the same `casCommitMu`-serialized window and the same owner-local `backend.Transaction` as v0.6:
+
+  1. **Validate (decode-on-read).** For each `ReadCheck`, `tx.Get` returns the stored envelope; `Decode` it before comparing. A winning **tombstone** envelope (empty payload) counts as not-found: it satisfies `expect_absent`, and conflicts a value-match check (the key the client saw is gone). Otherwise compare the decoded payload to `expected_value` byte-for-byte. Conflict semantics are identical to R=1; only the decode step is inserted.
+  2. **Apply (shared-stamp encode-on-write).** Compute ONE shared `Stamp{now, owner NodeID}` for the whole commit. For each `WriteOp`, build an `Envelope` (Put -> payload = value; Delete -> empty payload tombstone) with that shared stamp, `Encode` it, and `tx.Put(key, envBytes)` into the local tx. Delete is written as a tombstone-envelope Put, NOT `tx.Delete`, so `getReplicated`'s LWW comparator sees a stamped tombstone (a bare key-removal would lose to a stale stamped value on another replica). Commit the local tx: atomic on the owner.
+  3. **Replicate (fan out the SAME envelopes).** After the local commit returns nil, fan out the identical encoded envelopes to the R-1 OTHER replicas via `ApplyBatch` (one call per replica carrying the whole write-set). Reuse `fanout` + `requiredWriteAcks`; wait for W total acks. **The owner's own local commit counts as 1 ack.** So `ApplyBatch` only needs W-1 more replica acks; under `WriteOne` (W=1) the local commit alone satisfies W and no replica ack is required to return success (the fan-out still runs for durability, best-effort). Migration-guard rejections from a mid-handoff replica are transient (don't count toward acks or the failure budget), same as single-key Put.
+
+The owner's local commit plus the replica fan-out mirror `putReplicated`, except the owner side is a transactional validate-and-apply rather than a single Put, and the owner's commit is pre-counted as one of the W acks.
+
+**The shared commit stamp.** Every write in one CAS commit carries the SAME `Stamp`, so the whole write-set replicates and LWW-resolves as a unit: a later single-key Put or a later CAS commit with a greater stamp wins uniformly across all the keys, and a concurrent write with a lesser stamp loses uniformly. A per-op stamp would let LWW split a single transaction's keys across two winners on a laggy replica, breaking the atomicity the OCC commit just established.
+
+**Atomicity boundary (same model as single-key Put).** The CAS commit is atomic ON THE OWNER: the owner-local tx either commits the whole write-set or none of it. Replication is best-effort-to-W AFTER that local commit, exactly like `putReplicated`. If fewer than W acks land, `CommitCASApply` returns an error (`codes.Unavailable`), but the write is ALREADY durable on the owner and on however many replicas did ack. This is the same success-but-under-W shape a single-key Put already has: the operator's `WriteConsistency` choice governs the durability guarantee, and an under-W result means the write landed on fewer than W replicas, not that it was rolled back. Each replica applies the whole batch atomically through its OWN local `backend.Transaction` (begin, apply all entries, commit), so a replica holds either the entire write-set or none of it. There is no 2PC across replicas: replicas are apply-only.
+
+**Validation soundness at R>1 (owner-local validation).** The read-set is validated against the OWNER's local copy, not a full `getReplicated` quorum read. This is sound because the owner is always one of the R replicas AND is the write-routing target for this shard: every committed write to this shard (single-key Put fan-out and CAS commit alike) lands on the owner's local copy, so the owner's local copy reflects this shard's committed state. The assumption is exactly that the owner is a replica and a write target, which the ring guarantees for the pin key's owner. The heavier alternative, validating via a quorum read across replicas, would tolerate a stale-owner window during a ring move at the cost of R-fan-out reads inside the commit critical section; it is deferred. v0.6.x ships owner-local validation; quorum-read validation is a forward option, not a v0.6.x deliverable.
+
+#### `ApplyBatch` wire protocol (v0.6.x)
+
+A new unary RPC on `ShaleNode`, used only owner-to-replica for CAS write-set fan-out:
+
+```
+rpc ApplyBatch(ApplyBatchRequest) returns (ApplyBatchResponse);
+```
+
+```
+message ApplyBatchRequest {
+  repeated EnvelopeWrite writes = 1;
+}
+
+message EnvelopeWrite {
+  bytes key      = 1;
+  bytes envelope = 2;  // already Encode()d by the owner (shared stamp + payload);
+                       // an empty-payload envelope is a tombstone. Written verbatim.
+}
+
+message ApplyBatchResponse {
+  string error = 1;  // non-empty => the replica failed to apply (rolled back)
+}
+```
+
+The envelope is opaque to the replica: the owner `Encode`d it (shared stamp + payload, tombstones included), so the replica writes the bytes verbatim and never re-stamps. The handler opens ONE local `backend.Transaction`, `tx.Put(key, envelope)` for each `EnvelopeWrite` (apply-only, no re-validation), and commits; any error rolls the whole batch back. It respects the migration guard the same way `dispatchReplicaPut` does: if a key in the batch is migrating or being received on this replica, it returns the migration-guard error (`codes.ResourceExhausted`) so the owner's `fanout` classifies it transient rather than a failure. There is no ownership re-check beyond the migration guard (the owner already validated; the replica trusts the fan-out target the same way `LocalReplicaPut` trusts `OwnsReplica`).
+
+This is **implemented in v0.6.x.** v0.6 shipped the OCC commit at R=1 with full tests; v0.6.x adds envelope-aware CAS validate-and-apply plus `ApplyBatch` write-set replication so transactional writes get the same R-replica durability single-key writes already have.
 
 ---
 
@@ -984,7 +1027,12 @@ Default `go test ./...` skips both layers (no cgo, no Docker), so the regular de
   - [ ] `Begin` re-shaped to uniform OCC (one transaction model local + remote; pre-1.0 contract change documented)
   - [ ] ABA caveat documented (value-based read-checks; benign for shale usage); version/seqno read-checks noted as the future option
   - [ ] hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Default config: `slate.Config{WriteOptions: &slatedb.WriteOptions{AwaitDurable: false}}` paired with `cluster.Config{ReplicationFactor: 3}`. The v0.5 bench measured this at 11,661 puts/s on the cluster-n3-r3 production shape, ~150x the strict baseline of 77 puts/s, with the durability budget covered by 3-way replication during the ~100ms per-replica WAL-flush window. Validate on production-like data.
-- [ ] **v0.6.x** - `ApplyBatch` unary RPC: replicate the committed OCC write-set to R-1 replicas (apply-only, no re-validation), ack-counted per `WriteConsistency`, owner-stamped LWW envelopes. Closes the R=1 transactional-write durability gap left by v0.6.
+- [~] **v0.6.x** (in progress) - replicate the committed OCC write-set to R replicas, closing the R=1 transactional-write durability gap left by v0.6. Sub-tasks:
+  - [ ] `ApplyBatch` unary RPC (`repeated EnvelopeWrite`; key + already-encoded envelope) on `ShaleNode`; replica handler applies the whole batch in ONE local transaction, apply-only, no re-validation, migration-guard respected, rolls back on any error
+  - [ ] `CommitCASApply` envelope-aware at R>1: decode-on-validate (tombstone counts as not-found), shared `Stamp{now, owner NodeID}` for the whole commit, encode-on-apply (Delete written as a tombstone-envelope Put), local commit then fan out the same envelopes
+  - [ ] R=1 path byte-for-byte unchanged (raw values, no envelopes, no fan-out)
+  - [ ] Fan-out reuses `fanout` + `requiredWriteAcks`, owner's local commit counts as 1 ack, W-ack target, migration-guard transient handling; under-W returns `codes.Unavailable` (write already durable on owner + acked replicas, same best-effort-to-W model as single-key Put)
+  - [ ] Owner-local validation soundness documented (owner is always a replica + the write target); quorum-read validation noted as the deferred heavier alternative
 
 Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly, plus the CLI for daily ergonomics) and grow into v0.2+ when their workload demands it.
 
