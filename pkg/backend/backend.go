@@ -64,6 +64,36 @@ type Transaction interface {
 	Rollback() error
 }
 
+// ReadCheck is one entry in a CAS (optimistic-concurrency) read-set: the
+// value a client observed for a key at read time. The owner re-reads the
+// key inside its commit transaction and compares. ExpectAbsent=true means
+// the key must NOT exist (a found value is a conflict) and ExpectedVal is
+// ignored; otherwise the current value must match ExpectedVal byte-for-
+// byte. It is a pure value object: no I/O, no clustering awareness.
+type ReadCheck struct {
+	Key          []byte
+	ExpectedVal  []byte
+	ExpectAbsent bool
+}
+
+// WriteOp is one entry in a CAS write-set. Del=true deletes Key (Value is
+// ignored); otherwise it Puts Value under Key. Pure value object.
+type WriteOp struct {
+	Key   []byte
+	Value []byte
+	Del   bool
+}
+
+// CASResult is the outcome of an owner-side validate-and-apply. Exactly
+// one of Committed / Conflict / Err is meaningful, mirroring the
+// CommitCASResponse wire shape: a Conflict is NOT an Err (it is the
+// expected OCC retry signal), and a successful apply sets Committed.
+type CASResult struct {
+	Committed bool
+	Conflict  bool
+	Err       error
+}
+
 // IsolationLevel is the strongest visibility guarantee a transaction
 // makes. Backends may implement stronger; never weaker.
 type IsolationLevel int

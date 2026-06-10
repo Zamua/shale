@@ -14,3 +14,12 @@ var ErrCrossShard = errors.New("backend: cross-shard transaction not supported")
 
 // ErrClosed is returned by any Backend method called after Close.
 var ErrClosed = errors.New("backend: closed")
+
+// ErrCASConflict is returned by a CAS-buffered transaction's Commit (and
+// surfaced by Cluster.Transact when its retry budget is exhausted) when the
+// owner's validate-and-apply step found that a key in the read-set changed
+// between the client's read and the commit. It is the optimistic-concurrency
+// retry signal, NOT a hard failure: the caller re-reads + recomputes against
+// fresh state and tries again. Distinct from a backend / ownership error so
+// retry helpers can branch on it (errors.Is-comparable).
+var ErrCASConflict = errors.New("backend: CAS conflict; read-set changed, retry")
