@@ -18,7 +18,7 @@ import (
 //     are no longer the owner), returns FailedPrecondition WITHOUT opening
 //     a backend transaction, so the client re-pins against the new ring
 //     and retries rather than us applying to the wrong backend.
-//  2. Delegates to Cluster.CommitCASLocal, which opens ONE short local
+//  2. Delegates to Cluster.CommitCASApply, which opens ONE short local
 //     backend.Transaction, validates the read-set, applies the write-set,
 //     and commits, with a deferred Rollback guarding every non-committed
 //     return path (validation conflict, op error, commit error, context

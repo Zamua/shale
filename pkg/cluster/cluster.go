@@ -561,7 +561,7 @@ func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
 
 // LocalBegin opens a transaction directly against the local Backend at
 // the given isolation level, bypassing ring routing. It is the owner-
-// local primitive the CAS validate-and-apply commit (CommitCASLocal)
+// local primitive the CAS validate-and-apply commit (CommitCASApply)
 // opens its single short transaction on; the caller is responsible for
 // having verified ownership of the pin key first. Returns
 // backend.ErrClosed if the cluster is shutting down.

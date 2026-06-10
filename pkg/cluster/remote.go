@@ -128,7 +128,7 @@ func (c *Cluster) txRoutedGet(key []byte) ([]byte, error) {
 }
 
 // commitCAS dispatches a CAS commit to the pinned shard owner. When the
-// owner is this node it is an in-process fast-path (CommitCASLocal, no
+// owner is this node it is an in-process fast-path (CommitCASApply, no
 // RPC); otherwise it serializes the read-set + write-set onto the wire
 // and calls the peer's CommitCAS RPC. Either way a reported conflict maps
 // to backend.ErrCASConflict; a backend / ownership failure (including the
