@@ -3,7 +3,6 @@ package cluster
 import (
 	"context"
 	"errors"
-	"fmt"
 	"io"
 	"sort"
 	"sync"
@@ -112,117 +111,305 @@ func (c *peerClient) LocalScan(ctx context.Context, prefix []byte) (grpc.ServerS
 	return c.api.LocalScan(ctx, &pb.LocalScanRequest{Prefix: prefix})
 }
 
-// clusterTx is the multi-node transaction wrapper returned by
-// Cluster.Begin. It defers opening the underlying Backend transaction
-// until the first key is touched: the shard pinning decision needs a
-// key in hand, which cluster.Begin alone does not see.
+// CommitCAS ships a CAS validate-and-apply to the owning peer. The wire
+// response carries the outcome as typed booleans (committed / conflict)
+// plus an error string for backend / ownership failures; the caller maps
+// those back into a casResult.
+func (c *peerClient) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*pb.CommitCASResponse, error) {
+	return c.api.CommitCAS(ctx, req)
+}
+
+// txRoutedGet performs the normal single-key routed Get the CAS read-set
+// records against. It reuses Cluster.Get so a read inside a transaction
+// sees exactly what a standalone Get would (same local/remote routing,
+// same replication read path). Returns backend.ErrNotFound on absence.
+func (c *Cluster) txRoutedGet(key []byte) ([]byte, error) {
+	return c.Get(key)
+}
+
+// commitCAS dispatches a CAS commit to the pinned shard owner. When the
+// owner is this node it is an in-process fast-path (CommitCASLocal, no
+// RPC); otherwise it serializes the read-set + write-set onto the wire
+// and calls the peer's CommitCAS RPC. Either way a reported conflict maps
+// to backend.ErrCASConflict; a backend / ownership failure (including the
+// owner reporting it no longer owns the pin key) surfaces as that error.
+func (c *Cluster) commitCAS(pinKey []byte, level backend.IsolationLevel, reads []backend.ReadCheck, writes []backend.WriteOp) error {
+	if c.closed.Load() || c.backend == nil {
+		return backend.ErrClosed
+	}
+	// Re-resolve the owner from the LIVE ring in case it moved between
+	// pin and commit. When the owner is us, take the in-process fast-path
+	// (CommitCASApply, no RPC); otherwise serialize onto the wire and
+	// call the peer's CommitCAS RPC.
+	curOwner, isLocal := c.ownerOf(pinKey)
+	if isLocal {
+		res := c.CommitCASApply(context.Background(), level, reads, writes)
+		return casResultToError(res)
+	}
+	cli, err := c.clientFor(curOwner.Addr)
+	if err != nil {
+		return err
+	}
+	req := &pb.CommitCASRequest{
+		PinKey:         pinKey,
+		IsolationLevel: int32(level),
+		Reads:          make([]*pb.ReadCheck, len(reads)),
+		Writes:         make([]*pb.WriteOp, len(writes)),
+	}
+	for i, r := range reads {
+		req.Reads[i] = &pb.ReadCheck{Key: r.Key, ExpectedValue: r.ExpectedVal, ExpectAbsent: r.ExpectAbsent}
+	}
+	for i, w := range writes {
+		req.Writes[i] = &pb.WriteOp{Key: w.Key, Value: w.Value, Delete: w.Del}
+	}
+	resp, err := cli.CommitCAS(context.Background(), req)
+	if err != nil {
+		return err
+	}
+	if resp.GetConflict() {
+		return backend.ErrCASConflict
+	}
+	if e := resp.GetError(); e != "" {
+		return errors.New("cluster: CommitCAS owner error: " + e)
+	}
+	return nil
+}
+
+// casResultToError maps a backend.CASResult into the error the cluster
+// surface returns: nil on committed, backend.ErrCASConflict on conflict,
+// the backend / ownership error otherwise.
+func casResultToError(r backend.CASResult) error {
+	if r.Conflict {
+		return backend.ErrCASConflict
+	}
+	if r.Err != nil {
+		return r.Err
+	}
+	return nil
+}
+
+// clusterTx is the CAS-buffered transaction returned by Cluster.Begin
+// (and driven by Cluster.Transact). It is a BUFFER, not a live backend
+// session: it never holds an open backend.Transaction across a network
+// round-trip. See docs/SPEC.md "Single-shard transactions (CAS / OCC)".
 //
-// Once pinned, every subsequent key must shard to the same owner.
-// Cross-shard touches return backend.ErrCrossShard so the caller sees
-// the limitation at the offending operation, not later in Commit.
+// Lazy pinning: the shard is pinned on the first key touched (the first
+// Get / Put / Delete), to whichever node the ring says owns that key's
+// shard. Every subsequent key MUST shard to that same owner; a key that
+// shards elsewhere returns backend.ErrCrossShard at the offending
+// operation (the cross-shard guard, the load-bearing correctness
+// property). This holds whether the pinned shard is local or remote: a
+// genuinely cross-shard transaction STILL fails with ErrCrossShard.
 //
-// In v0.2, only locally-pinned transactions execute; a remote pin
-// returns an ErrCrossShard-wrapped error on first use until the gRPC
-// transaction-proxy work lands. This is intentional: silently routing
-// transactional work to the wrong backend would be a correctness bug,
-// so we surface the gap at the call site.
+// Buffering:
+//   - Get does a real routed Get (the normal single-key read path,
+//     local-or-remote) and records (key, value-seen) in the read-set; a
+//     not-found records an expect_absent entry. A Get of a key the tx
+//     itself already wrote is served from the write buffer (read-your-
+//     writes) with no round-trip and adds NO read-check.
+//   - Put / Delete buffer into the write-set; they do not hit the owner.
+//   - Commit assembles the read-set + write-set and sends ONE CommitCAS
+//     to the pinned owner (an in-process fast-path when the owner is this
+//     node, no RPC). A reported conflict maps to backend.ErrCASConflict.
+//   - Rollback / abandoning the tx is purely local: nothing was sent to
+//     the owner, so there is nothing to undo.
 type clusterTx struct {
 	c     *Cluster
 	level backend.IsolationLevel
 
-	mu       sync.Mutex
-	pinned   bool
-	ownerID  string
-	tx       backend.Transaction
-	done     bool
-	pinError error // sticky if prepare failed to acquire the underlying tx
+	mu      sync.Mutex
+	pinned  bool
+	pinKey  []byte
+	ownerID string // ring owner of the pinned shard; the cross-shard guard compares against this
+	done    bool
+
+	// reads is the read-set: keys the tx READ from the cluster (and did
+	// not itself write), in first-seen order, deduped by readSeen.
+	reads    []backend.ReadCheck
+	readSeen map[string]int // key -> index into reads (for dedupe)
+
+	// writeBuf is the buffered write-set in order. writeIdx maps a key to
+	// its latest entry so read-your-writes can serve the buffered value
+	// and a re-write of the same key overwrites in place rather than
+	// appending a duplicate.
+	writeBuf []backend.WriteOp
+	writeIdx map[string]int
 }
 
-func (t *clusterTx) prepare(key []byte) (backend.Transaction, error) {
+// newCASTx constructs an empty CAS-buffered transaction.
+func (c *Cluster) newCASTx(level backend.IsolationLevel) *clusterTx {
+	return &clusterTx{
+		c:        c,
+		level:    level,
+		readSeen: make(map[string]int),
+		writeIdx: make(map[string]int),
+	}
+}
+
+// pin records the pin key without performing an operation. Transact calls
+// it so the shard is fixed to the caller-supplied pinKey even if fn's
+// first touched key differs (they must still co-shard, enforced on that
+// first op). A no-op if already pinned.
+func (t *clusterTx) pin(key []byte) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	t.pinLocked(key)
+}
+
+// pinLocked pins the shard on key if not already pinned. Caller holds mu.
+// Pinning is a pure ring lookup that cannot fail; the owner Addr is
+// resolved fresh from the live ring at Commit time, so the tx records
+// only the owner ID (for the cross-shard equality check) and the pin key.
+func (t *clusterTx) pinLocked(key []byte) {
+	if t.pinned {
+		return
+	}
+	owner, _ := t.c.ownerOf(key)
+	t.pinned = true
+	t.pinKey = append([]byte(nil), key...)
+	t.ownerID = owner.ID
+}
+
+// guardShard pins on first touch + enforces the cross-shard guard on
+// every subsequent key. Caller holds mu. Returns backend.ErrCrossShard
+// if key shards to a different owner than the pinned one.
+func (t *clusterTx) guardShard(key []byte) error {
 	if t.done {
-		return nil, errors.New("cluster: transaction already finalized")
+		return errors.New("cluster: transaction already finalized")
 	}
-	// If a previous prepare failed (e.g. remote-pinned tx), every
-	// subsequent op returns the same sticky error rather than
-	// re-running prepare and dereferencing a nil t.tx.
-	if t.pinError != nil {
-		return nil, t.pinError
-	}
-	owner, local := t.c.ownerOf(key)
 	if !t.pinned {
-		t.pinned = true
-		t.ownerID = owner.ID
-		if !local {
-			err := fmt.Errorf("%w: v0.2 cannot proxy transactions to remote owner %s", backend.ErrCrossShard, owner.ID)
-			t.pinError = err
-			return nil, err
-		}
-		tx, err := t.c.backend.Begin(t.level)
-		if err != nil {
-			t.pinError = err
-			return nil, err
-		}
-		t.tx = tx
-		return tx, nil
+		t.pinLocked(key)
+		return nil
 	}
+	owner, _ := t.c.ownerOf(key)
 	if owner.ID != t.ownerID {
-		return nil, backend.ErrCrossShard
+		return backend.ErrCrossShard
 	}
-	return t.tx, nil
+	return nil
 }
 
 func (t *clusterTx) Get(key []byte) ([]byte, error) {
-	tx, err := t.prepare(key)
-	if err != nil {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.guardShard(key); err != nil {
 		return nil, err
 	}
-	return tx.Get(key)
+	// Read-your-writes: a key the tx already wrote is served from the
+	// buffer and adds no read-check (validating it against pre-write
+	// state would be wrong: the tx itself changed it).
+	if idx, ok := t.writeIdx[string(key)]; ok {
+		w := t.writeBuf[idx]
+		if w.Del {
+			return nil, backend.ErrNotFound
+		}
+		return append([]byte(nil), w.Value...), nil
+	}
+	// Routed Get against the cluster. Released the lock would let a
+	// concurrent op race the read-set; the routed Get is a single network
+	// op and clusterTx is not advertised as goroutine-safe across
+	// concurrent ops on the SAME tx, so holding mu here is fine.
+	val, err := t.c.txRoutedGet(key)
+	if err != nil && !errors.Is(err, backend.ErrNotFound) {
+		return nil, err
+	}
+	absent := errors.Is(err, backend.ErrNotFound)
+	t.recordRead(key, val, absent)
+	if absent {
+		return nil, backend.ErrNotFound
+	}
+	return val, nil
+}
+
+// recordRead adds (or refreshes) a read-check for key. Caller holds mu.
+// The FIRST observation of a key is the snapshot the OCC validate checks
+// against; a later Get of the same key (without an intervening write)
+// keeps the first-seen expectation rather than overwriting it, so the
+// read-set stays a faithful record of what the client computed against.
+func (t *clusterTx) recordRead(key, val []byte, absent bool) {
+	if _, ok := t.readSeen[string(key)]; ok {
+		return
+	}
+	rc := backend.ReadCheck{Key: append([]byte(nil), key...), ExpectAbsent: absent}
+	if !absent {
+		rc.ExpectedVal = append([]byte(nil), val...)
+	}
+	t.readSeen[string(key)] = len(t.reads)
+	t.reads = append(t.reads, rc)
 }
 
 func (t *clusterTx) Put(key, value []byte) error {
-	tx, err := t.prepare(key)
-	if err != nil {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.guardShard(key); err != nil {
 		return err
 	}
-	return tx.Put(key, value)
+	t.bufferWrite(backend.WriteOp{Key: append([]byte(nil), key...), Value: append([]byte(nil), value...)})
+	return nil
 }
 
 func (t *clusterTx) Delete(key []byte) error {
-	tx, err := t.prepare(key)
-	if err != nil {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if err := t.guardShard(key); err != nil {
 		return err
 	}
-	return tx.Delete(key)
+	t.bufferWrite(backend.WriteOp{Key: append([]byte(nil), key...), Del: true})
+	return nil
 }
 
-func (t *clusterTx) ScanPrefix(prefix []byte) (backend.Iterator, error) {
-	tx, err := t.prepare(prefix)
-	if err != nil {
-		return nil, err
+// bufferWrite appends w to the write-set, or overwrites the prior entry
+// for the same key in place (last-write-wins within the tx). Caller holds
+// mu. The key is now "owned" by the tx, so subsequent Gets read-your-
+// writes from here.
+func (t *clusterTx) bufferWrite(w backend.WriteOp) {
+	if idx, ok := t.writeIdx[string(w.Key)]; ok {
+		t.writeBuf[idx] = w
+		return
 	}
-	return tx.ScanPrefix(prefix)
+	t.writeIdx[string(w.Key)] = len(t.writeBuf)
+	t.writeBuf = append(t.writeBuf, w)
 }
 
+// ScanPrefix inside a CAS-buffered transaction is not supported in v0.6:
+// a scanned range cannot be cheaply turned into a read-set of discrete
+// key checks, and validating a range against concurrent inserts needs
+// phantom protection the value-based read-set does not provide. Callers
+// scan outside the transaction. See docs/SPEC.md "Begin vs Transact".
+func (t *clusterTx) ScanPrefix(_ []byte) (backend.Iterator, error) {
+	return nil, errors.New("cluster: ScanPrefix is not supported inside a CAS transaction; scan outside the transaction (see docs/SPEC.md)")
+}
+
+// Commit assembles the buffered read-set + write-set and ships ONE
+// CommitCAS to the pinned shard owner. A nil-buffer tx (nothing touched,
+// or a read-only tx with nothing to validate against) commits trivially.
+// A reported conflict returns backend.ErrCASConflict; a backend /
+// ownership failure returns that error.
 func (t *clusterTx) Commit() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
+	if t.done {
+		return errors.New("cluster: transaction already finalized")
+	}
 	t.done = true
-	if t.tx == nil {
+
+	// Nothing to commit: no shard was pinned (the tx touched no key) or
+	// the tx had no writes and no reads. Either way there is no state to
+	// validate-and-apply; succeed trivially.
+	if !t.pinned || (len(t.writeBuf) == 0 && len(t.reads) == 0) {
 		return nil
 	}
-	return t.tx.Commit()
+
+	return t.c.commitCAS(t.pinKey, t.level, t.reads, t.writeBuf)
 }
 
+// Rollback abandons the buffer. Purely local: nothing was sent to the
+// owner (Commit is the only thing that ships), so there is nothing to
+// undo. Idempotent with Commit via the done flag.
 func (t *clusterTx) Rollback() error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	t.done = true
-	if t.tx == nil {
-		return nil
-	}
-	return t.tx.Rollback()
+	return nil
 }
 
 // remoteIterator adapts a server-streaming ScanPrefix RPC into the

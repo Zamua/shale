@@ -240,6 +240,19 @@ type Cluster struct {
 	clientsMu sync.RWMutex
 	clients   map[string]*peerClient // peer gRPC addr -> client
 
+	// casCommitMu serializes the owner-side CAS validate-and-apply
+	// (CommitCASApply) so the read-set validation and the write-set apply
+	// are atomic relative to other CAS commits on this node. Without it,
+	// two concurrent commits could both pass validation against the same
+	// observed value and both apply (a lost update): the memory backend's
+	// transaction provides snapshot-isolation reads but NOT write-write
+	// conflict detection, so OCC correctness depends on the owner
+	// serializing the check-and-apply step here. This is a coarse
+	// per-node lock; the commit window is short (one local tx with no
+	// network inside it), so contention is bounded. A future refinement
+	// could stripe it per shard / per partition.
+	casCommitMu sync.Mutex
+
 	// peerClientsBlocked, when true, makes clientFor return an error
 	// instead of dialing. Test-only seam used by the destination-
 	// crash failure tests to guarantee a node cannot reach any peer
@@ -544,6 +557,19 @@ func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
 		return nil, backend.ErrClosed
 	}
 	return c.backend.Get(key)
+}
+
+// LocalBegin opens a transaction directly against the local Backend at
+// the given isolation level, bypassing ring routing. It is the owner-
+// local primitive the CAS validate-and-apply commit (CommitCASLocal)
+// opens its single short transaction on; the caller is responsible for
+// having verified ownership of the pin key first. Returns
+// backend.ErrClosed if the cluster is shutting down.
+func (c *Cluster) LocalBegin(level backend.IsolationLevel) (backend.Transaction, error) {
+	if c.closed.Load() || c.backend == nil {
+		return nil, backend.ErrClosed
+	}
+	return c.backend.Begin(level)
 }
 
 // Close releases all cluster resources. After Close, no other method
@@ -908,26 +934,28 @@ func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	return &remoteIterator{stream: stream, cancel: cancel}, nil
 }
 
-// Begin starts a transaction on the shard that owns the FIRST key
-// touched. The returned Transaction is lazy: the underlying Backend
-// transaction is opened on the first Put / Get / Delete / ScanPrefix,
-// pinned to that key's owning shard. Subsequent operations whose key
-// hashes to a different shard return backend.ErrCrossShard. If the
-// owning shard is remote, gRPC transaction proxying lands in a future
-// version; for v0.2 a remote-pinned transaction returns ErrCrossShard
-// on first use, with a descriptive wrap, so callers see the limitation
-// at the call site rather than silently running against the wrong
-// backend.
+// Begin starts a CAS-buffered (optimistic-concurrency) transaction. The
+// returned Transaction is a BUFFER, not a live backend session: Get does
+// a routed read (recording a read-check), Put / Delete buffer write-ops,
+// and Commit ships the read-set + write-set to the pinned shard owner in
+// ONE validate-and-apply call (an in-process fast-path when the owner is
+// local). The shard is pinned lazily on the first key touched; any
+// subsequent key sharding to a different owner returns
+// backend.ErrCrossShard at the offending op (the cross-shard guard).
+// Commit returns backend.ErrCASConflict if the owner found a read-set key
+// changed; the caller retries (Transact wraps that loop).
+//
+// This is uniform OCC everywhere: single-node, local-pin, and remote-pin
+// transactions all run through the same validate-and-apply path. It is a
+// behavior change from the pre-v0.6 Begin contract (which ran ops against
+// a live local backend.Transaction and returned ErrCrossShard on a remote
+// pin); changing it pre-1.0 is intentional. See docs/SPEC.md
+// "Single-shard transactions (CAS / OCC)" + "Begin vs Transact".
 func (c *Cluster) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
 	if c.closed.Load() || c.backend == nil {
 		return nil, backend.ErrClosed
 	}
-	if c.ring == nil {
-		// Single-node mode: every key belongs to us, so delegate
-		// straight through.
-		return c.backend.Begin(level)
-	}
-	return &clusterTx{c: c, level: level}, nil
+	return c.newCASTx(level), nil
 }
 
 // AggregateResult is one entry in the slice returned by Aggregate:

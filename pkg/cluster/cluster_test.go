@@ -365,16 +365,19 @@ func TestCloseRace(t *testing.T) {
 	}
 }
 
-// TestRemoteTx_StaysCrossShard pins the failure mode where a remote-
-// pinned transaction's first prepare set t.pinned=true but did NOT
-// open t.tx (because the pin landed on a remote owner, which v0.2
-// can't proxy). The second op then re-ran prepare, saw "already
-// pinned" + the owner matched, and returned t.tx == nil - which a
-// caller would then dereference and panic on.
+// TestRemoteTx_CommitsViaCAS pins the v0.6 CAS contract for a
+// single-shard transaction whose shard is owned by a REMOTE node.
+// Pre-v0.6 this returned backend.ErrCrossShard (no remote proxy); under
+// the CAS model the client buffers reads + writes locally and ships a
+// single CommitCAS to the remote owner, which validate-and-applies.
 //
-// The contract: any op AFTER the failed prepare also returns
-// backend.ErrCrossShard (or a wrap thereof), never a nil tx.
-func TestRemoteTx_StaysCrossShard(t *testing.T) {
+// Two assertions:
+//  1. A remote-pinned single-shard tx (all keys on n2, opened from n1)
+//     COMMITS, and the write is visible via a routed Get afterward.
+//  2. A genuinely cross-shard tx (one key on n2, one on n1) STILL fails
+//     with backend.ErrCrossShard at the offending op, before anything
+//     goes on the wire.
+func TestRemoteTx_CommitsViaCAS(t *testing.T) {
 	n1Mem := memory.New()
 	n2Mem := memory.New()
 
@@ -414,34 +417,162 @@ func TestRemoteTx_StaysCrossShard(t *testing.T) {
 	n2GRPC.register(c2)
 
 	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
-		t.Fatalf("ring: %v", err)
+		t.Fatalf("n1 ring: %v", err)
+	}
+	if err := waitForRingSize(c2, 2, 5*time.Second); err != nil {
+		t.Fatalf("n2 ring: %v", err)
+	}
+	// Let any joiner-bootstrap rebalance settle so the forwarded reads /
+	// CommitCAS below don't race a StateReceiving window on n2.
+	for _, c := range []*cluster.Cluster{c1, c2} {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := c.WaitForRebalanceIdle(ctx); err != nil {
+			cancel()
+			t.Fatalf("%s rebalance idle: %v", c.NodeID(), err)
+		}
+		cancel()
 	}
 
-	// Find a key whose owner is n2; open a tx on n1 + pin it on
-	// that remote-owned key. The first op should return ErrCrossShard.
+	// (1) Remote single-shard tx commits via CAS. Pin on a key owned by
+	// n2; do a buffered Get (records an expect_absent read-check) + a
+	// Put; Commit ships ONE CommitCAS to n2.
 	remoteKey := findKeyOwnedBy(t, c1, "n2", 1000)
 	tx, err := c1.Begin(backend.SnapshotIsolation)
 	if err != nil {
 		t.Fatalf("Begin: %v", err)
 	}
-	defer func() { _ = tx.Rollback() }()
-
-	if err := tx.Put([]byte(remoteKey), []byte("v")); !errors.Is(err, backend.ErrCrossShard) {
-		t.Fatalf("first Put: want ErrCrossShard, got %v", err)
+	if _, err := tx.Get([]byte(remoteKey)); !errors.Is(err, backend.ErrNotFound) {
+		t.Fatalf("buffered Get of absent remote key: want ErrNotFound, got %v", err)
+	}
+	if err := tx.Put([]byte(remoteKey), []byte("v")); err != nil {
+		t.Fatalf("buffered Put on remote shard: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatalf("Commit of remote single-shard tx: want nil, got %v", err)
+	}
+	// The committed write must be visible via a routed Get from n1.
+	got, err := c1.Get([]byte(remoteKey))
+	if err != nil {
+		t.Fatalf("Get after remote commit: %v", err)
+	}
+	if !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("Get after remote commit: want %q, got %q", "v", got)
 	}
 
-	// Pre-fix: this second op would re-run prepare, see "already
-	// pinned, owner matches", return t.tx == nil, and panic on the
-	// nil dereference inside tx.Put -> nil.Put. Post-fix: the
-	// sticky pinError flips us straight back to ErrCrossShard.
-	if err := tx.Put([]byte(remoteKey), []byte("v2")); !errors.Is(err, backend.ErrCrossShard) {
-		t.Fatalf("second Put: want ErrCrossShard, got %v", err)
+	// (2) Genuinely cross-shard tx still fails with ErrCrossShard. Pin on
+	// a key owned by n2, then touch a key owned by n1 (different owner):
+	// the cross-shard guard fires at the offending op, before any wire.
+	localKey := findKeyOwnedBy(t, c1, "n1", 1000)
+	tx2, err := c1.Begin(backend.SnapshotIsolation)
+	if err != nil {
+		t.Fatalf("Begin tx2: %v", err)
 	}
-	if _, err := tx.Get([]byte(remoteKey)); !errors.Is(err, backend.ErrCrossShard) {
-		t.Fatalf("Get after failed pin: want ErrCrossShard, got %v", err)
+	defer func() { _ = tx2.Rollback() }()
+	if err := tx2.Put([]byte(remoteKey), []byte("a")); err != nil {
+		t.Fatalf("tx2 first Put (pins n2): %v", err)
 	}
-	if err := tx.Delete([]byte(remoteKey)); !errors.Is(err, backend.ErrCrossShard) {
-		t.Fatalf("Delete after failed pin: want ErrCrossShard, got %v", err)
+	if err := tx2.Put([]byte(localKey), []byte("b")); !errors.Is(err, backend.ErrCrossShard) {
+		t.Fatalf("tx2 cross-shard Put: want ErrCrossShard, got %v", err)
+	}
+	if _, err := tx2.Get([]byte(localKey)); !errors.Is(err, backend.ErrCrossShard) {
+		t.Fatalf("tx2 cross-shard Get: want ErrCrossShard, got %v", err)
+	}
+}
+
+// TestTransact_RemoteContention drives the CAS retry loop over the WIRE:
+// both nodes concurrently Transact a counter pinned to a key owned by n2,
+// so n1's increments forward a CommitCAS RPC to n2 while n2's run the
+// in-process fast-path. The owner's casCommitMu must serialize all of
+// them so the counter converges to the exact increment count (no lost
+// update across the local + remote commit paths).
+func TestTransact_RemoteContention(t *testing.T) {
+	n1Mem := memory.New()
+	n2Mem := memory.New()
+
+	n1MemberPort := freePort(t)
+	n2MemberPort := freePort(t)
+
+	n1GRPC, n1stop := startGRPC(t)
+	defer n1stop()
+	n2GRPC, n2stop := startGRPC(t)
+	defer n2stop()
+
+	c1, err := cluster.Open(cluster.Config{
+		NodeID: "n1", Backend: n1Mem,
+		BindAddr: hostPort(n1MemberPort), GRPCAddr: n1GRPC.addr, LogOutput: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("open n1: %v", err)
+	}
+	defer func() { _ = c1.Close() }()
+	n1GRPC.register(c1)
+
+	c2, err := cluster.Open(cluster.Config{
+		NodeID: "n2", Backend: n2Mem,
+		BindAddr: hostPort(n2MemberPort), GRPCAddr: n2GRPC.addr,
+		Seeds: []string{hostPort(n1MemberPort)}, LogOutput: io.Discard,
+	})
+	if err != nil {
+		t.Fatalf("open n2: %v", err)
+	}
+	defer func() { _ = c2.Close() }()
+	n2GRPC.register(c2)
+
+	for _, c := range []*cluster.Cluster{c1, c2} {
+		if err := waitForRingSize(c, 2, 5*time.Second); err != nil {
+			t.Fatalf("%s ring: %v", c.NodeID(), err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		if err := c.WaitForRebalanceIdle(ctx); err != nil {
+			cancel()
+			t.Fatalf("%s rebalance idle: %v", c.NodeID(), err)
+		}
+		cancel()
+	}
+
+	// Raise the retry budget so heavy single-key contention across the
+	// local + remote commit paths still converges (the default 10 can be
+	// tight when many goroutines hammer one key).
+	oldMax := cluster.CASMaxAttempts
+	cluster.CASMaxAttempts = 200
+	defer func() { cluster.CASMaxAttempts = oldMax }()
+
+	counter := findKeyOwnedBy(t, c1, "n2", 1000)
+	if err := c1.Put([]byte(counter), []byte("0")); err != nil {
+		t.Fatalf("seed counter: %v", err)
+	}
+
+	const perNode = 15
+	inc := func(c *cluster.Cluster, wg *sync.WaitGroup) {
+		defer wg.Done()
+		err := c.Transact([]byte(counter), func(tx backend.Transaction) error {
+			cur, err := tx.Get([]byte(counter))
+			if err != nil {
+				return err
+			}
+			var n int
+			_, _ = fmt.Sscanf(string(cur), "%d", &n)
+			return tx.Put([]byte(counter), []byte(strconv.Itoa(n+1)))
+		})
+		if err != nil {
+			t.Errorf("Transact: %v", err)
+		}
+	}
+
+	var wg sync.WaitGroup
+	wg.Add(2 * perNode)
+	for i := 0; i < perNode; i++ {
+		go inc(c1, &wg) // forwards CommitCAS to n2
+		go inc(c2, &wg) // in-process fast-path on n2
+	}
+	wg.Wait()
+
+	got, err := c1.Get([]byte(counter))
+	if err != nil {
+		t.Fatalf("final Get: %v", err)
+	}
+	if string(got) != strconv.Itoa(2*perNode) {
+		t.Fatalf("counter: want %d, got %q", 2*perNode, got)
 	}
 }
 
