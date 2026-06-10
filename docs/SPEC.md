@@ -627,9 +627,129 @@ The v0.3 design does not preclude any of this. It deliberately leaves the per-ra
 
 shale is **per-key linearizable**. Each key has exactly one owner at a time; all ops for that key serialize through that owner's local Backend. Cross-key operations are NOT atomic (no distributed transactions).
 
-The Backend's own transaction interface (`Begin/Commit/Rollback`) operates on the LOCAL Backend only - so transactions are scoped to keys owned by ONE node. shale's transaction proxy routes the transaction to that owner.
+Multi-key atomicity within ONE shard is provided by **optimistic concurrency control (OCC)**: a transaction reads through normal routed Gets, computes locally, and commits a read-set + write-set in a single owner-local validate-and-apply step. The owner re-checks the read-set against current state inside one short `backend.Transaction` and applies the write-set only if nothing it read changed; otherwise it reports a conflict and the client retries. This is the same compare-and-set / conditional-write model DynamoDB, etcd, and FoundationDB use, and it fits the object-store grain of the default backend.
 
-If a transaction touches keys owned by multiple nodes, shale returns an error. App code is expected to use a single shard-key prefix for related keys (the standard sharded-KV pattern).
+If a transaction touches keys owned by multiple nodes, shale returns `backend.ErrCrossShard`. App code is expected to use a single shard-key prefix (or hash tag) for related keys so they co-locate on one shard (the standard sharded-KV pattern).
+
+### Single-shard transactions (CAS / OCC)
+
+A `Cluster.Begin` transaction is **single-shard by construction** and runs **optimistically**: it never holds an open `backend.Transaction` across a network round-trip. The transaction is lazy: `Begin` returns a `clusterTx` that has not yet touched a backend. The shard is **pinned** on the first key the caller operates on (the first `Get` / `Put` / `Delete`), to whichever node the ring says owns that key's shard. Every subsequent key in the same transaction MUST shard to that same owner; a key that shards elsewhere returns `backend.ErrCrossShard` at the offending operation (not deferred to Commit), so the caller sees the limitation at the call site.
+
+The cross-shard guard is the load-bearing correctness property and it stays **client-side and unchanged**: a genuinely cross-shard transaction (two keys whose shards have different owners) STILL fails with `ErrCrossShard`, and that check fires on the client *before* anything goes on the wire. shale does NOT gain cross-shard transactions; it gains atomic multi-key transactions against an already-single-shard key-set, and runs them whether that shard is local or remote with ONE uniform model.
+
+#### Why CAS, not an interactive proxy
+
+An interactive remote transaction (open a `backend.Transaction` on the owner and round-trip each op to it over a long-lived stream) holds a backend writer OPEN on the owner across every client think-time gap. On a backend like slate that is an open object-store writer pinned for the whole client-side transaction; it is the throughput anti-pattern scalable systems avoid. CAS keeps the owner's transaction tiny and owner-local: the client reads via normal Gets, computes locally with no writer held anywhere, then ships a read-set + write-set in ONE unary call. The owner validates and applies inside a single short local transaction that opens and commits without any network round-trip inside it. There is no transaction open across the network, so the disconnect / leak-guard complexity of an interactive proxy mostly evaporates: a cancelled `CommitCAS` context just rolls back the owner's local transaction via `defer`, and a client that thinks for an hour holds nothing on the owner.
+
+#### The CAS-buffered transaction (client side)
+
+`clusterTx` is a buffer, not a live session:
+
+  - **`Get(key)`** does a real routed `Get` (local-or-remote, the normal single-key read path) and records `(key, value-seen)` in the **read-set**. A not-found records an `expect_absent` entry for that key. A Get whose key shards to a different owner than the pinned key returns `backend.ErrCrossShard` immediately, before recording anything.
+  - **`Put(key, value)` / `Delete(key)`** BUFFER into the **write-set** (an ordered list of write ops); they do NOT hit the owner yet. They enforce the same cross-shard guard before buffering.
+  - **Read-your-writes within the transaction** is served from the local write buffer: a `Get` after a `Put`/`Delete` of the same key in the same transaction returns the buffered value (or buffered-absence) without a round-trip, and does NOT add a read-check for that key (the client wrote it; validating it against pre-write state would be wrong). Only keys the transaction READ from the cluster (and did not itself write) become read-checks.
+  - **`Commit()`** sends ONE `CommitCAS` to the pinned shard owner. If the owner is this node, it is a **local fast-path**: the owner-side handler runs in-process with no RPC. On a reported conflict, `Commit` returns the sentinel `backend.ErrCASConflict`. On a backend / ownership failure, `Commit` returns that error. On success, `Commit` returns nil.
+  - **`Rollback()` / abandoning the tx** is purely local: nothing was sent to the owner, so there is nothing to undo. It just marks the buffer finalized.
+
+Because the buffer captures the exact value each read observed, the read-set is a precise record of the snapshot the client computed against. `IsolationLevel` is carried to the owner so its local validate-and-apply transaction opens at the requested level; the OCC read-set check is what provides the cross-key atomicity regardless.
+
+#### CommitCAS wire protocol
+
+A new unary RPC on `ShaleNode`:
+
+```
+rpc CommitCAS(CommitCASRequest) returns (CommitCASResponse);
+```
+
+```
+message CommitCASRequest {
+  bytes pin_key         = 1;  // the key that pinned the shard; owner verifies it owns this
+  int32 isolation_level = 2;  // mirrors backend.IsolationLevel (0=SnapshotIsolation, 1=SerializableSnapshot)
+  repeated ReadCheck reads  = 3;
+  repeated WriteOp   writes = 4;
+}
+
+message ReadCheck {
+  bytes key            = 1;
+  bytes expected_value = 2;  // the value the client observed for key
+  bool  expect_absent  = 3;  // true => key must NOT exist; expected_value ignored
+}
+
+message WriteOp {
+  bytes key   = 1;
+  bytes value = 2;  // ignored when delete=true
+  bool  delete = 3; // true => Delete(key); false => Put(key, value)
+}
+
+message CommitCASResponse {
+  bool   committed = 1;  // true => the write-set was applied + committed
+  bool   conflict  = 2;  // true => a read-check failed; client should retry
+  string error     = 3;  // non-empty => a backend / ownership failure (NOT a conflict)
+}
+```
+
+`committed`, `conflict`, and `error` are mutually exclusive outcomes: exactly one of "committed=true", "conflict=true", or "error set" is meaningful per response. A `conflict` is NOT an `error`: it is the expected OCC retry signal, so it travels as a typed boolean rather than a gRPC error code (the same not-found-is-not-an-error convention `GetResponse` already uses).
+
+#### Owner-side validate-and-apply (the heart of it)
+
+The `CommitCAS` handler is fully synchronous and owner-local. There is no open transaction across the network at any point:
+
+  1. **Ownership check.** Verify the local node owns `pin_key` via `Cluster.OwnsKey`. If not (the ring moved and this node is no longer the owner), return `error` (a NotOwner condition) WITHOUT opening a backend transaction, so the client re-pins against the new ring and retries. It does NOT apply anything to the wrong backend.
+  2. **Open ONE local transaction** via `Cluster.LocalBegin(isolation_level)` (the owner-local `backend.Begin`). A `defer tx.Rollback()` is armed immediately, guarded by a `committed` flag so a successful commit does not double-finalize.
+  3. **Validate the read-set.** For each `ReadCheck`, `Get` the key inside the transaction:
+       - `expect_absent=true`: a found value is a CONFLICT.
+       - otherwise: a not-found OR a value that does not match `expected_value` byte-for-byte is a CONFLICT.
+     On the first conflict, the handler stops, the deferred `Rollback` runs, and it returns `{conflict:true}`.
+  4. **Apply the write-set.** For each `WriteOp` in order: `delete=true` -> `tx.Delete(key)`; else `tx.Put(key, value)`. A backend error here returns `{error}` (the deferred rollback runs).
+  5. **Commit.** `tx.Commit()`. On a commit error, the handler does NOT set `committed` (the deferred `Rollback` runs) and returns `{error}`: same leak-guard discipline a failed commit demands, because a backend's failed `Commit` is not guaranteed to have finalized the transaction. On success, it sets `committed` (suppressing the deferred rollback) and returns `{committed:true}`.
+
+A cancelled RPC context (client disconnect, deadline) propagates to the local transaction; the deferred `Rollback` runs and the transaction did not happen (all-or-nothing holds). Because the whole sequence is one in-handler goroutine against one `backend.Transaction` (which is not goroutine-safe), there is no concurrency to coordinate.
+
+**Ownership is checked once, on the pin key, not per read-check key.** The cross-shard guard already ran on the client, so every read-check and write-op key shards to the same owner as `pin_key`; re-checking each would only reintroduce torn-state failure modes during a ring move with no benefit.
+
+#### The retry closure (primary consumer API)
+
+The ergonomic surface is a retry closure that hides the conflict loop:
+
+```go
+func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error) error
+```
+
+`Transact` opens a CAS-buffered transaction pinned to `pinKey`, runs `fn` (which issues Gets + buffered Puts/Deletes against `tx`), commits via `CommitCAS`, and on `backend.ErrCASConflict` RE-RUNS `fn` from scratch (fresh reads, fresh buffer) up to a bounded number of attempts (`CASMaxAttempts`, default 10) with a small randomized backoff between attempts. If it never converges within the budget it returns `backend.ErrCASConflict` (the exhausted-retries case reuses the same sentinel; the caller cannot make progress either way). A NON-conflict error from `fn` or from `Commit` aborts immediately with that error and is NOT retried.
+
+`fn` MUST be re-runnable and side-effect-free outside `tx`: `Transact` may invoke it multiple times. Mutating external state (incrementing a process-local counter, sending a notification) inside `fn` is a bug, because a conflict re-runs the whole closure. The canonical pattern is "read current value(s) via `tx`, compute the new value(s) purely, buffer the writes, return nil"; the retry then re-reads the now-changed value and recomputes.
+
+`pinKey` should be a key in (or sharding to the same shard as) the transaction's key-set; it fixes the shard the OCC commit validates against. The first `tx.Get`/`tx.Put` would pin the same shard anyway, so passing the natural anchor key (e.g. the counter the transaction updates) is the convention.
+
+#### Begin vs Transact
+
+`Cluster.Begin(level) (backend.Transaction, error)` SURVIVES, re-shaped to CAS-buffered OCC semantics. It is the lower-level surface for callers who want explicit control of the commit point or who are migrating existing `Begin`/`Commit` code; `Transact` is the recommended primary API because almost every OCC caller wants the conflict-retry loop and writing it by hand is error-prone. There is now ONE transaction model, not an interactive-local / CAS-remote split: a single-node / local-pin commit goes through the SAME `CommitCAS` validate-and-apply path (just in-process, no RPC), so local and remote transactions have identical semantics. This is a behavior change to `Begin`'s pre-v0.6 contract (it used to run ops against a live local `backend.Transaction` and return `ErrCrossShard` on a remote pin). Changing it pre-1.0 is acceptable and is documented here; the payoff is one uniform OCC model everywhere.
+
+`tx.Commit()` returning `backend.ErrCASConflict` is the signal a hand-rolled `Begin` caller checks to decide whether to retry. `tx.ScanPrefix` inside a CAS-buffered transaction is NOT supported in v0.6 (a scanned range cannot be cheaply turned into a read-set of discrete key checks, and validating a range against concurrent inserts needs phantom protection the value-based read-set does not provide); it returns an error directing the caller to scan outside the transaction. Single-key reads + writes are the supported transactional surface.
+
+#### ABA caveat (value-based read-checks)
+
+Read-checks compare **value bytes**, not a version number or sequence number. This is vulnerable to ABA: if a key goes X -> Y -> X between the client's read and the owner's validate, the value still matches `expected_value` and validation passes even though the key changed and changed back. shale accepts this deliberately:
+
+  - **It is benign for shale's target usage** because the values fully capture state. A reservation counter that returns to `5` means a net-zero change, so "5 + my delta" is still the correct result. A slug that was created then deleted is absent again, so a "create if absent" is still valid against the observed-absent read-check. The transaction's correctness depends on the *current value*, which ABA preserves, not on *whether the value was ever touched*.
+  - **Value-based is simpler**: no per-key version counter to store, increment, and replicate; the read-set is just the bytes the client already read.
+
+If a future consumer needs strict ABA-safety (a use case where "was this touched at all" matters, independent of the final value), the upgrade path is a version/seqno-based `ReadCheck` (compare a monotonic per-key version instead of, or alongside, the value bytes). That is a forward option, not a v0.6 deliverable; v0.6 ships value-based.
+
+#### Replication scope (v0.6 vs v0.6.x)
+
+Single-key `Put` already replicates to R replicas when `ReplicationFactor > 1` (primary + R-1 successors, ack-counted per `WriteConsistency`). The OCC commit does NOT yet replicate: a committed write-set lands only on the **owner's local Backend**.
+
+**Decision for v0.6: the OCC commit executes at R=1 on the owner.** The validate-and-apply path is the foundational primitive; it is cleanly testable on its own (validation, conflict detection, read-your-writes, cross-shard guard, retry loop) without dragging in fan-out / ack accounting / LWW reconciliation. Write-set replication composes cleanly ON TOP and does not change the `CommitCAS` protocol: it is a separate additive step after the owner's `tx.Commit()` succeeds.
+
+**Known gap and its closure in v0.6.x.** With a fast-ack Backend (slate `AwaitDurable=false`, the hostthis default) and the R=1 commit path, a committed write-set sits in the owner's loss window with no replica copy until v0.6.x. Operators running transactions against a fast-ack backend should know that, unlike single-key Puts, transactional writes are not yet replicated in v0.6. The closure:
+
+  - **`ApplyBatch` unary RPC.** After the owner's `tx.Commit()` returns nil, the owner replicates the **committed write-set** (the exact ordered puts + delete tombstones from that transaction, nothing re-validated) to the shard's R-1 other replicas via `ApplyBatch`. Each replica applies the whole batch atomically through its OWN local `backend.Transaction` (begin, apply all entries, commit), so a replica holds either the entire write-set or none of it.
+  - **No re-validation on replicas.** The owner already validated the read-set; replicas just apply. This is what makes the write-set "exactly what gets replicated" and composes more cleanly than an interactive proxy would.
+  - **Ack accounting reuses `WriteConsistency`.** `ApplyBatch` fan-out waits for W acks per `One | Quorum | All`, mirroring single-key Put accounting, with the same failure budget and migration-guard handling (a mid-handoff replica is transient, not a failure).
+  - **Stamping.** Each entry carries an LWW envelope stamped by the owner at commit time (single-sourced; replicas do not re-stamp), so the batch reconciles against single-key writes under the existing LWW comparator.
+
+This is **specified now, implemented in v0.6.x.** v0.6 ships the OCC commit with full tests; v0.6.x adds `ApplyBatch` write-set replication so transactional writes get the same R-replica durability single-key writes already have.
 
 ---
 
@@ -644,7 +764,8 @@ If a transaction touches keys owned by multiple nodes, shale returns an error. A
 ## Non-goals
 
 - **SQL queries** - Vitess (MySQL) / Citus (Postgres) do this well; shale stays out of that domain.
-- **Cross-shard transactions** - requires consensus (Paxos/Raft); out of scope. Apps that need this use FoundationDB / TiKV.
+- **Cross-shard transactions** - requires consensus (Paxos/Raft); out of scope. Apps that need this use FoundationDB / TiKV. (Single-shard transactions DO work, including when the shard lives on a remote node, via the CAS / OCC commit: see "Single-shard transactions (CAS / OCC)". What stays out of scope is a transaction spanning more than one shard, plus any 2PC, timestamp oracle, or external coordinator.)
+- **Interactive open-across-the-network transactions** - shale does NOT hold a backend writer open on the owner across client think-time. Multi-key atomicity is OCC (buffer locally, validate-and-apply in one owner-local commit), not a long-lived remote transaction session.
 - **Strong consistency across partitions** - shale chooses AP over CP (eventual consistency on partition heal). Need CP? Use Raft-based stores.
 - **Multi-region replication** - out of scope for v1; possibly v2.
 - **Backend-specific features** (Redis pub/sub, Postgres extensions, etc.) - the abstraction stays minimal.
@@ -850,7 +971,16 @@ Default `go test ./...` skips both layers (no cgo, no Docker), so the regular de
 - [ ] **v0.4.1** - hinted handoff for replicas down at Put time; foundations for anti-entropy.
 - [ ] **v0.5** - Prometheus metrics, tracing hooks, real benchmarks vs single-node SlateDB. `shale bench` subcommand.
 - [ ] **v0.5.x** - multi-module monorepo split: `backends/slate` + `backends/pebble` move out of `pkg/backend/` into their own Go modules; backend-specific `Settings` pass-through (`Config.Settings *engine.Settings` on each backend); `cmd/shaled` becomes a thin core shell with per-backend builds living alongside each backend module. Import-path break-and-bump (no deprecation forwarders). Done before v0.6 stabilizes the API.
-- [ ] **v0.6** - hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Default config: `slate.Config{WriteOptions: &slatedb.WriteOptions{AwaitDurable: false}}` paired with `cluster.Config{ReplicationFactor: 3}`. The v0.5 bench measured this at 11,661 puts/s on the cluster-n3-r3 production shape, ~150x the strict baseline of 77 puts/s, with the durability budget covered by 3-way replication during the ~100ms per-replica WAL-flush window. Validate on production-like data.
+- [~] **v0.6** (in progress) - single-shard transactions via CAS / optimistic concurrency, then the hostthis migration. Sub-tasks:
+  - [ ] `CommitCAS` unary RPC (ReadCheck with expect_absent + value-byte compare; WriteOp with delete flag) on `ShaleNode`
+  - [ ] Owner-side validate-and-apply handler: ownership check on pin_key, ONE `LocalBegin` transaction, read-set validation -> conflict, write-set apply, commit with failed-commit-rolls-back leak guard
+  - [ ] CAS-buffered `clusterTx`: recorded routed Gets (not-found -> expect_absent), buffered Puts/Deletes, read-your-writes from the buffer, cross-shard guard before buffering, local fast-path commit when owner is this node
+  - [ ] `backend.ErrCASConflict` sentinel; `Commit` returns it on a reported conflict
+  - [ ] `Cluster.Transact(pinKey, fn)` retry closure: re-run fn on conflict up to `CASMaxAttempts` (default 10) with backoff; non-conflict errors abort immediately
+  - [ ] `Begin` re-shaped to uniform OCC (one transaction model local + remote; pre-1.0 contract change documented)
+  - [ ] ABA caveat documented (value-based read-checks; benign for shale usage); version/seqno read-checks noted as the future option
+  - [ ] hostthis migration: swap raw SlateDB for shale-with-SlateDB-backend. Default config: `slate.Config{WriteOptions: &slatedb.WriteOptions{AwaitDurable: false}}` paired with `cluster.Config{ReplicationFactor: 3}`. The v0.5 bench measured this at 11,661 puts/s on the cluster-n3-r3 production shape, ~150x the strict baseline of 77 puts/s, with the durability budget covered by 3-way replication during the ~100ms per-replica WAL-flush window. Validate on production-like data.
+- [ ] **v0.6.x** - `ApplyBatch` unary RPC: replicate the committed OCC write-set to R-1 replicas (apply-only, no re-validation), ack-counted per `WriteConsistency`, owner-stamped LWW envelopes. Closes the R=1 transactional-write durability gap left by v0.6.
 
 Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly, plus the CLI for daily ergonomics) and grow into v0.2+ when their workload demands it.
 
