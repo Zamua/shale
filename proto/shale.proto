@@ -6,12 +6,16 @@
 // owned by node B, A forwards the operation to B via this same service.
 // One protocol, two callers; keeps the wire surface small.
 //
-// Transactions (Backend.Begin / Commit / Rollback) are intentionally
-// NOT exposed in v0.1. A streaming transaction RPC needs careful design
-// around connection lifetime + idempotency + cross-shard rejection; it
-// will land in v0.2+ alongside the rest of the multi-node machinery.
-// Local-process apps that need transactions today should use the
-// cluster.Cluster.Begin API directly without going through gRPC.
+// Transactions reach the wire in v0.6 as the unary CommitCAS RPC, an
+// optimistic-concurrency (read-set / write-set) commit pinned to a
+// single shard owner. Earlier versions (v0.1 through v0.5) did NOT
+// expose transactions: a streaming/interactive transaction RPC would
+// have needed careful design around connection lifetime + idempotency +
+// cross-shard rejection, and holding a backend writer open across client
+// think-time is the throughput anti-pattern CAS exists to avoid. The CAS
+// shape keeps the owner's transaction tiny and owner-local: no
+// transaction is ever open across the network, so the disconnect /
+// leak-guard complexity of an interactive proxy mostly evaporates.
 syntax = "proto3";
 
 package shale.v1;
@@ -86,6 +90,17 @@ service ShaleNode {
   // one of dry_run / apply / cancel must be true; the server returns
   // InvalidArgument otherwise.
   rpc ProposeRebalance(ProposeRebalanceRequest) returns (ProposeRebalanceResponse);
+
+  // CommitCAS is the v0.6 optimistic-concurrency commit. The client reads
+  // via normal Gets, computes locally with no writer held anywhere, then
+  // ships a read-set (reads) + write-set (writes) in ONE unary call to the
+  // owner of pin_key. The owner verifies it owns pin_key, opens ONE short
+  // owner-local backend transaction, validates every ReadCheck (a mismatch
+  // is a conflict, not an error), applies the write-set, and commits. A
+  // conflict travels as the typed conflict bool on the response, NOT as a
+  // gRPC error code (the same not-found-is-not-an-error convention Get
+  // uses); a backend / ownership failure travels as the error string.
+  rpc CommitCAS(CommitCASRequest) returns (CommitCASResponse);
 }
 
 // The `forwarded` flag on each per-key op is the cluster-internal
@@ -278,4 +293,53 @@ message RangePlanItem {
   string current_owner = 2;
   string proposed_owner = 3;
   uint64 estimated_key_count = 4;
+}
+
+// -- CommitCAS -------------------------------------------------------
+
+// CommitCASRequest carries one optimistic-concurrency commit. pin_key is
+// the key that pinned the shard; the owner verifies it owns this key and
+// does NOT re-check ownership per read/write key (the client's cross-shard
+// guard already ensured every key shards to the same owner). reads is the
+// read-set the owner re-validates; writes is the write-set the owner
+// applies in order once validation passes.
+message CommitCASRequest {
+  bytes pin_key = 1;
+
+  // isolation_level mirrors backend.IsolationLevel
+  // (0=SnapshotIsolation, 1=SerializableSnapshot). The owner opens its
+  // local transaction at this level.
+  int32 isolation_level = 2;
+
+  repeated ReadCheck reads = 3;
+  repeated WriteOp writes = 4;
+}
+
+// ReadCheck is one entry in the read-set: the value the client observed
+// for key at read time. The owner re-reads key inside its transaction and
+// compares. expect_absent=true means the key must NOT exist (a found value
+// is a conflict) and expected_value is ignored; otherwise the current
+// value must match expected_value byte-for-byte.
+message ReadCheck {
+  bytes key = 1;
+  bytes expected_value = 2;
+  bool expect_absent = 3;
+}
+
+// WriteOp is one entry in the write-set. delete=true deletes key (value is
+// ignored); else it Puts value under key.
+message WriteOp {
+  bytes key = 1;
+  bytes value = 2;
+  bool delete = 3;
+}
+
+// CommitCASResponse reports the outcome. committed, conflict, and error are
+// mutually exclusive: exactly one is meaningful per response. A conflict is
+// NOT an error: it is the expected OCC retry signal, so it travels as a
+// typed bool rather than a gRPC error code.
+message CommitCASResponse {
+  bool committed = 1;
+  bool conflict = 2;
+  string error = 3;
 }
