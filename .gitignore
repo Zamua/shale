@@ -9,3 +9,7 @@
 /coverage.*
 /shale
 /shale-bench
+# per-backend + core shaled binaries, built anywhere in the tree
+shaled
+shaled-slate
+shaled-pebble
