@@ -587,6 +587,31 @@ The unit of migration is the **key range**, defined as the contiguous arc of the
 
 Both sides of any (send, receive) pair derive the plan from the same ring inputs, so they agree on who sends what without explicit negotiation. The plan is held in memory; there is no persisted plan object and no plan ID. A crash mid-migration is recovered by the next `Evaluate` run on restart: the node observes the current ring versus what it actually holds and re-issues whatever migrations are still needed. This recovery path is the same code path as the steady-state one.
 
+#### Reconcile (owned-but-missing repair)
+
+The ring-vs-ring `ComputePlan` above is correct but incomplete on its own: it can only see ownership transitions that show up as a *difference between two ring snapshots it actually observed*. It is blind to a partition this node owns but never physically received, because that partition looks stable (old owner = new owner = self) in both snapshots the node holds. That blind spot is the **founder-grows (1 -> 2) data-loss path** and it arises from a ring-convergence race at the joiner's bootstrap:
+
+  - A joiner's `Membership.Join` returns once it has *contacted* a seed, but memberlist's push/pull state transfer and the `NotifyJoin` callbacks that populate the local member list may not have completed. Under slow gossip (real gRPC + an object-store backend), the at-startup ring snapshot the joiner pins as its `lastEvalRing` baseline can be self-only: `{joiner}`.
+  - When the founder later becomes visible, the joiner runs `ComputePlan(joiner, old={joiner}, new={founder, joiner})`. For every partition the consistent-hash ring assigns to the joiner in *both* rings (old owner self, new owner self), the diff is a no-op. No `Receive` is scheduled. The keys for those partitions physically live on the founder and are never streamed across, so a routed `Get` to the new owner (the joiner) finds nothing. The bytes survive on the founder but are unreachable from the cluster: data loss by un-reachability, not destruction.
+
+Ring-vs-ring diffing cannot close this because the joiner's two snapshots agree; the only authority that disagrees is **physical placement**. So `Evaluate` runs a second, independent pass keyed on what this node actually holds, not on ring history:
+
+  - For each partition `p` whose **new-ring owner is self**, the node asks: do I physically hold any of `p`'s keys? It answers by consulting the same local scan + partition function the source/sweep already use (`Coordinator.partFn`). A partition the ring assigns to self for which the local backend holds **zero** keys is an *owned-but-missing* partition.
+  - For each owned-but-missing partition, the node schedules a **Receive from the partition's previous owner** (the node the *current* ring would have placed `p` on before self joined, i.e. the successor in the ring with self removed). That `From` is the same peer `ComputePlan` would have named had the joiner seen the converged ring at bootstrap. The Receive is registered through the *identical* `tryRegister` -> `runReceive` -> `FetchRange` path the ring-vs-ring plan uses; there is no second migration mechanism.
+
+This pass is folded into the existing settle-timer `Evaluate` (it runs on every tick, after the ring-vs-ring plan), and is also reachable from the ~5s membership reconciler that already re-arms the settle timer. So convergence is self-healing on a bounded schedule: even if the bootstrap snapshot was self-only, the first settle-timer `Evaluate` after the founder becomes visible repairs every owned-but-missing partition. No new wire message, no persisted state, no operator action.
+
+Two guards keep the reconcile pass from over-firing:
+
+  - **Hold-detection, not count-matching.** A partition is owned-but-missing only when the node holds *zero* keys for it. A partition the node already received (or always held) is skipped, so a settled cluster issues no reconcile Receives and the pass is idle in steady state. (A partition that legitimately holds zero keys because no key has ever hashed into it is indistinguishable from missing, but pulling an empty range from its prior owner is a harmless zero-key `FetchRange` that flips straight to `Done`.)
+  - **No double-register.** `tryRegister` already refuses to register a partition that is in a non-terminal state, so a reconcile Receive scheduled while the ring-vs-ring plan already has that partition in `Receiving` is dropped. The two passes can name the same partition without racing.
+
+**The convergence invariant.** Once the ring has settled (membership stable, every in-flight migration terminal), every node physically holds every partition the current ring assigns to it, and no committed key is unreachable: a routed `Get` to any key reaches an owner that holds it. The ring-vs-ring plan moves data across ownership *transitions* the node witnessed; the reconcile pass repairs ownership the node holds but never witnessed a transition for. Together they make physical placement match ring assignment, which is the property the founder-grows gate test asserts.
+
+#### Interaction with the existing 2 -> 3 growth path
+
+The reconcile pass is additive and changes nothing about a node that *did* see the ring transition. In the established 2 -> 3 path, the third node joins a ring whose two members are already gossiped + converged; its bootstrap snapshot lists all three, the synthesized `old = current - self` baseline is `{n1, n2}`, and `ComputePlan` emits the correct Receives directly. Hold-detection then finds those partitions already in flight (or, after they land, physically held) and the reconcile pass issues nothing further. The 2 -> 3 case never depended on the blind spot, so repairing the blind spot leaves it untouched. The danger the founder-grows case exposes is specifically the *founder's* self-only bootstrap snapshot under slow gossip; the reconcile pass closes that without perturbing the snapshot-was-converged case.
+
 #### Wire
 
 A single server-streaming gRPC method:
@@ -619,6 +644,14 @@ Each range has a lifecycle:
 
 The write-rejection window is the price paid for avoiding WAL-tailing. At hostthis-scale workloads (tens of thousands of keys per range, small values), the streaming copy completes in well under a minute on a local network; clients retrying with exponential backoff over that window do not see user-visible errors.
 
+#### Why reconcile cannot itself lose data
+
+The reconcile pass (above) only ever schedules **Receives**: it *pulls* a partition's keys onto the node that owns it but is missing them. It never schedules a Send and never deletes anything. The copy-before-delete safety that protects the existing handoff is therefore preserved verbatim:
+
+  - **A Receive is a non-destructive copy.** `FetchRange` writes the pulled keys into the destination's local backend and never touches the source. The only code path that deletes a source's local copy is the grace sweep (`StateHandedOff -> StateDone` after `T_drain`), and the sweep fires only after the source's `runSendWired` has observed a successful destination ack via `MarkSendComplete` (gated by `AwaitHandoffSignal`, which the cluster always sets). The reconcile pass does not produce Sends, so it never arms the sweep on the prior owner. The prior owner keeps its copy until (and only until) it has independently received its own ack-gated Send for that partition. There is no path by which scheduling a reconcile Receive causes any node to delete the only copy of a key.
+  - **The destination's atomicity is unchanged.** A reconcile Receive uses the same `FetchRange` that validates the terminal CRC32 + count and rolls back its partial writes on any mid-stream failure (source EOF before `MigrationDone`, checksum mismatch, transport error). A failed reconcile pull leaves the destination exactly as it was (no partial range made authoritative) and the prior owner still holds the data, so the next settle-timer `Evaluate` re-detects the partition as owned-but-missing and retries. The failure mode is "retry," never "loss."
+  - **Idempotent and convergent.** Re-pulling a partition that is actually already held is prevented by hold-detection (the node skips partitions for which it holds any key) and by `tryRegister` (no double-register of an in-flight partition). In the worst case a benign empty-range pull flips straight to `Done`. The pass quiesces once every owned partition is physically held, which is exactly the invariant below.
+
 #### Failure handling
 
   - **Source crashes mid-stream**: destination's `MigrateRange` call returns an error. Destination discards what it received (the partial range is not authoritative). On the next `Evaluate` pass, if the source comes back, migration retries. If the source does not come back, the range is owned by no one at R=1; reads return not-found, writes are rejected. This is the unavoidable R=1 failure mode and is the central motivation for v0.4 replication.
@@ -626,6 +659,7 @@ The write-rejection window is the price paid for avoiding WAL-tailing. At hostth
   - **Checksum mismatch on `MigrationDone`**: destination errors its stream (does not drain it cleanly), the source's handler returns that error rather than success, and the coordinator does NOT flip state. Destination rolls back its writes for the range; source remains owner; migration retries on the next `Evaluate`. Checksum is computed over the sorted `(key, value)` byte stream.
   - **Ring divergence during cutover**: handled by the existing loop-guard. A read or write landing on the wrong node gets one forward; if the forwarded-to node also disagrees, the request returns `FailedPrecondition` and the client retries after the rings converge.
   - **Operator cancellation**: `shale rebalance --cancel` aborts in-progress streams. Source remains owner of any range not yet swapped; destination discards any partial state.
+  - **Owned-but-missing after a bootstrap race**: a node that pinned a self-only ring snapshot at join (slow gossip) owns partitions it never received. The reconcile pass detects each such partition (owned by self, zero keys held) and pulls it from its prior owner. The pull is a non-destructive Receive; on failure the prior owner still holds the data and the next `Evaluate` retries. This is the founder-grows path and it self-heals within one settle interval; no data is destroyed because no Send (and therefore no sweep delete) is ever scheduled by the reconcile pass.
 
 #### Observability
 
@@ -638,6 +672,8 @@ The write-rejection window is the price paid for avoiding WAL-tailing. At hostth
 With R>1, the read-unavailability problem largely disappears: reads can be served from any replica, including ones not currently sending or receiving. The migration unit becomes a (range, replica-position) pair rather than just a range. The write-rejection window can shrink to the duration of the ownership swap rather than the entire streaming copy, because the destination can receive writes via the replication path while the bulk copy is in flight and the conflict resolver (LWW, v0.4) reconciles. The wire protocol stays the same shape; the cutover protocol gains a "live writes also flow via replication" overlay.
 
 The v0.3 design does not preclude any of this. It deliberately leaves the per-range cutover as the only place where v0.4 needs to intervene.
+
+The reconcile pass generalizes cleanly to R>1: the unit becomes a (partition, replica-position) pair, and "owned-but-missing" means this node holds a replica slot the ring assigns to it but has not yet received. The pull is the same non-destructive `FetchRange` from a peer that already holds a copy (any current replica, not necessarily the prior primary), so it composes with the apply-if-newer (LWW-on-write) rule: a reconcile pull that arrives out of order relative to a live replicated write loses the per-key stamp compare and is a silent no-op, never a clobber. Because the pass only copies and never deletes, it is also the natural seed for the v0.4.1+ anti-entropy / Merkle-tree repair: founder-grows is the degenerate, zero-key-held case of the same "make my physical holdings match my ring assignment" reconciliation.
 
 #### Known limitations in v0.3
 
