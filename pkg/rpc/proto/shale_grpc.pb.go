@@ -49,6 +49,7 @@ const (
 	ShaleNode_MigrateRange_FullMethodName     = "/shale.v1.ShaleNode/MigrateRange"
 	ShaleNode_ProposeRebalance_FullMethodName = "/shale.v1.ShaleNode/ProposeRebalance"
 	ShaleNode_CommitCAS_FullMethodName        = "/shale.v1.ShaleNode/CommitCAS"
+	ShaleNode_ApplyBatch_FullMethodName       = "/shale.v1.ShaleNode/ApplyBatch"
 )
 
 // ShaleNodeClient is the client API for ShaleNode service.
@@ -124,6 +125,20 @@ type ShaleNodeClient interface {
 	// gRPC error code (the same not-found-is-not-an-error convention Get
 	// uses); a backend / ownership failure travels as the error string.
 	CommitCAS(ctx context.Context, in *CommitCASRequest, opts ...grpc.CallOption) (*CommitCASResponse, error)
+	// ApplyBatch is a cluster-internal, owner-to-replica RPC (never called
+	// from outside the cluster). Like the forwarded/replica Put path it is
+	// an apply-only fan-out: the owner has already validated + stamped a CAS
+	// write-set and committed it locally, then ships the SAME encoded
+	// envelopes to each of the R-1 other replicas via this call so the
+	// transactional writes get the R-replica durability single-key writes
+	// already have. The replica applies the whole batch in ONE local backend
+	// transaction (no re-validation, no re-stamp, written verbatim) and
+	// commits, rolling back on any error. It honors the per-key migration
+	// guard the same way the replica Put path does: a batch key that is
+	// migrating or being received returns codes.ResourceExhausted so the
+	// owner's fan-out classifies it transient rather than a failure. No
+	// ownership re-check beyond that guard.
+	ApplyBatch(ctx context.Context, in *ApplyBatchRequest, opts ...grpc.CallOption) (*ApplyBatchResponse, error)
 }
 
 type shaleNodeClient struct {
@@ -271,6 +286,16 @@ func (c *shaleNodeClient) CommitCAS(ctx context.Context, in *CommitCASRequest, o
 	return out, nil
 }
 
+func (c *shaleNodeClient) ApplyBatch(ctx context.Context, in *ApplyBatchRequest, opts ...grpc.CallOption) (*ApplyBatchResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ApplyBatchResponse)
+	err := c.cc.Invoke(ctx, ShaleNode_ApplyBatch_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ShaleNodeServer is the server API for ShaleNode service.
 // All implementations must embed UnimplementedShaleNodeServer
 // for forward compatibility.
@@ -344,6 +369,20 @@ type ShaleNodeServer interface {
 	// gRPC error code (the same not-found-is-not-an-error convention Get
 	// uses); a backend / ownership failure travels as the error string.
 	CommitCAS(context.Context, *CommitCASRequest) (*CommitCASResponse, error)
+	// ApplyBatch is a cluster-internal, owner-to-replica RPC (never called
+	// from outside the cluster). Like the forwarded/replica Put path it is
+	// an apply-only fan-out: the owner has already validated + stamped a CAS
+	// write-set and committed it locally, then ships the SAME encoded
+	// envelopes to each of the R-1 other replicas via this call so the
+	// transactional writes get the R-replica durability single-key writes
+	// already have. The replica applies the whole batch in ONE local backend
+	// transaction (no re-validation, no re-stamp, written verbatim) and
+	// commits, rolling back on any error. It honors the per-key migration
+	// guard the same way the replica Put path does: a batch key that is
+	// migrating or being received returns codes.ResourceExhausted so the
+	// owner's fan-out classifies it transient rather than a failure. No
+	// ownership re-check beyond that guard.
+	ApplyBatch(context.Context, *ApplyBatchRequest) (*ApplyBatchResponse, error)
 	mustEmbedUnimplementedShaleNodeServer()
 }
 
@@ -386,6 +425,9 @@ func (UnimplementedShaleNodeServer) ProposeRebalance(context.Context, *ProposeRe
 }
 func (UnimplementedShaleNodeServer) CommitCAS(context.Context, *CommitCASRequest) (*CommitCASResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method CommitCAS not implemented")
+}
+func (UnimplementedShaleNodeServer) ApplyBatch(context.Context, *ApplyBatchRequest) (*ApplyBatchResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ApplyBatch not implemented")
 }
 func (UnimplementedShaleNodeServer) mustEmbedUnimplementedShaleNodeServer() {}
 func (UnimplementedShaleNodeServer) testEmbeddedByValue()                   {}
@@ -585,6 +627,24 @@ func _ShaleNode_CommitCAS_Handler(srv interface{}, ctx context.Context, dec func
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ShaleNode_ApplyBatch_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ApplyBatchRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShaleNodeServer).ApplyBatch(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ShaleNode_ApplyBatch_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShaleNodeServer).ApplyBatch(ctx, req.(*ApplyBatchRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ShaleNode_ServiceDesc is the grpc.ServiceDesc for ShaleNode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -623,6 +683,10 @@ var ShaleNode_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "CommitCAS",
 			Handler:    _ShaleNode_CommitCAS_Handler,
+		},
+		{
+			MethodName: "ApplyBatch",
+			Handler:    _ShaleNode_ApplyBatch_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

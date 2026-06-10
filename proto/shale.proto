@@ -101,6 +101,21 @@ service ShaleNode {
   // gRPC error code (the same not-found-is-not-an-error convention Get
   // uses); a backend / ownership failure travels as the error string.
   rpc CommitCAS(CommitCASRequest) returns (CommitCASResponse);
+
+  // ApplyBatch is a cluster-internal, owner-to-replica RPC (never called
+  // from outside the cluster). Like the forwarded/replica Put path it is
+  // an apply-only fan-out: the owner has already validated + stamped a CAS
+  // write-set and committed it locally, then ships the SAME encoded
+  // envelopes to each of the R-1 other replicas via this call so the
+  // transactional writes get the R-replica durability single-key writes
+  // already have. The replica applies the whole batch in ONE local backend
+  // transaction (no re-validation, no re-stamp, written verbatim) and
+  // commits, rolling back on any error. It honors the per-key migration
+  // guard the same way the replica Put path does: a batch key that is
+  // migrating or being received returns codes.ResourceExhausted so the
+  // owner's fan-out classifies it transient rather than a failure. No
+  // ownership re-check beyond that guard.
+  rpc ApplyBatch(ApplyBatchRequest) returns (ApplyBatchResponse);
 }
 
 // The `forwarded` flag on each per-key op is the cluster-internal
@@ -342,4 +357,31 @@ message CommitCASResponse {
   bool committed = 1;
   bool conflict = 2;
   string error = 3;
+}
+
+// -- ApplyBatch ------------------------------------------------------
+
+// ApplyBatchRequest carries one CAS write-set fan-out from owner to
+// replica. The owner has already committed these envelopes locally; the
+// replica applies the whole batch (all writes) in ONE local transaction,
+// apply-only, and commits. Any error rolls the entire batch back.
+message ApplyBatchRequest {
+  repeated EnvelopeWrite writes = 1;
+}
+
+// EnvelopeWrite is one entry in the fan-out batch: a key plus its already
+// Encode()d envelope (shared stamp + payload). An empty-payload envelope
+// is a tombstone. The replica writes the envelope bytes verbatim and never
+// re-stamps.
+message EnvelopeWrite {
+  bytes key = 1;
+  bytes envelope = 2;
+}
+
+// ApplyBatchResponse reports the outcome. A non-empty error means the
+// replica failed to apply the batch and rolled back. A migration-guard
+// rejection travels as a gRPC codes.ResourceExhausted error (transient),
+// not in this field.
+message ApplyBatchResponse {
+  string error = 1;
 }

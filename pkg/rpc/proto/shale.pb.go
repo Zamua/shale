@@ -1602,6 +1602,158 @@ func (x *CommitCASResponse) GetError() string {
 	return ""
 }
 
+// ApplyBatchRequest carries one CAS write-set fan-out from owner to
+// replica. The owner has already committed these envelopes locally; the
+// replica applies the whole batch (all writes) in ONE local transaction,
+// apply-only, and commits. Any error rolls the entire batch back.
+type ApplyBatchRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Writes        []*EnvelopeWrite       `protobuf:"bytes,1,rep,name=writes,proto3" json:"writes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ApplyBatchRequest) Reset() {
+	*x = ApplyBatchRequest{}
+	mi := &file_shale_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ApplyBatchRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ApplyBatchRequest) ProtoMessage() {}
+
+func (x *ApplyBatchRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ApplyBatchRequest.ProtoReflect.Descriptor instead.
+func (*ApplyBatchRequest) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *ApplyBatchRequest) GetWrites() []*EnvelopeWrite {
+	if x != nil {
+		return x.Writes
+	}
+	return nil
+}
+
+// EnvelopeWrite is one entry in the fan-out batch: a key plus its already
+// Encode()d envelope (shared stamp + payload). An empty-payload envelope
+// is a tombstone. The replica writes the envelope bytes verbatim and never
+// re-stamps.
+type EnvelopeWrite struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Envelope      []byte                 `protobuf:"bytes,2,opt,name=envelope,proto3" json:"envelope,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *EnvelopeWrite) Reset() {
+	*x = EnvelopeWrite{}
+	mi := &file_shale_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *EnvelopeWrite) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*EnvelopeWrite) ProtoMessage() {}
+
+func (x *EnvelopeWrite) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use EnvelopeWrite.ProtoReflect.Descriptor instead.
+func (*EnvelopeWrite) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{29}
+}
+
+func (x *EnvelopeWrite) GetKey() []byte {
+	if x != nil {
+		return x.Key
+	}
+	return nil
+}
+
+func (x *EnvelopeWrite) GetEnvelope() []byte {
+	if x != nil {
+		return x.Envelope
+	}
+	return nil
+}
+
+// ApplyBatchResponse reports the outcome. A non-empty error means the
+// replica failed to apply the batch and rolled back. A migration-guard
+// rejection travels as a gRPC codes.ResourceExhausted error (transient),
+// not in this field.
+type ApplyBatchResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Error         string                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ApplyBatchResponse) Reset() {
+	*x = ApplyBatchResponse{}
+	mi := &file_shale_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ApplyBatchResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ApplyBatchResponse) ProtoMessage() {}
+
+func (x *ApplyBatchResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ApplyBatchResponse.ProtoReflect.Descriptor instead.
+func (*ApplyBatchResponse) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *ApplyBatchResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_shale_proto protoreflect.FileDescriptor
 
 const file_shale_proto_rawDesc = "" +
@@ -1696,7 +1848,14 @@ const file_shale_proto_rawDesc = "" +
 	"\x11CommitCASResponse\x12\x1c\n" +
 	"\tcommitted\x18\x01 \x01(\bR\tcommitted\x12\x1a\n" +
 	"\bconflict\x18\x02 \x01(\bR\bconflict\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error2\xd7\x05\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\"D\n" +
+	"\x11ApplyBatchRequest\x12/\n" +
+	"\x06writes\x18\x01 \x03(\v2\x17.shale.v1.EnvelopeWriteR\x06writes\"=\n" +
+	"\rEnvelopeWrite\x12\x10\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1a\n" +
+	"\benvelope\x18\x02 \x01(\fR\benvelope\"*\n" +
+	"\x12ApplyBatchResponse\x12\x14\n" +
+	"\x05error\x18\x01 \x01(\tR\x05error2\xa0\x06\n" +
 	"\tShaleNode\x122\n" +
 	"\x03Put\x12\x14.shale.v1.PutRequest\x1a\x15.shale.v1.PutResponse\x122\n" +
 	"\x03Get\x12\x14.shale.v1.GetRequest\x1a\x15.shale.v1.GetResponse\x12;\n" +
@@ -1709,7 +1868,9 @@ const file_shale_proto_rawDesc = "" +
 	"\x04Ping\x12\x15.shale.v1.PingRequest\x1a\x16.shale.v1.PingResponse\x12=\n" +
 	"\fMigrateRange\x12\x13.shale.v1.RangeSpec\x1a\x16.shale.v1.MigrateChunk0\x01\x12Y\n" +
 	"\x10ProposeRebalance\x12!.shale.v1.ProposeRebalanceRequest\x1a\".shale.v1.ProposeRebalanceResponse\x12D\n" +
-	"\tCommitCAS\x12\x1a.shale.v1.CommitCASRequest\x1a\x1b.shale.v1.CommitCASResponseB.Z,github.com/Zamua/shale/pkg/rpc/proto;shalepbb\x06proto3"
+	"\tCommitCAS\x12\x1a.shale.v1.CommitCASRequest\x1a\x1b.shale.v1.CommitCASResponse\x12G\n" +
+	"\n" +
+	"ApplyBatch\x12\x1b.shale.v1.ApplyBatchRequest\x1a\x1c.shale.v1.ApplyBatchResponseB.Z,github.com/Zamua/shale/pkg/rpc/proto;shalepbb\x06proto3"
 
 var (
 	file_shale_proto_rawDescOnce sync.Once
@@ -1723,7 +1884,7 @@ func file_shale_proto_rawDescGZIP() []byte {
 	return file_shale_proto_rawDescData
 }
 
-var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 28)
+var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_shale_proto_goTypes = []any{
 	(*PutRequest)(nil),               // 0: shale.v1.PutRequest
 	(*PutResponse)(nil),              // 1: shale.v1.PutResponse
@@ -1753,6 +1914,9 @@ var file_shale_proto_goTypes = []any{
 	(*ReadCheck)(nil),                // 25: shale.v1.ReadCheck
 	(*WriteOp)(nil),                  // 26: shale.v1.WriteOp
 	(*CommitCASResponse)(nil),        // 27: shale.v1.CommitCASResponse
+	(*ApplyBatchRequest)(nil),        // 28: shale.v1.ApplyBatchRequest
+	(*EnvelopeWrite)(nil),            // 29: shale.v1.EnvelopeWrite
+	(*ApplyBatchResponse)(nil),       // 30: shale.v1.ApplyBatchResponse
 }
 var file_shale_proto_depIdxs = []int32{
 	12, // 0: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
@@ -1761,33 +1925,36 @@ var file_shale_proto_depIdxs = []int32{
 	23, // 3: shale.v1.ProposeRebalanceResponse.ranges:type_name -> shale.v1.RangePlanItem
 	25, // 4: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
 	26, // 5: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
-	0,  // 6: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
-	2,  // 7: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
-	4,  // 8: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
-	6,  // 9: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
-	8,  // 10: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
-	10, // 11: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
-	13, // 12: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
-	15, // 13: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
-	17, // 14: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
-	21, // 15: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
-	24, // 16: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
-	1,  // 17: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
-	3,  // 18: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
-	5,  // 19: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
-	7,  // 20: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
-	9,  // 21: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
-	11, // 22: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
-	14, // 23: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
-	16, // 24: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
-	18, // 25: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
-	22, // 26: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
-	27, // 27: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
-	17, // [17:28] is the sub-list for method output_type
-	6,  // [6:17] is the sub-list for method input_type
-	6,  // [6:6] is the sub-list for extension type_name
-	6,  // [6:6] is the sub-list for extension extendee
-	0,  // [0:6] is the sub-list for field type_name
+	29, // 6: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
+	0,  // 7: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
+	2,  // 8: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
+	4,  // 9: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
+	6,  // 10: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
+	8,  // 11: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
+	10, // 12: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
+	13, // 13: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
+	15, // 14: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
+	17, // 15: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
+	21, // 16: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
+	24, // 17: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
+	28, // 18: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
+	1,  // 19: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
+	3,  // 20: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
+	5,  // 21: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
+	7,  // 22: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
+	9,  // 23: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
+	11, // 24: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
+	14, // 25: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
+	16, // 26: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
+	18, // 27: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
+	22, // 28: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
+	27, // 29: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
+	30, // 30: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
+	19, // [19:31] is the sub-list for method output_type
+	7,  // [7:19] is the sub-list for method input_type
+	7,  // [7:7] is the sub-list for extension type_name
+	7,  // [7:7] is the sub-list for extension extendee
+	0,  // [0:7] is the sub-list for field type_name
 }
 
 func init() { file_shale_proto_init() }
@@ -1805,7 +1972,7 @@ func file_shale_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_shale_proto_rawDesc), len(file_shale_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   28,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
