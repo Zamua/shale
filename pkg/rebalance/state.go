@@ -284,6 +284,14 @@ func (c *Coordinator) Evaluate(oldRing, newRing *ring.Ring, gen uint64) {
 			}
 		}
 	}
+
+	// Reconcile pass: repair partitions the new ring assigns to self
+	// but which this node never physically received. The ring-vs-ring
+	// plan above is blind to these (old owner == new owner == self in
+	// the snapshots the node holds); reconcile keys on physical
+	// placement instead and pulls each owned-but-missing partition from
+	// its prior owner. See reconcile.go + docs/SPEC.md "Reconcile."
+	c.reconcile(newRing)
 }
 
 // tryRegister adds a Move under state, IFF the partition is not
