@@ -87,6 +87,20 @@ func (f *Factory) CurrentEpoch(u storageunit.UnitID) (storageunit.Epoch, bool) {
 	return e, ok
 }
 
+// UnitBackend returns the per-unit backend this factory holds for u, and
+// ok=false if the factory has never opened u (so no store exists yet). It
+// exposes the unit -> backend map to tests so they can assert PHYSICAL
+// placement at the unit granularity: a key must land in exactly its own
+// unit's backend and nowhere else. The store survives CloseUnit (see the
+// Factory doc), so this returns the backend whether u is currently mounted
+// or not. Inspection only; it does not mount, fence, or mutate epoch.
+func (f *Factory) UnitBackend(u storageunit.UnitID) (backend.Backend, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	b, ok := f.store[u]
+	return b, ok
+}
+
 // OpenUnits returns the currently-mounted units in ascending order. The
 // returned slice is a fresh copy the caller may retain.
 func (f *Factory) OpenUnits() []storageunit.UnitID {
