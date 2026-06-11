@@ -157,7 +157,7 @@ func (c *Cluster) txRoutedGet(key []byte) ([]byte, error) {
 // to backend.ErrCASConflict; a backend / ownership failure (including the
 // owner reporting it no longer owns the pin key) surfaces as that error.
 func (c *Cluster) commitCAS(pinKey []byte, level backend.IsolationLevel, reads []backend.ReadCheck, writes []backend.WriteOp) error {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.ErrClosed
 	}
 	// Re-resolve the owner from the LIVE ring in case it moved between

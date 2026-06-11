@@ -59,7 +59,7 @@ import "github.com/Zamua/shale/pkg/backend"
 // This is only ever called on the R>1 replica-receiving write paths;
 // callers pass already-Encode()d envelope bytes.
 func (c *Cluster) applyEnvelopeIfNewer(key, incomingEnvBytes []byte) error {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.ErrClosed
 	}
 

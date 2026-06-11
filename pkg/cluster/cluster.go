@@ -35,6 +35,7 @@ import (
 	"github.com/Zamua/shale/pkg/membership"
 	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 // reconcileInterval is how often the cluster polls membership for a
@@ -97,8 +98,31 @@ type Config struct {
 	// ring placement. MUST be unique within the cluster.
 	NodeID string
 
-	// Backend is the local KV engine this node owns. Required.
+	// Backend is the local KV engine this node owns. Required in the
+	// legacy per-node mode; MUST be nil in multi-backend mode (set
+	// BackendFactory + UnitCount instead). See "Two modes" below.
 	Backend backend.Backend
+
+	// BackendFactory + UnitCount select MULTI-BACKEND mode (v0.8 Phase
+	// 2). When BOTH are set (and Backend is nil), the node mounts one
+	// backend per OWNED storage unit and routes each key to its unit's
+	// owner (key -> shardKey -> unit -> owner) instead of a single
+	// Backend. The factory opens / closes per-unit backends; UnitCount
+	// is the fixed power-of-two number of units N the unit space is
+	// partitioned into.
+	//
+	// Two modes, mutually exclusive (validated in Open):
+	//   - legacy per-node: Backend set, BackendFactory + UnitCount unset.
+	//     The default; unchanged byte-for-byte.
+	//   - multi-backend:   BackendFactory + UnitCount set, Backend unset.
+	//
+	// Setting both modes, or neither, is a config error. Multi-backend
+	// mode is STATIC in Phase 2: the unit set this node owns is fixed at
+	// Open (no rebalance / lease handoff on membership change; that is
+	// Phase 3). It also requires ReplicationFactor == 1 in Phase 2 (the
+	// per-unit replication interplay is out of scope).
+	BackendFactory storageunit.BackendFactory
+	UnitCount      storageunit.UnitCount
 
 	// BindAddr is the host:port memberlist listens on (UDP + TCP).
 	// Non-empty enables multi-node mode. Format: "host:port" (host
@@ -203,6 +227,42 @@ type Config struct {
 	TestingBlockPeerDials bool
 }
 
+// validateBackendMode enforces the legacy-vs-multi-backend XOR and
+// returns whether the cluster runs in multi-backend mode (v0.8 Phase 2).
+//
+// Exactly one mode must be selected:
+//   - legacy per-node: Backend set, BackendFactory + UnitCount unset.
+//   - multi-backend:   BackendFactory + UnitCount set, Backend unset.
+//
+// Setting both, or neither, is an error (fail closed: an operator who
+// half-configures multi-backend mode must hear about it, not silently get
+// the legacy path). Multi-backend mode additionally requires
+// ReplicationFactor in {0, 1}: the per-unit replication interplay is out
+// of Phase 2 scope, so a multi-backend cluster is single-replica.
+func validateBackendMode(cfg *Config) (multi bool, err error) {
+	hasFactory := cfg.BackendFactory != nil
+	hasUnitCount := !cfg.UnitCount.IsZero()
+	hasBackend := cfg.Backend != nil
+
+	switch {
+	case hasBackend && (hasFactory || hasUnitCount):
+		return false, errors.New("cluster: set EITHER Backend (legacy per-node) OR BackendFactory+UnitCount (multi-backend), not both")
+	case hasFactory != hasUnitCount:
+		return false, errors.New("cluster: multi-backend mode requires BOTH BackendFactory and UnitCount")
+	case hasFactory && hasUnitCount:
+		// Multi-backend mode. ReplicationFactor must be the single-replica
+		// default in Phase 2 (per-unit replication is Phase 3+).
+		if cfg.ReplicationFactor > 1 {
+			return false, fmt.Errorf("cluster: multi-backend mode requires ReplicationFactor 1 in v0.8 Phase 2, got %d", cfg.ReplicationFactor)
+		}
+		return true, nil
+	case hasBackend:
+		return false, nil
+	default:
+		return false, errors.New("cluster: Backend is required (or BackendFactory+UnitCount for multi-backend mode)")
+	}
+}
+
 // normalizeConfig fills in v0.4 default values for any zero-valued
 // fields that have a defined default. Called once at the top of Open
 // so the rest of the package can rely on the normalized values
@@ -232,6 +292,22 @@ func normalizeConfig(cfg *Config) {
 type Cluster struct {
 	cfg     Config
 	backend backend.Backend
+
+	// multi-backend mode (v0.8 Phase 2). multi is true when the cluster
+	// runs in multi-backend mode (BackendFactory + UnitCount set); in
+	// that mode c.backend is nil and every op resolves a per-unit backend
+	// from mountMap instead. In legacy mode multi is false, mountMap is
+	// nil, and none of this is touched. factory opens / closes per-unit
+	// backends; unitCount is the fixed N; ownerLookup answers "which node
+	// owns this unit" off the ring; mountMap holds the units this node
+	// has mounted (fixed at Open in Phase 2). mountMu guards mountMap.
+	// See multibackend.go.
+	multi       bool
+	factory     storageunit.BackendFactory
+	unitCount   storageunit.UnitCount
+	ownerLookup storageunit.OwnerLookup
+	mountMu     sync.RWMutex
+	mountMap    map[storageunit.UnitID]backend.Backend
 
 	// Populated in multi-node mode; nil in single-node mode.
 	ring       *ring.Ring
@@ -340,14 +416,18 @@ func Open(cfg Config) (*Cluster, error) {
 		return nil, fmt.Errorf("cluster: NodeID length %d exceeds MaxNodeIDLen %d; the envelope's uint16 length prefix would silently truncate",
 			len(cfg.NodeID), MaxNodeIDLen)
 	}
-	if cfg.Backend == nil {
-		return nil, errors.New("cluster: Backend is required")
+	multi, err := validateBackendMode(&cfg)
+	if err != nil {
+		return nil, err
 	}
 	normalizeConfig(&cfg)
 
 	c := &Cluster{
 		cfg:                cfg,
-		backend:            cfg.Backend,
+		backend:            cfg.Backend, // nil in multi-backend mode
+		multi:              multi,
+		factory:            cfg.BackendFactory,
+		unitCount:          cfg.UnitCount,
 		clients:            make(map[string]*peerClient),
 		closeCh:            make(chan struct{}),
 		peerClientsBlocked: cfg.TestingBlockPeerDials,
@@ -356,6 +436,14 @@ func Open(cfg Config) (*Cluster, error) {
 
 	if cfg.BindAddr == "" {
 		// Single-node mode: no membership, no ring, every op is local.
+		// In multi-backend mode this node still owns the whole unit
+		// space (ringOwnerLookup reports local owner on an empty ring),
+		// so mount it now.
+		if multi {
+			if err := c.initMultiBackend(); err != nil {
+				return nil, err
+			}
+		}
 		return c, nil
 	}
 
@@ -382,6 +470,24 @@ func Open(cfg Config) (*Cluster, error) {
 	// returned a populated snapshot).
 	for _, m := range mem.Members() {
 		c.ring.Add(ring.Member{ID: m.ID, Addr: m.Addr})
+	}
+
+	if multi {
+		// Multi-backend mode is STATIC in Phase 2: derive the owned units
+		// from the now-seeded ring + mount them, but do NOT start the
+		// rebalance machinery (no lease handoff / mount-unmount on
+		// membership change; that is Phase 3). The events / reconcile
+		// loops below still keep the ring in sync for ROUTING (so a
+		// forward goes to the right peer), they just don't move data.
+		// TODO(phase3): start the per-unit lease-handoff reconcile here.
+		if err := c.initMultiBackend(); err != nil {
+			_ = mem.Close()
+			return nil, err
+		}
+		c.loopWG.Add(2)
+		go c.runEventsLoop()
+		go c.runReconcileLoop()
+		return c, nil
 	}
 
 	// Rebalance machinery: Coordinator + settle-timer + sweep.
@@ -547,7 +653,18 @@ func (c *Cluster) Members() []ring.Member {
 // arrives with forwarded=true but does NOT belong here is refused
 // rather than re-forwarded (which would loop A->B->A on diverged
 // rings).
+//
+// In multi-backend mode (v0.8 Phase 2) the guard is UNIT-based: a key
+// belongs to this node iff this node has the key's storage unit MOUNTED.
+// ownerOf already routes through the unit in multi mode, but ring
+// ownership of a unit and having it mounted can diverge after a mid-run
+// membership change (static topology). The forwarding guard checks the
+// mount map (the authoritative "can I serve this") so a forwarded op for
+// a unit this node does not hold is refused, not re-forwarded.
 func (c *Cluster) OwnsKey(key []byte) bool {
+	if c.multi {
+		return c.ownsUnitForKey(key)
+	}
 	_, local := c.ownerOf(key)
 	return local
 }
@@ -557,9 +674,18 @@ func (c *Cluster) OwnsKey(key []byte) bool {
 // for admin-style operations (peer snapshotting, per-node counters)
 // where the receiver explicitly wants to see what's physically on
 // this node's storage, not "what the ring says belongs here".
+//
+// In multi-backend mode (v0.8 Phase 2) "the local backend" is the union
+// of every MOUNTED unit, so the scan walks all mounted units in unit
+// order and concatenates their iterators. keysHeld + Aggregate's
+// per-node snapshot rely on this seeing the node's whole physical
+// keyspace, not one unit.
 func (c *Cluster) LocalScanPrefix(prefix []byte) (backend.Iterator, error) {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return nil, backend.ErrClosed
+	}
+	if c.multi {
+		return c.localScanMounted(prefix)
 	}
 	return c.backend.ScanPrefix(prefix)
 }
@@ -573,8 +699,15 @@ func (c *Cluster) LocalScanPrefix(prefix []byte) (backend.Iterator, error) {
 // partition off us. Returns backend.ErrNotFound if the key is
 // absent locally.
 func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return nil, backend.ErrClosed
+	}
+	if c.multi {
+		b, ok := c.localBackendForKey(key)
+		if !ok {
+			return nil, backend.ErrNotFound
+		}
+		return b.Get(key)
 	}
 	return c.backend.Get(key)
 }
@@ -585,9 +718,37 @@ func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
 // opens its single short transaction on; the caller is responsible for
 // having verified ownership of the pin key first. Returns
 // backend.ErrClosed if the cluster is shutting down.
+//
+// Legacy mode only: in multi-backend mode there is no single backend to
+// begin against (the right backend depends on the pin key's unit), so the
+// CAS path uses localBeginForKey instead. Calling LocalBegin in multi
+// mode is a programming error and returns an error.
 func (c *Cluster) LocalBegin(level backend.IsolationLevel) (backend.Transaction, error) {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return nil, backend.ErrClosed
+	}
+	if c.multi {
+		return nil, errors.New("cluster: LocalBegin is not valid in multi-backend mode; use localBeginForKey")
+	}
+	return c.backend.Begin(level)
+}
+
+// localBeginForKey opens a transaction against the mounted backend that
+// owns key's unit (legacy mode: the single backend). It is the CAS
+// validate-and-apply primitive that works in BOTH modes: the caller has
+// already verified this node owns the pin key, so in multi-backend mode
+// the unit MUST be mounted; a missing mount is the unit-not-mounted guard
+// (the commit is refused, not applied against the wrong engine).
+func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (backend.Transaction, error) {
+	if c.notReady() {
+		return nil, backend.ErrClosed
+	}
+	if c.multi {
+		b, ok := c.localBackendForKey(key)
+		if !ok {
+			return nil, errUnitNotMounted("CommitCASApply")
+		}
+		return b.Begin(level)
 	}
 	return c.backend.Begin(level)
 }
@@ -674,6 +835,18 @@ func (c *Cluster) Close() error {
 	}
 	c.clientsMu.Unlock()
 
+	// Multi-backend mode: close every mounted unit via the factory
+	// (CloseUnit each) instead of a single backend. c.closed is already
+	// set, so KV ops starting after this point short-circuit on notReady
+	// before touching a unit. Done before returning so a unit's resources
+	// are released on Close.
+	if c.multi {
+		if err := c.closeMountedUnits(); err != nil && firstErr == nil {
+			firstErr = err
+		}
+		return firstErr
+	}
+
 	// Close the backend but DO NOT nil it out: a Put racing with
 	// Close could have already loaded c.backend before this point,
 	// and nil-ing it under their feet would either panic or trip
@@ -700,7 +873,15 @@ func (c *Cluster) shardKey(key []byte) []byte {
 // ownerOf returns the ring member that owns key + a bool indicating
 // whether the local node is that owner. In single-node mode (no ring)
 // it reports local-ownership unconditionally.
+//
+// In multi-backend mode (v0.8 Phase 2) ownership goes through the key's
+// storage UNIT, not the raw key: the unit id is placed on the ring, so
+// the owner of a key is the owner of its unit. This is the SAME ring used
+// for legacy routing, re-keyed onto unit ids (no second ring).
 func (c *Cluster) ownerOf(key []byte) (owner ring.Member, isLocal bool) {
+	if c.multi {
+		return c.unitOwnerOf(key)
+	}
 	if c.ring == nil || c.ring.Empty() {
 		return ring.Member{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}, true
 	}
@@ -817,11 +998,26 @@ func (c *Cluster) evictClient(addr string) {
 // successful Put). The asymmetry is a foot-gun. Apps that want to
 // remove a key must call Delete explicitly.
 func (c *Cluster) Put(key, value []byte) error {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.ErrClosed
 	}
 	if len(value) == 0 {
 		return ErrEmptyValue
+	}
+	if c.multi {
+		owner, local := c.ownerOf(key)
+		if local {
+			b, ok := c.localBackendForKey(key)
+			if !ok {
+				return errUnitNotMounted("Put")
+			}
+			return b.Put(key, value)
+		}
+		cli, err := c.clientFor(owner.Addr)
+		if err != nil {
+			return err
+		}
+		return cli.PutForwarded(context.Background(), key, value)
 	}
 	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
 		return c.putReplicated(key, value)
@@ -858,8 +1054,19 @@ func (c *Cluster) Put(key, value []byte) error {
 // pushes the winner back to any lagging replica. Tombstones (empty
 // payload) surface as backend.ErrNotFound. See docs/SPEC.md "Read path".
 func (c *Cluster) Get(key []byte) ([]byte, error) {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return nil, backend.ErrClosed
+	}
+	if c.multi {
+		owner, local := c.ownerOf(key)
+		if local {
+			b, ok := c.localBackendForKey(key)
+			if !ok {
+				return nil, errUnitNotMounted("Get")
+			}
+			return b.Get(key)
+		}
+		return c.forwardGet(owner.Addr, key)
 	}
 	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
 		return c.getReplicated(key)
@@ -909,8 +1116,23 @@ func (c *Cluster) forwardGet(addr string, key []byte) ([]byte, error) {
 // any other write, so a Delete that races with a concurrent Put
 // resolves by timestamp.
 func (c *Cluster) Delete(key []byte) error {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.ErrClosed
+	}
+	if c.multi {
+		owner, local := c.ownerOf(key)
+		if local {
+			b, ok := c.localBackendForKey(key)
+			if !ok {
+				return errUnitNotMounted("Delete")
+			}
+			return b.Delete(key)
+		}
+		cli, err := c.clientFor(owner.Addr)
+		if err != nil {
+			return err
+		}
+		return cli.DeleteForwarded(context.Background(), key)
 	}
 	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
 		return c.putReplicated(key, nil)
@@ -934,11 +1156,18 @@ func (c *Cluster) Delete(key []byte) error {
 // the owning node; the scan runs entirely on that node's backend. For
 // cross-shard scans, use Aggregate.
 func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return nil, backend.ErrClosed
 	}
 	owner, local := c.ownerOf(prefix)
 	if local {
+		if c.multi {
+			b, ok := c.localBackendForKey(prefix)
+			if !ok {
+				return nil, errUnitNotMounted("ScanPrefix")
+			}
+			return b.ScanPrefix(prefix)
+		}
 		return c.backend.ScanPrefix(prefix)
 	}
 	cli, err := c.clientFor(owner.Addr)
@@ -972,7 +1201,7 @@ func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 // pin); changing it pre-1.0 is intentional. See docs/SPEC.md
 // "Single-shard transactions (CAS / OCC)" + "Begin vs Transact".
 func (c *Cluster) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return nil, backend.ErrClosed
 	}
 	return c.newCASTx(level), nil
@@ -1010,7 +1239,7 @@ type AggregateResult struct {
 // routing) into a transient in-memory backend snapshot that fn sees.
 // The local node runs fn against its own backend directly.
 func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return nil
 	}
 	members := c.Members()
@@ -1022,6 +1251,18 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 		go func() {
 			defer wg.Done()
 			if m.ID == c.cfg.NodeID {
+				if c.multi {
+					// Multi-backend: no single c.backend. Give fn a
+					// read-only view spanning this node's mounted units
+					// (same snapshot shape snapshotPeer builds for peers).
+					snap, err := c.localMountedSnapshot()
+					if err != nil {
+						results[i] = AggregateResult{Err: err}
+						return
+					}
+					results[i] = AggregateResult{Value: fn(snap)}
+					return
+				}
 				results[i] = AggregateResult{Value: fn(c.backend)}
 				return
 			}

@@ -55,7 +55,7 @@ type EnvelopeWrite struct {
 // ApplyBatchLocal trusts the bytes it is handed (an incoming envelope
 // that fails to Decode is a hard error, not v0.3 compat data).
 func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.ErrClosed
 	}
 	if rb := c.rebalance.Load(); rb != nil {

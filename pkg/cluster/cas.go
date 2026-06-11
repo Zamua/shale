@@ -85,7 +85,7 @@ var casBaseBackoff = 2 * time.Millisecond
 // shards with it (the client's cross-shard guard guarantees this), so one
 // replica set covers the whole write-set. It is unused at R=1.
 func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLevel, pinKey []byte, reads []backend.ReadCheck, writes []backend.WriteOp) backend.CASResult {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.CASResult{Err: backend.ErrClosed}
 	}
 
@@ -111,7 +111,7 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 		}
 	}()
 
-	tx, err := c.LocalBegin(level)
+	tx, err := c.localBeginForKey(pinKey, level)
 	if err != nil {
 		return backend.CASResult{Err: err}
 	}
@@ -303,7 +303,7 @@ func bytesEqual(a, b []byte) bool {
 // passing the natural anchor key (e.g. the counter the transaction
 // updates) is the convention.
 func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error) error {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.ErrClosed
 	}
 	var conflicted bool

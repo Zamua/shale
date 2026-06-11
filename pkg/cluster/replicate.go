@@ -563,8 +563,19 @@ func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []
 // Caller (rpc.Server.Put) is responsible for the OwnsReplica check;
 // LocalReplicaPut trusts that gate.
 func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.ErrClosed
+	}
+	if c.multi {
+		// Multi-backend mode (R=1, no rebalance): apply against the key's
+		// mounted unit. The caller's OwnsKey guard already confirmed this
+		// node owns the unit, so a missing mount is the unit-not-mounted
+		// refusal, not a re-forward.
+		b, ok := c.localBackendForKey(key)
+		if !ok {
+			return errUnitNotMounted("Put")
+		}
+		return b.Put(key, bytesToWrite)
 	}
 	if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 		return migrationGuardError(c.retryAfterMs())
@@ -582,8 +593,15 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 // a tombstone envelope; this path covers the R=1 forwarded-Delete
 // shape that mirrors v0.3 behavior.
 func (c *Cluster) LocalReplicaDelete(key []byte) error {
-	if c.closed.Load() || c.backend == nil {
+	if c.notReady() {
 		return backend.ErrClosed
+	}
+	if c.multi {
+		b, ok := c.localBackendForKey(key)
+		if !ok {
+			return errUnitNotMounted("Delete")
+		}
+		return b.Delete(key)
 	}
 	if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 		return migrationGuardError(c.retryAfterMs())
@@ -598,7 +616,15 @@ func (c *Cluster) LocalReplicaDelete(key []byte) error {
 // only) would reject legitimate replica writes.
 //
 // At R=1, OwnsReplica == OwnsKey (LocateKeyN with n=1 == LocateKey).
+//
+// In multi-backend mode (v0.8 Phase 2, R=1) "replica" collapses to the
+// single unit owner, so the guard is the unit-mount check OwnsKey uses:
+// the forwarded Put / Delete handler refuses an op for a unit this node
+// does not hold.
 func (c *Cluster) OwnsReplica(key []byte) bool {
+	if c.multi {
+		return c.ownsUnitForKey(key)
+	}
 	return c.ownsAsReplica(key)
 }
 
