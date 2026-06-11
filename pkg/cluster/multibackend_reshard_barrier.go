@@ -312,6 +312,26 @@ func (c *Cluster) reshardAbort(targetGen storageunit.Generation) error {
 	return nil
 }
 
+// TestingIsFrozen reports whether this node is currently write-frozen for an
+// in-flight cluster-wide reshard. Test-only white-box hook (the production
+// freeze check isFrozen is unexported); it lets an integration test in another
+// package assert the read-availability + abort-path freeze semantics. Follows
+// the Testing* convention (see TestingClearMount / TestingDropAllPeerClients).
+func (c *Cluster) TestingIsFrozen() bool {
+	c.freezeMu.Lock()
+	defer c.freezeMu.Unlock()
+	return c.frozen
+}
+
+// TestingUnfreeze clears the write-freeze WITHOUT advancing the generation or
+// touching units. Test-only white-box hook used by the multi-node reshard gate's
+// break-demonstration to model a node that fails to honor the freeze (lets a
+// write through mid-barrier). NO production path unfreezes this way; RESUME /
+// ABORT are the real un-freeze. Follows the Testing* convention.
+func (c *Cluster) TestingUnfreeze() {
+	c.unfreeze()
+}
+
 // frozenFor reports whether this node is frozen AND its freeze target is exactly
 // targetGen. The phase handlers gate on this so a bisect / flip can only run
 // under the freeze the coordinator established for this very reshard.
