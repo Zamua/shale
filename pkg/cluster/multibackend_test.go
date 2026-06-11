@@ -9,6 +9,7 @@ package cluster
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 
 	"github.com/Zamua/shale/internal/memfactory"
@@ -361,4 +362,52 @@ func (f *failingFactory) OpenUnit(u storageunit.UnitID, epoch storageunit.Epoch)
 		return nil, errors.New("failingFactory: injected open failure")
 	}
 	return f.Factory.OpenUnit(u, epoch)
+}
+
+// TestMultiBackendTransact_CrossUnitSameNodeRejected pins the multi-backend
+// cross-shard guard against a co-location split. A node owns many units, so
+// two keys on DIFFERENT units of the SAME node share an owner NODE. The
+// transactable boundary is the storage UNIT (one engine), not the node: a
+// transaction spanning two units must be REJECTED with ErrCrossShard, not
+// silently committed against only the pin key's unit (which would write the
+// second key to the wrong unit and lose it on read). A node-based guard
+// (comparing owner.ID) admits this split; the unit-based guard rejects it.
+// This test fails on the node-based guard and passes on the unit-based one.
+func TestMultiBackendTransact_CrossUnitSameNodeRejected(t *testing.T) {
+	c, fac := openSingleNodeMulti(t, 8) // single node owns all 8 units
+
+	// Find two no-tag keys that map to DIFFERENT units (same node).
+	k1 := []byte("nokey-0")
+	var k2 []byte
+	for i := 1; i < 10000; i++ {
+		cand := []byte(fmt.Sprintf("nokey-%d", i))
+		if c.unitForKey(cand) != c.unitForKey(k1) {
+			k2 = cand
+			break
+		}
+	}
+	if k2 == nil {
+		t.Fatal("could not find two keys mapping to different units")
+	}
+
+	err := c.Transact(k1, func(tx backend.Transaction) error {
+		if err := tx.Put(k1, []byte("v1")); err != nil {
+			return err
+		}
+		return tx.Put(k2, []byte("v2")) // different unit -> cross-shard
+	})
+	if !errors.Is(err, backend.ErrCrossShard) {
+		t.Fatalf("cross-unit Transact: got %v, want ErrCrossShard (a node-based guard would silently admit + split this)", err)
+	}
+
+	// The rejected write must not have landed anywhere: k2 absent from its
+	// own unit's backend.
+	u2 := c.unitForKey(k2)
+	be2, ok := fac.UnitBackend(u2)
+	if !ok {
+		t.Fatalf("unit %d not mounted", u2)
+	}
+	if _, err := be2.Get(k2); !errors.Is(err, backend.ErrNotFound) {
+		t.Fatalf("k2 in unit %d after rejected cross-unit txn: got %v, want ErrNotFound", u2, err)
+	}
 }

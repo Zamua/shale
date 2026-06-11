@@ -121,6 +121,14 @@ func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 		}
 		return nil, errForwardLoop("Get: this node does not own the key")
 	}
+	// TODO(v0.8 phase3): in multi-backend mode a forwarded Get whose unit
+	// this node OWNS (mounted) falls through to c.Get, which re-routes via
+	// the ring and could take one extra forward hop if the ring view has
+	// diverged from the mount during a membership change. Phase 2 topology
+	// is static, so that window is documented-unsupported; phase 3's lease
+	// handoff reworks the forwarded-read path to serve a mounted unit
+	// locally (never re-route). The loop-guard above bounds it to one hop
+	// (no infinite A->B->A) even today.
 	v, err := s.c.Get(req.GetKey())
 	if errors.Is(err, backend.ErrNotFound) {
 		return &pb.GetResponse{NotFound: true}, nil

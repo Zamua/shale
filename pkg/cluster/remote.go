@@ -10,6 +10,7 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -243,7 +244,13 @@ type clusterTx struct {
 	mu      sync.Mutex
 	pinned  bool
 	pinKey  []byte
-	ownerID string // ring owner of the pinned shard; the cross-shard guard compares against this
+	ownerID string // legacy mode: ring owner NODE of the pinned shard; the cross-shard guard compares against this
+	// pinUnit is the storage UNIT of the pinned key in multi-backend mode.
+	// The guard compares units (not owner nodes) there: a node owns many
+	// units, so a single owner-node check would wrongly admit two keys on
+	// different units of the same node into one transaction, which commits
+	// against only the pin unit (a co-location split / silent loss).
+	pinUnit storageunit.UnitID
 	done    bool
 
 	// reads is the read-set: keys the tx READ from the cluster (and did
@@ -291,6 +298,9 @@ func (t *clusterTx) pinLocked(key []byte) {
 	t.pinned = true
 	t.pinKey = append([]byte(nil), key...)
 	t.ownerID = owner.ID
+	if t.c.multi {
+		t.pinUnit = t.c.unitForKey(key)
+	}
 }
 
 // guardShard pins on first touch + enforces the cross-shard guard on
@@ -302,6 +312,16 @@ func (t *clusterTx) guardShard(key []byte) error {
 	}
 	if !t.pinned {
 		t.pinLocked(key)
+		return nil
+	}
+	// Multi-backend: the transactable boundary is the storage UNIT (one
+	// slatedb engine), not the owner node. A node owns many units, so
+	// comparing owner nodes would admit a cross-unit transaction that then
+	// commits against only the pin unit. Compare units.
+	if t.c.multi {
+		if t.c.unitForKey(key) != t.pinUnit {
+			return backend.ErrCrossShard
+		}
 		return nil
 	}
 	owner, _ := t.c.ownerOf(key)

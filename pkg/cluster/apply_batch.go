@@ -58,6 +58,13 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 	if c.notReady() {
 		return backend.ErrClosed
 	}
+	if c.multi {
+		// ApplyBatch is the R>1 CAS write-set fan-out protocol. Multi-backend
+		// mode is single-replica (R=1) in Phase 2, so no legitimate caller
+		// sends it; refuse cleanly rather than dereference the nil c.backend
+		// below. A registered RPC must fail closed, never panic.
+		return errors.New("cluster: ApplyBatch unsupported in multi-backend mode (single-replica)")
+	}
 	if rb := c.rebalance.Load(); rb != nil {
 		for _, w := range writes {
 			if rb.IsMigrating(w.Key) || rb.IsReceiving(w.Key) {
