@@ -1117,6 +1117,20 @@ Phase 2 wires the `pkg/storageunit` domain into the cluster as a MULTI-BACKEND n
 
 **IN SCOPE: static topology.** The unit set a node owns is fixed at Open. If membership changes mid-run, Phase 2 may serve stale ownership for the moved units; that is acceptable and documented, exactly as v0.2 served stale routing before v0.3. **OUT OF SCOPE (later phases):** rebalance / lease handoff and mount-unmount on membership change (Phase 3); epoch fencing / writer-epoch handoff (Phase 3, opened at a fixed epoch here); doubling / resharding and the migration tool (Phase 4+). The legacy per-node path is untouched.
 
+### v0.8 Phase 3: lease-handoff rebalance
+
+Phase 3 makes a multi-backend node ACT on membership changes: when the ring re-assigns units, a unit whose owner changed hands off COPY-FREE. The old owner closes it (flush + release the lease); the new owner opens it at a higher epoch (fencing the old). Bytes never move (they live in shared object storage); only the writer lease moves. This is the data-loss-sensitive phase, built to a NO-ACKED-WRITE-LOST invariant. Multi-backend mode only: the legacy per-node path and its v0.3 Coordinator rebalance are UNTOUCHED.
+
+- **Reconcile on membership change (anti-entropy).** Hook the existing membership path: `bumpRingGen` -> `scheduleEvaluate`. In multi mode (`c.multi`) scheduleEvaluate runs the unit reconcile instead of the v0.3 Coordinator (which is nil / short-circuited in multi mode per Phase 2). The reconcile is desired-vs-mounted: desired = `storageunit.OwnedUnits(self, unitCount, ringOwnerLookup)` against the CURRENT ring; mounted = the mountMap keys (`factory.OpenUnits()`). For each unit desired-but-not-mounted: ACQUIRE (`OpenUnit` at the next epoch). For each mounted-but-not-desired: RELEASE (`CloseUnit`). It is idempotent and self-healing (a node that should own U but lost its mount re-acquires it), safe to run on every membership event. All mountMap mutations are `mountMu`-guarded and the reconcile is serialized (one at a time) so two membership changes cannot interleave mounts.
+
+- **Epoch fencing (the safety core).** Acquire opens at an epoch STRICTLY HIGHER than the unit's current DURABLE lease epoch, which fences the prior owner: its further writes to that unit fail. The cross-node epoch source of truth is the durable lease state (the slatedb manifest writer-epoch for slate; a shared epoch registry for the test factory), NOT in-process state. `OpenUnit(u, epoch)` carries the intended epoch; the backend factory performs the actual fence against the durable manifest.
+
+- **Flush-before-release ordering + the NO-ACKED-WRITE-LOST invariant.** The old owner's `CloseUnit(u)` FLUSHES (durable) then releases. Phase 3 is single-replica with durable-before-ack (R=1 + AwaitDurable=true), so every ACKED write is already durable in object storage before the handoff: the new owner opening the unit sees all acked writes. In-flight (un-acked) writes may be fenced or lost, but the client never got success for those and retries. **NO ACKED WRITE may be lost.** The phase is built to this invariant.
+
+- **Handoff window.** Between old-owner-release and new-owner-acquire the unit is briefly unavailable. An op routed to a unit not currently mounted by its ring-owner returns a RETRYABLE error (`codes.Unavailable` / `FailedPrecondition`, reusing the existing migration-guard / cutover retry shape) so the originator retries and succeeds once the new owner has acquired. Never serve a wrong or stale result; never lose a write.
+
+**OUT OF SCOPE (later phases):** doubling / resharding and the migration tool (Phase 4+); per-unit replication / R>1 in multi mode (still R=1); relaxed durability (still AwaitDurable=true; that combo needs R>=2). The legacy per-node path and its Coordinator are not touched.
+
 ---
 
 ## Roadmap
