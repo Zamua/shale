@@ -146,7 +146,40 @@ func (h *harness) runScheduler(rng *rand.Rand, stop <-chan struct{}, wg *sync.Wa
 	// the units), so we can refuse a reshard that would exceed a sane test ceiling
 	// and report the final generation.
 	liveGen := 0
-	const maxGen = 3 // cap doublings so a long soak does not explode the unit space
+	// Cap doublings so a long soak does not explode the unit space (each reshard
+	// DOUBLES the units: at base 8 a cap of 5 tops out at 256 units, which keeps
+	// the final full-sweep tractable). A reshard monotonically climbs liveGen
+	// toward the cap (there is no halving), so the cap is also the total number of
+	// reshards a single run can fire; 5 is enough for the reshard + the two reshard
+	// COMBINATIONS to each fire a few times in a default soak before the ceiling.
+	const maxGen = 5
+
+	// COVERAGE PROLOGUE: deterministically fire each high-value scenario ONCE up
+	// front, before the random schedule, so a default soak is GUARANTEED to
+	// exercise the hard cases (reshard, reshard-while-down, leave-mid-reshard, join,
+	// kill+restart) regardless of how few events the per-event settle cost lets a
+	// given DURATION fire. Relying on the weighted RNG alone to eventually hit every
+	// combination needs a long run; the prologue makes the default non-vacuous at a
+	// reasonable length while the random schedule still piles adversarial churn on
+	// top. The smoke variant SKIPS the prologue (it is meant to be fast + shallow).
+	// Each prologue step that commits a reshard advances liveGen, same as the random
+	// path. A step is best-effort: if a guard refuses it (too few live nodes, at the
+	// reshard ceiling) it is simply skipped and the run continues.
+	if !h.cfg.smoke {
+		// The prologue runs to COMPLETION even if the workload-duration timer fires
+		// mid-way (stop is NOT checked here): its whole purpose is to GUARANTEE the
+		// hard cases ran, so cutting it short would defeat it. It is naturally
+		// bounded (a fixed handful of events), and the writers/readers keep running
+		// against it until stop; if stop lands mid-prologue the remaining steps still
+		// fire against a quiescing workload, which the oracle still checks. Pick a
+		// default DURATION comfortably above the prologue's wall cost so the random
+		// schedule below also gets a turn.
+		prologue := []chaosEventKind{evReshard, evReshardWhileDown, evLeaveMidReshard, evJoin, evKill}
+		for _, kind := range prologue {
+			liveGen += h.fireEvent(kind, rng)
+			h.cl.WaitSettled(h.cfg.units<<liveGen, 15*time.Second)
+		}
+	}
 
 	for {
 		select {
@@ -167,29 +200,7 @@ func (h *harness) runScheduler(rng *rand.Rand, stop <-chan struct{}, wg *sync.Wa
 
 		nodes := h.cl.MemberCount()
 		kind := h.pickEvent(rng, nodes, liveGen, maxGen)
-		switch kind {
-		case evKill:
-			h.doKillRestart(rng)
-		case evJoin:
-			h.doJoin()
-		case evLeave:
-			h.doLeave(rng)
-		case evReshard:
-			if h.doReshard() {
-				liveGen++
-			}
-		case evReshardWhileDown:
-			if h.doReshardWhileDown(rng) {
-				liveGen++
-			}
-		case evLeaveMidReshard:
-			// This intentionally drives the clean-abort path; on the rare timing
-			// where the reshard committed before the membership change landed, it
-			// counts as a successful reshard instead.
-			if h.doLeaveMidReshard(rng) {
-				liveGen++
-			}
-		}
+		liveGen += h.fireEvent(kind, rng)
 		// Settle the cluster to a clean, fully-mounted state before the next event
 		// fires. Without this, a reshard or membership change whose redistribution
 		// has not yet completed gets compounded by the next event, and the cluster
@@ -202,6 +213,37 @@ func (h *harness) runScheduler(rng *rand.Rand, stop <-chan struct{}, wg *sync.Wa
 	}
 }
 
+// fireEvent dispatches one chaos event of the given kind and returns the
+// liveGen DELTA (1 if it committed a reshard, else 0). It is the single dispatch
+// point shared by the deterministic coverage prologue and the random schedule, so
+// the two paths stay in lockstep on how an event mutates the generation.
+func (h *harness) fireEvent(kind chaosEventKind, rng *rand.Rand) int {
+	switch kind {
+	case evKill:
+		h.doKillRestart(rng)
+	case evJoin:
+		h.doJoin()
+	case evLeave:
+		h.doLeave(rng)
+	case evReshard:
+		if h.doReshard() {
+			return 1
+		}
+	case evReshardWhileDown:
+		if h.doReshardWhileDown(rng) {
+			return 1
+		}
+	case evLeaveMidReshard:
+		// This intentionally drives the clean-abort path; on the rare timing where
+		// the reshard committed before the membership change landed, it counts as a
+		// successful reshard instead.
+		if h.doLeaveMidReshard(rng) {
+			return 1
+		}
+	}
+	return 0
+}
+
 // pickEvent chooses the next event kind subject to guards. With <= 1 live node,
 // only join is possible. With >= 2, the full menu is available, weighted toward
 // the simple events with the combinations sprinkled in.
@@ -210,21 +252,29 @@ func (h *harness) pickEvent(rng *rand.Rand, liveNodes, liveGen, maxGen int) chao
 		return evJoin
 	}
 	canReshard := liveGen < maxGen
-	// Weighted menu. Numbers are relative weights.
+	// Weighted menu. Numbers are relative weights. The per-event SETTLE +
+	// convergence wait dominates wall clock, so a default soak fires only a modest
+	// number of events; we therefore bias toward the RESHARD + the two COMBINATIONS
+	// (the high-value adversarial cases the single gates cannot express, and the
+	// ones the join-after-reshard gen path lives in) so they fire a meaningful
+	// number of times rather than being crowded out by plain kills/joins. The
+	// combinations themselves drive kill / reshard / leave underneath, so biasing
+	// toward them still exercises the base operations. When the cluster is at the
+	// reshard ceiling (liveGen == maxGen) the menu falls back to membership churn.
 	type wk struct {
 		kind chaosEventKind
 		w    int
 	}
 	menu := []wk{
-		{evKill, 30},
-		{evJoin, 20},
-		{evLeave, 15},
+		{evKill, 20},
+		{evJoin, 18},
+		{evLeave, 12},
 	}
 	if canReshard {
 		menu = append(menu,
-			wk{evReshard, 15},
-			wk{evReshardWhileDown, 10},
-			wk{evLeaveMidReshard, 10},
+			wk{evReshard, 20},
+			wk{evReshardWhileDown, 15},
+			wk{evLeaveMidReshard, 15},
 		)
 	}
 	total := 0
@@ -312,10 +362,14 @@ func (h *harness) doReshardWhileDown(rng *rand.Rand) bool {
 		return false
 	}
 	h.met.evKill.Add(1)
+	// Record that the COMBINATION fired (a node went down with a reshard to follow),
+	// distinct from a plain kill, so the report proves this hard case ran.
+	h.met.evReshardWhileDown.Add(1)
 	// Reshard over the survivors while the victim is down.
 	committed := false
 	if err := h.cl.Reshard(); err == nil {
 		h.met.evReshard.Add(1)
+		h.met.evReshardWhileDownC.Add(1) // the reshard committed WHILE a node was down
 		committed = true
 	} else {
 		h.met.evReshardAbrt.Add(1)
@@ -335,21 +389,30 @@ func (h *harness) doReshardWhileDown(rng *rand.Rand) bool {
 // committed before the leave landed, it counts as a committed reshard. Returns
 // true iff the reshard committed.
 func (h *harness) doLeaveMidReshard(rng *rand.Rand) bool {
+	// Record that the COMBINATION fired (a reshard kicked off with a membership
+	// change to land mid-barrier), distinct from a plain leave/reshard, so the
+	// report proves this hard case ran.
+	h.met.evLeaveMidReshard.Add(1)
 	done := h.cl.ReshardAsync()
 	// Give the barrier a moment to engage (freeze), then fire the membership
 	// change so it lands mid-barrier.
 	time.Sleep(jitterDuration(rng, 30*time.Millisecond))
 	victim := h.randomVictim(rng)
 	if victim != "" {
-		_ = h.cl.RemoveNode(victim) // may race the abort; either order is valid
+		if err := h.cl.RemoveNode(victim); err == nil {
+			h.met.evLeave.Add(1) // the membership change itself landed
+		}
 	}
 	err := <-done
 	if err == nil {
 		h.met.evReshard.Add(1)
 		return true
 	}
-	// Aborted (the expected outcome of a mid-reshard membership change).
+	// Aborted (the expected outcome of a mid-reshard membership change): count it
+	// as both a reshard-abort AND distinctly as a leave-mid-reshard that drove the
+	// clean-abort path, so the report proves the abort case actually exercised.
 	h.met.evReshardAbrt.Add(1)
+	h.met.evLeaveMidReshardAb.Add(1)
 	return false
 }
 

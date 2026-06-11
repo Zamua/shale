@@ -164,6 +164,44 @@ func TestOracleInFlightScopedToOneKey(t *testing.T) {
 	o.EndOp("k1")
 }
 
+func TestOracleEverValuesBounded(t *testing.T) {
+	o := NewOracle()
+	// Overwrite one key far past the cap. everValues must stay bounded.
+	total := everValuesCap * 4
+	for v := uint64(1); v <= uint64(total); v++ {
+		o.RecordPut("k", EncodeValue("k", v, "p"), v)
+	}
+	o.mu.RLock()
+	e := o.model["k"]
+	got := len(e.everValues)
+	o.mu.RUnlock()
+	if got > everValuesCap {
+		t.Fatalf("everValues should be capped at %d, grew to %d", everValuesCap, got)
+	}
+
+	// The latest value still passes.
+	latest := EncodeValue("k", uint64(total), "p")
+	if vd, detail := o.Verify("k", Observed{Value: latest}); vd != VerdictPass {
+		t.Fatalf("latest value should PASS after eviction, got %s: %s", vd, detail)
+	}
+
+	// A RETAINED recent-but-stale value is still STALE (a real violation).
+	recentStale := EncodeValue("k", uint64(total-1), "p")
+	if vd, _ := o.Verify("k", Observed{Value: recentStale}); vd != VerdictStale {
+		t.Fatalf("a retained older acked value should be STALE, got %s", vd)
+	}
+
+	// An EVICTED very-old value (version 1, long past the cap) re-surfacing must
+	// STILL be a violation - the cap must never turn a real loss into a pass. It
+	// is well-formed + addressed to this key at a version below the retained
+	// window, so it is flagged STALE rather than CORRUPT, but either way it is not
+	// a PASS.
+	evictedOld := EncodeValue("k", 1, "p")
+	if vd, detail := o.Verify("k", Observed{Value: evictedOld}); vd == VerdictPass {
+		t.Fatalf("an evicted very-old value re-surfacing must NOT pass (the cap excused a real loss): %s", detail)
+	}
+}
+
 func TestOracleSnapshotReflectsLatest(t *testing.T) {
 	o := NewOracle()
 	o.RecordPut("a", EncodeValue("a", 1, "p"), 1)

@@ -52,6 +52,26 @@ type metrics struct {
 	evReshard     atomic.Int64
 	evReshardAbrt atomic.Int64
 
+	// COMBINATION event counts, tracked DISTINCTLY from the base counters above so
+	// a passing report can PROVE the hard adversarial cases actually fired (they
+	// are the high-value scenarios the single gates cannot express). Without these,
+	// a reshard-while-down looks identical to a plain kill+reshard in the report,
+	// and a vacuous run that never hit a combination would read as "passed" with no
+	// way to tell. Each combination increments BOTH a base counter (for the kill /
+	// reshard / leave totals) AND its own combination counter here.
+	//
+	//   evReshardWhileDown  - a reshard driven over the reduced membership while a
+	//                         node is down (then the node restarts at the new gen).
+	//   evReshardWhileDownC  - of those, how many actually COMMITTED the reshard.
+	//   evLeaveMidReshard   - a membership change fired mid-reshard (the clean-abort
+	//                         driver).
+	//   evLeaveMidReshardAb  - of those, how many drove the reshard to a clean ABORT
+	//                         (the intended outcome); the remainder committed first.
+	evReshardWhileDown  atomic.Int64
+	evReshardWhileDownC atomic.Int64
+	evLeaveMidReshard   atomic.Int64
+	evLeaveMidReshardAb atomic.Int64
+
 	finalNodes int
 	finalUnits int
 }
@@ -91,6 +111,11 @@ type config struct {
 	units       int
 	chaosEvery  time.Duration
 	settleDelay time.Duration
+	// smoke is set for the fast inner-loop variant (SHALE_CHAOS_SMOKE=1). It runs
+	// few events quickly and RELAXES the vacuous-check so it does not demand the
+	// full combination coverage a real soak proves. The default (smoke=false) is a
+	// genuine soak that MUST exercise each combination, or it fails as vacuous.
+	smoke bool
 }
 
 // harness wires the cluster, oracle, metrics, and violation log together and runs
@@ -403,7 +428,7 @@ func (h *harness) runWriter(id int, rng *rand.Rand, stop <-chan struct{}, wg *sy
 			// Transact is an acked increment. Retries the retryable freeze/handoff
 			// signal internally (Transact already does), so a nil return is a
 			// genuine ack.
-			if err := h.transactInc(entrySel, ctrKey); err != nil {
+			if err := h.transactInc(entrySel, ctrKey, ctrAcked+1); err != nil {
 				h.vlog.add(VerdictLost, fmt.Sprintf("writer %d Transact(%q) failed (hard error): %v", id, ctrKey, err))
 				continue
 			}
@@ -413,11 +438,14 @@ func (h *harness) runWriter(id int, rng *rand.Rand, stop <-chan struct{}, wg *sy
 	}
 }
 
-// transactInc runs a read-modify-write increment on the counter key under
-// Transact, retrying the entry-node-gone case (Transact handles the freeze/handoff
-// retry itself). The counter value is stored as a plain decimal so the final
-// sweep can compare it to the acked-increment count.
-func (h *harness) transactInc(entrySel func() *cluster.Cluster, ctrKey string) error {
+// transactInc advances the counter key toward target (the caller's acked-count+1)
+// under Transact, retrying the entry-node-gone case (Transact handles the freeze/
+// handoff retry itself). The update is an IDEMPOTENT monotonic-max, NOT a blind
+// +1: a retried Transact whose first commit was durable-but-unacked re-applies the
+// same target as a no-op instead of double-counting (see the inline comment + the
+// verifyCounters invariant). The counter value is stored as a plain decimal so the
+// final sweep can compare it to the acked-increment count exactly.
+func (h *harness) transactInc(entrySel func() *cluster.Cluster, ctrKey string, target int64) error {
 	deadline := time.Now().Add(retryBudget)
 	for {
 		c := entrySel()
@@ -437,7 +465,18 @@ func (h *harness) transactInc(entrySel func() *cluster.Cluster, ctrKey string) e
 			if len(cur) > 0 {
 				_, _ = fmt.Sscanf(string(cur), "%d", &n)
 			}
-			return tx.Put([]byte(ctrKey), []byte(fmt.Sprintf("%d", n+1)))
+			// IDEMPOTENT monotonic-max increment: the writer's target is its own
+			// (acked-count + 1). Re-applying the SAME target after a durable-but-
+			// unacked commit (entry node died after the commit landed) is a no-op
+			// (max(stored, target) == stored), so a retried Transact never DOUBLE-
+			// counts. This makes the final stored == acked an exact, falsifiable
+			// lossless check robust to Transact's at-least-once contract under a
+			// crash, instead of conflating a benign retry with a real lost update.
+			next := n
+			if target > next {
+				next = target
+			}
+			return tx.Put([]byte(ctrKey), []byte(fmt.Sprintf("%d", next)))
 		})
 		if err == nil {
 			return nil

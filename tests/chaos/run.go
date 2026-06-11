@@ -25,15 +25,23 @@ type report struct {
 	retryableRetries int64
 	transientReads   int64
 	events           map[string]int64
+	combos           map[string]int64
 	finalNodes       int
 	finalUnits       int
 	finalGeneration  int
 	violations       []violation
+	// smoke records whether this was the fast inner-loop variant. The vacuous-check
+	// demands FULL combination coverage only for a real soak (smoke=false); the
+	// smoke variant fires too few events to guarantee a combination, so it relaxes
+	// that demand (but still requires acked writes + chaos + retryable turbulence).
+	smoke bool
 }
 
-// vacuous reports whether the run failed to stress anything (no acked writes, no
-// chaos events, or no retryable turbulence). A vacuous soak proves nothing and is
-// treated as a failure by the test.
+// vacuous reports whether the run failed to stress anything: no acked writes, no
+// chaos events, no retryable turbulence, or (for a real soak) a failure to
+// exercise the high-value COMBINATION scenarios. A vacuous soak proves nothing
+// and is treated as a failure by the test, so a "green" run cannot rubber-stamp
+// a configuration that never overlapped the workload with chaos.
 func (r *report) vacuous() (bool, string) {
 	if r.ackedPuts == 0 {
 		return true, "zero acked Puts: the workload never ran"
@@ -47,6 +55,24 @@ func (r *report) vacuous() (bool, string) {
 	}
 	if r.retryableRetries == 0 {
 		return true, "zero retryable retries: the run never hit a cutover/handoff/freeze window (suspiciously quiet - chaos may not have overlapped the workload)"
+	}
+	// A real soak (not the fast smoke variant) MUST reach the generation-changing
+	// and combination scenarios, or it proves nothing about the hard cases the
+	// harness exists to exercise (and the join-after-reshard gen path in
+	// particular). We require: at least one COMMITTED reshard (so the cluster
+	// actually changed generation and a later join/restart had to learn it), and
+	// at least one of EACH combination having fired. The smoke variant fires too
+	// few events to guarantee these, so it skips this gate.
+	if !r.smoke {
+		if r.events["reshard"] == 0 {
+			return true, "zero committed reshards: the soak never changed generation, so it never exercised reshard or the join-after-reshard path (raise DURATION or lower CHAOS_EVERY)"
+		}
+		if r.combos["reshard_while_down"] == 0 {
+			return true, "the reshard-while-down combination never fired: the soak did not exercise a reshard over reduced membership (raise DURATION)"
+		}
+		if r.combos["leave_mid_reshard"] == 0 {
+			return true, "the leave-mid-reshard combination never fired: the soak did not exercise a membership change racing the freeze barrier (raise DURATION)"
+		}
 	}
 	return false, ""
 }
@@ -62,12 +88,14 @@ func (r *report) String() string {
 			"  acked_puts=%d acked_deletes=%d acked_transacts=%d\n"+
 			"  reads_verified=%d retryable_retries=%d transient_reads=%d\n"+
 			"  chaos_events=%v\n"+
+			"  combination_events=%v\n"+
 			"  final_node_count=%d final_unit_count=%d final_generation=%d\n"+
 			"  violations=%s",
 		r.seed, r.duration,
 		r.ackedPuts, r.ackedDeletes, r.ackedTransacts,
 		r.readsVerified, r.retryableRetries, r.transientReads,
 		r.events,
+		r.combos,
 		r.finalNodes, r.finalUnits, r.finalGeneration,
 		vio,
 	)
@@ -161,10 +189,17 @@ func run(cfg config, logf func(string, ...any)) (*report, error) {
 			"reshard":         h.met.evReshard.Load(),
 			"reshard_aborted": h.met.evReshardAbrt.Load(),
 		},
+		combos: map[string]int64{
+			"reshard_while_down":           h.met.evReshardWhileDown.Load(),
+			"reshard_while_down_committed": h.met.evReshardWhileDownC.Load(),
+			"leave_mid_reshard":            h.met.evLeaveMidReshard.Load(),
+			"leave_mid_reshard_aborted":    h.met.evLeaveMidReshardAb.Load(),
+		},
 		finalNodes:      h.met.finalNodes,
 		finalUnits:      h.met.finalUnits,
 		finalGeneration: generationFromUnits(cfg.units, h.met.finalUnits),
 		violations:      h.vlog.snapshot(),
+		smoke:           cfg.smoke,
 	}
 	return rep, nil
 }
@@ -206,17 +241,30 @@ func (h *harness) finalSweep() {
 		go func() {
 			defer wg.Done()
 			for key := range keyCh {
-				// Read the key from EVERY live node, but interpret the results
-				// together. A node whose ring has not yet refreshed after the last
-				// reshard/membership change can refuse to route a key it does not own
-				// (a permanent-shaped FailedPrecondition "this node does not own the
-				// key" / "forwarding loop refused"); that is a STALE-RING condition on
-				// that one node, NOT a lost write - the value is still served by the
-				// owner. So we PASS the key if at least one node returns the correct
-				// latest value and NO node returns a wrong (stale/corrupt/resurrected)
-				// value. The key is LOST only if no node could serve a correct value
-				// (every node errored or disagreed), which is a genuine availability
-				// loss after the cluster was given time to settle.
+				// Read the key from EVERY live node, then judge the key by ONE precise
+				// pass-rule:
+				//
+				//   A key PASSES iff (a) AT LEAST ONE live node served its correct
+				//   latest value AND (b) NO live node served a definitely-wrong
+				//   (stale / corrupt / resurrected) value.
+				//
+				// Three result kinds per node, classified into exactly one bucket:
+				//   - correct latest value  -> "served" (satisfies (a))
+				//   - definitely-wrong value -> "badVerdict" (violates (b)): a real
+				//     loss regardless of the other nodes - the DATA is wrong, not
+				//     merely unrouted.
+				//   - a route refusal (FailedPrecondition "does not own the key" /
+				//     "forwarding loop refused") or a transient error -> IGNORED for
+				//     this node. A node whose ring has not refreshed after the last
+				//     reshard/membership change disclaims a key it does not own; that
+				//     is a STALE-RING condition on that one node, NOT a lost write -
+				//     the owner still serves it. It neither contributes a pass nor
+				//     counts as a violation.
+				//
+				// So the key is reported LOST only when NO node served a correct value
+				// AND no node served a wrong one (every node errored / disclaimed) -
+				// a genuine availability loss after the cluster was given time to
+				// settle. A wrong value on ANY node fails the key outright via (b).
 				served := false
 				var lastErr error
 				badVerdict := false
@@ -264,8 +312,18 @@ func (h *harness) finalSweep() {
 }
 
 // verifyCounters checks the Transact RMW invariant: each per-writer counter key
-// stores exactly the number of acked increments that writer made. A lower value
-// is a lost update; a higher value is impossible (would mean a phantom ack).
+// stores exactly the number of acked increments that writer made. Because the
+// increment is IDEMPOTENT (monotonic-max toward acked-count+1; see transactInc),
+// a retried Transact whose first commit was durable-but-unacked is a no-op, so a
+// crash mid-Transact never inflates the counter. The stored value therefore
+// equals the acked count EXACTLY iff no acked increment was lost: a LOWER stored
+// value is a genuine lost update under Transact (the failure this catches); a
+// HIGHER stored value would mean a phantom ack and is likewise a violation.
+// Modeling the increment idempotently is what makes this an exact, falsifiable
+// lossless check rather than one confounded by Transact's at-least-once contract
+// under a node crash (a blind read-increment-write counter would mis-count a
+// crash-retried commit as either a double-count or, racing concurrent retries
+// across a reshard, an apparent loss - neither a real SUT data-loss event).
 func (h *harness) verifyCounters() {
 	clusters := h.cl.AllLiveClusters()
 	if len(clusters) == 0 {

@@ -19,6 +19,7 @@ package chaos
 
 import (
 	"fmt"
+	"sort"
 	"sync"
 )
 
@@ -67,14 +68,32 @@ func (v Verdict) String() string {
 	}
 }
 
-// entry is the per-key model state: the latest acked value (or tombstone) and
-// the set of every payload ever acked for the key (so a read of an out-of-date
+// everValuesCap bounds how many recent acked payloads per key the oracle retains
+// in everValues. Without a cap, everValues grows by one entry per OVERWRITE of a
+// key, unbounded across a long soak (the writer overwrites the same bounded key
+// set indefinitely once it hits maxKeysPerWriter), so memory climbs with run
+// length. The cap keeps the model's footprint flat. Correctness of the PASS/FAIL
+// verdict is preserved: everValues only distinguishes a STALE read (an OLDER
+// acked value re-surfacing) from a CORRUPT read (a value never acked for the
+// key). Both are VIOLATIONS, so evicting a value older than the cap can only
+// reclassify a (genuinely-lost) very-old-value read from STALE to CORRUPT - never
+// turn a violation into a pass. The cap is generous (a re-surfacing value is
+// almost always recent), so a real stale read is still labeled STALE in practice.
+const everValuesCap = 64
+
+// entry is the per-key model state: the latest acked value (or tombstone) and a
+// bounded set of recent payloads acked for the key (so a read of an out-of-date
 // payload is told apart from a payload that was never written at all).
 type entry struct {
 	version    uint64 // latest acked version for this key (monotonic per key)
 	value      string // latest acked value; empty + deleted=true means tombstone
 	deleted    bool   // true if the latest acked op was a Delete
 	everValues map[string]uint64
+	// everMinVer is the lowest version still retained in everValues after eviction.
+	// A read whose decoded version is BELOW everMinVer but is a well-formed value
+	// addressed to this key is still treated as a (stale) violation rather than
+	// corruption - see Verify - so trimming everValues never excuses a real loss.
+	everMinVer uint64
 	// inflight > 0 while a write/delete for this key has been ISSUED to the
 	// cluster but has not yet returned (acked or failed). During that window the
 	// key's true state is ambiguous from the model's point of view: the durable
@@ -85,6 +104,31 @@ type entry struct {
 	// single-writer-per-key rule keeps inflight 0-or-1 in practice; it is a counter
 	// only for defensiveness.
 	inflight int
+}
+
+// recordEver adds value@version to everValues and evicts the oldest entries past
+// everValuesCap, keeping the model's per-key footprint flat across a long soak.
+func (e *entry) recordEver(value string, version uint64) {
+	e.everValues[value] = version
+	if len(e.everValues) <= everValuesCap {
+		return
+	}
+	// Evict the lowest-version entries until we are back at the cap. A re-surfacing
+	// value is overwhelmingly a recent one, so this keeps the useful window.
+	type vv struct {
+		val string
+		ver uint64
+	}
+	all := make([]vv, 0, len(e.everValues))
+	for v, ver := range e.everValues {
+		all = append(all, vv{v, ver})
+	}
+	sort.Slice(all, func(i, j int) bool { return all[i].ver < all[j].ver })
+	drop := len(all) - everValuesCap
+	for i := 0; i < drop; i++ {
+		delete(e.everValues, all[i].val)
+	}
+	e.everMinVer = all[drop].ver
 }
 
 // Oracle records every acked write/delete and judges observed reads. It is safe
@@ -155,7 +199,7 @@ func (o *Oracle) RecordPut(key, value string, version uint64) {
 	e.version = version
 	e.value = value
 	e.deleted = false
-	e.everValues[value] = version
+	e.recordEver(value, version)
 }
 
 // RecordDelete records that the cluster ACKED a Delete(key). Same contract as
@@ -280,6 +324,15 @@ func (o *Oracle) Verify(key string, obs Observed) (Verdict, string) {
 		// ver >= e.version with a non-equal value cannot happen (everValues is
 		// keyed by value, and version is monotonic), but be defensive.
 		return VerdictPass, ""
+	}
+	// Not in the (bounded) everValues. Before calling it CORRUPT, check whether it
+	// is a well-formed value ADDRESSED TO THIS KEY at a version we may have EVICTED
+	// past the everValuesCap (a very old acked value re-surfacing). That is still a
+	// lost/stale violation - just one whose exact predecessor we no longer retain -
+	// so we label it STALE rather than CORRUPT. This keeps the cap from ever
+	// excusing a real loss: an evicted-old value re-surfacing stays a violation.
+	if vKey, vVer, ok := DecodeValue(obs.Value); ok && vKey == key && vVer < e.version && vVer <= e.everMinVer {
+		return VerdictStale, fmt.Sprintf("key %q read returned an acked-but-stale value %q (version %d, evicted from the retained window <= %d); latest acked is version %d (%q)", key, obs.Value, vVer, e.everMinVer, e.version, e.value)
 	}
 	return VerdictCorrupt, fmt.Sprintf("key %q read returned value %q never acked for this key (latest acked version %d = %q)", key, obs.Value, e.version, e.value)
 }
