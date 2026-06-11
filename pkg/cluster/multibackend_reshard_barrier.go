@@ -457,15 +457,35 @@ func (c *Cluster) TestingSetAfterFreezeHook(fn func()) {
 // barrier's membershipChanged re-check observe an identity change). Test-only
 // white-box hook; multi-node mode only (no-op if the ring is nil). Follows the
 // Testing* convention.
+//
+// It MUTATES the existing *ring.Ring in place (Remove every current member, Add
+// the desired set) rather than swapping the c.ring POINTER. The c.ring field is
+// assigned once in Open before any goroutine spawns; thereafter only the
+// *Ring's own internally-locked Add/Remove mutate the membership, and the events
+// loop reads c.ring concurrently to call those. Reassigning the pointer here
+// would race that unguarded field read in the events loop (the *Ring is
+// internally locked, but the c.ring field is not). Going through Add/Remove on
+// the SAME pointer keeps every membership mutation under the ring's own RWMutex,
+// so there is no unsynchronized field access.
 func (c *Cluster) TestingSetRingMembers(members []ring.Member) {
 	if c.ring == nil {
 		return
 	}
-	r := ring.New()
+	want := make(map[string]struct{}, len(members))
 	for _, m := range members {
-		r.Add(m)
+		want[m.ID] = struct{}{}
 	}
-	c.ring = r
+	// Remove any current member not in the desired set, then Add/refresh the
+	// desired set. Both go through the ring's internal lock; the c.ring pointer
+	// never changes, so the concurrent events-loop read is race-free.
+	for _, cur := range c.ring.Members() {
+		if _, keep := want[cur.ID]; !keep {
+			c.ring.Remove(cur.ID)
+		}
+	}
+	for _, m := range members {
+		c.ring.Add(m)
+	}
 }
 
 // frozenFor reports whether this node is frozen AND its freeze target is exactly
