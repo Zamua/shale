@@ -354,6 +354,14 @@ type Cluster struct {
 	// self-heal clears the freeze. Zero in legacy mode.
 	frozenAt time.Time
 
+	// testingAfterFreezeHook, when non-nil, runs on the COORDINATOR exactly once
+	// after the FREEZE barrier completes and BEFORE the pre-BISECT membership
+	// re-check. Test-only seam (nil in every production path, so it costs one nil
+	// compare): it lets a test inject a membership change across the barrier and
+	// assert the coordinator ABORTS on it deterministically, without racing a real
+	// node join/leave against the phase timing. See TestingSetAfterFreezeHook.
+	testingAfterFreezeHook func()
+
 	// reconcileMu serializes the Phase 3 lease-handoff reconcile
 	// (multibackend_rebalance.go): at most one reconcile mutates the mount
 	// map at a time, so two membership changes whose settle timers fire

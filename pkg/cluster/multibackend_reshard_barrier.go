@@ -77,6 +77,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Zamua/shale/pkg/ring"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
@@ -412,6 +413,56 @@ func (c *Cluster) TestingUnfreeze() {
 	c.unfreeze()
 }
 
+// TestingRunReconcile runs ONE reconcile pass (the same runReconcile the periodic
+// self-heal loop ticks), synchronously. Test-only white-box hook: it lets a test
+// drive the stale-freeze self-heal (a node left frozen by a dropped RESUME RPC
+// auto-unfreezes once it has aged past staleFreezeGrace) on demand instead of
+// waiting out the production reconcile interval. Follows the Testing* convention
+// (see TestingClearMount / TestingDropAllPeerClients).
+func (c *Cluster) TestingRunReconcile() {
+	c.runReconcile()
+}
+
+// TestingSetStaleFreezeGrace overrides the stale-freeze grace window (how long a
+// node must sit flipped-but-frozen before the self-heal auto-unfreezes it) and
+// returns a restore func the caller MUST defer. Test-only white-box hook so an
+// integration test in another package can shrink the grace from its 25s default
+// to a few milliseconds and exercise the self-heal without a long sleep. The
+// production default is unchanged for every non-test path. Follows the Testing*
+// convention.
+func TestingSetStaleFreezeGrace(d time.Duration) (restore func()) {
+	prev := staleFreezeGrace
+	staleFreezeGrace = d
+	return func() { staleFreezeGrace = prev }
+}
+
+// TestingSetAfterFreezeHook installs fn (or clears it with nil) as the coordinator
+// post-FREEZE / pre-membership-re-check seam reshardCoordinated invokes. Test-only
+// white-box hook: it lets a test inject a membership change across the freeze
+// barrier deterministically and assert the coordinator ABORTS, rather than racing
+// a real node join/leave against the phase timing. Follows the Testing*
+// convention.
+func (c *Cluster) TestingSetAfterFreezeHook(fn func()) {
+	c.testingAfterFreezeHook = fn
+}
+
+// TestingSetRingMembers replaces the local node's ring membership with the given
+// members (used to model a count-preserving membership swap mid-reshard: the
+// coordinator's Members() reads the ring, so swapping a member here makes the
+// barrier's membershipChanged re-check observe an identity change). Test-only
+// white-box hook; multi-node mode only (no-op if the ring is nil). Follows the
+// Testing* convention.
+func (c *Cluster) TestingSetRingMembers(members []ring.Member) {
+	if c.ring == nil {
+		return
+	}
+	r := ring.New()
+	for _, m := range members {
+		r.Add(m)
+	}
+	c.ring = r
+}
+
 // frozenFor reports whether this node is frozen AND its freeze target is exactly
 // targetGen. The phase handlers gate on this so a bisect / flip can only run
 // under the freeze the coordinator established for this very reshard.
@@ -639,6 +690,13 @@ func (c *Cluster) reshardCoordinated() error {
 	if err := c.broadcastPhase(members, pb.ReshardPhase_RESHARD_PHASE_FREEZE, targetGen); err != nil {
 		c.abortReshard(members, targetGen)
 		return fmt.Errorf("cluster: Reshard FREEZE barrier failed: %w", err)
+	}
+
+	// Test-only seam: a hook fires here (post-FREEZE, pre-membership-re-check) so
+	// a test can deterministically inject a membership change across the barrier
+	// and prove the coordinator ABORTS on it. Nil in production.
+	if c.testingAfterFreezeHook != nil {
+		c.testingAfterFreezeHook()
 	}
 
 	// Membership must be stable across the bisect: re-check before BISECT.
