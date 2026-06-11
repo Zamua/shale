@@ -90,11 +90,15 @@ func TestColocation_SameHashSameUnit(t *testing.T) {
 	}
 }
 
-// TestUnitMap_AlignsWithRingHasher proves the unit map and the ring start
-// from the SAME hash function. If pkg/ring ever swaps its hasher, this test
-// (which hard-codes xxhash here) keeps the unit placement honest by failing
-// when the two diverge.
-func TestUnitMap_AlignsWithRingHasher(t *testing.T) {
+// TestUnitMap_HashesRingShardKeyWithXXHash pins the unit map's formula:
+// UnitForShardKey extracts the co-location tag via ring.ShardKey and masks
+// the low log2(N) bits of xxhash.Sum64 over it. This documents that the unit
+// map is built on the SAME shard-key extraction + hasher pkg/ring uses
+// today, so unit placement and ring routing share their hash INPUT. It
+// recomputes xxhash here rather than driving pkg/ring's router, so it pins
+// the formula (UnitForShardKey == xxhash(ring.ShardKey) & (N-1)), not the
+// ring's live partition routing (which v0.8 re-keys onto unit ids anyway).
+func TestUnitMap_HashesRingShardKeyWithXXHash(t *testing.T) {
 	c := storageunit.MustUnitCount(32)
 	for i := 0; i < 200; i++ {
 		key := []byte(fmt.Sprintf("{user%d}/payload/%d", i, i))

@@ -1,8 +1,11 @@
 // Package storageunit is the pure domain layer for shale's per-shard
-// lease-handoff storage model (see docs/per-shard-lease.md). It owns the
-// three-layer routing math: a key hashes to a SHARD (co-location), a shard
-// maps to a storage UNIT (physical database + lease), and the ring owns
-// units (not shards) to a NODE.
+// lease-handoff storage model (see the "Per-shard lease-handoff storage"
+// section in docs/SPEC.md). It owns the routing math: a key's shard key
+// hashes directly to a storage UNIT (unit = hash(ShardKey) & (N-1), the
+// physical database + lease unit), co-located keys (same shard key, same
+// hash) share a unit so a transaction stays in one engine, and the ring
+// owns units to NODES. The unit is the single routing + storage + lease
+// granularity; there is no separate coarse-partition layer.
 //
 // This package is deliberately I/O-free. It holds value types and pure
 // functions only; the one interface it declares (BackendFactory) is the
@@ -13,9 +16,9 @@
 //
 // Why a unit layer at all: slatedb is single-writer per database, so to get
 // concurrent writers you need more than one database. A unit IS one slatedb
-// (one object-store prefix) and IS the unit of ownership/lease. Many shards
-// live in one unit; the unit count N is a small fixed power of two so the
-// cluster can grow by DOUBLING (N -> 2N) where each unit cleanly bisects.
+// (one object-store prefix) and IS the unit of ownership/lease. The unit
+// count N is a small fixed power of two so the cluster can grow by DOUBLING
+// (N -> 2N) where each unit cleanly bisects into {K, K+N}.
 package storageunit
 
 import (

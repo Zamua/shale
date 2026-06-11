@@ -60,8 +60,22 @@ type BackendFactory interface {
 	CloseUnit(u UnitID) error
 
 	// CurrentEpoch reports the epoch at which this factory currently holds
-	// unit u open, and ok=false if the factory does not have u open. A new
-	// owner uses this against the prior owner's reported epoch to choose the
-	// fencing epoch (prior + 1). Pure query: no mount/unmount side effect.
+	// unit u open, and ok=false if the factory does not have u open. This is
+	// the LOCAL in-process view only; it is NOT the cross-node source of
+	// truth. The authoritative writer epoch for a unit lives in that unit's
+	// durable lease state (the slatedb manifest writer-epoch in object
+	// storage). A new owner acquiring a unit it has never held does not learn
+	// the prior owner's epoch from here (CurrentEpoch returns ok=false for an
+	// unmounted unit); instead OpenUnit reads the durable manifest epoch and
+	// fences above it. Pure query: no mount/unmount side effect.
 	CurrentEpoch(u UnitID) (e Epoch, ok bool)
+
+	// OpenUnits returns the set of units this factory currently has mounted,
+	// in ascending UnitID order. The anti-entropy reconcile diffs this
+	// against OwnedUnits(self, ...): units owned-but-not-mounted must be
+	// opened (acquire the lease), units mounted-but-not-owned must be closed
+	// (release it). Without this enumerator a node would have to track its
+	// own mounted set outside the factory. Pure query: no side effect; the
+	// returned slice is a copy the caller may retain.
+	OpenUnits() []UnitID
 }

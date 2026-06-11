@@ -1067,6 +1067,46 @@ Default `go test ./...` skips both layers (no cgo, no Docker), so the regular de
 
 ---
 
+## Per-shard lease-handoff storage (v0.8, PROPOSED)
+
+Status: PROPOSED, not yet shipped. Everything above describes the current per-node model; this section is the v0.8 design. Domain types have landed in `pkg/storageunit` (pure, no I/O); the wiring phases are listed in the Roadmap.
+
+### Why
+
+The per-node model (one slatedb per node, all the node's keys in one LSM) makes a rebalance COPY the moved keys: the owning engine reads each key's merged value and streams it over gRPC to the receiver, which writes it into its own LSM. The bytes are already durable in object storage, but they live as one node's LSM files that only that node's engine can interpret, so they cannot be re-pointed. v0.8 makes rebalance copy-free: data has a permanent home in object storage; scaling moves OWNERSHIP, not bytes.
+
+### Model
+
+The keyspace is partitioned into a FIXED, power-of-two count N of STORAGE UNITS. A unit is `hash(ShardKey(key)) & (N-1)` (the low log2(N) bits of the same xxhash the ring uses). Each unit is a self-contained slatedb database under its own object-store prefix.
+
+- **Co-location** is by ShardKey: co-located keys (a record and its versions) share a ShardKey tag, hence the same hash, hence the same unit, so a transaction stays inside one engine and CAS works. There is NO separate coarse-partition layer: the unit, derived directly from the shard-key hash, is the single routing + storage + lease granularity. This supersedes the per-node ring's 271-partition routing (in v0.8 the ring is re-keyed onto unit ids); co-location is achieved by hash tags, not by a shard->unit grouping.
+- **Ownership** is a LEASE. The ring assigns units to nodes (N units; N must comfortably exceed the max node count). A node MOUNTS the units it owns, ~N/nodes of them.
+- N is bounded ABOVE by per-engine memory (slatedb's memtable, default 64 MB, tunable to a few MB so many units fit a small node) and BELOW by the max node count. Pick N for the ceiling.
+
+### Two maps, opposite natures
+
+- **Data-location** (`unit -> object-store prefix`): STATIC. A unit's bytes have a permanent home; that permanence is what makes rebalance copy-free.
+- **Ownership** (`unit -> node`): DYNAMIC. The ring; changes on every membership event. Rebalance re-runs it and hands leases over.
+
+### Lease handoff (the single-writer reality)
+
+slatedb is single-writer per database (writer-epoch fencing: opening at a higher epoch fences the prior writer). That is why concurrent writers need separate databases, and it is also the lease primitive. Handoff of unit U from node A to B: B is assigned U; A flushes U's memtable, stops writing U, releases; B opens U at epoch+1 (fencing any stale A writer) and serves U. Object-store bytes never move. During the brief release-to-acquire window U is momentarily unavailable (route reads to A until B acquires, or fail-fast and retry, for that one unit). Rebalance is a lease handoff per unit whose owner changed; the anti-entropy reconcile generalizes (a node the ring says owns U but has not MOUNTED, mounts it). The cross-node epoch source of truth is the durable lease state (the slatedb manifest writer-epoch), not in-process state.
+
+### Resharding: grow by doubling, online, no downtime
+
+When N units across N nodes is maxed and you must grow, DOUBLE: N -> 2N. Because `hash mod 2N = (hash mod N) + N*(one more hash bit)`, every unit K bisects into EXACTLY units K and K+N by a single additional hash bit. No global re-partition. Online, per-unit: for a live unit K, background-create K and K+N and stream K's keys into them by the new bit (K keeps serving); near catch-up, a brief write-pause for K's keys only, atomically flip routing for K's key-space, retire K. March through all N units one at a time. The split copies one unit's data once (per-unit, parallelizable, bounded, online); the routing state added is tiny (a generation N->2N plus a per-unit cut-over flag). This buys online elastic growth without the dynamic range-catalog of range-based sharding, keeping hash's even distribution. Tradeoff vs range-based: doubling-only granularity and no per-range hotspot splitting (neither needed for hash-uniform keys).
+
+### Migration from per-node
+
+One-time, standalone op tool (additive, dry-run on a bucket copy first): read each node's single LSM and re-write every key into its destination unit's database. After it, the per-node dbs retire and units are the source of truth.
+
+### Constraints
+
+- Memtable memory dominates per-engine cost (slatedb default 64 MB, tunable). N engines per node = N x memtable, so shrink the memtable for many units. The small-memtable downside (more frequent SST flushes) only bites at high write volume.
+- Single-writer per unit is preserved end to end. Cross-unit transactions are unsupported; ShardKey co-location keeps a transaction inside one unit.
+
+---
+
 ## Roadmap
 
 - [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.
@@ -1107,7 +1147,13 @@ Default `go test ./...` skips both layers (no cgo, no Docker), so the regular de
   - [ ] R=1 path unchanged (raw values, no envelopes, no apply-if-newer, no lock)
   - [ ] `CommitCASApply` releases `casCommitMu` after the owner-local commit, before the fan-out: reordered fan-outs self-resolve via apply-if-newer, restoring "no lock held across the network"
   - [ ] Fixes the read-repair-clobbers-newer-write lost-update bug under `Quorum` / `All`; owner-local validation now sound under every read consistency
-- [ ] **v0.8** (proposed) - per-shard lease-handoff storage: copy-free rebalance + online doubling resharding. Replaces the per-node single-database model (one slatedb per node, rebalance copies keys) with a FIXED pile of self-contained storage-unit databases whose OWNERSHIP is a lease (the ring assigns units to nodes; handoff is close-on-old-owner / open-at-epoch+1-on-new-owner, zero bytes copied). Shard count (routing/co-location) decoupled from storage-unit count (physical/lease, bounded by per-engine memtable memory). Growth by doubling makes resharding an online per-unit bisect with no global re-partition. Full design + the implementation phases in [`per-shard-lease.md`](per-shard-lease.md).
+- [~] **v0.8** (in progress) - per-shard lease-handoff storage: copy-free rebalance + online doubling resharding. Replaces the per-node single-database model (one slatedb per node, rebalance copies keys) with a FIXED power-of-two count N of self-contained storage-unit databases whose OWNERSHIP is a lease (the ring is re-keyed onto unit ids; handoff is close-on-old-owner / open-at-epoch+1-on-new-owner, zero bytes copied). N is bounded by per-engine memtable memory; growth by doubling makes resharding an online per-unit bisect with no global re-partition. Full design in the "Per-shard lease-handoff storage" section above. Sub-tasks:
+  - [x] Storage-unit domain types (`pkg/storageunit`): UnitID + power-of-two UnitCount, the `hash(ShardKey) & (N-1)` unit map, the doubling bisect (ChildUnit/ChildUnits, exhaustively tested), Epoch + BackendFactory mount/lease seam, OwnedUnits derivation. Pure, no I/O.
+  - [ ] Multi-backend node: a backend FACTORY + a `unit -> backend` mount map replacing the single `Config.Backend`; the ring re-keyed onto unit ids; routing `key -> unit -> owner`.
+  - [ ] Lease-handoff rebalance: close-on-old / open-at-epoch+1-on-new, the handoff window, the anti-entropy reconcile (own-but-not-mounted -> mount).
+  - [ ] Doubling resharder: the online per-unit bisect + atomic cut-over + the generation / per-unit-cut-over routing state.
+  - [ ] Migration tool: per-node LSM -> per-unit LSMs (standalone, additive, dry-run on a copy).
+  - [ ] Memtable / cache tuning surface so operators size N against RAM.
 
 Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly, plus the CLI for daily ergonomics) and grow into v0.2+ when their workload demands it.
 

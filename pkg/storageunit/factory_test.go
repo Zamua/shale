@@ -3,6 +3,7 @@ package storageunit_test
 import (
 	"errors"
 	"fmt"
+	"slices"
 	"testing"
 
 	"github.com/Zamua/shale/pkg/backend"
@@ -59,6 +60,15 @@ func (f *fakeFactory) CurrentEpoch(u storageunit.UnitID) (storageunit.Epoch, boo
 	return e, ok
 }
 
+func (f *fakeFactory) OpenUnits() []storageunit.UnitID {
+	ids := make([]storageunit.UnitID, 0, len(f.open))
+	for u := range f.open {
+		ids = append(ids, u)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
 // Compile-time assertion: fakeFactory satisfies BackendFactory. If the
 // interface shape drifts, this fails to build.
 var _ storageunit.BackendFactory = (*fakeFactory)(nil)
@@ -75,6 +85,31 @@ func TestBackendFactory_OpenReturnsUsableBackend(t *testing.T) {
 	// The returned value really is a backend.Backend (use it).
 	if _, err := be.Get([]byte("k")); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("stub backend Get should be ErrNotFound, got %v", err)
+	}
+}
+
+// TestBackendFactory_OpenUnitsTracksMountedSet pins the enumerator the
+// anti-entropy reconcile diffs against OwnedUnits: OpenUnits returns exactly
+// the currently-mounted units, ascending, and CloseUnit removes one without
+// disturbing the rest.
+func TestBackendFactory_OpenUnitsTracksMountedSet(t *testing.T) {
+	f := newFakeFactory()
+	if got := f.OpenUnits(); len(got) != 0 {
+		t.Fatalf("fresh factory OpenUnits = %v, want empty", got)
+	}
+	for _, u := range []storageunit.UnitID{5, 1, 9} {
+		if _, err := f.OpenUnit(u, 1); err != nil {
+			t.Fatalf("OpenUnit(%d): %v", u, err)
+		}
+	}
+	if got, want := f.OpenUnits(), []storageunit.UnitID{1, 5, 9}; !slices.Equal(got, want) {
+		t.Fatalf("OpenUnits = %v, want %v (ascending mounted set)", got, want)
+	}
+	if err := f.CloseUnit(5); err != nil {
+		t.Fatalf("CloseUnit(5): %v", err)
+	}
+	if got, want := f.OpenUnits(), []storageunit.UnitID{1, 9}; !slices.Equal(got, want) {
+		t.Fatalf("OpenUnits after CloseUnit(5) = %v, want %v", got, want)
 	}
 }
 
