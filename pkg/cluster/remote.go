@@ -153,6 +153,15 @@ func (c *peerClient) ReshardControl(ctx context.Context, phase pb.ReshardPhase, 
 	return c.api.ReshardControl(ctx, &pb.ReshardControlRequest{Phase: phase, TargetGen: targetGen})
 }
 
+// GenState asks a seed for its live {generation, unit-count}. A JOINER calls
+// it exactly once during Open (before mounting any unit) to learn the
+// cluster's live generation, so it never routes / owns a key at gen 0 after
+// the cluster has resharded. Cluster-internal: only a multi-backend Open WITH
+// seeds calls it; never from outside the cluster.
+func (c *peerClient) GenState(ctx context.Context) (*pb.GenStateResponse, error) {
+	return c.api.GenState(ctx, &pb.GenStateRequest{})
+}
+
 // txRoutedGet performs the normal single-key routed Get the CAS read-set
 // records against. It reuses Cluster.Get so a read inside a transaction
 // sees exactly what a standalone Get would (same local/remote routing,

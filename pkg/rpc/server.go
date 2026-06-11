@@ -270,6 +270,20 @@ func (s *Server) ReshardControl(_ context.Context, req *pb.ReshardControlRequest
 	return &pb.ReshardControlResponse{}, nil
 }
 
+// GenState is the cluster-internal generation-propagation RPC for the v0.8
+// join-after-reshard fix. A node opening in multi-backend mode WITH seeds (a
+// JOINER) calls this on a live seed exactly once during Open - before it
+// mounts any unit - to learn the cluster's live {generation, unit-count} and
+// seed its own routing state from it (so it never routes / owns a key at gen 0
+// after the cluster has resharded). The handler delegates to the cluster's
+// snapshot accessor; the live value is coherent because a join only ever lands
+// at a stable generation (a membership change mid-reshard ABORTS the reshard).
+// Never called from outside the cluster.
+func (s *Server) GenState(_ context.Context, _ *pb.GenStateRequest) (*pb.GenStateResponse, error) {
+	gen, count := s.c.GenStateSnapshot()
+	return &pb.GenStateResponse{Generation: gen, UnitCount: count}, nil
+}
+
 // -- Cluster RPCs ----------------------------------------------------
 
 // Topology returns this node's current view of cluster membership.

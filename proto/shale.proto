@@ -131,6 +131,23 @@ service ShaleNode {
   // the cluster (CLI callers use Reshard via the cluster surface, not this
   // wire method directly).
   rpc ReshardControl(ReshardControlRequest) returns (ReshardControlResponse);
+
+  // GenState is the cluster-internal generation-propagation RPC for the
+  // v0.8 join-after-reshard fix. A node opening in multi-backend mode WITH
+  // seeds (a JOINER, not the founder) calls this on a live seed exactly once
+  // during Open - BEFORE it derives or mounts any unit - to learn the
+  // cluster's live {generation, unit-count}, then seeds its own routing state
+  // from the answer. Without this a fresh joiner starts at generation 0 and,
+  // after the cluster has resharded, routes / owns keys at the WRONG
+  // generation (orphaning acked writes: "forwarding loop refused: this node
+  // does not own the key"). The responder returns its current genSnapshot()
+  // {gen, count}. Because a membership change mid-reshard ABORTS the reshard,
+  // a join only ever lands at a STABLE generation, so the answer is a single
+  // coherent value (no mid-cutover straddle to reason about). Direct peer RPC,
+  // NOT gossip: a joiner needs a definite generation before it can serve, a
+  // guarantee an eventually-consistent broadcast cannot give. Never called
+  // from outside the cluster.
+  rpc GenState(GenStateRequest) returns (GenStateResponse);
 }
 
 // The `forwarded` flag on each per-key op is the cluster-internal
@@ -451,4 +468,21 @@ message ReshardControlRequest {
 // treats as an ABORT trigger.
 message ReshardControlResponse {
   string error = 1;
+}
+
+// -- GenState --------------------------------------------------------
+
+// GenStateRequest carries no parameters: the joiner just asks the seed for
+// its current generation state. The seed answers from its own genSnapshot().
+message GenStateRequest {}
+
+// GenStateResponse carries the responder's live {generation, unit-count}.
+// The joiner commits genState{gen: generation, count: unit_count, cutOver
+// empty} before mounting any unit. unit_count is carried explicitly (rather
+// than re-derived from the joiner's configured UnitCount doubled `generation`
+// times) so the contract is unambiguous and a future non-doubling resize
+// cannot silently desync the count from the generation.
+message GenStateResponse {
+  uint64 generation = 1;
+  uint32 unit_count = 2;
 }

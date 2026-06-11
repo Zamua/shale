@@ -51,6 +51,7 @@ const (
 	ShaleNode_CommitCAS_FullMethodName        = "/shale.v1.ShaleNode/CommitCAS"
 	ShaleNode_ApplyBatch_FullMethodName       = "/shale.v1.ShaleNode/ApplyBatch"
 	ShaleNode_ReshardControl_FullMethodName   = "/shale.v1.ShaleNode/ReshardControl"
+	ShaleNode_GenState_FullMethodName         = "/shale.v1.ShaleNode/GenState"
 )
 
 // ShaleNodeClient is the client API for ShaleNode service.
@@ -154,6 +155,22 @@ type ShaleNodeClient interface {
 	// the cluster (CLI callers use Reshard via the cluster surface, not this
 	// wire method directly).
 	ReshardControl(ctx context.Context, in *ReshardControlRequest, opts ...grpc.CallOption) (*ReshardControlResponse, error)
+	// GenState is the cluster-internal generation-propagation RPC for the
+	// v0.8 join-after-reshard fix. A node opening in multi-backend mode WITH
+	// seeds (a JOINER, not the founder) calls this on a live seed exactly once
+	// during Open - BEFORE it derives or mounts any unit - to learn the
+	// cluster's live {generation, unit-count}, then seeds its own routing state
+	// from the answer. Without this a fresh joiner starts at generation 0 and,
+	// after the cluster has resharded, routes / owns keys at the WRONG
+	// generation (orphaning acked writes: "forwarding loop refused: this node
+	// does not own the key"). The responder returns its current genSnapshot()
+	// {gen, count}. Because a membership change mid-reshard ABORTS the reshard,
+	// a join only ever lands at a STABLE generation, so the answer is a single
+	// coherent value (no mid-cutover straddle to reason about). Direct peer RPC,
+	// NOT gossip: a joiner needs a definite generation before it can serve, a
+	// guarantee an eventually-consistent broadcast cannot give. Never called
+	// from outside the cluster.
+	GenState(ctx context.Context, in *GenStateRequest, opts ...grpc.CallOption) (*GenStateResponse, error)
 }
 
 type shaleNodeClient struct {
@@ -321,6 +338,16 @@ func (c *shaleNodeClient) ReshardControl(ctx context.Context, in *ReshardControl
 	return out, nil
 }
 
+func (c *shaleNodeClient) GenState(ctx context.Context, in *GenStateRequest, opts ...grpc.CallOption) (*GenStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GenStateResponse)
+	err := c.cc.Invoke(ctx, ShaleNode_GenState_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ShaleNodeServer is the server API for ShaleNode service.
 // All implementations must embed UnimplementedShaleNodeServer
 // for forward compatibility.
@@ -422,6 +449,22 @@ type ShaleNodeServer interface {
 	// the cluster (CLI callers use Reshard via the cluster surface, not this
 	// wire method directly).
 	ReshardControl(context.Context, *ReshardControlRequest) (*ReshardControlResponse, error)
+	// GenState is the cluster-internal generation-propagation RPC for the
+	// v0.8 join-after-reshard fix. A node opening in multi-backend mode WITH
+	// seeds (a JOINER, not the founder) calls this on a live seed exactly once
+	// during Open - BEFORE it derives or mounts any unit - to learn the
+	// cluster's live {generation, unit-count}, then seeds its own routing state
+	// from the answer. Without this a fresh joiner starts at generation 0 and,
+	// after the cluster has resharded, routes / owns keys at the WRONG
+	// generation (orphaning acked writes: "forwarding loop refused: this node
+	// does not own the key"). The responder returns its current genSnapshot()
+	// {gen, count}. Because a membership change mid-reshard ABORTS the reshard,
+	// a join only ever lands at a STABLE generation, so the answer is a single
+	// coherent value (no mid-cutover straddle to reason about). Direct peer RPC,
+	// NOT gossip: a joiner needs a definite generation before it can serve, a
+	// guarantee an eventually-consistent broadcast cannot give. Never called
+	// from outside the cluster.
+	GenState(context.Context, *GenStateRequest) (*GenStateResponse, error)
 	mustEmbedUnimplementedShaleNodeServer()
 }
 
@@ -470,6 +513,9 @@ func (UnimplementedShaleNodeServer) ApplyBatch(context.Context, *ApplyBatchReque
 }
 func (UnimplementedShaleNodeServer) ReshardControl(context.Context, *ReshardControlRequest) (*ReshardControlResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReshardControl not implemented")
+}
+func (UnimplementedShaleNodeServer) GenState(context.Context, *GenStateRequest) (*GenStateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GenState not implemented")
 }
 func (UnimplementedShaleNodeServer) mustEmbedUnimplementedShaleNodeServer() {}
 func (UnimplementedShaleNodeServer) testEmbeddedByValue()                   {}
@@ -705,6 +751,24 @@ func _ShaleNode_ReshardControl_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ShaleNode_GenState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GenStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShaleNodeServer).GenState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ShaleNode_GenState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShaleNodeServer).GenState(ctx, req.(*GenStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ShaleNode_ServiceDesc is the grpc.ServiceDesc for ShaleNode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -751,6 +815,10 @@ var ShaleNode_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReshardControl",
 			Handler:    _ShaleNode_ReshardControl_Handler,
+		},
+		{
+			MethodName: "GenState",
+			Handler:    _ShaleNode_GenState_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

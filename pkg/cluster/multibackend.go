@@ -173,6 +173,22 @@ func (c *Cluster) initMultiBackend() error {
 		c.genOwner = c.genUnitOwner
 	}
 	c.initGenState()
+
+	// Generation propagation (join-after-reshard fix): a JOINER (multi-backend
+	// Open WITH seeds) must learn the cluster's LIVE {generation, unit-count}
+	// BEFORE it derives or mounts any unit below, or it routes / owns keys at
+	// gen 0 and orphans acked writes after the cluster has resharded. Query a
+	// seed and commit the live generation here, ahead of the mount loop, so
+	// there is NO window in which this node serves at gen 0. The founder /
+	// single-node / legacy paths have no seeds and keep initGenState's gen-0
+	// default. Fail closed: a seed that cannot be reached fails Open rather
+	// than leaving the joiner at the wrong generation.
+	if len(c.cfg.Seeds) > 0 {
+		if err := c.learnGenerationFromSeed(); err != nil {
+			return err
+		}
+	}
+
 	c.mountMap = make(map[storageunit.GenUnit]backend.Backend)
 
 	for _, gu := range c.desiredGenUnits() {
