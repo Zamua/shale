@@ -275,6 +275,39 @@ func (c *Cluster) casReadPayload(tx backend.Transaction, key []byte, replicated 
 	return env.Payload, true, nil
 }
 
+// commitRetryable reports whether a CommitCAS error is a TRANSIENT
+// reshard-window signal that Transact should ride out by re-running fn
+// (re-resolving the owner from the live ring each attempt), rather than a
+// terminal failure. Two gRPC status codes qualify:
+//
+//   - codes.Unavailable: the cluster-wide write-freeze window, or the pin
+//     unit's lease mid-handoff. The owner refuses the commit retryably.
+//   - codes.FailedPrecondition: a forwarded CommitCAS reached the node that
+//     just lost ownership of pin_key across the reshard FLIP/redistribution
+//     cutover. The owner refuses WITHOUT applying ("re-pin against the current
+//     ring", the ring-refresh loop-guard). The next attempt re-resolves the
+//     owner and lands on the new one. This is the SAME retryable window the
+//     SPEC's read path already retries across the staggered-generation FLIP
+//     (docs/SPEC.md "READ AVAILABILITY ... retryable across FLIP"); the write
+//     path must match it so a Transact spanning a reshard commits exactly once
+//     at the new generation instead of surfacing the bare re-pin error.
+//
+// A genuine cross-shard guard violation is NOT a FailedPrecondition here: it
+// fires inside fn as backend.ErrCrossShard and aborts before any commit, so it
+// never reaches this classifier.
+func commitRetryable(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch st.Code() {
+	case codes.Unavailable, codes.FailedPrecondition:
+		return true
+	default:
+		return false
+	}
+}
+
 // bytesEqual reports byte-for-byte equality, treating nil and empty as
 // equal (a read-check's expected value and the backend's stored value can
 // each be either). Same semantics as bytes.Equal.
@@ -313,13 +346,23 @@ func bytesEqual(a, b []byte) bool {
 // passing the natural anchor key (e.g. the counter the transaction
 // updates) is the convention.
 //
-// A commit that fails with the RETRYABLE codes.Unavailable (the cluster is
-// briefly write-frozen for a reshard, or the pin unit's lease is mid-handoff)
-// is NOT a conflict and NOT a hard failure: Transact re-runs fn after a
-// randomized backoff WITHOUT consuming the conflict budget, up to
-// transactUnavailableTimeout, so a brief freeze is transparent to the caller.
-// Past that deadline the Unavailable surfaces as-is (still a retryable status
-// the caller may handle).
+// A commit that fails with a RETRYABLE status is NOT a conflict and NOT a hard
+// failure: Transact re-runs fn after a randomized backoff WITHOUT consuming the
+// conflict budget, up to transactUnavailableTimeout, so a brief reshard window
+// is transparent to the caller. Two status codes are retryable here (see
+// commitRetryable + docs/SPEC.md "The retry closure"):
+//   - codes.Unavailable: the cluster is briefly write-frozen for a reshard, or
+//     the pin unit's lease is mid-handoff.
+//   - codes.FailedPrecondition: a forwarded CommitCAS landed on the node that
+//     JUST lost ownership of pinKey across the FLIP/redistribution cutover; the
+//     owner refuses with the "re-pin against the current ring" loop-guard. Since
+//     commitCAS re-resolves the owner from the LIVE ring on every attempt, the
+//     re-run lands on the NEW owner and commits. A genuine cross-shard violation
+//     does NOT reach here: it fires inside fn as backend.ErrCrossShard and aborts
+//     immediately, before any commit.
+//
+// Past transactUnavailableTimeout either code surfaces as-is (still a retryable
+// status the caller may handle).
 func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error) error {
 	if c.notReady() {
 		return backend.ErrClosed
@@ -343,12 +386,14 @@ func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error)
 		if err == nil {
 			return nil
 		}
-		// A retryable Unavailable (freeze / handoff window) is transient:
-		// back off and re-run fn from scratch without spending a conflict
-		// attempt, until the deadline. This makes a reshard freeze invisible
-		// to Transact callers (the commit's gRPC status survives the wire per
-		// the CAS server's status-preserving path).
-		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+		// A retryable commit status (freeze / handoff Unavailable, or the
+		// reshard-cutover re-pin FailedPrecondition) is transient: back off and
+		// re-run fn from scratch without spending a conflict attempt, until the
+		// deadline. This makes a reshard barrier invisible to Transact callers -
+		// the commit re-resolves the owner from the live ring each attempt, so a
+		// re-run after a cutover lands on the new owner (the commit's gRPC status
+		// survives the wire per the CAS server's status-preserving path).
+		if commitRetryable(err) {
 			if time.Now().After(unavailableDeadline) {
 				return err
 			}
