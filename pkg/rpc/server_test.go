@@ -9,10 +9,12 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/memfactory"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rpc"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -475,5 +477,99 @@ func assertNotUnimplemented(t *testing.T, op string, err error) {
 	}
 	if st.Code() == codes.Unimplemented {
 		t.Fatalf("%s: handler still Unimplemented (v0.3 Core not wired): %v", op, err)
+	}
+}
+
+// newMultiBackendServer spins up an rpc.Server over a MULTI-BACKEND cluster
+// (single node, owns the whole unit space) so a test can freeze it for a
+// cluster-wide reshard and exercise the freeze-window wire behavior. Returns the
+// dial address, the cluster (so the test can drive ApplyReshardPhase), and a
+// cleanup func.
+func newMultiBackendServer(t *testing.T) (addr string, c *cluster.Cluster, cleanup func()) {
+	t.Helper()
+	c, err := cluster.Open(cluster.Config{
+		NodeID:         "mb-node",
+		BackendFactory: memfactory.New(),
+		UnitCount:      storageunit.MustUnitCount(4),
+	})
+	if err != nil {
+		t.Fatalf("cluster.Open (multi): %v", err)
+	}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("net.Listen: %v", err)
+	}
+	g := grpc.NewServer()
+	rpc.NewServer(c).Register(g)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = g.Serve(lis)
+	}()
+	return lis.Addr().String(), c, func() {
+		g.GracefulStop()
+		<-done
+		_ = c.Close()
+	}
+}
+
+// TestCommitCAS_FrozenIsRetryableUnavailableOverWire is the P2-A regression: a
+// CAS commit against a FROZEN multi-backend owner must reach the client as a
+// gRPC status with codes.Unavailable (the retryable freeze-window code), NOT a
+// flattened response-error string that the client would wrap as codes.Unknown.
+// Without preserving the status across CommitCAS, a client classifying frozen
+// writes as retryable would treat a frozen remote CAS commit as a hard failure.
+func TestCommitCAS_FrozenIsRetryableUnavailableOverWire(t *testing.T) {
+	addr, c, cleanup := newMultiBackendServer(t)
+	defer cleanup()
+	cli := newTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Freeze the node for a cluster-wide reshard toward gen 1.
+	if err := c.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FREEZE, 1); err != nil {
+		t.Fatalf("freeze: %v", err)
+	}
+
+	// A CAS commit while frozen: the write path refuses with errWriteFrozen
+	// (codes.Unavailable). It must arrive as a gRPC status error, NOT a typed
+	// response field, so the client can classify it retryable.
+	_, err := cli.CommitCAS(ctx, &pb.CommitCASRequest{
+		PinKey: []byte("k"),
+		Reads:  []*pb.ReadCheck{{Key: []byte("k"), ExpectAbsent: true}},
+		Writes: []*pb.WriteOp{{Key: []byte("k"), Value: []byte("v1")}},
+	})
+	if err == nil {
+		t.Fatal("P2-A VIOLATED: frozen CommitCAS returned no error; want a retryable Unavailable status")
+	}
+	st, ok := status.FromError(err)
+	if !ok {
+		t.Fatalf("P2-A VIOLATED: frozen CommitCAS error is not a gRPC status: %v", err)
+	}
+	if st.Code() != codes.Unavailable {
+		t.Fatalf("P2-A VIOLATED: frozen CommitCAS code = %v, want codes.Unavailable (retryable freeze window)", st.Code())
+	}
+
+	// Unfreeze (RESUME) and confirm the same commit now succeeds at the new gen.
+	if err := c.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_BISECT, 1); err != nil {
+		t.Fatalf("bisect: %v", err)
+	}
+	if err := c.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FLIP, 1); err != nil {
+		t.Fatalf("flip: %v", err)
+	}
+	if err := c.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_RESUME, 1); err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	resp, err := cli.CommitCAS(ctx, &pb.CommitCASRequest{
+		PinKey: []byte("k"),
+		Reads:  []*pb.ReadCheck{{Key: []byte("k"), ExpectAbsent: true}},
+		Writes: []*pb.WriteOp{{Key: []byte("k"), Value: []byte("v1")}},
+	})
+	if err != nil {
+		t.Fatalf("CommitCAS after RESUME: %v", err)
+	}
+	if !resp.GetCommitted() {
+		t.Fatalf("CommitCAS after RESUME: want committed, got %+v", resp)
 	}
 }

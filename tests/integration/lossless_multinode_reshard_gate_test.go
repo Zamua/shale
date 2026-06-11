@@ -46,9 +46,14 @@ package integration
 //     unit and is served by ONE owner node after the bisect (a co-located set is
 //     never split), because the whole set shares one ShardHash and one ShardHash
 //     bisects to exactly one child.
-//  4. READS AVAILABLE DURING THE FREEZE. A read issued while the cluster is
-//     frozen mid-reshard succeeds, served from the live gen-g units; writes are
-//     refused with the retryable error during the freeze, and resume after.
+//  4. READS AVAILABLE (strict during FREEZE/BISECT, retryable across FLIP). A
+//     read issued while the cluster is frozen mid-reshard succeeds STRICTLY
+//     (no retry), served from the live gen-g units. Across the staggered FLIP
+//     window generations differ across nodes, so a read may briefly hit the
+//     retryable acquiring-window / ring-refresh error; a reader running through
+//     the WHOLE reshard with the standard retry must always eventually read the
+//     correct value (retryable-available, never lost). Writes are refused with
+//     the retryable error during the freeze and resume after.
 //  5. BREAK DEMONSTRATION (TestMultiNodeReshardGateCatchesLostWrite, below). A
 //     deliberately broken barrier - one node SKIPS the freeze, so a write slips
 //     through at gen g into a gen-g unit that is then retired by FLIP without
@@ -281,6 +286,39 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 		}
 	}()
 
+	// === Step 4b (req 3, the FLIP-window read model): RETRYABLE-AVAILABLE ACROSS
+	// THE WHOLE RESHARD. Reads are STRICTLY served during FREEZE/BISECT but only
+	// RETRYABLE-available across the staggered FLIP window (a peer-at-g forwards a
+	// read to a node-at-g+1 that may briefly return the retryable acquiring-window
+	// error or the ring-refresh loop-guard). So a reader running through the whole
+	// reshard must, WITH the standard retry, always eventually read the correct
+	// value - never a permanent failure, never a wrong value. We rotate the entry
+	// node so the read routes both locally and forwarded. A read that fails even
+	// after the retry budget, or returns a wrong value, is a violation. ===
+	var flipReadViolation atomic.Value // stores a string describing the first violation
+	readWg.Add(1)
+	go func() {
+		defer readWg.Done()
+		i := 0
+		for !stop.Load() {
+			entry := nodes[i%len(nodes)]
+			// getWithRetryUnavailable retries codes.Unavailable; the brief
+			// ring-refresh FailedPrecondition window self-heals as the ring
+			// re-keys, so a generous timeout rides out both.
+			got, err := getWithRetryUnavailable(t, entry.Cluster, freezeProbeKey, 8*time.Second)
+			if err != nil {
+				flipReadViolation.CompareAndSwap(nil, fmt.Sprintf("read of %q via %s failed across the reshard even with retry: %v", freezeProbeKey, entry.ID, err))
+				return
+			}
+			if !bytes.Equal(got, freezeProbeVal) {
+				flipReadViolation.CompareAndSwap(nil, fmt.Sprintf("read of %q via %s returned %q, want %q (wrong value mid-reshard)", freezeProbeKey, entry.ID, got, freezeProbeVal))
+				return
+			}
+			i++
+			time.Sleep(2 * time.Millisecond)
+		}
+	}()
+
 	// === Step 3: trigger the coordinated multi-node reshard on n1 (coordinator).
 	// It drives FREEZE -> BISECT -> FLIP -> RESUME across all three nodes. ===
 	if err := n1.Cluster.Reshard(); err != nil {
@@ -318,6 +356,14 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	}
 	if !readOKWhileFrozen.Load() {
 		t.Fatal("READ-AVAILABILITY VIOLATED: no read succeeded while the cluster was frozen; reads must continue under the freeze, served from the live gen-g units")
+	}
+
+	// === ASSERTION (req 3, the FLIP-window read model): a reader running across
+	// the WHOLE reshard, WITH the standard Unavailable-retry, never hit a
+	// permanent failure or a wrong value. Reads are strict during FREEZE/BISECT
+	// and retryable-available across the staggered FLIP window - never lost. ===
+	if v := flipReadViolation.Load(); v != nil {
+		t.Fatalf("FLIP-WINDOW READ-AVAILABILITY VIOLATED: %s (reads must be retryable-available across the whole reshard)", v.(string))
 	}
 
 	// === ASSERTION (req 1, THE ORACLE): EVERY baseline key AND every acked probe

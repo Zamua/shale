@@ -91,8 +91,21 @@ func (c *Cluster) runReconcile() {
 	// desired and RELEASE). Skip the reconcile until RESUME / ABORT unfreezes;
 	// RESUME then bumps the ring generation, which schedules a fresh reconcile
 	// that does the post-flip redistribution against the advanced generation.
+	//
+	// STALE-FREEZE SELF-HEAL: first try to clear a freeze that is STRANDED - a
+	// node that FLIPPED to its target generation but never got RESUME (a dropped
+	// RESUME RPC) would otherwise reject every write forever. clearStaleFreeze
+	// only clears a freeze the node has already flipped past AND that has aged
+	// beyond the coordinator's RESUME retry budget, so it never races a normal
+	// in-flight reshard. When it clears one, do the ring re-key the missed RESUME
+	// would have done (bumpRingGen) and fall through to the post-flip reconcile.
 	if c.isFrozen() {
-		return
+		if !c.clearStaleFreeze() {
+			return
+		}
+		if c.ring != nil {
+			c.bumpRingGen()
+		}
 	}
 	c.reconcileMu.Lock()
 	defer c.reconcileMu.Unlock()

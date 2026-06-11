@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // casReplicated reports whether this cluster stores CAS write-sets as LWW
@@ -34,6 +36,14 @@ var CASMaxAttempts = 10
 // contending clients all re-reading + re-committing in lockstep). var so
 // tests can zero it for speed.
 var casBaseBackoff = 2 * time.Millisecond
+
+// transactUnavailableTimeout bounds how long Transact keeps re-running its
+// closure through a retryable codes.Unavailable commit (the cluster is briefly
+// write-frozen for a reshard, or the pin unit's lease is mid-handoff) before
+// surfacing the Unavailable to the caller. Generous enough to ride out a
+// cluster-wide freeze (bounded by the reshard's per-phase timeout). var so
+// tests can shrink it.
+var transactUnavailableTimeout = 30 * time.Second
 
 // CommitCASApply is the owner-side validate-and-apply: the heart of the
 // CAS protocol. It runs fully synchronously and owner-local, against a
@@ -302,11 +312,20 @@ func bytesEqual(a, b []byte) bool {
 // against. The first tx.Get / tx.Put would pin the same shard anyway, so
 // passing the natural anchor key (e.g. the counter the transaction
 // updates) is the convention.
+//
+// A commit that fails with the RETRYABLE codes.Unavailable (the cluster is
+// briefly write-frozen for a reshard, or the pin unit's lease is mid-handoff)
+// is NOT a conflict and NOT a hard failure: Transact re-runs fn after a
+// randomized backoff WITHOUT consuming the conflict budget, up to
+// transactUnavailableTimeout, so a brief freeze is transparent to the caller.
+// Past that deadline the Unavailable surfaces as-is (still a retryable status
+// the caller may handle).
 func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error) error {
 	if c.notReady() {
 		return backend.ErrClosed
 	}
 	var conflicted bool
+	unavailableDeadline := time.Now().Add(transactUnavailableTimeout)
 	for attempt := 0; attempt < CASMaxAttempts; attempt++ {
 		tx := c.newCASTx(backend.SnapshotIsolation)
 		tx.pin(pinKey)
@@ -323,6 +342,22 @@ func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error)
 		err = tx.Commit()
 		if err == nil {
 			return nil
+		}
+		// A retryable Unavailable (freeze / handoff window) is transient:
+		// back off and re-run fn from scratch without spending a conflict
+		// attempt, until the deadline. This makes a reshard freeze invisible
+		// to Transact callers (the commit's gRPC status survives the wire per
+		// the CAS server's status-preserving path).
+		if st, ok := status.FromError(err); ok && st.Code() == codes.Unavailable {
+			if time.Now().After(unavailableDeadline) {
+				return err
+			}
+			if casBaseBackoff > 0 {
+				jitter := time.Duration(rand.Int63n(int64(casBaseBackoff) + 1))
+				time.Sleep(casBaseBackoff + jitter)
+			}
+			attempt-- // do not consume the conflict budget for a transient freeze
+			continue
 		}
 		if !errors.Is(err, backend.ErrCASConflict) {
 			return err

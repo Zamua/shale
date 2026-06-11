@@ -346,6 +346,13 @@ type Cluster struct {
 	freezeMu        sync.Mutex
 	frozen          bool
 	freezeTargetGen storageunit.Generation
+	// frozenAt records when this node most recently ENTERED the freeze (the
+	// false->true edge in reshardFreeze). The self-heal loop uses it to age out a
+	// STALE freeze: a node that FLIPPED to the target generation but never got
+	// RESUME (a dropped RESUME RPC) would otherwise reject every write forever, so
+	// once it has been frozen-past-its-flip longer than staleFreezeGrace the
+	// self-heal clears the freeze. Zero in legacy mode.
+	frozenAt time.Time
 
 	// reconcileMu serializes the Phase 3 lease-handoff reconcile
 	// (multibackend_rebalance.go): at most one reconcile mutates the mount

@@ -60,6 +60,19 @@ func (s *Server) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*pb.C
 	case res.Conflict:
 		resp.Conflict = true
 	case res.Err != nil:
+		// A commit error that carries a gRPC status (the freeze-window /
+		// acquiring-window retryable codes.Unavailable, the migration-guard
+		// codes.ResourceExhausted) must reach the client AS a gRPC status error
+		// so status.Code() classifies it - exactly the convention ApplyBatch
+		// uses for its migration-guard rejection. Flattening it to resp.Error
+		// would erase the code: the client would wrap the string with
+		// status.Code()==Unknown, and a caller classifying a frozen CAS commit
+		// as retryable would mis-read it as a hard failure. A plain backend
+		// failure (no status) still travels as the response error string (the
+		// wire convention for an unexpected apply error -> the owner rolled back).
+		if _, ok := status.FromError(res.Err); ok {
+			return nil, res.Err
+		}
 		resp.Error = res.Err.Error()
 	default:
 		resp.Committed = true
