@@ -69,7 +69,6 @@ func startSharedNode(t *testing.T, id, seedAddr string, unitCount int, backing *
 	t.Helper()
 
 	h := backing.Handle()
-	bindAddr := hostPort(freePort(t))
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -83,7 +82,6 @@ func startSharedNode(t *testing.T, id, seedAddr string, unitCount int, backing *
 		NodeID:               id,
 		BackendFactory:       h,
 		UnitCount:            storageunit.MustUnitCount(unitCount),
-		BindAddr:             bindAddr,
 		GRPCAddr:             grpcAddr,
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 300 * time.Millisecond,
@@ -92,11 +90,10 @@ func startSharedNode(t *testing.T, id, seedAddr string, unitCount int, backing *
 		cfg.Seeds = []string{seedAddr}
 	}
 
-	c, err := cluster.Open(cfg)
-	if err != nil {
-		_ = lis.Close()
-		t.Fatalf("startSharedNode %s: cluster.Open: %v", id, err)
-	}
+	// openClusterRetryBind sets cfg.BindAddr (re-rolling a fresh port and
+	// retrying if memberlist hits the release-rebind port race) and returns
+	// the address actually bound, which the node advertises as its seed.
+	c, bindAddr := openClusterRetryBind(t, cfg)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
