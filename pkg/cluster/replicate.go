@@ -567,13 +567,15 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 		return backend.ErrClosed
 	}
 	if c.multi {
-		// Multi-backend mode (R=1, no rebalance): apply against the key's
-		// mounted unit. The caller's OwnsKey guard already confirmed this
-		// node owns the unit, so a missing mount is the unit-not-mounted
-		// refusal, not a re-forward.
+		// Multi-backend mode (R=1): apply against the key's mounted unit.
+		// The caller's OwnsKey guard already confirmed this node owns the
+		// unit, so a missing mount means the unit's lease is HANDING OFF to
+		// this node (Phase 3 window): return the retryable acquiring-window
+		// error so the forwarder retries once the reconcile has acquired,
+		// rather than re-forwarding or losing the write.
 		b, ok := c.localBackendForKey(key)
 		if !ok {
-			return errUnitNotMounted("Put")
+			return errUnitAcquiring("Put")
 		}
 		return b.Put(key, bytesToWrite)
 	}
@@ -597,9 +599,11 @@ func (c *Cluster) LocalReplicaDelete(key []byte) error {
 		return backend.ErrClosed
 	}
 	if c.multi {
+		// Owner-but-unmounted: handoff landing on us. Retryable
+		// acquiring-window error (never lose the forwarded delete).
 		b, ok := c.localBackendForKey(key)
 		if !ok {
-			return errUnitNotMounted("Delete")
+			return errUnitAcquiring("Delete")
 		}
 		return b.Delete(key)
 	}
@@ -617,13 +621,17 @@ func (c *Cluster) LocalReplicaDelete(key []byte) error {
 //
 // At R=1, OwnsReplica == OwnsKey (LocateKeyN with n=1 == LocateKey).
 //
-// In multi-backend mode (v0.8 Phase 2, R=1) "replica" collapses to the
-// single unit owner, so the guard is the unit-mount check OwnsKey uses:
-// the forwarded Put / Delete handler refuses an op for a unit this node
-// does not hold.
+// In multi-backend mode (v0.8 Phase 3, R=1) "replica" collapses to the
+// single unit owner, so the guard is the unit-RING-ownership check OwnsKey
+// uses (NOT the mount): a forwarded Put / Delete that lands on the ring
+// owner of the key's unit passes even during the handoff window before the
+// unit is mounted, so the local apply path can return the retryable
+// acquiring-window error instead of the originator looping on a
+// refresh-ring refusal. See OwnsKey for the full rationale.
 func (c *Cluster) OwnsReplica(key []byte) bool {
 	if c.multi {
-		return c.ownsUnitForKey(key)
+		_, isLocal := c.unitOwnerOf(key)
+		return isLocal
 	}
 	return c.ownsAsReplica(key)
 }

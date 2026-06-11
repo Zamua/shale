@@ -1,4 +1,4 @@
-// Multi-backend node (v0.8 Phase 2, static routing).
+// Multi-backend node (v0.8): mount-map plumbing + per-unit routing.
 //
 // This file holds the multi-backend MODE of the cluster: instead of one
 // Config.Backend per node, the node mounts a SET of per-unit backends and
@@ -9,22 +9,15 @@
 // (c.multi == false) NOTHING here runs and the legacy path is byte-for-
 // byte unchanged.
 //
-// Static topology (Phase 2 scope): the set of units a node owns is fixed
-// at Open. Membership changes mid-run are NOT acted on - no mount/unmount,
-// no lease handoff. If a unit's ring owner moves after Open this node may
-// keep serving (or refusing) it per the Open-time map; that staleness is
-// accepted here and fixed by the Phase 3 lease handoff, exactly as v0.2
-// served stale routing before v0.3 added rebalance.
-//
-// TODO(phase3): epoch fencing + lease handoff. OpenUnit is called at a
-// FIXED epoch here (epochAtOpen); the real per-unit writer-epoch handoff
-// (close-on-old-owner / open-at-epoch+1-on-new-owner) is a Phase 3
-// concern. Do not grow durable epoch logic in this file.
-//
-// TODO(phase3): rebalance / anti-entropy reconcile. The membership events
-// loop does not mount or unmount units in this mode (rebalance is not even
-// initialized). Phase 3 adds the own-but-not-mounted -> OpenUnit /
-// mounted-but-not-owned -> CloseUnit reconcile.
+// Initial mount happens at Open (initMultiBackend, below). Membership
+// changes mid-run are acted on by the Phase 3 lease-handoff RECONCILE in
+// multibackend_rebalance.go: a unit whose owner moved is released by the
+// old owner (CloseUnit, flush) and acquired by the new owner (OpenUnit at a
+// strictly higher epoch, fencing the old) - copy-free, the bytes stay in
+// shared object storage. That reconcile is wired through bumpRingGen ->
+// scheduleReconcile (multi branch). THIS file is the mount-map plumbing +
+// routing; the handoff / fencing / reconcile logic lives next door in
+// multibackend_rebalance.go.
 
 package cluster
 
@@ -35,8 +28,6 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // notReady reports whether the cluster cannot serve an op: it is closed,
@@ -56,22 +47,12 @@ func (c *Cluster) notReady() bool {
 	return c.backend == nil
 }
 
-// errUnitNotMounted is the multi-backend unit-based owner-guard refusal:
-// an op routed to this node whose unit this node does not have mounted is
-// rejected, NOT re-forwarded (re-forwarding could loop on a diverged
-// view). FailedPrecondition matches the legacy forwarding loop-guard code
-// so callers refresh their routing view + retry rather than treating it as
-// a transient backend error.
-func errUnitNotMounted(op string) error {
-	return status.Errorf(codes.FailedPrecondition,
-		"cluster: %s: this node does not own/mount the unit for key (shardKey hashes outside its mounted unit set)", op)
-}
-
-// epochAtOpen is the fixed epoch every unit is opened at in Phase 2.
-// Phase 2 has no writer-epoch handoff: there is one owner per unit for
-// the whole run (static topology), so a single fixed epoch suffices and
-// no fencing is required. TODO(phase3): replace with the real per-unit
-// epoch (open the new owner at prior_epoch+1 to fence the old writer).
+// epochAtOpen is the epoch a unit is opened at during the INITIAL mount in
+// initMultiBackend (cold start). 0 is the base: there is no prior owner to
+// fence at first start, the durable manifest (if any) governs, and the
+// factory fences against it regardless. The Phase 3 lease HANDOFF acquires
+// at a strictly higher epoch instead (acquireUnit / nextEpochFor in
+// multibackend_rebalance.go), which is the path that fences a prior owner.
 const epochAtOpen storageunit.Epoch = 0
 
 // unitIDBytes encodes a UnitID as 4 fixed-width big-endian bytes. This is
@@ -121,9 +102,10 @@ func (c *Cluster) initMultiBackend() error {
 
 	owned := storageunit.OwnedUnits(storageunit.NodeID(c.cfg.NodeID), c.unitCount, c.ownerLookup)
 	for _, u := range owned {
-		// TODO(phase3): open at the unit's real next epoch to fence the
-		// prior owner. Phase 2 is static topology with one owner per unit,
-		// so a fixed epoch is correct here.
+		// Cold-start mount at the base epoch. The factory fences against
+		// the unit's durable manifest if one already exists. A later
+		// membership change drives the Phase 3 handoff (acquireUnit) which
+		// opens at a strictly higher epoch to fence a prior owner.
 		b, err := c.factory.OpenUnit(u, epochAtOpen)
 		if err != nil {
 			// Rollback is best-effort: we are already failing Open, so a
@@ -188,16 +170,6 @@ func (c *Cluster) localBackendForKey(key []byte) (backend.Backend, bool) {
 	defer c.mountMu.RUnlock()
 	b, ok := c.mountMap[u]
 	return b, ok
-}
-
-// ownsUnitForKey reports whether this node currently has key's unit mounted.
-// It is the unit-based owner guard the gRPC forwarding loop-guard uses in
-// multi-backend mode: a forwarded op whose unit this node does not hold is
-// refused (the originator refreshes its view + retries) rather than bounced
-// back. Multi-backend mode only.
-func (c *Cluster) ownsUnitForKey(key []byte) bool {
-	_, ok := c.localBackendForKey(key)
-	return ok
 }
 
 // mountedBackends returns a snapshot of every backend this node currently

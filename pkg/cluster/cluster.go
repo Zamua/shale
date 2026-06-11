@@ -293,21 +293,34 @@ type Cluster struct {
 	cfg     Config
 	backend backend.Backend
 
-	// multi-backend mode (v0.8 Phase 2). multi is true when the cluster
-	// runs in multi-backend mode (BackendFactory + UnitCount set); in
-	// that mode c.backend is nil and every op resolves a per-unit backend
-	// from mountMap instead. In legacy mode multi is false, mountMap is
-	// nil, and none of this is touched. factory opens / closes per-unit
-	// backends; unitCount is the fixed N; ownerLookup answers "which node
-	// owns this unit" off the ring; mountMap holds the units this node
-	// has mounted (fixed at Open in Phase 2). mountMu guards mountMap.
-	// See multibackend.go.
+	// multi-backend mode (v0.8). multi is true when the cluster runs in
+	// multi-backend mode (BackendFactory + UnitCount set); in that mode
+	// c.backend is nil and every op resolves a per-unit backend from
+	// mountMap instead. In legacy mode multi is false, mountMap is nil, and
+	// none of this is touched. factory opens / closes per-unit backends;
+	// unitCount is the fixed N; ownerLookup answers "which node owns this
+	// unit" off the ring; mountMap holds the units this node has mounted
+	// (initialized at Open, then mutated by the Phase 3 lease-handoff
+	// reconcile on every membership change - acquire newly-owned / release
+	// no-longer-owned). mountMu guards mountMap. See multibackend.go and
+	// multibackend_rebalance.go.
 	multi       bool
 	factory     storageunit.BackendFactory
 	unitCount   storageunit.UnitCount
 	ownerLookup storageunit.OwnerLookup
 	mountMu     sync.RWMutex
 	mountMap    map[storageunit.UnitID]backend.Backend
+
+	// reconcileMu serializes the Phase 3 lease-handoff reconcile
+	// (multibackend_rebalance.go): at most one reconcile mutates the mount
+	// map at a time, so two membership changes whose settle timers fire
+	// close together cannot interleave mounts. It is the multi-backend
+	// analogue of the legacy single-flight settle-timer Evaluate. Nil work
+	// in legacy mode (the reconcile never runs there). It is DISTINCT from
+	// mountMu: mountMu guards individual mount-map reads/writes (taken by
+	// every KV op); reconcileMu serializes whole reconcile PASSES so the
+	// acquire/release diff sees a coherent before-state.
+	reconcileMu sync.Mutex
 
 	// Populated in multi-node mode; nil in single-node mode.
 	ring       *ring.Ring
@@ -473,13 +486,16 @@ func Open(cfg Config) (*Cluster, error) {
 	}
 
 	if multi {
-		// Multi-backend mode is STATIC in Phase 2: derive the owned units
-		// from the now-seeded ring + mount them, but do NOT start the
-		// rebalance machinery (no lease handoff / mount-unmount on
-		// membership change; that is Phase 3). The events / reconcile
-		// loops below still keep the ring in sync for ROUTING (so a
-		// forward goes to the right peer), they just don't move data.
-		// TODO(phase3): start the per-unit lease-handoff reconcile here.
+		// Multi-backend mode (v0.8). Derive the owned units from the
+		// now-seeded ring + mount them at Open. On every later membership
+		// change the events / reconcile loops below call bumpRingGen, which
+		// in multi mode arms the COPY-FREE lease-handoff reconcile (Phase 3,
+		// multibackend_rebalance.go) instead of the v0.3 Coordinator: a unit
+		// whose owner moved is released by the old owner (CloseUnit, flush)
+		// and acquired by the new owner (OpenUnit at a higher epoch,
+		// fencing the old). The v0.3 Coordinator is intentionally NOT
+		// started here (c.rebalance stays nil); the reconcile is its
+		// multi-backend replacement.
 		if err := c.initMultiBackend(); err != nil {
 			_ = mem.Close()
 			return nil, err
@@ -648,22 +664,31 @@ func (c *Cluster) Members() []ring.Member {
 	return c.ring.Members()
 }
 
-// OwnsKey reports whether the local node is the ring owner of key.
+// OwnsKey reports whether the local node is the RING owner of key.
 // Used by the gRPC server's forwarding-loop guard: a request that
 // arrives with forwarded=true but does NOT belong here is refused
 // rather than re-forwarded (which would loop A->B->A on diverged
 // rings).
 //
-// In multi-backend mode (v0.8 Phase 2) the guard is UNIT-based: a key
-// belongs to this node iff this node has the key's storage unit MOUNTED.
-// ownerOf already routes through the unit in multi mode, but ring
-// ownership of a unit and having it mounted can diverge after a mid-run
-// membership change (static topology). The forwarding guard checks the
-// mount map (the authoritative "can I serve this") so a forwarded op for
-// a unit this node does not hold is refused, not re-forwarded.
+// In multi-backend mode (v0.8 Phase 3) the guard is UNIT-RING-OWNERSHIP
+// based: a key belongs to this node iff the ring places the key's storage
+// UNIT on this node, WHETHER OR NOT it is mounted yet. This is the Phase 3
+// correction of the Phase 2 mount-based guard: during a lease handoff the
+// new owner is the ring owner BEFORE it has mounted the unit (the acquire
+// is in flight). A mount-based guard would refuse a forwarded op there with
+// FailedPrecondition ("refresh your ring"), but the originator's ring is
+// already correct - refreshing changes nothing and it would re-forward to
+// the same node in a tight loop. Checking RING ownership instead lets the
+// forwarded op fall through to the local apply path, which returns the
+// retryable acquiring-window error (errUnitAcquiring, codes.Unavailable) so
+// the originator backs off and succeeds once the reconcile mounts the unit.
+// A node that is NOT the ring owner still returns false here, so the
+// classic loop-guard (FailedPrecondition, refresh + re-route) is preserved
+// for a genuinely diverged ring.
 func (c *Cluster) OwnsKey(key []byte) bool {
 	if c.multi {
-		return c.ownsUnitForKey(key)
+		_, isLocal := c.unitOwnerOf(key)
+		return isLocal
 	}
 	_, local := c.ownerOf(key)
 	return local
@@ -736,9 +761,12 @@ func (c *Cluster) LocalBegin(level backend.IsolationLevel) (backend.Transaction,
 // localBeginForKey opens a transaction against the mounted backend that
 // owns key's unit (legacy mode: the single backend). It is the CAS
 // validate-and-apply primitive that works in BOTH modes: the caller has
-// already verified this node owns the pin key, so in multi-backend mode
-// the unit MUST be mounted; a missing mount is the unit-not-mounted guard
-// (the commit is refused, not applied against the wrong engine).
+// already verified this node owns the pin key, so in multi-backend mode a
+// missing mount means the unit's lease is HANDING OFF to this node (Phase 3
+// window) - the commit is refused with the retryable acquiring-window error
+// (codes.Unavailable), never applied against a wrong / unmounted engine. The
+// originator retries and the commit succeeds once the reconcile has acquired
+// the unit.
 func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (backend.Transaction, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed
@@ -746,7 +774,7 @@ func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (ba
 	if c.multi {
 		b, ok := c.localBackendForKey(key)
 		if !ok {
-			return nil, errUnitNotMounted("CommitCASApply")
+			return nil, errUnitAcquiring("CommitCASApply")
 		}
 		return b.Begin(level)
 	}
@@ -1009,7 +1037,12 @@ func (c *Cluster) Put(key, value []byte) error {
 		if local {
 			b, ok := c.localBackendForKey(key)
 			if !ok {
-				return errUnitNotMounted("Put")
+				// This node IS the ring owner but has not mounted the
+				// unit yet: the Phase 3 handoff is landing on us. Return
+				// the RETRYABLE acquiring-window error so the originator
+				// retries and succeeds once the reconcile has acquired
+				// (never lose the write, never serve from a wrong engine).
+				return errUnitAcquiring("Put")
 			}
 			return b.Put(key, value)
 		}
@@ -1062,7 +1095,9 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 		if local {
 			b, ok := c.localBackendForKey(key)
 			if !ok {
-				return nil, errUnitNotMounted("Get")
+				// Owner-but-unmounted: handoff landing on us. Retryable
+				// acquiring-window error (never serve a stale result).
+				return nil, errUnitAcquiring("Get")
 			}
 			return b.Get(key)
 		}
@@ -1124,7 +1159,9 @@ func (c *Cluster) Delete(key []byte) error {
 		if local {
 			b, ok := c.localBackendForKey(key)
 			if !ok {
-				return errUnitNotMounted("Delete")
+				// Owner-but-unmounted: handoff landing on us. Retryable
+				// acquiring-window error (never lose the delete).
+				return errUnitAcquiring("Delete")
 			}
 			return b.Delete(key)
 		}
@@ -1164,7 +1201,9 @@ func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 		if c.multi {
 			b, ok := c.localBackendForKey(prefix)
 			if !ok {
-				return nil, errUnitNotMounted("ScanPrefix")
+				// Owner-but-unmounted: handoff landing on us. Retryable
+				// acquiring-window error (never serve a stale scan).
+				return nil, errUnitAcquiring("ScanPrefix")
 			}
 			return b.ScanPrefix(prefix)
 		}

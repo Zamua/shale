@@ -180,14 +180,25 @@ func (c *Cluster) handoffTimeout() time.Duration {
 	return 5 * time.Minute
 }
 
-// bumpRingGen records that the ring shape has changed + schedules an
-// Evaluate at settleDelay from now. Subsequent calls within the
-// window reset the timer rather than fire multiple Evaluates. Called
-// from the membership events loop AND from the reconcile loop AND
-// from ProposeRebalance(apply) (the latter bypasses the timer; see
+// bumpRingGen records that the ring shape has changed + schedules the
+// debounced response at settleDelay from now. Subsequent calls within the
+// window reset the timer rather than fire multiple passes. Called from the
+// membership events loop AND from the reconcile loop AND from
+// ProposeRebalance(apply) (the latter bypasses the timer; see
 // runEvaluateNow).
+//
+// The debounced response differs by mode. In the legacy per-node mode it is
+// the v0.3 Coordinator Evaluate (ring-vs-ring plan + key copy). In
+// multi-backend mode (v0.8 Phase 3) it is instead the COPY-FREE unit
+// reconcile (acquire newly-owned units / release no-longer-owned units; see
+// multibackend_rebalance.go). A cluster runs in exactly one mode, so exactly
+// one of these arms the shared settle timer.
 func (c *Cluster) bumpRingGen() {
 	c.ringGen.Add(1)
+	if c.multi {
+		c.scheduleReconcile()
+		return
+	}
 	c.scheduleEvaluate()
 }
 

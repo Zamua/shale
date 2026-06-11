@@ -121,14 +121,16 @@ func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 		}
 		return nil, errForwardLoop("Get: this node does not own the key")
 	}
-	// TODO(v0.8 phase3): in multi-backend mode a forwarded Get whose unit
-	// this node OWNS (mounted) falls through to c.Get, which re-routes via
-	// the ring and could take one extra forward hop if the ring view has
-	// diverged from the mount during a membership change. Phase 2 topology
-	// is static, so that window is documented-unsupported; phase 3's lease
-	// handoff reworks the forwarded-read path to serve a mounted unit
-	// locally (never re-route). The loop-guard above bounds it to one hop
-	// (no infinite A->B->A) even today.
+	// In multi-backend mode (v0.8 Phase 3) the guard above (OwnsKey) is RING
+	// ownership of the key's unit, not mount-ness. So a forwarded Get that
+	// reaches the ring owner during a lease handoff (owner assigned, unit
+	// not yet mounted) passes the guard and falls through to c.Get, which
+	// resolves the local unit: mounted -> serve; mid-handoff -> the
+	// retryable acquiring-window error (codes.Unavailable) so the originator
+	// backs off and retries once the reconcile mounts the unit. A
+	// genuinely-diverged ring (this node is NOT the unit's ring owner) was
+	// already refused above with the loop-guard. Either way the originator
+	// makes progress without an A->B->A bounce.
 	v, err := s.c.Get(req.GetKey())
 	if errors.Is(err, backend.ErrNotFound) {
 		return &pb.GetResponse{NotFound: true}, nil
