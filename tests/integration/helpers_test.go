@@ -17,9 +17,11 @@ import (
 	"io"
 	"net"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/goleakignore"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rebalance"
@@ -51,31 +53,15 @@ import (
 // content (testNode + friends are test-only anyway).
 func TestMain(m *testing.M) {
 	rebalance.SetSweepInterval(50 * time.Millisecond)
-	goleak.VerifyTestMain(m,
-		// memberlist background workers; see pkg/cluster/main_test.go
-		// for the rationale + the full enumeration.
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).probeNode"),
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).pushPullTrigger"),
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).gossip"),
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).triggerFunc"),
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).probe"),
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).streamListen"),
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).packetListen"),
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).packetHandler"),
-		goleak.IgnoreTopFunction("github.com/hashicorp/memberlist.(*Memberlist).deschedule"),
-		// gRPC client/server background loops that linger briefly past Stop.
-		goleak.IgnoreTopFunction("google.golang.org/grpc.(*ccBalancerWrapper).watcher"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/grpcsync.(*CallbackSerializer).run"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*controlBuffer).get"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*http2Client).keepalive"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*http2Client).reader"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*http2Server).keepalive"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.(*http2Server).HandleStreams"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc/internal/transport.NewServerTransport.func2"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc.(*Server).handleStream"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc.(*addrConn).resetTransportAndUnlock"),
-		goleak.IgnoreAnyFunction("google.golang.org/grpc.(*addrConn).connect"),
-	)
+	// Share the ONE canonical ignore set with pkg/cluster's TestMain via
+	// internal/goleakignore so the two lists can never drift. The drift
+	// this closes was real: the integration list used to be a hand-copied
+	// SUBSET that missed IgnoreAnyFunction for memberlist pushPullTrigger,
+	// so an in-flight push-pull blocked in network I/O at teardown (its
+	// top frame net/bufio, pushPullTrigger only deeper in the stack)
+	// slipped past the IgnoreTopFunction form and failed the whole binary
+	// intermittently.
+	goleak.VerifyTestMain(m, goleakignore.Options()...)
 }
 
 // testNode is the bundle of state behind one node in an integration
@@ -132,11 +118,12 @@ func (n *testNode) Close() {
 // returned node registers itself for cleanup via t.Cleanup so tests
 // that forget to Close it explicitly still tear down.
 //
-// Port allocation: both the memberlist BindAddr + the gRPC addr come
-// from freePort, which uses the OS ephemeral-port pool. There is a
-// tiny race window between "port returned" and "port bound" but
-// loopback under a test process never hits a conflicting bind in
-// practice; the harness in pkg/cluster relies on the same pattern.
+// Port allocation: the gRPC listener binds 127.0.0.1:0 directly (held
+// open, no rebind gap). The memberlist BindAddr is allocated through
+// openClusterRetryBind, which re-rolls a fresh freePort and retries if
+// the release-then-rebind window lets another listener grab the port -
+// so a port collision under a stress loop self-heals instead of failing
+// the test.
 func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 	return startTestNodeWithReplication(t, id, seedAddr, 1, 0, 0)
 }
@@ -154,7 +141,6 @@ func startBlockedDestTestNode(t *testing.T, id, seedAddr string) *testNode {
 	t.Helper()
 
 	mem := memory.New()
-	bindAddr := hostPort(freePort(t))
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -167,7 +153,6 @@ func startBlockedDestTestNode(t *testing.T, id, seedAddr string) *testNode {
 	cfg := cluster.Config{
 		NodeID:                  id,
 		Backend:                 mem,
-		BindAddr:                bindAddr,
 		GRPCAddr:                grpcAddr,
 		LogOutput:               io.Discard,
 		RebalanceSettleDelay:    500 * time.Millisecond,
@@ -180,11 +165,10 @@ func startBlockedDestTestNode(t *testing.T, id, seedAddr string) *testNode {
 		cfg.Seeds = []string{seedAddr}
 	}
 
-	c, err := cluster.Open(cfg)
-	if err != nil {
-		_ = lis.Close()
-		t.Fatalf("startBlockedDestTestNode %s: cluster.Open: %v", id, err)
-	}
+	// openClusterRetryBind sets cfg.BindAddr (re-rolling a fresh port and
+	// retrying if memberlist hits the release-rebind port race) and returns
+	// the address actually bound, which the node advertises as its seed.
+	c, bindAddr := openClusterRetryBind(t, cfg)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
@@ -217,7 +201,6 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	t.Helper()
 
 	mem := memory.New()
-	bindAddr := hostPort(freePort(t))
 
 	// The gRPC listener has to exist BEFORE cluster.Open so we know the
 	// address to advertise via memberlist Meta. Same two-phase pattern
@@ -233,7 +216,6 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	cfg := cluster.Config{
 		NodeID:    id,
 		Backend:   mem,
-		BindAddr:  bindAddr,
 		GRPCAddr:  grpcAddr,
 		LogOutput: io.Discard,
 		// Shrunken rebalance tunables: keep integration tests
@@ -258,11 +240,10 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 		cfg.Seeds = []string{seedAddr}
 	}
 
-	c, err := cluster.Open(cfg)
-	if err != nil {
-		_ = lis.Close()
-		t.Fatalf("startTestNode %s: cluster.Open: %v", id, err)
-	}
+	// openClusterRetryBind sets cfg.BindAddr (re-rolling a fresh port and
+	// retrying if memberlist hits the release-rebind port race) and returns
+	// the address actually bound, which the node advertises as its seed.
+	c, bindAddr := openClusterRetryBind(t, cfg)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
@@ -326,8 +307,15 @@ func ownerOf(c *cluster.Cluster, key string) string {
 }
 
 // freePort grabs an OS-assigned ephemeral TCP port + releases the
-// listener so the caller can bind it for real. The tiny race between
-// release + rebind is harmless under loopback.
+// listener so the caller can bind it for real. There is a real race
+// between release and rebind: between freePort closing the probe
+// listener and memberlist re-binding the same number, another node's
+// freePort (or the OS) can take it, and memberlist binds BOTH TCP and
+// UDP, so even this TCP-only probe cannot reserve the UDP side. Under a
+// stress loop that bind-conflict surfaces as "address already in use"
+// out of memberlist.Create (~1/25 iterations observed). Callers that
+// bind this for a Cluster must go through openClusterRetryBind, which
+// re-rolls a fresh port and retries on exactly that conflict.
 func freePort(t *testing.T) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
@@ -337,6 +325,47 @@ func freePort(t *testing.T) int {
 	port := l.Addr().(*net.TCPAddr).Port
 	_ = l.Close()
 	return port
+}
+
+// isBindConflict reports whether err is a memberlist.Create failure
+// caused by another listener already holding the bind port (the
+// release-then-rebind race freePort cannot close on its own). memberlist
+// wraps the OS bind error as "failed to start TCP/UDP listener on ...:
+// bind: address already in use"; we match the stable substring rather
+// than reaching for syscall.EADDRINUSE so the check survives the wrap.
+func isBindConflict(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "address already in use")
+}
+
+// openClusterRetryBind opens a Cluster, retrying on a memberlist bind
+// conflict with a FRESH port each time. cfg.BindAddr is replaced with a
+// new freePort allocation on every attempt (including the first, so the
+// caller does not have to seed it), and the BindAddr actually bound is
+// returned so the node fixture advertises the right seed address. This
+// waits on a REAL condition (a successful bind), not a sleep: it loops
+// only while memberlist reports the port is taken, and fails loudly if
+// every attempt in the bounded budget conflicts (which would indicate a
+// genuine port-exhaustion problem, not the transient release-rebind
+// race). A non-bind error (bad config, join failure) returns
+// immediately - those are real test failures, not flakes to retry.
+func openClusterRetryBind(t *testing.T, cfg cluster.Config) (*cluster.Cluster, string) {
+	t.Helper()
+	const maxAttempts = 8
+	var lastErr error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		bindAddr := hostPort(freePort(t))
+		cfg.BindAddr = bindAddr
+		c, err := cluster.Open(cfg)
+		if err == nil {
+			return c, bindAddr
+		}
+		if !isBindConflict(err) {
+			t.Fatalf("openClusterRetryBind %s: cluster.Open: %v", cfg.NodeID, err)
+		}
+		lastErr = err
+	}
+	t.Fatalf("openClusterRetryBind %s: %d bind attempts all hit a port conflict: %v", cfg.NodeID, maxAttempts, lastErr)
+	return nil, ""
 }
 
 func hostPort(port int) string {
