@@ -251,9 +251,9 @@ func validateBackendMode(cfg *Config) (multi bool, err error) {
 		return false, errors.New("cluster: multi-backend mode requires BOTH BackendFactory and UnitCount")
 	case hasFactory && hasUnitCount:
 		// Multi-backend mode. ReplicationFactor must be the single-replica
-		// default in Phase 2 (per-unit replication is Phase 3+).
+		// default (per-unit replication is a later phase).
 		if cfg.ReplicationFactor > 1 {
-			return false, fmt.Errorf("cluster: multi-backend mode requires ReplicationFactor 1 in v0.8 Phase 2, got %d", cfg.ReplicationFactor)
+			return false, fmt.Errorf("cluster: multi-backend mode requires ReplicationFactor 1 (per-unit replication is a later phase), got %d", cfg.ReplicationFactor)
 		}
 		return true, nil
 	case hasBackend:
@@ -587,6 +587,18 @@ func (c *Cluster) runReconcileLoop() {
 			return
 		case <-t.C:
 			c.reconcileRingFromMembership()
+			if c.multi {
+				// Self-heal (v0.8 Phase 3): a transient OpenUnit/CloseUnit
+				// failure during an earlier reconcile would otherwise strand
+				// a unit (owned but not mounted, or mounted but not owned)
+				// until the next membership change, since membership-driven
+				// reconciles only fire on a ring change. The unit reconcile
+				// is idempotent and cheap when the mounted set already matches
+				// desired, so run it every tick to re-acquire/release any
+				// drifted unit. This runs inside the loopWG-tracked loop, so
+				// Close awaits it.
+				c.runReconcile()
+			}
 		}
 	}
 }

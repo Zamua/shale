@@ -282,6 +282,16 @@ type fencedBackend struct {
 
 // fenced reports whether this writer has been superseded: the durable epoch
 // is now ABOVE the epoch this backend was opened at.
+//
+// TODO(test-hardening): the fenced()-then-store.Put sequence below is not
+// atomic. A concurrent acquire that advances durableEpoch BETWEEN the fenced
+// check and the store write can let a write that should be fenced slip into
+// the shared store. This is a test-double fidelity gap (the real slatedb
+// manifest fence is atomic), not a production path. To close it, take a
+// per-unit lock spanning the fenced check + the store mutation so acquire
+// and a fenced write cannot interleave. Harmless to the current gate (which
+// does not race a write against an in-flight acquire of the same unit), but
+// worth tightening before relying on the factory for concurrency fuzzing.
 func (f *fencedBackend) fenced() bool {
 	return f.backing.durableEpoch(f.unit) > f.epoch
 }

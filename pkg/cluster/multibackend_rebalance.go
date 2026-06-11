@@ -174,6 +174,15 @@ func (c *Cluster) acquireUnit(u storageunit.UnitID) {
 		return
 	}
 	c.mountMu.Lock()
+	if c.closed.Load() {
+		// Close raced us between OpenUnit and the mount. Close already ran
+		// closeMountedUnits over the mountMap, so inserting now would leak
+		// this freshly-opened backend past shutdown (and risk a write after
+		// Close). Release it instead of mounting.
+		c.mountMu.Unlock()
+		_ = c.factory.CloseUnit(u)
+		return
+	}
 	c.mountMap[u] = b
 	c.mountMu.Unlock()
 }
