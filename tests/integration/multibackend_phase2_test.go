@@ -46,10 +46,11 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// unitForKeyTest is the test-side mirror of cluster.unitForKey: extract the
-// shard key the SAME way the ring does, then mask to the unit. Lets a test
-// name the exact unit a key must land in without reaching into the
-// unexported cluster internals.
+// unitForKeyTest is the test-side mirror of the cluster's unit map: extract
+// the shard key the SAME way the ring does, then mask to the unit (the logical
+// gen-0 unit; these Phase 2 tests do not reshard). Lets a test name the exact
+// unit a key must land in without reaching into the unexported cluster
+// internals.
 func unitForKeyTest(key string, unitCount int) storageunit.UnitID {
 	uc := storageunit.MustUnitCount(unitCount)
 	return storageunit.UnitForShardKey(ring.ShardKey([]byte(key)), uc)
@@ -60,7 +61,7 @@ func unitForKeyTest(key string, unitCount int) storageunit.UnitID {
 // never opened (no store) or the key is absent / has a different value.
 func keyInUnitBackend(t *testing.T, fac *memfactory.Factory, u storageunit.UnitID, key, val string) bool {
 	t.Helper()
-	b, present := fac.UnitBackend(u)
+	b, present := fac.UnitBackend(storageunit.NewGenUnit(0, u))
 	if !present {
 		return false
 	}
@@ -85,7 +86,7 @@ func keyPresentInAnyUnitExcept(t *testing.T, fac *memfactory.Factory, unitCount 
 		if u == keepUnit {
 			continue
 		}
-		b, present := fac.UnitBackend(u)
+		b, present := fac.UnitBackend(storageunit.NewGenUnit(0, u))
 		if !present {
 			continue
 		}

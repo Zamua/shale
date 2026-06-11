@@ -128,12 +128,10 @@ func unitOwnerOnRing(c *cluster.Cluster, key string, unitCount int) string {
 	}
 	uc := storageunit.MustUnitCount(unitCount)
 	u := storageunit.UnitForShardKey(ring.ShardKey([]byte(key)), uc)
-	var b [4]byte
-	b[0] = byte(uint32(u) >> 24)
-	b[1] = byte(uint32(u) >> 16)
-	b[2] = byte(uint32(u) >> 8)
-	b[3] = byte(uint32(u))
-	return r.LocateKey(b[:]).ID
+	// Encode the gen-0 unit id the way the cluster's genUnitBytes does (8-byte
+	// generation prefix, then the 4-byte unit id) so this test ring agrees with
+	// routing. These tests do not reshard, so the generation is 0.
+	return r.LocateKey(gen0UnitBytes(u)).ID
 }
 
 // waitUntil polls fn until it returns true or the deadline passes.

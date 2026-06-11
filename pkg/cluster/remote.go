@@ -245,12 +245,14 @@ type clusterTx struct {
 	pinned  bool
 	pinKey  []byte
 	ownerID string // legacy mode: ring owner NODE of the pinned shard; the cross-shard guard compares against this
-	// pinUnit is the storage UNIT of the pinned key in multi-backend mode.
-	// The guard compares units (not owner nodes) there: a node owns many
-	// units, so a single owner-node check would wrongly admit two keys on
-	// different units of the same node into one transaction, which commits
-	// against only the pin unit (a co-location split / silent loss).
-	pinUnit storageunit.UnitID
+	// pinUnit is the generation-qualified storage UNIT of the pinned key in
+	// multi-backend mode. The guard compares units (not owner nodes) there: a
+	// node owns many units, so a single owner-node check would wrongly admit
+	// two keys on different units of the same node into one transaction, which
+	// commits against only the pin unit (a co-location split / silent loss).
+	// Qualified by generation so a key resolved before a reshard cut-over and
+	// one resolved after are correctly seen as different units.
+	pinUnit storageunit.GenUnit
 	done    bool
 
 	// reads is the read-set: keys the tx READ from the cluster (and did
@@ -299,7 +301,7 @@ func (t *clusterTx) pinLocked(key []byte) {
 	t.pinKey = append([]byte(nil), key...)
 	t.ownerID = owner.ID
 	if t.c.multi {
-		t.pinUnit = t.c.unitForKey(key)
+		t.pinUnit = t.c.genUnitForKey(key)
 	}
 }
 
@@ -319,7 +321,7 @@ func (t *clusterTx) guardShard(key []byte) error {
 	// comparing owner nodes would admit a cross-unit transaction that then
 	// commits against only the pin unit. Compare units.
 	if t.c.multi {
-		if t.c.unitForKey(key) != t.pinUnit {
+		if t.c.genUnitForKey(key) != t.pinUnit {
 			return backend.ErrCrossShard
 		}
 		return nil

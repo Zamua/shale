@@ -10,6 +10,7 @@ package cluster
 import (
 	"bytes"
 	"errors"
+	"sync"
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
@@ -17,13 +18,18 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
-// fakeOwnership is a mutable OwnerLookup a test can flip to simulate the
-// ring re-assigning a unit. owner[u] = node that owns u; absent means
-// no owner (skipped).
+// fakeOwnership is a mutable owner map a test can flip to simulate the ring
+// re-assigning a unit. owner[u] = node that owns unit u (at generation 0;
+// these Phase 3 reconcile tests do not reshard); absent means no owner
+// (skipped). It is adapted to the cluster's generation-aware genOwner via
+// OwnerOfGen, which keys on the GenUnit's UnitID.
 type fakeOwnership map[storageunit.UnitID]storageunit.NodeID
 
-func (f fakeOwnership) OwnerOf(u storageunit.UnitID) (storageunit.NodeID, bool) {
-	n, ok := f[u]
+// OwnerOfGen answers ownership for a GenUnit by its UnitID, ignoring the
+// generation (the reconcile tests stay at gen 0). This lets a UnitID-keyed
+// fake drive the GenUnit-shaped genOwner hook.
+func (f fakeOwnership) OwnerOfGen(gu storageunit.GenUnit) (storageunit.NodeID, bool) {
+	n, ok := f[gu.ID]
 	return n, ok
 }
 
@@ -35,24 +41,32 @@ func newReconcileCluster(t *testing.T, self string, n int, backing *sharedfactor
 	t.Helper()
 	h := backing.Handle()
 	c := &Cluster{
-		cfg:         Config{NodeID: self},
-		multi:       true,
-		factory:     h,
-		unitCount:   storageunit.MustUnitCount(n),
-		ownerLookup: owners,
-		mountMap:    make(map[storageunit.UnitID]backend.Backend),
-		closeCh:     make(chan struct{}),
+		cfg:        Config{NodeID: self},
+		multi:      true,
+		factory:    h,
+		unitCount:  storageunit.MustUnitCount(n),
+		genOwner:   owners.OwnerOfGen,
+		mountMap:   make(map[storageunit.GenUnit]backend.Backend),
+		pauseUnits: make(map[storageunit.UnitID]*sync.RWMutex),
+		closeCh:    make(chan struct{}),
 	}
+	c.initGenState()
 	return c
 }
 
-// mountedUnits returns this node's mounted unit ids (sorted by the factory).
+// gu0 builds a generation-0 GenUnit (these reconcile tests stay at gen 0).
+func gu0(id storageunit.UnitID) storageunit.GenUnit {
+	return storageunit.NewGenUnit(0, id)
+}
+
+// mountedUnits returns this node's mounted unit ids (gen-0, ascending). The
+// reconcile tests do not reshard, so every mounted GenUnit is at generation 0.
 func mountedUnits(c *Cluster) []storageunit.UnitID {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
 	out := make([]storageunit.UnitID, 0, len(c.mountMap))
-	for u := range c.mountMap {
-		out = append(out, u)
+	for gu := range c.mountMap {
+		out = append(out, gu.ID)
 	}
 	// insertion-sort for determinism
 	for i := 1; i < len(out); i++ {
@@ -66,7 +80,7 @@ func mountedUnits(c *Cluster) []storageunit.UnitID {
 func hasUnit(c *Cluster, u storageunit.UnitID) bool {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
-	_, ok := c.mountMap[u]
+	_, ok := c.mountMap[gu0(u)]
 	return ok
 }
 
@@ -112,7 +126,7 @@ func TestReconcileReleasesNoLongerOwned(t *testing.T) {
 		t.Fatalf("after release, A mounted %v, want [0]", got)
 	}
 	// The factory handle no longer holds unit 1 either.
-	if _, ok := c.factory.CurrentEpoch(1); ok {
+	if _, ok := c.factory.CurrentEpoch(gu0(1)); ok {
 		t.Fatal("factory still holds unit 1 after release")
 	}
 }
@@ -128,14 +142,14 @@ func TestReconcileIdempotent(t *testing.T) {
 	first := mountedUnits(c)
 	// Capture the epoch each owned unit was opened at; a second reconcile
 	// must NOT re-open (which would bump the epoch).
-	e0, _ := c.factory.CurrentEpoch(0)
+	e0, _ := c.factory.CurrentEpoch(gu0(0))
 	for i := 0; i < 5; i++ {
 		c.reconcileUnits()
 	}
 	if got := mountedUnits(c); len(got) != len(first) || got[0] != first[0] || got[1] != first[1] {
 		t.Fatalf("idempotent reconcile changed mounted set: %v -> %v", first, got)
 	}
-	if e, _ := c.factory.CurrentEpoch(0); e != e0 {
+	if e, _ := c.factory.CurrentEpoch(gu0(0)); e != e0 {
 		t.Fatalf("idempotent reconcile re-opened unit 0: epoch %d -> %d", e0, e)
 	}
 }
@@ -156,9 +170,9 @@ func TestReconcileSelfHealsLostMount(t *testing.T) {
 	// Simulate a lost mount: drop unit 1 from the map (and from the handle)
 	// without changing ownership.
 	c.mountMu.Lock()
-	delete(c.mountMap, 1)
+	delete(c.mountMap, gu0(1))
 	c.mountMu.Unlock()
-	_ = c.factory.CloseUnit(1)
+	_ = c.factory.CloseUnit(gu0(1))
 
 	// Reconcile re-acquires it (still owned, not mounted -> acquire).
 	c.reconcileUnits()
@@ -181,7 +195,7 @@ func TestAcquireFencesPriorOwner(t *testing.T) {
 
 	// A mounts its units and writes an ACKED key directly to U's backend.
 	a.reconcileUnits()
-	abk := a.mountMap[u]
+	abk := a.mountMap[gu0(u)]
 	if abk == nil {
 		t.Fatal("A did not mount unit 1")
 	}
@@ -192,7 +206,7 @@ func TestAcquireFencesPriorOwner(t *testing.T) {
 	// Ring hands U to B. B reconciles -> acquires U at a higher epoch.
 	ownersB[1] = "B"
 	b.reconcileUnits()
-	bbk := b.mountMap[u]
+	bbk := b.mountMap[gu0(u)]
 	if bbk == nil {
 		t.Fatal("B did not acquire unit 1 on reconcile")
 	}
@@ -228,7 +242,7 @@ func TestAcquireOpensAtHigherEpoch(t *testing.T) {
 	b := newReconcileCluster(t, "B", 1, backing, ownersB)
 
 	a.reconcileUnits()
-	epochAfterA := backing.DurableEpoch(u)
+	epochAfterA := backing.DurableEpoch(gu0(u))
 	if epochAfterA == 0 {
 		t.Fatalf("durable epoch still 0 after A acquired")
 	}
@@ -236,7 +250,7 @@ func TestAcquireOpensAtHigherEpoch(t *testing.T) {
 	// Hand off to B.
 	ownersB[0] = "B"
 	b.reconcileUnits()
-	epochAfterB := backing.DurableEpoch(u)
+	epochAfterB := backing.DurableEpoch(gu0(u))
 	if epochAfterB <= epochAfterA {
 		t.Fatalf("durable epoch did not advance on handoff: A=%d B=%d (no fence)", epochAfterA, epochAfterB)
 	}

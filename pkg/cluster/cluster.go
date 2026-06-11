@@ -298,18 +298,41 @@ type Cluster struct {
 	// c.backend is nil and every op resolves a per-unit backend from
 	// mountMap instead. In legacy mode multi is false, mountMap is nil, and
 	// none of this is touched. factory opens / closes per-unit backends;
-	// unitCount is the fixed N; ownerLookup answers "which node owns this
-	// unit" off the ring; mountMap holds the units this node has mounted
-	// (initialized at Open, then mutated by the Phase 3 lease-handoff
-	// reconcile on every membership change - acquire newly-owned / release
-	// no-longer-owned). mountMu guards mountMap. See multibackend.go and
-	// multibackend_rebalance.go.
-	multi       bool
-	factory     storageunit.BackendFactory
-	unitCount   storageunit.UnitCount
-	ownerLookup storageunit.OwnerLookup
-	mountMu     sync.RWMutex
-	mountMap    map[storageunit.UnitID]backend.Backend
+	// unitCount is the fixed N AT THE STARTING GENERATION (the live count +
+	// generation that routing uses are in genState, which a doubling reshard
+	// advances). genOwner answers "which node owns this generation-qualified
+	// unit" off the ring (default c.genUnitOwner; tests override it). mountMap
+	// holds the units this node has mounted, KEYED BY GenUnit so a gen-g unit
+	// K and a gen-(g+1) unit K (the doubling's old + new) coexist without
+	// colliding. The map is initialized at Open, then mutated by the Phase 3
+	// lease-handoff reconcile on every membership change (acquire newly-owned
+	// / release no-longer-owned) and by the Phase 4 resharder (bisect creates
+	// the gen-(g+1) children, cut-over retires the gen-g unit). mountMu guards
+	// mountMap. See multibackend.go and multibackend_rebalance.go.
+	multi     bool
+	factory   storageunit.BackendFactory
+	unitCount storageunit.UnitCount
+	genOwner  func(storageunit.GenUnit) (storageunit.NodeID, bool)
+	mountMu   sync.RWMutex
+	mountMap  map[storageunit.GenUnit]backend.Backend
+
+	// genState is the generation-aware routing state (v0.8 Phase 4): the
+	// CURRENT generation, the unit count at that generation, the doubled
+	// count at the next generation, and the per-old-unit cut-over set. A key
+	// resolves to GenUnit{gen, UnitForHash(h, count)} unless its old unit has
+	// cut over, in which case it resolves to GenUnit{gen+1, UnitForHash(h,
+	// nextCount)}. genMu guards it (RWMutex: every routed op takes the read
+	// lock; the resharder takes the write lock to flip a cut-over flag or
+	// advance the generation). pauseUnits holds, per OLD unit being cut over,
+	// a mutex the routed write path briefly blocks on so the catch-up drain
+	// has a clean write-pause boundary (the NO-ACKED-WRITE-LOST cut-over).
+	// reshardMu serializes whole reshards (one Reshard at a time). All zero /
+	// nil in legacy mode.
+	genMu      sync.RWMutex
+	genState   genState
+	reshardMu  sync.Mutex
+	pauseMu    sync.Mutex
+	pauseUnits map[storageunit.UnitID]*sync.RWMutex
 
 	// reconcileMu serializes the Phase 3 lease-handoff reconcile
 	// (multibackend_rebalance.go): at most one reconcile mutates the mount
@@ -450,7 +473,7 @@ func Open(cfg Config) (*Cluster, error) {
 	if cfg.BindAddr == "" {
 		// Single-node mode: no membership, no ring, every op is local.
 		// In multi-backend mode this node still owns the whole unit
-		// space (ringOwnerLookup reports local owner on an empty ring),
+		// space (genUnitOwner reports the local owner on an empty ring),
 		// so mount it now.
 		if multi {
 			if err := c.initMultiBackend(); err != nil {
@@ -779,18 +802,64 @@ func (c *Cluster) LocalBegin(level backend.IsolationLevel) (backend.Transaction,
 // (codes.Unavailable), never applied against a wrong / unmounted engine. The
 // originator retries and the commit succeeds once the reconcile has acquired
 // the unit.
+//
+// RESHARD SAFETY (Phase 4): in multi mode the transaction is opened while
+// holding the pin unit's write-pause read-lock (localWriteBackendForKey), and
+// the returned transaction is wrapped (pausedTx) so the pause is released only
+// when the transaction commits or rolls back. This keeps the whole validate-
+// and-apply on the SAME generation: a reshard cut-over for the pin unit
+// (which needs the pause WRITE side) cannot land between resolve and commit,
+// so a CAS write never lands in a unit that was retired mid-transaction.
 func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (backend.Transaction, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed
 	}
 	if c.multi {
-		b, ok := c.localBackendForKey(key)
+		b, gu, unlock, ok := c.localWriteBackendForKey(key)
 		if !ok {
+			unlock()
 			return nil, errUnitAcquiring("CommitCASApply")
 		}
-		return b.Begin(level)
+		tx, err := b.Begin(level)
+		if err != nil {
+			// Stale mount (lease moved): evict + retryable so the CAS commit
+			// retries and lands on the freshly re-acquired mount.
+			c.evictStaleMount(gu, b)
+			unlock()
+			return nil, errUnitAcquiring("CommitCASApply")
+		}
+		return &pausedTx{Transaction: tx, unlock: unlock}, nil
 	}
 	return c.backend.Begin(level)
+}
+
+// pausedTx wraps a backend.Transaction so the reshard write-pause read-lock
+// held while the transaction was opened is released exactly once, when the
+// transaction terminates (Commit or Rollback). It keeps a CAS validate-and-
+// apply bound to a single generation across the whole commit window.
+type pausedTx struct {
+	backend.Transaction
+	unlock   func()
+	released bool
+}
+
+func (t *pausedTx) Commit() error {
+	err := t.Transaction.Commit()
+	t.release()
+	return err
+}
+
+func (t *pausedTx) Rollback() error {
+	err := t.Transaction.Rollback()
+	t.release()
+	return err
+}
+
+func (t *pausedTx) release() {
+	if !t.released {
+		t.released = true
+		t.unlock()
+	}
 }
 
 // Close releases all cluster resources. After Close, no other method
@@ -1047,7 +1116,12 @@ func (c *Cluster) Put(key, value []byte) error {
 	if c.multi {
 		owner, local := c.ownerOf(key)
 		if local {
-			b, ok := c.localBackendForKey(key)
+			// Resolve the local backend UNDER the reshard write-pause (Phase 4):
+			// if a cut-over for this key's old unit is in flight, this blocks
+			// until it completes and then resolves to the new gen-(g+1) child,
+			// so the write never lands in a retired unit (NO ACKED WRITE LOST).
+			b, gu, unlock, ok := c.localWriteBackendForKey(key)
+			defer unlock()
 			if !ok {
 				// This node IS the ring owner but has not mounted the
 				// unit yet: the Phase 3 handoff is landing on us. Return
@@ -1056,7 +1130,17 @@ func (c *Cluster) Put(key, value []byte) error {
 				// (never lose the write, never serve from a wrong engine).
 				return errUnitAcquiring("Put")
 			}
-			return b.Put(key, value)
+			if err := b.Put(key, value); err != nil {
+				// A failed local write on an owned+mounted unit means the mount
+				// is stale (its lease moved to a higher epoch - the reshard
+				// redistribution window). Evict it so the next reconcile
+				// re-acquires fresh, and return the RETRYABLE acquiring-window
+				// error so the originator retries (never ack a write that did
+				// not land).
+				c.evictStaleMount(gu, b)
+				return errUnitAcquiring("Put")
+			}
+			return nil
 		}
 		cli, err := c.clientFor(owner.Addr)
 		if err != nil {
@@ -1169,13 +1253,22 @@ func (c *Cluster) Delete(key []byte) error {
 	if c.multi {
 		owner, local := c.ownerOf(key)
 		if local {
-			b, ok := c.localBackendForKey(key)
+			// Delete is a write: resolve under the reshard write-pause so a
+			// mid-flight cut-over routes it to the new child, not a retired
+			// unit (NO ACKED WRITE LOST; see Put).
+			b, gu, unlock, ok := c.localWriteBackendForKey(key)
+			defer unlock()
 			if !ok {
 				// Owner-but-unmounted: handoff landing on us. Retryable
 				// acquiring-window error (never lose the delete).
 				return errUnitAcquiring("Delete")
 			}
-			return b.Delete(key)
+			if err := b.Delete(key); err != nil {
+				// Stale mount (lease moved): evict + retryable, same as Put.
+				c.evictStaleMount(gu, b)
+				return errUnitAcquiring("Delete")
+			}
+			return nil
 		}
 		cli, err := c.clientFor(owner.Addr)
 		if err != nil {

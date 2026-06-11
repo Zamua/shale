@@ -62,25 +62,37 @@ func (c *Cluster) scheduleReconcile() {
 	c.settleTimer = time.AfterFunc(c.settleDelay(), c.runReconcile)
 }
 
-// runReconcile fires when the settle timer elapses in multi-backend mode.
-// It runs one reconcile pass against the CURRENT ring. Serialized by
-// reconcileMu so two membership changes whose timers fire close together
-// cannot interleave mounts (only one reconcile mutates the mount map at a
-// time); a change that arrives mid-pass re-arms the timer and runs after.
+// runReconcile fires when the settle timer elapses in multi-backend mode (and
+// from the slow self-heal loop). It runs one reconcile pass against the
+// CURRENT ring + generation. Serialized by reconcileMu so two membership
+// changes whose timers fire close together cannot interleave mounts (only one
+// reconcile mutates the mount map at a time); a change that arrives mid-pass
+// re-arms the timer and runs after.
+//
+// It also takes reshardMu (BEFORE reconcileMu) so a reconcile never runs
+// concurrently with an in-flight Reshard: the resharder transiently mounts the
+// gen-(g+1) children and holds the gen-g old units until cut-over, and a
+// reconcile diffing against the live generation mid-bisect could release them.
+// The resharder itself, already holding reshardMu, calls reconcileUnits
+// directly (not runReconcile) after the generation has advanced. Lock order
+// is reshardMu -> reconcileMu everywhere to avoid deadlock.
 func (c *Cluster) runReconcile() {
 	if c.closed.Load() {
 		return
 	}
+	c.reshardMu.Lock()
+	defer c.reshardMu.Unlock()
 	c.reconcileMu.Lock()
 	defer c.reconcileMu.Unlock()
 	c.reconcileUnits()
 }
 
 // reconcileUnits is the anti-entropy heart of Phase 3. It makes this node's
-// MOUNTED unit set match the unit set the CURRENT ring assigns it:
+// MOUNTED unit set match the generation-qualified unit set the CURRENT ring +
+// CURRENT generation assign it:
 //
-//   - desired = OwnedUnits(self, unitCount, ringOwnerLookup) against the
-//     live ring (who SHOULD this node own right now).
+//   - desired = desiredGenUnits() against the live ring at the live
+//     generation (who SHOULD this node own right now).
 //   - mounted = the mount-map keys (what this node ACTUALLY has open).
 //   - desired-but-not-mounted -> ACQUIRE: OpenUnit at a strictly higher
 //     epoch (fences the prior owner; see acquireUnit).
@@ -90,6 +102,16 @@ func (c *Cluster) runReconcile() {
 // It is idempotent (a node already holding exactly its desired set does no
 // work) and self-healing (a node that should own U but lost its mount
 // re-acquires it), so it is safe to run on every membership event.
+//
+// RESHARD INTERACTION (Phase 4): a unit being actively bisected by a local
+// Reshard is a mountMap entry the reshard owns for the duration of the
+// bisect. To avoid the reconcile fighting the resharder (releasing a
+// mid-bisect old unit, or releasing a freshly-created child before the
+// generation advances), the reconcile takes reshardMu for the snapshot +
+// diff so it cannot run concurrently with a Reshard. desiredGenUnits is
+// computed against the live generation, so once a reshard has advanced the
+// generation the reconcile naturally releases the retired old-gen units and
+// acquires the new-gen units the ring assigns this node.
 //
 // ORDERING - release first, then acquire - is deliberate. On the node
 // LOSING a unit, the release half runs here; on the node GAINING it, the
@@ -103,13 +125,18 @@ func (c *Cluster) runReconcile() {
 // before we acquire, keeping the mounted set from transiently exceeding the
 // desired set.
 //
-// Caller MUST hold reconcileMu (runReconcile does). mountMap mutations
+// Caller MUST hold reconcileMu (runReconcile does) AND must exclude an
+// in-flight Reshard - either by holding reshardMu (the resharder's own
+// post-bisect call) or because runReconcile took reshardMu before reconcileMu.
+// This mutual exclusion matters because a bisect transiently mounts the
+// gen-(g+1) children and holds the gen-g old unit until cut-over; a reconcile
+// running concurrently could release those mid-bisect. mountMap mutations
 // inside acquireUnit / releaseUnit take mountMu.
 func (c *Cluster) reconcileUnits() {
-	desired := storageunit.OwnedUnits(storageunit.NodeID(c.cfg.NodeID), c.unitCount, c.ownerLookup)
-	desiredSet := make(map[storageunit.UnitID]struct{}, len(desired))
-	for _, u := range desired {
-		desiredSet[u] = struct{}{}
+	desired := c.desiredGenUnits()
+	desiredSet := make(map[storageunit.GenUnit]struct{}, len(desired))
+	for _, gu := range desired {
+		desiredSet[gu] = struct{}{}
 	}
 
 	// Snapshot the currently-mounted set under the read lock so we diff
@@ -117,9 +144,9 @@ func (c *Cluster) reconcileUnits() {
 	// (write) to mutate, so a concurrent reader of the mount map never sees
 	// a half-applied reconcile.
 	c.mountMu.RLock()
-	mounted := make(map[storageunit.UnitID]struct{}, len(c.mountMap))
-	for u := range c.mountMap {
-		mounted[u] = struct{}{}
+	mounted := make(map[storageunit.GenUnit]struct{}, len(c.mountMap))
+	for gu := range c.mountMap {
+		mounted[gu] = struct{}{}
 	}
 	c.mountMu.RUnlock()
 
@@ -127,29 +154,29 @@ func (c *Cluster) reconcileUnits() {
 	// handed-off unit runs this half. CloseUnit flushes (durable) then
 	// releases the lease so the new owner, opening at a higher epoch, sees
 	// every acked write.
-	for u := range mounted {
-		if _, want := desiredSet[u]; !want {
-			c.releaseUnit(u)
+	for gu := range mounted {
+		if _, want := desiredSet[gu]; !want {
+			c.releaseUnit(gu)
 		}
 	}
 
 	// ACQUIRE: units this node now owns but has not mounted. The new owner
 	// of a handed-off unit runs this half, opening at a strictly higher
 	// epoch to FENCE the prior owner.
-	for _, u := range desired {
-		if _, have := mounted[u]; !have {
-			c.acquireUnit(u)
+	for _, gu := range desired {
+		if _, have := mounted[gu]; !have {
+			c.acquireUnit(gu)
 		}
 	}
 }
 
-// acquireUnit mounts unit u, opening it at a strictly higher epoch than the
-// unit's current durable lease epoch. THIS IS THE FENCE POINT: opening at a
-// higher epoch makes the prior owner's further writes to u FAIL (slatedb's
-// single-writer writer-epoch fencing; the test factory mirrors it via a
-// shared epoch registry). The new owner therefore acquires the lease and
-// the old owner is locked out, even if the old owner has not yet observed
-// the membership change.
+// acquireUnit mounts the generation-qualified unit gu, opening it at a
+// strictly higher epoch than the unit's current durable lease epoch. THIS IS
+// THE FENCE POINT: opening at a higher epoch makes the prior owner's further
+// writes to gu FAIL (slatedb's single-writer writer-epoch fencing; the test
+// factory mirrors it via a shared epoch registry). The new owner therefore
+// acquires the lease and the old owner is locked out, even if the old owner
+// has not yet observed the membership change.
 //
 // The intended epoch passed to OpenUnit is the cluster's best-effort next
 // epoch (durable epoch + 1). The factory is AUTHORITATIVE: it reads the
@@ -157,18 +184,18 @@ func (c *Cluster) reconcileUnits() {
 // stale intended epoch cannot under-fence. The cross-node source of truth
 // is the durable lease state, NOT this in-process value.
 //
-// On OpenUnit error the unit is left unmounted: an op routed here for u then
+// On OpenUnit error the unit is left unmounted: an op routed here for gu then
 // hits the handoff-window guard (errUnitAcquiring, a retryable
 // codes.Unavailable) and the next membership tick / reconcile retries the
-// acquire. We never serve u from a wrong engine and never lose a write by
+// acquire. We never serve gu from a wrong engine and never lose a write by
 // failing to mount.
 //
 // Caller MUST hold reconcileMu. mountMap mutation takes mountMu.
-func (c *Cluster) acquireUnit(u storageunit.UnitID) {
-	epoch := c.nextEpochFor(u)
-	b, err := c.factory.OpenUnit(u, epoch)
+func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
+	epoch := c.nextEpochFor(gu)
+	b, err := c.factory.OpenUnit(gu, epoch)
 	if err != nil {
-		// Leaving u unmounted is safe: routed ops get the retryable
+		// Leaving gu unmounted is safe: routed ops get the retryable
 		// acquiring-window error and the next reconcile retries. Do not
 		// mount a half-open unit.
 		return
@@ -180,47 +207,47 @@ func (c *Cluster) acquireUnit(u storageunit.UnitID) {
 		// this freshly-opened backend past shutdown (and risk a write after
 		// Close). Release it instead of mounting.
 		c.mountMu.Unlock()
-		_ = c.factory.CloseUnit(u)
+		_ = c.factory.CloseUnit(gu)
 		return
 	}
-	c.mountMap[u] = b
+	c.mountMap[gu] = b
 	c.mountMu.Unlock()
 }
 
-// releaseUnit unmounts unit u via CloseUnit, which FLUSHES anything durable
-// then releases the lease. Flush-before-release is what upholds the
-// NO-ACKED-WRITE-LOST invariant: every acked write is forced down to the
-// unit's shared backing store before the lease moves, so the new owner sees
-// it. After CloseUnit the unit may be re-opened (here or on another node) at
-// a higher epoch.
+// releaseUnit unmounts the generation-qualified unit gu via CloseUnit, which
+// FLUSHES anything durable then releases the lease. Flush-before-release is
+// what upholds the NO-ACKED-WRITE-LOST invariant: every acked write is forced
+// down to the unit's shared backing store before the lease moves, so the new
+// owner sees it. After CloseUnit the unit may be re-opened (here or on another
+// node) at a higher epoch.
 //
 // The mount-map entry is removed BEFORE CloseUnit so that, the instant the
 // lease is being released, a routed op no longer resolves the local backend
-// for u (it falls through to the handoff-window guard and retries). Removing
+// for gu (it falls through to the handoff-window guard and retries). Removing
 // after the close would leave a brief window where the local map still
 // points at a backend whose lease is being torn down.
 //
 // Caller MUST hold reconcileMu. mountMap mutation takes mountMu.
-func (c *Cluster) releaseUnit(u storageunit.UnitID) {
+func (c *Cluster) releaseUnit(gu storageunit.GenUnit) {
 	c.mountMu.Lock()
-	delete(c.mountMap, u)
+	delete(c.mountMap, gu)
 	c.mountMu.Unlock()
 	// CloseUnit is idempotent + best-effort: a close error does not change
-	// ownership (the ring already moved u off this node), and the new
+	// ownership (the ring already moved gu off this node), and the new
 	// owner's higher-epoch open fences any writer this close failed to stop.
-	_ = c.factory.CloseUnit(u)
+	_ = c.factory.CloseUnit(gu)
 }
 
-// nextEpochFor computes the INTENDED epoch to open unit u at: one above the
-// epoch this node currently holds u at, or the base acquire epoch if this
-// node does not currently hold u (the common handoff case - the new owner
-// never had u open). This is a best-effort hint only; the factory fences
+// nextEpochFor computes the INTENDED epoch to open gu at: one above the
+// epoch this node currently holds gu at, or the base acquire epoch if this
+// node does not currently hold gu (the common handoff case - the new owner
+// never had gu open). This is a best-effort hint only; the factory fences
 // authoritatively against the unit's DURABLE writer-epoch (see acquireUnit).
 // CurrentEpoch is the LOCAL in-process view and is NOT the cross-node source
 // of truth, which is exactly why the factory - not this function - performs
 // the real fence.
-func (c *Cluster) nextEpochFor(u storageunit.UnitID) storageunit.Epoch {
-	if cur, ok := c.factory.CurrentEpoch(u); ok {
+func (c *Cluster) nextEpochFor(gu storageunit.GenUnit) storageunit.Epoch {
+	if cur, ok := c.factory.CurrentEpoch(gu); ok {
 		return cur + 1
 	}
 	return acquireBaseEpoch
@@ -234,18 +261,20 @@ func (c *Cluster) nextEpochFor(u storageunit.UnitID) storageunit.Epoch {
 // regardless, so the exact value here only matters as a floor.
 const acquireBaseEpoch storageunit.Epoch = 1
 
-// TestingClearMount removes unit u from the mount map WITHOUT releasing the
-// factory lease, putting this node into the owner-but-unmounted state (the
-// instantaneous handoff window) DETERMINISTICALLY for a test. A routed op
-// for u's keys then hits the retryable acquiring-window guard
-// (errUnitAcquiring). Test-only; follows the Testing* white-box-hook
-// convention (see TestingDropAllPeerClients). No-op in legacy mode.
+// TestingClearMount removes unit u (at the cluster's CURRENT generation) from
+// the mount map WITHOUT releasing the factory lease, putting this node into
+// the owner-but-unmounted state (the instantaneous handoff window)
+// DETERMINISTICALLY for a test. A routed op for u's keys then hits the
+// retryable acquiring-window guard (errUnitAcquiring). Test-only; follows the
+// Testing* white-box-hook convention (see TestingDropAllPeerClients). No-op in
+// legacy mode.
 func (c *Cluster) TestingClearMount(u storageunit.UnitID) {
 	if !c.multi {
 		return
 	}
+	gu := storageunit.NewGenUnit(c.genSnapshot().gen, u)
 	c.mountMu.Lock()
-	delete(c.mountMap, u)
+	delete(c.mountMap, gu)
 	c.mountMu.Unlock()
 }
 

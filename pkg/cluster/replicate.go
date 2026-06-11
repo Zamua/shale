@@ -567,17 +567,28 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 		return backend.ErrClosed
 	}
 	if c.multi {
-		// Multi-backend mode (R=1): apply against the key's mounted unit.
-		// The caller's OwnsKey guard already confirmed this node owns the
-		// unit, so a missing mount means the unit's lease is HANDING OFF to
-		// this node (Phase 3 window): return the retryable acquiring-window
-		// error so the forwarder retries once the reconcile has acquired,
-		// rather than re-forwarding or losing the write.
-		b, ok := c.localBackendForKey(key)
+		// Multi-backend mode (R=1): apply against the key's mounted unit,
+		// resolved UNDER the reshard write-pause so a mid-flight cut-over
+		// routes the write to the new gen-(g+1) child, not a retired unit
+		// (Phase 4, NO ACKED WRITE LOST). The caller's OwnsKey guard already
+		// confirmed this node owns the unit, so a missing mount means the
+		// unit's lease is HANDING OFF to this node (Phase 3 window): return
+		// the retryable acquiring-window error so the forwarder retries once
+		// the reconcile has acquired, rather than re-forwarding or losing the
+		// write.
+		b, gu, unlock, ok := c.localWriteBackendForKey(key)
+		defer unlock()
 		if !ok {
 			return errUnitAcquiring("Put")
 		}
-		return b.Put(key, bytesToWrite)
+		if err := b.Put(key, bytesToWrite); err != nil {
+			// Stale mount (lease moved during the reshard redistribution):
+			// evict + retryable so the forwarder retries and lands on the
+			// freshly re-acquired mount (never ack a write that did not land).
+			c.evictStaleMount(gu, b)
+			return errUnitAcquiring("Put")
+		}
+		return nil
 	}
 	if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 		return migrationGuardError(c.retryAfterMs())
@@ -599,13 +610,20 @@ func (c *Cluster) LocalReplicaDelete(key []byte) error {
 		return backend.ErrClosed
 	}
 	if c.multi {
-		// Owner-but-unmounted: handoff landing on us. Retryable
-		// acquiring-window error (never lose the forwarded delete).
-		b, ok := c.localBackendForKey(key)
+		// Resolve under the reshard write-pause (Phase 4). Owner-but-unmounted:
+		// handoff landing on us. Retryable acquiring-window error (never lose
+		// the forwarded delete).
+		b, gu, unlock, ok := c.localWriteBackendForKey(key)
+		defer unlock()
 		if !ok {
 			return errUnitAcquiring("Delete")
 		}
-		return b.Delete(key)
+		if err := b.Delete(key); err != nil {
+			// Stale mount (lease moved): evict + retryable, same as Put.
+			c.evictStaleMount(gu, b)
+			return errUnitAcquiring("Delete")
+		}
+		return nil
 	}
 	if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 		return migrationGuardError(c.retryAfterMs())

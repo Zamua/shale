@@ -60,27 +60,33 @@ var ErrFenced = errors.New("sharedfactory: writer fenced; unit lease moved to a 
 // Backing is the shared object-storage analogue: per-unit durable bytes +
 // per-unit durable writer-epoch, referenced by every per-node Handle. One
 // Backing per CLUSTER in a test; one Handle per NODE off that Backing.
+//
+// Keyed by GenUnit (the generation-qualified identity), so a gen-g unit K
+// and a gen-(g+1) unit K are SEPARATE durable databases with SEPARATE
+// writer-epochs - exactly the property the v0.8 Phase 4 doubling reshard
+// depends on, where the old unit keeps serving while its two new-generation
+// children are populated.
 type Backing struct {
 	mu     sync.Mutex
-	stores map[storageunit.UnitID]*memory.Memory // shared durable bytes per unit
-	epochs map[storageunit.UnitID]storageunit.Epoch
+	stores map[storageunit.GenUnit]*memory.Memory // shared durable bytes per unit
+	epochs map[storageunit.GenUnit]storageunit.Epoch
 }
 
 // NewBacking returns an empty shared backing (no units written yet).
 func NewBacking() *Backing {
 	return &Backing{
-		stores: make(map[storageunit.UnitID]*memory.Memory),
-		epochs: make(map[storageunit.UnitID]storageunit.Epoch),
+		stores: make(map[storageunit.GenUnit]*memory.Memory),
+		epochs: make(map[storageunit.GenUnit]storageunit.Epoch),
 	}
 }
 
-// storeFor returns the shared *memory.Memory for u, creating it on first
+// storeFor returns the shared *memory.Memory for gu, creating it on first
 // touch. Caller must hold b.mu.
-func (b *Backing) storeFor(u storageunit.UnitID) *memory.Memory {
-	s, ok := b.stores[u]
+func (b *Backing) storeFor(gu storageunit.GenUnit) *memory.Memory {
+	s, ok := b.stores[gu]
 	if !ok {
 		s = memory.New()
-		b.stores[u] = s
+		b.stores[gu] = s
 	}
 	return s
 }
@@ -88,25 +94,26 @@ func (b *Backing) storeFor(u storageunit.UnitID) *memory.Memory {
 // durableEpoch reports the unit's durable writer-epoch (0 if never opened).
 // This is the cross-node source of truth a real factory reads from the
 // slatedb manifest. Exposed for test assertions.
-func (b *Backing) durableEpoch(u storageunit.UnitID) storageunit.Epoch {
+func (b *Backing) durableEpoch(gu storageunit.GenUnit) storageunit.Epoch {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	return b.epochs[u]
+	return b.epochs[gu]
 }
 
 // DurableEpoch is the exported form of durableEpoch for tests that assert
 // the fence advanced the epoch.
-func (b *Backing) DurableEpoch(u storageunit.UnitID) storageunit.Epoch {
-	return b.durableEpoch(u)
+func (b *Backing) DurableEpoch(gu storageunit.GenUnit) storageunit.Epoch {
+	return b.durableEpoch(gu)
 }
 
-// UnitStore returns the shared backend for u (and ok=false if u was never
+// UnitStore returns the shared backend for gu (and ok=false if gu was never
 // opened). Tests use it to assert the SAME bytes are visible regardless of
-// which node currently owns the lease (the copy-free property).
-func (b *Backing) UnitStore(u storageunit.UnitID) (backend.Backend, bool) {
+// which node currently owns the lease (the copy-free property), and to
+// inspect a freshly-bisected gen-(g+1) child unit's contents.
+func (b *Backing) UnitStore(gu storageunit.GenUnit) (backend.Backend, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s, ok := b.stores[u]
+	s, ok := b.stores[gu]
 	return s, ok
 }
 
@@ -122,10 +129,10 @@ func (b *Backing) UnitStore(u storageunit.UnitID) (backend.Backend, bool) {
 // flushes and never destroys durable bytes. The durable epoch is left
 // untouched so a subsequent acquire still fences correctly; only the data is
 // gone, which is precisely the failure the gate must detect.
-func (b *Backing) WipeUnit(u storageunit.UnitID) {
+func (b *Backing) WipeUnit(gu storageunit.GenUnit) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	s, ok := b.stores[u]
+	s, ok := b.stores[gu]
 	if !ok {
 		return
 	}
@@ -163,15 +170,15 @@ func (b *Backing) WipeUnit(u storageunit.UnitID) {
 // cold acquire for being "too low": a new owner must always be able to take
 // the lease. (Re-acquire of a unit THIS handle already holds is gated by
 // Handle.OpenUnit before it reaches here.)
-func (b *Backing) acquire(u storageunit.UnitID, intended storageunit.Epoch) (*memory.Memory, storageunit.Epoch) {
+func (b *Backing) acquire(gu storageunit.GenUnit, intended storageunit.Epoch) (*memory.Memory, storageunit.Epoch) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	opened := intended
-	if floor := b.epochs[u] + 1; floor > opened {
+	if floor := b.epochs[gu] + 1; floor > opened {
 		opened = floor
 	}
-	b.epochs[u] = opened
-	return b.storeFor(u), opened
+	b.epochs[gu] = opened
+	return b.storeFor(gu), opened
 }
 
 // Handle is a per-node factory handle over a shared Backing. It implements
@@ -181,7 +188,7 @@ type Handle struct {
 	backing *Backing
 
 	mu   sync.Mutex
-	open map[storageunit.UnitID]storageunit.Epoch // units THIS handle has open + at what epoch
+	open map[storageunit.GenUnit]storageunit.Epoch // units THIS handle has open + at what epoch
 }
 
 // Handle returns a fresh per-node handle over this backing. Each node in a
@@ -189,7 +196,7 @@ type Handle struct {
 func (b *Backing) Handle() *Handle {
 	return &Handle{
 		backing: b,
-		open:    make(map[storageunit.UnitID]storageunit.Epoch),
+		open:    make(map[storageunit.GenUnit]storageunit.Epoch),
 	}
 }
 
@@ -212,56 +219,61 @@ func (b *Backing) Handle() *Handle {
 //     cluster cannot know another node's durable epoch from its in-process
 //     view (CurrentEpoch returns ok=false for a unit it never held), so it
 //     passes a low floor and the durable manifest governs.
-func (h *Handle) OpenUnit(u storageunit.UnitID, epoch storageunit.Epoch) (backend.Backend, error) {
+func (h *Handle) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
 	h.mu.Lock()
-	if cur, held := h.open[u]; held && epoch <= cur {
+	if cur, held := h.open[gu]; held && epoch <= cur {
 		h.mu.Unlock()
-		return nil, fmt.Errorf("sharedfactory: unit %d already open on this handle at epoch %d, refusing open at %d", u, cur, epoch)
+		return nil, fmt.Errorf("sharedfactory: unit %s already open on this handle at epoch %d, refusing open at %d", gu, cur, epoch)
 	}
 	h.mu.Unlock()
 
-	store, opened := h.backing.acquire(u, epoch)
+	store, opened := h.backing.acquire(gu, epoch)
 	h.mu.Lock()
-	h.open[u] = opened
+	h.open[gu] = opened
 	h.mu.Unlock()
-	return &fencedBackend{backing: h.backing, unit: u, epoch: opened, store: store}, nil
+	return &fencedBackend{backing: h.backing, unit: gu, epoch: opened, store: store}, nil
 }
 
-// CloseUnit releases u from THIS handle. It flushes nothing (memory is
+// CloseUnit releases gu from THIS handle. It flushes nothing (memory is
 // always "durable" here) and does NOT lower the backing's durable epoch -
 // releasing a lease never un-fences a higher-epoch owner. Idempotent:
 // closing a unit this handle does not hold is a no-op returning nil. The
 // shared bytes are retained in the Backing so a later OpenUnit (here or on
 // another handle) at a higher epoch sees them - this is the durable-bytes-
 // survive-unmount property a real handoff relies on.
-func (h *Handle) CloseUnit(u storageunit.UnitID) error {
+func (h *Handle) CloseUnit(gu storageunit.GenUnit) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	delete(h.open, u)
+	delete(h.open, gu)
 	return nil
 }
 
-// CurrentEpoch reports the epoch THIS handle currently holds u open at, and
-// ok=false if this handle does not have u open. LOCAL in-process view only,
+// CurrentEpoch reports the epoch THIS handle currently holds gu open at, and
+// ok=false if this handle does not have gu open. LOCAL in-process view only,
 // per the BackendFactory contract: the cross-node source of truth is the
 // Backing's durable epoch (DurableEpoch), which OpenUnit fences against.
-func (h *Handle) CurrentEpoch(u storageunit.UnitID) (storageunit.Epoch, bool) {
+func (h *Handle) CurrentEpoch(gu storageunit.GenUnit) (storageunit.Epoch, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	e, ok := h.open[u]
+	e, ok := h.open[gu]
 	return e, ok
 }
 
-// OpenUnits returns the units THIS handle currently has open, ascending. A
-// fresh copy the caller may retain.
-func (h *Handle) OpenUnits() []storageunit.UnitID {
+// OpenUnits returns the units THIS handle currently has open, ascending by
+// (Generation, UnitID). A fresh copy the caller may retain.
+func (h *Handle) OpenUnits() []storageunit.GenUnit {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	out := make([]storageunit.UnitID, 0, len(h.open))
-	for u := range h.open {
-		out = append(out, u)
+	out := make([]storageunit.GenUnit, 0, len(h.open))
+	for gu := range h.open {
+		out = append(out, gu)
 	}
-	sort.Slice(out, func(i, j int) bool { return out[i] < out[j] })
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Gen != out[j].Gen {
+			return out[i].Gen < out[j].Gen
+		}
+		return out[i].ID < out[j].ID
+	})
 	return out
 }
 
@@ -275,7 +287,7 @@ func (h *Handle) OpenUnits() []storageunit.UnitID {
 // even though A has not yet observed the membership change.
 type fencedBackend struct {
 	backing *Backing
-	unit    storageunit.UnitID
+	unit    storageunit.GenUnit
 	epoch   storageunit.Epoch
 	store   *memory.Memory
 }

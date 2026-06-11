@@ -55,66 +55,140 @@ func (c *Cluster) notReady() bool {
 // multibackend_rebalance.go), which is the path that fences a prior owner.
 const epochAtOpen storageunit.Epoch = 0
 
-// unitIDBytes encodes a UnitID as 4 fixed-width big-endian bytes. This is
-// the stable encoding fed to the ring (LocateKey hashes it whole, since a
-// bare unit id carries no "{...}" hash tag) so a unit's owner is the same
-// on every node. The encoding MUST be identical everywhere a unit owner is
-// computed; centralizing it here is what guarantees that.
-func unitIDBytes(u storageunit.UnitID) []byte {
-	var b [4]byte
-	binary.BigEndian.PutUint32(b[:], uint32(u))
+// genUnitBytes encodes a GenUnit (the generation-qualified storage identity)
+// as 12 fixed-width big-endian bytes: 8 bytes of Generation followed by 4
+// bytes of UnitID. This is the stable encoding fed to the ring (LocateKey
+// hashes it whole, since a generation-qualified id carries no "{...}" hash
+// tag) so a unit's owner is the same on every node. The generation is part
+// of the hash input, so the gen-g and gen-(g+1) ids of the SAME UnitID hash
+// to potentially DIFFERENT ring positions (hence potentially different
+// owners) - which is what lets a doubling reshard land the new generation's
+// units wherever the ring places them. The encoding MUST be identical
+// everywhere a unit owner is computed; centralizing it here is what
+// guarantees that.
+func genUnitBytes(gu storageunit.GenUnit) []byte {
+	var b [12]byte
+	binary.BigEndian.PutUint64(b[0:8], uint64(gu.Gen))
+	binary.BigEndian.PutUint32(b[8:12], uint32(gu.ID))
 	return b[:]
 }
 
-// ringOwnerLookup adapts the cluster's ring into a storageunit.OwnerLookup.
-// OwnerOf(u) hashes unitIDBytes(u) through the SAME ring the cluster routes
-// keys with (no second ring), so unit ownership and key routing agree by
-// construction. An empty ring (single-node multi-backend, before any peer
-// is known) reports the local node as owner of every unit: with no ring to
-// place units on, this node owns them all.
-type ringOwnerLookup struct {
-	c *Cluster
-}
-
-// OwnerOf returns the node that owns unit u. With an empty / nil ring it
-// returns the local node (ok=true) so a single-node multi-backend cluster
-// mounts the whole unit space locally. Otherwise it locates the unit id on
-// the ring.
-func (l ringOwnerLookup) OwnerOf(u storageunit.UnitID) (storageunit.NodeID, bool) {
-	if l.c.ring == nil || l.c.ring.Empty() {
-		return storageunit.NodeID(l.c.cfg.NodeID), true
+// genUnitOwner returns the node that owns the generation-qualified unit gu,
+// hashing genUnitBytes(gu) through the SAME ring the cluster routes keys with
+// (no second ring), so unit ownership and key routing agree by construction.
+// With an empty / nil ring (single-node multi-backend, before any peer is
+// known) it returns the local node (ok=true): with no ring to place units on,
+// this node owns them all.
+func (c *Cluster) genUnitOwner(gu storageunit.GenUnit) (storageunit.NodeID, bool) {
+	if c.ring == nil || c.ring.Empty() {
+		return storageunit.NodeID(c.cfg.NodeID), true
 	}
-	m := l.c.ring.LocateKey(unitIDBytes(u))
+	m := c.ring.LocateKey(genUnitBytes(gu))
 	if m.ID == "" {
 		return "", false
 	}
 	return storageunit.NodeID(m.ID), true
 }
 
-// initMultiBackend wires up multi-backend mode at Open: build the owner
-// lookup from the ring, derive the units this node owns, and mount each via
-// the factory into the mount map. Called only when c.multi is true. On any
-// OpenUnit error it rolls back (closes everything it already opened) so Open
-// fails cleanly with nothing half-mounted.
-func (c *Cluster) initMultiBackend() error {
-	c.ownerLookup = ringOwnerLookup{c: c}
-	c.mountMap = make(map[storageunit.UnitID]backend.Backend)
+// desiredGenUnits returns the generation-qualified units this node SHOULD
+// have mounted right now: for the cluster's CURRENT generation + count, every
+// unit whose GenUnit the ring assigns to self. Mid-reshard a unit that has
+// already cut over is resolved at the NEW generation (its gen-(g+1) children),
+// so the desired set is the union of the not-yet-cut-over gen-g units and the
+// cut-over units' gen-(g+1) children that this node owns. This is the
+// generation-aware analogue of storageunit.OwnedUnits; the Phase 3 reconcile
+// diffs it against the factory's OpenUnits() to decide acquire / release.
+func (c *Cluster) desiredGenUnits() []storageunit.GenUnit {
+	gs := c.genSnapshot()
+	want := make(map[storageunit.GenUnit]struct{})
+	self := storageunit.NodeID(c.cfg.NodeID)
+	ownerOf := c.genOwner // ring-backed by default; test-overridable
 
-	owned := storageunit.OwnedUnits(storageunit.NodeID(c.cfg.NodeID), c.unitCount, c.ownerLookup)
-	for _, u := range owned {
+	// Old-generation units that have NOT cut over are still live at gen g.
+	for _, u := range gs.count.IDs() {
+		if gs.hasCutOver(u) {
+			// This old unit has been retired; its key-space now lives in the
+			// gen-(g+1) children, handled by the new-count pass below.
+			continue
+		}
+		gu := storageunit.NewGenUnit(gs.gen, u)
+		if owner, ok := ownerOf(gu); ok && owner == self {
+			want[gu] = struct{}{}
+		}
+	}
+
+	// Cut-over units contribute their two gen-(g+1) children. nextCount is the
+	// doubled count; with no reshard in flight the cut-over set is empty and
+	// this loop adds nothing (steady state is the old-gen pass only).
+	if !gs.nextCount.IsZero() {
+		for u := range gs.cutOver {
+			low, high, err := storageunit.ChildUnits(u, gs.count)
+			if err != nil {
+				continue
+			}
+			for _, child := range []storageunit.UnitID{low, high} {
+				gu := storageunit.NewGenUnit(gs.gen+1, child)
+				if owner, ok := ownerOf(gu); ok && owner == self {
+					want[gu] = struct{}{}
+				}
+			}
+		}
+	}
+
+	out := make([]storageunit.GenUnit, 0, len(want))
+	for gu := range want {
+		out = append(out, gu)
+	}
+	sortGenUnits(out)
+	return out
+}
+
+// sortGenUnits sorts in place ascending by (Generation, UnitID). A small
+// insertion sort keeps the dependency surface minimal (the sets are tiny:
+// at most N entries).
+func sortGenUnits(g []storageunit.GenUnit) {
+	for i := 1; i < len(g); i++ {
+		for j := i; j > 0 && genUnitLess(g[j], g[j-1]); j-- {
+			g[j-1], g[j] = g[j], g[j-1]
+		}
+	}
+}
+
+// genUnitLess orders by Generation then UnitID.
+func genUnitLess(a, b storageunit.GenUnit) bool {
+	if a.Gen != b.Gen {
+		return a.Gen < b.Gen
+	}
+	return a.ID < b.ID
+}
+
+// initMultiBackend wires up multi-backend mode at Open: seed the
+// generation-aware routing state (generation 0, count N), derive the
+// generation-qualified units this node owns, and mount each via the factory
+// into the mount map. Called only when c.multi is true. On any OpenUnit error
+// it rolls back (closes everything it already opened) so Open fails cleanly
+// with nothing half-mounted.
+func (c *Cluster) initMultiBackend() error {
+	if c.genOwner == nil {
+		c.genOwner = c.genUnitOwner
+	}
+	c.initGenState()
+	c.mountMap = make(map[storageunit.GenUnit]backend.Backend)
+
+	for _, gu := range c.desiredGenUnits() {
 		// Cold-start mount at the base epoch. The factory fences against
 		// the unit's durable manifest if one already exists. A later
 		// membership change drives the Phase 3 handoff (acquireUnit) which
 		// opens at a strictly higher epoch to fence a prior owner.
-		b, err := c.factory.OpenUnit(u, epochAtOpen)
+		b, err := c.factory.OpenUnit(gu, epochAtOpen)
 		if err != nil {
 			// Rollback is best-effort: we are already failing Open, so a
 			// secondary close error does not change the outcome. The
 			// primary OpenUnit error is what the caller acts on.
 			_ = c.closeMountedUnits()
-			return fmt.Errorf("cluster: open unit %d: %w", u, err)
+			return fmt.Errorf("cluster: open unit %s: %w", gu, err)
 		}
-		c.mountMap[u] = b
+		c.mountMap[gu] = b
 	}
 	return nil
 }
@@ -128,71 +202,64 @@ func (c *Cluster) closeMountedUnits() error {
 	c.mountMu.Lock()
 	defer c.mountMu.Unlock()
 	var firstErr error
-	for u := range c.mountMap {
-		if err := c.factory.CloseUnit(u); err != nil && firstErr == nil {
+	for gu := range c.mountMap {
+		if err := c.factory.CloseUnit(gu); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		delete(c.mountMap, u)
+		delete(c.mountMap, gu)
 	}
 	return firstErr
 }
 
-// unitForKey computes the storage unit a key belongs to, using the SAME
-// shard-key extraction the ring uses (so co-located keys share a unit and a
-// transaction stays in one engine). Multi-backend mode only.
-func (c *Cluster) unitForKey(key []byte) storageunit.UnitID {
-	return storageunit.UnitForShardKey(c.shardKey(key), c.unitCount)
-}
-
-// unitOwnerOf returns the ring member that owns key's unit + whether the
-// local node is that owner. Multi-backend analogue of ownerOf: the ownership
-// question goes through the unit, not the raw key. With an empty / nil ring
-// the local node owns everything (single-node multi-backend).
+// unitOwnerOf returns the ring member that owns key's generation-qualified
+// unit + whether the local node is that owner. Multi-backend analogue of
+// ownerOf: the ownership question goes through the unit (resolved
+// generation-aware), not the raw key. With an empty / nil ring the local node
+// owns everything (single-node multi-backend).
 func (c *Cluster) unitOwnerOf(key []byte) (owner ring.Member, isLocal bool) {
-	u := c.unitForKey(key)
+	gu := c.genUnitForKey(key)
 	if c.ring == nil || c.ring.Empty() {
 		self := ring.Member{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}
 		return self, true
 	}
-	owner = c.ring.LocateKey(unitIDBytes(u))
+	owner = c.ring.LocateKey(genUnitBytes(gu))
 	return owner, owner.ID == c.cfg.NodeID
 }
 
 // localBackendForKey resolves the mounted backend a LOCAL operation on key
-// must apply against. ok is false when this node does not have key's unit
-// mounted - either it never owned the unit, or (Phase 3) the lease moved.
+// must apply against. ok is false when this node does not have key's
+// (generation-qualified) unit mounted - either it never owned the unit, the
+// lease moved (Phase 3), or a reshard is mid-flight for the unit (Phase 4).
 // Callers that have already established local ownership (the forwarding
 // guard) treat ok=false as "this node does not own the unit": refuse, do
 // NOT re-forward. Multi-backend mode only.
 func (c *Cluster) localBackendForKey(key []byte) (backend.Backend, bool) {
-	u := c.unitForKey(key)
+	gu := c.genUnitForKey(key)
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
-	b, ok := c.mountMap[u]
+	b, ok := c.mountMap[gu]
 	return b, ok
 }
 
 // mountedBackends returns a snapshot of every backend this node currently
-// has mounted, in ascending unit order. Used by the LOCAL admin scan
-// (LocalScanPrefix with the unit-spanning behavior keysHeld + Aggregate
-// need) so a multi-backend node reports the union of its units, not a
-// single engine. Multi-backend mode only.
+// has mounted, in ascending (generation, unit) order. Used by the LOCAL admin
+// scan (LocalScanPrefix with the unit-spanning behavior keysHeld + Aggregate
+// need) so a multi-backend node reports the union of its units, not a single
+// engine. During a reshard this transiently spans BOTH the old gen-g unit and
+// its gen-(g+1) children (until the old unit is retired); the admin scan
+// counting a key in both is acceptable for the non-routed keysHeld view.
+// Multi-backend mode only.
 func (c *Cluster) mountedBackends() []backend.Backend {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
-	ids := make([]storageunit.UnitID, 0, len(c.mountMap))
-	for u := range c.mountMap {
-		ids = append(ids, u)
+	ids := make([]storageunit.GenUnit, 0, len(c.mountMap))
+	for gu := range c.mountMap {
+		ids = append(ids, gu)
 	}
-	// Ascending unit order for a stable, deterministic scan sequence.
-	for i := 1; i < len(ids); i++ {
-		for j := i; j > 0 && ids[j-1] > ids[j]; j-- {
-			ids[j-1], ids[j] = ids[j], ids[j-1]
-		}
-	}
+	sortGenUnits(ids)
 	out := make([]backend.Backend, 0, len(ids))
-	for _, u := range ids {
-		out = append(out, c.mountMap[u])
+	for _, gu := range ids {
+		out = append(out, c.mountMap[gu])
 	}
 	return out
 }

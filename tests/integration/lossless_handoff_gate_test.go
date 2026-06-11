@@ -267,8 +267,8 @@ func TestLosslessHandoffGate(t *testing.T) {
 			return false
 		}
 		have := make(map[storageunit.UnitID]bool, len(open))
-		for _, u := range open {
-			have[u] = true
+		for _, gu := range open {
+			have[gu.ID] = true
 		}
 		for _, u := range movedUnits {
 			if !have[u] {
@@ -314,7 +314,7 @@ func TestLosslessHandoffGate(t *testing.T) {
 	// not a private copy. A node-to-node copy could never observe a write made
 	// straight to the shared backing after the copy completed. ===
 	probeUnit := movedUnits[0]
-	sharedStore, ok := backing.UnitStore(probeUnit)
+	sharedStore, ok := backing.UnitStore(gu0(probeUnit))
 	if !ok {
 		t.Fatalf("COPY-FREE check: shared backing has no store for handed-off unit %d", probeUnit)
 	}
@@ -365,7 +365,7 @@ func TestLosslessHandoffGate(t *testing.T) {
 	// owner still held for this unit at the pre-handoff epoch is, by the same
 	// rule, already fenced.
 	oldOwnerID := ownerOfUnitIn2NodeRing(probeUnit, n1.ID, n2.ID)
-	if backing.DurableEpoch(probeUnit) == 0 {
+	if backing.DurableEpoch(gu0(probeUnit)) == 0 {
 		t.Fatalf("FENCING check: handed-off unit %d (old owner %s) has durable epoch 0 - the acquire never fenced", probeUnit, oldOwnerID)
 	}
 	assertStaleHandleFenced(t, backing, probeUnit)
@@ -443,14 +443,22 @@ func tagWithUnit(target storageunit.UnitID, unitCount int) string {
 	panic(fmt.Sprintf("tagWithUnit: no tag maps to unit %d under %d units", target, unitCount))
 }
 
-// unitIDBytesForTest mirrors the cluster's internal unitIDBytes (4-byte
-// big-endian) so a test-side ring placement agrees with routing.
+// gu0 builds a generation-0 GenUnit. These lease-handoff gate tests do not
+// reshard, so every unit they touch is at generation 0.
+func gu0(u storageunit.UnitID) storageunit.GenUnit {
+	return storageunit.NewGenUnit(0, u)
+}
+
+// unitIDBytesForTest mirrors the cluster's internal genUnitBytes (8-byte
+// big-endian generation followed by 4-byte big-endian unit id) so a test-side
+// ring placement agrees with routing. These tests place gen-0 units.
 func unitIDBytesForTest(u storageunit.UnitID) []byte {
-	var b [4]byte
-	b[0] = byte(uint32(u) >> 24)
-	b[1] = byte(uint32(u) >> 16)
-	b[2] = byte(uint32(u) >> 8)
-	b[3] = byte(uint32(u))
+	var b [12]byte
+	// Generation 0 occupies bytes 0..7 (all zero); the unit id is bytes 8..11.
+	b[8] = byte(uint32(u) >> 24)
+	b[9] = byte(uint32(u) >> 16)
+	b[10] = byte(uint32(u) >> 8)
+	b[11] = byte(uint32(u))
 	return b[:]
 }
 
@@ -463,9 +471,10 @@ func unitIDBytesForTest(u storageunit.UnitID) []byte {
 // so it is exercising the real fence, not a mock.
 func assertStaleHandleFenced(t *testing.T, backing *sharedfactory.Backing, u storageunit.UnitID) {
 	t.Helper()
+	gu := gu0(u)
 	// "stale" handle: open u at the current durable epoch via a fresh handle.
 	stale := backing.Handle()
-	staleBk, err := stale.OpenUnit(u, backing.DurableEpoch(u))
+	staleBk, err := stale.OpenUnit(gu, backing.DurableEpoch(gu))
 	if err != nil {
 		t.Fatalf("FENCING setup: stale handle OpenUnit(%d): %v", u, err)
 	}
@@ -475,7 +484,7 @@ func assertStaleHandleFenced(t *testing.T, backing *sharedfactory.Backing, u sto
 	}
 	// A higher-epoch owner acquires (the next handoff): durable epoch advances.
 	newer := backing.Handle()
-	if _, err := newer.OpenUnit(u, backing.DurableEpoch(u)+1); err != nil {
+	if _, err := newer.OpenUnit(gu, backing.DurableEpoch(gu)+1); err != nil {
 		t.Fatalf("FENCING setup: newer handle OpenUnit(%d): %v", u, err)
 	}
 	// The stale handle is now fenced: its write MUST fail.
@@ -526,10 +535,10 @@ func (a *atomicUnit) get() (storageunit.UnitID, bool) {
 // armed unit, so the next OpenUnit lands an empty store and every acked write
 // in that unit is lost. This models the data-loss failure mode the gate is the
 // safety net for.
-func (h *brokenHandle) CloseUnit(u storageunit.UnitID) error {
-	err := h.Handle.CloseUnit(u)
-	if target, ok := h.breakUnit.get(); ok && u == target {
-		h.backing.WipeUnit(u)
+func (h *brokenHandle) CloseUnit(gu storageunit.GenUnit) error {
+	err := h.Handle.CloseUnit(gu)
+	if target, ok := h.breakUnit.get(); ok && gu.ID == target {
+		h.backing.WipeUnit(gu)
 	}
 	return err
 }
@@ -540,7 +549,7 @@ func (h *brokenHandle) CloseUnit(u storageunit.UnitID) error {
 // unit's bytes.
 func sharedStoreKeyCount(t *testing.T, backing *sharedfactory.Backing, u storageunit.UnitID) int {
 	t.Helper()
-	s, ok := backing.UnitStore(u)
+	s, ok := backing.UnitStore(gu0(u))
 	if !ok {
 		return 0
 	}
@@ -629,8 +638,8 @@ func TestGateCatchesLostWrite(t *testing.T) {
 	// (the shared store for breakUnit drained to zero keys).
 	if !waitUntil(12*time.Second, func() bool {
 		mounted := false
-		for _, u := range n2.Handle.OpenUnits() {
-			if u == breakUnit {
+		for _, gu := range n2.Handle.OpenUnits() {
+			if gu.ID == breakUnit {
 				mounted = true
 				break
 			}

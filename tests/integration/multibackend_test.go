@@ -109,10 +109,12 @@ func startMultiBackendNode(t *testing.T, id, seedAddr string, unitCount int) *mu
 }
 
 // unitOwnerID is the test-side mirror of the cluster's unit owner lookup:
-// build a ring from the cluster's Members() snapshot, hash the fixed-width
-// big-endian unit id (matching unitIDBytes), and report the owning node.
-// Two rings built from the same members agree (deterministic hashing), so
-// this faithfully previews which node owns a given key's unit.
+// build a ring from the cluster's Members() snapshot, hash the generation-
+// qualified unit id (matching the cluster's genUnitBytes: 8-byte big-endian
+// generation, here 0, followed by 4-byte big-endian unit id), and report the
+// owning node. Two rings built from the same members agree (deterministic
+// hashing), so this faithfully previews which node owns a given key's unit.
+// These tests do not reshard, so the generation is always 0.
 func unitOwnerID(c *cluster.Cluster, key string, unitCount int) string {
 	r := ring.New()
 	for _, m := range c.Members() {
@@ -120,12 +122,19 @@ func unitOwnerID(c *cluster.Cluster, key string, unitCount int) string {
 	}
 	uc := storageunit.MustUnitCount(unitCount)
 	u := storageunit.UnitForShardKey(ring.ShardKey([]byte(key)), uc)
-	var b [4]byte
-	b[0] = byte(uint32(u) >> 24)
-	b[1] = byte(uint32(u) >> 16)
-	b[2] = byte(uint32(u) >> 8)
-	b[3] = byte(uint32(u))
-	return r.LocateKey(b[:]).ID
+	return r.LocateKey(gen0UnitBytes(u)).ID
+}
+
+// gen0UnitBytes encodes a generation-0 unit id the way the cluster's internal
+// genUnitBytes does: 8 zero bytes (generation 0) then 4 big-endian bytes of
+// the unit id. The integration tests place gen-0 units only.
+func gen0UnitBytes(u storageunit.UnitID) []byte {
+	var b [12]byte
+	b[8] = byte(uint32(u) >> 24)
+	b[9] = byte(uint32(u) >> 16)
+	b[10] = byte(uint32(u) >> 8)
+	b[11] = byte(uint32(u))
+	return b[:]
 }
 
 // keyForOwner returns a key whose unit is owned by wantOwner under the

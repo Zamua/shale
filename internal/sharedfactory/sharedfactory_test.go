@@ -9,6 +9,12 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
+// gu0 builds a generation-0 GenUnit for the lease-handoff tests (handoff is
+// a generation-stable operation; only the doubling reshard advances the gen).
+func gu0(id storageunit.UnitID) storageunit.GenUnit {
+	return storageunit.NewGenUnit(0, id)
+}
+
 // TestCopyFreeHandoff is the core property: when unit U's lease moves from
 // node A's handle to node B's handle, B opens the SAME underlying bytes A
 // wrote - zero copy. B must see every key A persisted before the handoff.
@@ -16,7 +22,7 @@ func TestCopyFreeHandoff(t *testing.T) {
 	backing := NewBacking()
 	a := backing.Handle()
 	b := backing.Handle()
-	const u storageunit.UnitID = 3
+	u := gu0(3)
 
 	// A acquires U at epoch 1 and writes some keys (these are "acked" - they
 	// returned success, so they are durable).
@@ -61,7 +67,7 @@ func TestFenceLocksOutPriorOwner(t *testing.T) {
 	backing := NewBacking()
 	a := backing.Handle()
 	b := backing.Handle()
-	const u storageunit.UnitID = 0
+	u := gu0(0)
 
 	ba, err := a.OpenUnit(u, 1)
 	if err != nil {
@@ -112,7 +118,7 @@ func TestColdAcquireFencesAboveDurable(t *testing.T) {
 	backing := NewBacking()
 	a := backing.Handle()
 	b := backing.Handle()
-	const u storageunit.UnitID = 7
+	u := gu0(7)
 
 	if _, err := a.OpenUnit(u, 5); err != nil {
 		t.Fatalf("A.OpenUnit at 5: %v", err)
@@ -139,7 +145,7 @@ func TestColdAcquireFencesAboveDurable(t *testing.T) {
 func TestDoubleOpenSameHandleRejected(t *testing.T) {
 	backing := NewBacking()
 	a := backing.Handle()
-	const u storageunit.UnitID = 2
+	u := gu0(2)
 
 	if _, err := a.OpenUnit(u, 3); err != nil {
 		t.Fatalf("A.OpenUnit at 3: %v", err)
@@ -164,27 +170,27 @@ func TestHandlesIndependentOpenSets(t *testing.T) {
 	a := backing.Handle()
 	b := backing.Handle()
 
-	if _, err := a.OpenUnit(0, 1); err != nil {
+	if _, err := a.OpenUnit(gu0(0), 1); err != nil {
 		t.Fatalf("A.OpenUnit 0: %v", err)
 	}
-	if _, err := a.OpenUnit(1, 1); err != nil {
+	if _, err := a.OpenUnit(gu0(1), 1); err != nil {
 		t.Fatalf("A.OpenUnit 1: %v", err)
 	}
-	if _, err := b.OpenUnit(2, 1); err != nil {
+	if _, err := b.OpenUnit(gu0(2), 1); err != nil {
 		t.Fatalf("B.OpenUnit 2: %v", err)
 	}
 
-	if got := a.OpenUnits(); len(got) != 2 || got[0] != 0 || got[1] != 1 {
-		t.Fatalf("A.OpenUnits = %v, want [0 1]", got)
+	if got := a.OpenUnits(); len(got) != 2 || got[0] != gu0(0) || got[1] != gu0(1) {
+		t.Fatalf("A.OpenUnits = %v, want [g0/u0 g0/u1]", got)
 	}
-	if got := b.OpenUnits(); len(got) != 1 || got[0] != 2 {
-		t.Fatalf("B.OpenUnits = %v, want [2]", got)
+	if got := b.OpenUnits(); len(got) != 1 || got[0] != gu0(2) {
+		t.Fatalf("B.OpenUnits = %v, want [g0/u2]", got)
 	}
 	// CurrentEpoch is local: A holds 0 at epoch 1, B does not hold 0.
-	if e, ok := a.CurrentEpoch(0); !ok || e != 1 {
+	if e, ok := a.CurrentEpoch(gu0(0)); !ok || e != 1 {
 		t.Fatalf("A.CurrentEpoch(0) = (%d,%v), want (1,true)", e, ok)
 	}
-	if _, ok := b.CurrentEpoch(0); ok {
+	if _, ok := b.CurrentEpoch(gu0(0)); ok {
 		t.Fatalf("B.CurrentEpoch(0) ok=true, want false (B never opened unit 0)")
 	}
 }

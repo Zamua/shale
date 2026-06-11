@@ -2,7 +2,7 @@ package cluster
 
 // White-box tests for multi-backend mode (v0.8 Phase 2). These live in
 // package cluster (not cluster_test) so they can reach the unexported
-// mode wiring: validateBackendMode, unitIDBytes, the mountMap, and the
+// mode wiring: validateBackendMode, genUnitBytes, the mountMap, and the
 // per-unit routing. The cross-node forwarding path is covered separately
 // by the in-process integration tests in tests/integration.
 
@@ -97,25 +97,32 @@ func TestValidateBackendMode(t *testing.T) {
 	}
 }
 
-// TestUnitIDBytesStableEncoding pins the fixed-width big-endian encoding
-// fed to the ring. A drift in this encoding would silently re-route every
-// unit, so the test nails down concrete bytes for a few unit ids.
-func TestUnitIDBytesStableEncoding(t *testing.T) {
+// TestGenUnitBytesStableEncoding pins the fixed-width big-endian encoding fed
+// to the ring: 8 bytes of Generation followed by 4 bytes of UnitID. A drift in
+// this encoding would silently re-route every unit, so the test nails down
+// concrete bytes. The generation prefix is what makes a gen-g unit K and a
+// gen-(g+1) unit K hash to different ring positions.
+func TestGenUnitBytesStableEncoding(t *testing.T) {
 	cases := []struct {
-		u    storageunit.UnitID
+		gu   storageunit.GenUnit
 		want []byte
 	}{
-		{0, []byte{0, 0, 0, 0}},
-		{1, []byte{0, 0, 0, 1}},
-		{255, []byte{0, 0, 0, 255}},
-		{256, []byte{0, 0, 1, 0}},
-		{0xDEADBEEF, []byte{0xDE, 0xAD, 0xBE, 0xEF}},
+		{storageunit.NewGenUnit(0, 0), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
+		{storageunit.NewGenUnit(0, 1), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
+		{storageunit.NewGenUnit(1, 1), []byte{0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1}},
+		{storageunit.NewGenUnit(0, 256), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0}},
+		{storageunit.NewGenUnit(0, 0xDEADBEEF), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF}},
 	}
 	for _, tc := range cases {
-		got := unitIDBytes(tc.u)
+		got := genUnitBytes(tc.gu)
 		if !bytes.Equal(got, tc.want) {
-			t.Fatalf("unitIDBytes(%d) = %v, want %v", tc.u, got, tc.want)
+			t.Fatalf("genUnitBytes(%s) = %v, want %v", tc.gu, got, tc.want)
 		}
+	}
+	// The same UnitID at two generations must encode to DIFFERENT bytes (so
+	// the ring places them potentially differently).
+	if bytes.Equal(genUnitBytes(storageunit.NewGenUnit(0, 5)), genUnitBytes(storageunit.NewGenUnit(1, 5))) {
+		t.Fatal("gen-0 and gen-1 of unit 5 encoded identically; generations would collide on the ring")
 	}
 }
 
@@ -163,7 +170,6 @@ func TestMultiBackendMountsAllUnitsSingleNode(t *testing.T) {
 func TestMultiBackendRoundTripAndPlacement(t *testing.T) {
 	const n = 8
 	c, _ := openSingleNodeMulti(t, n)
-	uc := storageunit.MustUnitCount(n)
 
 	keys := [][]byte{
 		[]byte("alpha"), []byte("bravo"), []byte("charlie"),
@@ -185,11 +191,11 @@ func TestMultiBackendRoundTripAndPlacement(t *testing.T) {
 			t.Fatalf("Get %s = %q, want %q", k, got, want)
 		}
 		// And confirm physical placement: the value lives in the backend
-		// for THIS key's unit, and nowhere else.
-		u := storageunit.UnitForShardKey(c.shardKey(k), uc)
-		b := c.mountMap[u]
+		// for THIS key's generation-qualified unit, and nowhere else.
+		gu := c.genUnitForKey(k)
+		b := c.mountMap[gu]
 		if v, err := b.Get(k); err != nil || !bytes.Equal(v, []byte("v-"+string(k))) {
-			t.Fatalf("key %s not in unit %d's backend: v=%q err=%v", k, u, v, err)
+			t.Fatalf("key %s not in unit %s's backend: v=%q err=%v", k, gu, v, err)
 		}
 	}
 
@@ -357,11 +363,11 @@ type failingFactory struct {
 	failOn storageunit.UnitID
 }
 
-func (f *failingFactory) OpenUnit(u storageunit.UnitID, epoch storageunit.Epoch) (backend.Backend, error) {
-	if u == f.failOn {
+func (f *failingFactory) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
+	if gu.ID == f.failOn {
 		return nil, errors.New("failingFactory: injected open failure")
 	}
-	return f.Factory.OpenUnit(u, epoch)
+	return f.Factory.OpenUnit(gu, epoch)
 }
 
 // TestMultiBackendTransact_CrossUnitSameNodeRejected pins the multi-backend
@@ -381,7 +387,7 @@ func TestMultiBackendTransact_CrossUnitSameNodeRejected(t *testing.T) {
 	var k2 []byte
 	for i := 1; i < 10000; i++ {
 		cand := []byte(fmt.Sprintf("nokey-%d", i))
-		if c.unitForKey(cand) != c.unitForKey(k1) {
+		if c.genUnitForKey(cand) != c.genUnitForKey(k1) {
 			k2 = cand
 			break
 		}
@@ -401,13 +407,13 @@ func TestMultiBackendTransact_CrossUnitSameNodeRejected(t *testing.T) {
 	}
 
 	// The rejected write must not have landed anywhere: k2 absent from its
-	// own unit's backend.
-	u2 := c.unitForKey(k2)
-	be2, ok := fac.UnitBackend(u2)
+	// own (generation-qualified) unit's backend.
+	gu2 := c.genUnitForKey(k2)
+	be2, ok := fac.UnitBackend(gu2)
 	if !ok {
-		t.Fatalf("unit %d not mounted", u2)
+		t.Fatalf("unit %s not mounted", gu2)
 	}
 	if _, err := be2.Get(k2); !errors.Is(err, backend.ErrNotFound) {
-		t.Fatalf("k2 in unit %d after rejected cross-unit txn: got %v, want ErrNotFound", u2, err)
+		t.Fatalf("k2 in unit %s after rejected cross-unit txn: got %v, want ErrNotFound", gu2, err)
 	}
 }

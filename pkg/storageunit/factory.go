@@ -26,6 +26,15 @@ type Epoch uint64
 // in later phases / other packages; this interface is the only thing the
 // domain and the application service depend on.
 //
+// The unit it operates on is a GenUnit - the generation-qualified storage
+// identity (Generation, UnitID), NOT a bare UnitID. This is the v0.8 Phase 4
+// change: during a doubling reshard the old gen-g unit K and the new
+// gen-(g+1) unit K are DISTINCT databases that coexist (the bisect copies
+// K's bytes into its children while K keeps serving), so the factory must
+// open them as separate identities. In steady state (no reshard in flight)
+// every GenUnit shares the cluster's current generation, so the qualifier is
+// a constant prefix and nothing changes for Phase 2 / Phase 3 behavior.
+//
 // The contract is shaped for lease handoff, not just open/close:
 //
 //   - OpenUnit takes an Epoch so the new owner can open at epoch+1 and fence
@@ -38,29 +47,36 @@ type Epoch uint64
 // goroutine; concurrency of the returned backend.Backend is governed by the
 // backend.Backend contract, not this factory.
 type BackendFactory interface {
-	// OpenUnit opens (mounts) the backend for unit u at the given epoch and
-	// returns it ready to serve. Opening at an epoch higher than the unit's
-	// current writer epoch FENCES that prior writer: this is how a new owner
-	// acquires the lease during handoff. Opening a unit this factory already
-	// has open at the same or a lower epoch is an error (a unit has at most
-	// one live writer); callers detect a double-open / stale-epoch acquire
-	// that way.
+	// OpenUnit opens (mounts) the backend for the generation-qualified unit
+	// gu at the given epoch and returns it ready to serve. Opening at an
+	// epoch higher than the unit's current writer epoch FENCES that prior
+	// writer: this is how a new owner acquires the lease during handoff.
+	// Opening a GenUnit this factory already has open at the same or a lower
+	// epoch is an error (a unit has at most one live writer); callers detect
+	// a double-open / stale-epoch acquire that way.
+	//
+	// Two GenUnits sharing a UnitID but differing in Generation are
+	// INDEPENDENT databases: opening gen-(g+1) unit K does NOT fence or touch
+	// gen-g unit K, which is exactly what the online bisect relies on (the
+	// old unit keeps serving while the new ones fill).
 	//
 	// The returned Backend is owned by the caller until it passes it to
 	// CloseUnit (or the backend is otherwise closed). On error the Backend
 	// is nil and nothing was mounted.
-	OpenUnit(u UnitID, epoch Epoch) (backend.Backend, error)
+	OpenUnit(gu GenUnit, epoch Epoch) (backend.Backend, error)
 
-	// CloseUnit releases (unmounts) unit u: flushes anything durable, stops
-	// writing, and frees the unit's resources WITHOUT affecting any other
-	// unit this factory has open. This is the old owner's release half of a
-	// lease handoff. It is idempotent: closing a unit that is not open is a
-	// no-op and returns nil. After CloseUnit, the unit may be re-opened
-	// (here or on another node) at a higher epoch.
-	CloseUnit(u UnitID) error
+	// CloseUnit releases (unmounts) the generation-qualified unit gu: flushes
+	// anything durable, stops writing, and frees the unit's resources WITHOUT
+	// affecting any other unit this factory has open. This is the old owner's
+	// release half of a lease handoff, and also how the resharder RETIRES an
+	// old gen-g unit after its key-space has cut over to the gen-(g+1)
+	// children. It is idempotent: closing a unit that is not open is a no-op
+	// and returns nil. After CloseUnit, the unit may be re-opened (here or on
+	// another node) at a higher epoch.
+	CloseUnit(gu GenUnit) error
 
 	// CurrentEpoch reports the epoch at which this factory currently holds
-	// unit u open, and ok=false if the factory does not have u open. This is
+	// gu open, and ok=false if the factory does not have gu open. This is
 	// the LOCAL in-process view only; it is NOT the cross-node source of
 	// truth. The authoritative writer epoch for a unit lives in that unit's
 	// durable lease state (the slatedb manifest writer-epoch in object
@@ -68,14 +84,14 @@ type BackendFactory interface {
 	// the prior owner's epoch from here (CurrentEpoch returns ok=false for an
 	// unmounted unit); instead OpenUnit reads the durable manifest epoch and
 	// fences above it. Pure query: no mount/unmount side effect.
-	CurrentEpoch(u UnitID) (e Epoch, ok bool)
+	CurrentEpoch(gu GenUnit) (e Epoch, ok bool)
 
-	// OpenUnits returns the set of units this factory currently has mounted,
-	// in ascending UnitID order. The anti-entropy reconcile diffs this
-	// against OwnedUnits(self, ...): units owned-but-not-mounted must be
-	// opened (acquire the lease), units mounted-but-not-owned must be closed
-	// (release it). Without this enumerator a node would have to track its
-	// own mounted set outside the factory. Pure query: no side effect; the
-	// returned slice is a copy the caller may retain.
-	OpenUnits() []UnitID
+	// OpenUnits returns the set of GenUnits this factory currently has
+	// mounted, in ascending (Generation, UnitID) order. The anti-entropy
+	// reconcile diffs this against the desired set: units owned-but-not-
+	// mounted must be opened (acquire the lease), units mounted-but-not-owned
+	// must be closed (release it). Without this enumerator a node would have
+	// to track its own mounted set outside the factory. Pure query: no side
+	// effect; the returned slice is a copy the caller may retain.
+	OpenUnits() []GenUnit
 }
