@@ -40,6 +40,83 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
+// ReshardPhase is the barrier phase the coordinator is driving. The
+// receiving node's per-phase handler is idempotent (a repeated FREEZE is
+// a no-op while already frozen for the same target generation, etc.).
+type ReshardPhase int32
+
+const (
+	// RESHARD_PHASE_UNSPECIFIED is the proto3 zero value; the server rejects
+	// it with an error so a malformed request never silently no-ops.
+	ReshardPhase_RESHARD_PHASE_UNSPECIFIED ReshardPhase = 0
+	// FREEZE pauses writes cluster-wide: Put / Delete / Begin (and the CAS
+	// commit write path) return a retryable error (codes.Unavailable) until
+	// RESUME or ABORT. Reads continue, served from the live gen-g units.
+	ReshardPhase_RESHARD_PHASE_FREEZE ReshardPhase = 1
+	// BISECT runs the local per-node bisect under the freeze: for each gen-g
+	// unit this node owns, copy its keys into fresh gen-(g+1) units K and
+	// K+N (created in the shared backing). With writes frozen the copy is
+	// static, so there is no catch-up window.
+	ReshardPhase_RESHARD_PHASE_BISECT ReshardPhase = 2
+	// FLIP atomically advances this node's genState to the target generation
+	// (routing now resolves the 2N units) and retires its old gen-g units.
+	// No node flips until every node has bisected; the freeze still holds.
+	ReshardPhase_RESHARD_PHASE_FLIP ReshardPhase = 3
+	// RESUME unfreezes: writes resume at the new generation. The 2N units
+	// then redistribute across nodes via the Phase 3 lease handoff.
+	ReshardPhase_RESHARD_PHASE_RESUME ReshardPhase = 4
+	// ABORT is the fail-safe: unfreeze, discard any half-built gen-(g+1)
+	// units (harmless, never routed), and STAY at the current generation.
+	ReshardPhase_RESHARD_PHASE_ABORT ReshardPhase = 5
+)
+
+// Enum value maps for ReshardPhase.
+var (
+	ReshardPhase_name = map[int32]string{
+		0: "RESHARD_PHASE_UNSPECIFIED",
+		1: "RESHARD_PHASE_FREEZE",
+		2: "RESHARD_PHASE_BISECT",
+		3: "RESHARD_PHASE_FLIP",
+		4: "RESHARD_PHASE_RESUME",
+		5: "RESHARD_PHASE_ABORT",
+	}
+	ReshardPhase_value = map[string]int32{
+		"RESHARD_PHASE_UNSPECIFIED": 0,
+		"RESHARD_PHASE_FREEZE":      1,
+		"RESHARD_PHASE_BISECT":      2,
+		"RESHARD_PHASE_FLIP":        3,
+		"RESHARD_PHASE_RESUME":      4,
+		"RESHARD_PHASE_ABORT":       5,
+	}
+)
+
+func (x ReshardPhase) Enum() *ReshardPhase {
+	p := new(ReshardPhase)
+	*p = x
+	return p
+}
+
+func (x ReshardPhase) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (ReshardPhase) Descriptor() protoreflect.EnumDescriptor {
+	return file_shale_proto_enumTypes[0].Descriptor()
+}
+
+func (ReshardPhase) Type() protoreflect.EnumType {
+	return &file_shale_proto_enumTypes[0]
+}
+
+func (x ReshardPhase) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use ReshardPhase.Descriptor instead.
+func (ReshardPhase) EnumDescriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{0}
+}
+
 type PutRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
@@ -1754,6 +1831,110 @@ func (x *ApplyBatchResponse) GetError() string {
 	return ""
 }
 
+// ReshardControlRequest carries one barrier phase + the target generation
+// g+1 the coordinator is driving toward. target_gen lets a node reject a
+// request that disagrees with its own current generation (a stale or
+// crossed reshard) rather than apply it blindly.
+type ReshardControlRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Phase         ReshardPhase           `protobuf:"varint,1,opt,name=phase,proto3,enum=shale.v1.ReshardPhase" json:"phase,omitempty"`
+	TargetGen     uint64                 `protobuf:"varint,2,opt,name=target_gen,json=targetGen,proto3" json:"target_gen,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReshardControlRequest) Reset() {
+	*x = ReshardControlRequest{}
+	mi := &file_shale_proto_msgTypes[31]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReshardControlRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReshardControlRequest) ProtoMessage() {}
+
+func (x *ReshardControlRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[31]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReshardControlRequest.ProtoReflect.Descriptor instead.
+func (*ReshardControlRequest) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{31}
+}
+
+func (x *ReshardControlRequest) GetPhase() ReshardPhase {
+	if x != nil {
+		return x.Phase
+	}
+	return ReshardPhase_RESHARD_PHASE_UNSPECIFIED
+}
+
+func (x *ReshardControlRequest) GetTargetGen() uint64 {
+	if x != nil {
+		return x.TargetGen
+	}
+	return 0
+}
+
+// ReshardControlResponse is the node's ack. An empty error means the phase
+// was applied (the barrier ack the coordinator waits for); a non-empty
+// error means the node could not apply the phase, which the coordinator
+// treats as an ABORT trigger.
+type ReshardControlResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Error         string                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReshardControlResponse) Reset() {
+	*x = ReshardControlResponse{}
+	mi := &file_shale_proto_msgTypes[32]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReshardControlResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReshardControlResponse) ProtoMessage() {}
+
+func (x *ReshardControlResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[32]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReshardControlResponse.ProtoReflect.Descriptor instead.
+func (*ReshardControlResponse) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{32}
+}
+
+func (x *ReshardControlResponse) GetError() string {
+	if x != nil {
+		return x.Error
+	}
+	return ""
+}
+
 var File_shale_proto protoreflect.FileDescriptor
 
 const file_shale_proto_rawDesc = "" +
@@ -1855,7 +2036,20 @@ const file_shale_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1a\n" +
 	"\benvelope\x18\x02 \x01(\fR\benvelope\"*\n" +
 	"\x12ApplyBatchResponse\x12\x14\n" +
-	"\x05error\x18\x01 \x01(\tR\x05error2\xa0\x06\n" +
+	"\x05error\x18\x01 \x01(\tR\x05error\"d\n" +
+	"\x15ReshardControlRequest\x12,\n" +
+	"\x05phase\x18\x01 \x01(\x0e2\x16.shale.v1.ReshardPhaseR\x05phase\x12\x1d\n" +
+	"\n" +
+	"target_gen\x18\x02 \x01(\x04R\ttargetGen\".\n" +
+	"\x16ReshardControlResponse\x12\x14\n" +
+	"\x05error\x18\x01 \x01(\tR\x05error*\xac\x01\n" +
+	"\fReshardPhase\x12\x1d\n" +
+	"\x19RESHARD_PHASE_UNSPECIFIED\x10\x00\x12\x18\n" +
+	"\x14RESHARD_PHASE_FREEZE\x10\x01\x12\x18\n" +
+	"\x14RESHARD_PHASE_BISECT\x10\x02\x12\x16\n" +
+	"\x12RESHARD_PHASE_FLIP\x10\x03\x12\x18\n" +
+	"\x14RESHARD_PHASE_RESUME\x10\x04\x12\x17\n" +
+	"\x13RESHARD_PHASE_ABORT\x10\x052\xf5\x06\n" +
 	"\tShaleNode\x122\n" +
 	"\x03Put\x12\x14.shale.v1.PutRequest\x1a\x15.shale.v1.PutResponse\x122\n" +
 	"\x03Get\x12\x14.shale.v1.GetRequest\x1a\x15.shale.v1.GetResponse\x12;\n" +
@@ -1870,7 +2064,8 @@ const file_shale_proto_rawDesc = "" +
 	"\x10ProposeRebalance\x12!.shale.v1.ProposeRebalanceRequest\x1a\".shale.v1.ProposeRebalanceResponse\x12D\n" +
 	"\tCommitCAS\x12\x1a.shale.v1.CommitCASRequest\x1a\x1b.shale.v1.CommitCASResponse\x12G\n" +
 	"\n" +
-	"ApplyBatch\x12\x1b.shale.v1.ApplyBatchRequest\x1a\x1c.shale.v1.ApplyBatchResponseB.Z,github.com/Zamua/shale/pkg/rpc/proto;shalepbb\x06proto3"
+	"ApplyBatch\x12\x1b.shale.v1.ApplyBatchRequest\x1a\x1c.shale.v1.ApplyBatchResponse\x12S\n" +
+	"\x0eReshardControl\x12\x1f.shale.v1.ReshardControlRequest\x1a .shale.v1.ReshardControlResponseB.Z,github.com/Zamua/shale/pkg/rpc/proto;shalepbb\x06proto3"
 
 var (
 	file_shale_proto_rawDescOnce sync.Once
@@ -1884,77 +2079,84 @@ func file_shale_proto_rawDescGZIP() []byte {
 	return file_shale_proto_rawDescData
 }
 
-var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
+var file_shale_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
+var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 33)
 var file_shale_proto_goTypes = []any{
-	(*PutRequest)(nil),               // 0: shale.v1.PutRequest
-	(*PutResponse)(nil),              // 1: shale.v1.PutResponse
-	(*GetRequest)(nil),               // 2: shale.v1.GetRequest
-	(*GetResponse)(nil),              // 3: shale.v1.GetResponse
-	(*DeleteRequest)(nil),            // 4: shale.v1.DeleteRequest
-	(*DeleteResponse)(nil),           // 5: shale.v1.DeleteResponse
-	(*ScanPrefixRequest)(nil),        // 6: shale.v1.ScanPrefixRequest
-	(*ScanPrefixResponse)(nil),       // 7: shale.v1.ScanPrefixResponse
-	(*LocalScanRequest)(nil),         // 8: shale.v1.LocalScanRequest
-	(*LocalScanResponse)(nil),        // 9: shale.v1.LocalScanResponse
-	(*TopologyRequest)(nil),          // 10: shale.v1.TopologyRequest
-	(*TopologyResponse)(nil),         // 11: shale.v1.TopologyResponse
-	(*NodeInfo)(nil),                 // 12: shale.v1.NodeInfo
-	(*StatsRequest)(nil),             // 13: shale.v1.StatsRequest
-	(*StatsResponse)(nil),            // 14: shale.v1.StatsResponse
-	(*PingRequest)(nil),              // 15: shale.v1.PingRequest
-	(*PingResponse)(nil),             // 16: shale.v1.PingResponse
-	(*RangeSpec)(nil),                // 17: shale.v1.RangeSpec
-	(*MigrateChunk)(nil),             // 18: shale.v1.MigrateChunk
-	(*KeyValue)(nil),                 // 19: shale.v1.KeyValue
-	(*MigrationDone)(nil),            // 20: shale.v1.MigrationDone
-	(*ProposeRebalanceRequest)(nil),  // 21: shale.v1.ProposeRebalanceRequest
-	(*ProposeRebalanceResponse)(nil), // 22: shale.v1.ProposeRebalanceResponse
-	(*RangePlanItem)(nil),            // 23: shale.v1.RangePlanItem
-	(*CommitCASRequest)(nil),         // 24: shale.v1.CommitCASRequest
-	(*ReadCheck)(nil),                // 25: shale.v1.ReadCheck
-	(*WriteOp)(nil),                  // 26: shale.v1.WriteOp
-	(*CommitCASResponse)(nil),        // 27: shale.v1.CommitCASResponse
-	(*ApplyBatchRequest)(nil),        // 28: shale.v1.ApplyBatchRequest
-	(*EnvelopeWrite)(nil),            // 29: shale.v1.EnvelopeWrite
-	(*ApplyBatchResponse)(nil),       // 30: shale.v1.ApplyBatchResponse
+	(ReshardPhase)(0),                // 0: shale.v1.ReshardPhase
+	(*PutRequest)(nil),               // 1: shale.v1.PutRequest
+	(*PutResponse)(nil),              // 2: shale.v1.PutResponse
+	(*GetRequest)(nil),               // 3: shale.v1.GetRequest
+	(*GetResponse)(nil),              // 4: shale.v1.GetResponse
+	(*DeleteRequest)(nil),            // 5: shale.v1.DeleteRequest
+	(*DeleteResponse)(nil),           // 6: shale.v1.DeleteResponse
+	(*ScanPrefixRequest)(nil),        // 7: shale.v1.ScanPrefixRequest
+	(*ScanPrefixResponse)(nil),       // 8: shale.v1.ScanPrefixResponse
+	(*LocalScanRequest)(nil),         // 9: shale.v1.LocalScanRequest
+	(*LocalScanResponse)(nil),        // 10: shale.v1.LocalScanResponse
+	(*TopologyRequest)(nil),          // 11: shale.v1.TopologyRequest
+	(*TopologyResponse)(nil),         // 12: shale.v1.TopologyResponse
+	(*NodeInfo)(nil),                 // 13: shale.v1.NodeInfo
+	(*StatsRequest)(nil),             // 14: shale.v1.StatsRequest
+	(*StatsResponse)(nil),            // 15: shale.v1.StatsResponse
+	(*PingRequest)(nil),              // 16: shale.v1.PingRequest
+	(*PingResponse)(nil),             // 17: shale.v1.PingResponse
+	(*RangeSpec)(nil),                // 18: shale.v1.RangeSpec
+	(*MigrateChunk)(nil),             // 19: shale.v1.MigrateChunk
+	(*KeyValue)(nil),                 // 20: shale.v1.KeyValue
+	(*MigrationDone)(nil),            // 21: shale.v1.MigrationDone
+	(*ProposeRebalanceRequest)(nil),  // 22: shale.v1.ProposeRebalanceRequest
+	(*ProposeRebalanceResponse)(nil), // 23: shale.v1.ProposeRebalanceResponse
+	(*RangePlanItem)(nil),            // 24: shale.v1.RangePlanItem
+	(*CommitCASRequest)(nil),         // 25: shale.v1.CommitCASRequest
+	(*ReadCheck)(nil),                // 26: shale.v1.ReadCheck
+	(*WriteOp)(nil),                  // 27: shale.v1.WriteOp
+	(*CommitCASResponse)(nil),        // 28: shale.v1.CommitCASResponse
+	(*ApplyBatchRequest)(nil),        // 29: shale.v1.ApplyBatchRequest
+	(*EnvelopeWrite)(nil),            // 30: shale.v1.EnvelopeWrite
+	(*ApplyBatchResponse)(nil),       // 31: shale.v1.ApplyBatchResponse
+	(*ReshardControlRequest)(nil),    // 32: shale.v1.ReshardControlRequest
+	(*ReshardControlResponse)(nil),   // 33: shale.v1.ReshardControlResponse
 }
 var file_shale_proto_depIdxs = []int32{
-	12, // 0: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
-	19, // 1: shale.v1.MigrateChunk.kv:type_name -> shale.v1.KeyValue
-	20, // 2: shale.v1.MigrateChunk.done:type_name -> shale.v1.MigrationDone
-	23, // 3: shale.v1.ProposeRebalanceResponse.ranges:type_name -> shale.v1.RangePlanItem
-	25, // 4: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
-	26, // 5: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
-	29, // 6: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
-	0,  // 7: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
-	2,  // 8: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
-	4,  // 9: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
-	6,  // 10: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
-	8,  // 11: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
-	10, // 12: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
-	13, // 13: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
-	15, // 14: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
-	17, // 15: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
-	21, // 16: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
-	24, // 17: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
-	28, // 18: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
-	1,  // 19: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
-	3,  // 20: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
-	5,  // 21: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
-	7,  // 22: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
-	9,  // 23: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
-	11, // 24: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
-	14, // 25: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
-	16, // 26: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
-	18, // 27: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
-	22, // 28: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
-	27, // 29: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
-	30, // 30: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
-	19, // [19:31] is the sub-list for method output_type
-	7,  // [7:19] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	13, // 0: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
+	20, // 1: shale.v1.MigrateChunk.kv:type_name -> shale.v1.KeyValue
+	21, // 2: shale.v1.MigrateChunk.done:type_name -> shale.v1.MigrationDone
+	24, // 3: shale.v1.ProposeRebalanceResponse.ranges:type_name -> shale.v1.RangePlanItem
+	26, // 4: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
+	27, // 5: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
+	30, // 6: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
+	0,  // 7: shale.v1.ReshardControlRequest.phase:type_name -> shale.v1.ReshardPhase
+	1,  // 8: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
+	3,  // 9: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
+	5,  // 10: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
+	7,  // 11: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
+	9,  // 12: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
+	11, // 13: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
+	14, // 14: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
+	16, // 15: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
+	18, // 16: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
+	22, // 17: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
+	25, // 18: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
+	29, // 19: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
+	32, // 20: shale.v1.ShaleNode.ReshardControl:input_type -> shale.v1.ReshardControlRequest
+	2,  // 21: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
+	4,  // 22: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
+	6,  // 23: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
+	8,  // 24: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
+	10, // 25: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
+	12, // 26: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
+	15, // 27: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
+	17, // 28: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
+	19, // 29: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
+	23, // 30: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
+	28, // 31: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
+	31, // 32: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
+	33, // 33: shale.v1.ShaleNode.ReshardControl:output_type -> shale.v1.ReshardControlResponse
+	21, // [21:34] is the sub-list for method output_type
+	8,  // [8:21] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_shale_proto_init() }
@@ -1971,13 +2173,14 @@ func file_shale_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_shale_proto_rawDesc), len(file_shale_proto_rawDesc)),
-			NumEnums:      0,
-			NumMessages:   31,
+			NumEnums:      1,
+			NumMessages:   33,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_shale_proto_goTypes,
 		DependencyIndexes: file_shale_proto_depIdxs,
+		EnumInfos:         file_shale_proto_enumTypes,
 		MessageInfos:      file_shale_proto_msgTypes,
 	}.Build()
 	File_shale_proto = out.File

@@ -334,6 +334,19 @@ type Cluster struct {
 	pauseMu    sync.Mutex
 	pauseUnits map[storageunit.UnitID]*sync.RWMutex
 
+	// freeze is the cluster-wide WRITE-FREEZE flag for the v0.8 multi-node
+	// reshard (cluster-wide freeze barrier; see multibackend_reshard_barrier.go).
+	// While a node is frozen, every WRITE path (Put / Delete / the CAS commit
+	// write path) returns the retryable acquiring-window error (codes.Unavailable)
+	// so no write is acked during the static bisect; READS continue. The
+	// coordinator's FREEZE phase sets it on every node, RESUME / ABORT clears it.
+	// freezeMu guards both fields. All zero / nil in legacy mode (the barrier
+	// never runs there); zero-value (frozen=false) is the steady state in multi
+	// mode, so steady-state writes pay only one cheap atomic-free locked read.
+	freezeMu        sync.Mutex
+	frozen          bool
+	freezeTargetGen storageunit.Generation
+
 	// reconcileMu serializes the Phase 3 lease-handoff reconcile
 	// (multibackend_rebalance.go): at most one reconcile mutates the mount
 	// map at a time, so two membership changes whose settle timers fire
@@ -815,6 +828,14 @@ func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (ba
 		return nil, backend.ErrClosed
 	}
 	if c.multi {
+		// FREEZE gate (v0.8 multi-node reshard): the CAS commit write path is a
+		// WRITE, so a frozen node refuses it with the retryable error - even a
+		// transaction opened BEFORE the freeze is refused at commit, so no CAS
+		// write is acked during the static bisect. The client retries the whole
+		// transaction (Transact's loop) after RESUME, at the new generation.
+		if c.isFrozen() {
+			return nil, errWriteFrozen("CommitCASApply")
+		}
 		b, gu, unlock, ok := c.localWriteBackendForKey(key)
 		if !ok {
 			unlock()
@@ -1114,6 +1135,15 @@ func (c *Cluster) Put(key, value []byte) error {
 		return ErrEmptyValue
 	}
 	if c.multi {
+		// FREEZE gate (v0.8 multi-node reshard): while a cluster-wide reshard
+		// has this node write-frozen, refuse with the retryable error so the
+		// write is NEVER acked. It succeeds on the client's retry after RESUME,
+		// at the new generation. This is what makes the static bisect safe: no
+		// write is in flight during it. Checked before routing so a frozen node
+		// does no work; reads are never gated.
+		if c.isFrozen() {
+			return errWriteFrozen("Put")
+		}
 		owner, local := c.ownerOf(key)
 		if local {
 			// Resolve the local backend UNDER the reshard write-pause (Phase 4):
@@ -1251,6 +1281,12 @@ func (c *Cluster) Delete(key []byte) error {
 		return backend.ErrClosed
 	}
 	if c.multi {
+		// FREEZE gate (v0.8 multi-node reshard): a frozen node refuses Delete
+		// with the retryable error so it is never acked, succeeding on retry
+		// after RESUME. See Put for the full rationale.
+		if c.isFrozen() {
+			return errWriteFrozen("Delete")
+		}
 		owner, local := c.ownerOf(key)
 		if local {
 			// Delete is a write: resolve under the reshard write-pause so a
@@ -1347,6 +1383,17 @@ func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 func (c *Cluster) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed
+	}
+	// FREEZE gate (v0.8 multi-node reshard): a frozen node refuses Begin with
+	// the retryable error so a client does not buffer a transaction that is
+	// doomed to fail at Commit (the CAS commit write path is itself frozen). The
+	// client retries Begin after RESUME and commits at the new generation. The
+	// CAS commit write path (localBeginForKey, below) is ALSO gated, so a tx
+	// that was opened before the freeze and commits during it is refused too -
+	// belt and suspenders, since this gate alone cannot cover a pre-freeze
+	// Begin. Reads outside a tx are never gated.
+	if c.multi && c.isFrozen() {
+		return nil, errWriteFrozen("Begin")
 	}
 	return c.newCASTx(level), nil
 }

@@ -116,6 +116,21 @@ service ShaleNode {
   // owner's fan-out classifies it transient rather than a failure. No
   // ownership re-check beyond that guard.
   rpc ApplyBatch(ApplyBatchRequest) returns (ApplyBatchResponse);
+
+  // ReshardControl is the cluster-internal control RPC for the v0.8
+  // multi-node doubling reshard (cluster-wide freeze barrier). The
+  // COORDINATOR (the node where Reshard() was called on a multi-node
+  // cluster) drives a 4-phase barrier over every node (including itself)
+  // by calling this RPC once per phase: FREEZE -> BISECT -> FLIP ->
+  // RESUME (or ABORT on any failure / timeout / membership change). It is
+  // direct peer RPC, NOT gossip, because a barrier needs a synchronous ack
+  // from every node, which gossip (eventually-consistent broadcast) cannot
+  // give. Each phase handler is idempotent. The receiver acks success with
+  // an empty error string; a phase failure travels as the error string so
+  // the coordinator can ABORT the whole reshard. Never called from outside
+  // the cluster (CLI callers use Reshard via the cluster surface, not this
+  // wire method directly).
+  rpc ReshardControl(ReshardControlRequest) returns (ReshardControlResponse);
 }
 
 // The `forwarded` flag on each per-key op is the cluster-internal
@@ -383,5 +398,57 @@ message EnvelopeWrite {
 // rejection travels as a gRPC codes.ResourceExhausted error (transient),
 // not in this field.
 message ApplyBatchResponse {
+  string error = 1;
+}
+
+// -- ReshardControl --------------------------------------------------
+
+// ReshardPhase is the barrier phase the coordinator is driving. The
+// receiving node's per-phase handler is idempotent (a repeated FREEZE is
+// a no-op while already frozen for the same target generation, etc.).
+enum ReshardPhase {
+  // RESHARD_PHASE_UNSPECIFIED is the proto3 zero value; the server rejects
+  // it with an error so a malformed request never silently no-ops.
+  RESHARD_PHASE_UNSPECIFIED = 0;
+
+  // FREEZE pauses writes cluster-wide: Put / Delete / Begin (and the CAS
+  // commit write path) return a retryable error (codes.Unavailable) until
+  // RESUME or ABORT. Reads continue, served from the live gen-g units.
+  RESHARD_PHASE_FREEZE = 1;
+
+  // BISECT runs the local per-node bisect under the freeze: for each gen-g
+  // unit this node owns, copy its keys into fresh gen-(g+1) units K and
+  // K+N (created in the shared backing). With writes frozen the copy is
+  // static, so there is no catch-up window.
+  RESHARD_PHASE_BISECT = 2;
+
+  // FLIP atomically advances this node's genState to the target generation
+  // (routing now resolves the 2N units) and retires its old gen-g units.
+  // No node flips until every node has bisected; the freeze still holds.
+  RESHARD_PHASE_FLIP = 3;
+
+  // RESUME unfreezes: writes resume at the new generation. The 2N units
+  // then redistribute across nodes via the Phase 3 lease handoff.
+  RESHARD_PHASE_RESUME = 4;
+
+  // ABORT is the fail-safe: unfreeze, discard any half-built gen-(g+1)
+  // units (harmless, never routed), and STAY at the current generation.
+  RESHARD_PHASE_ABORT = 5;
+}
+
+// ReshardControlRequest carries one barrier phase + the target generation
+// g+1 the coordinator is driving toward. target_gen lets a node reject a
+// request that disagrees with its own current generation (a stale or
+// crossed reshard) rather than apply it blindly.
+message ReshardControlRequest {
+  ReshardPhase phase = 1;
+  uint64 target_gen = 2;
+}
+
+// ReshardControlResponse is the node's ack. An empty error means the phase
+// was applied (the barrier ack the coordinator waits for); a non-empty
+// error means the node could not apply the phase, which the coordinator
+// treats as an ABORT trigger.
+message ReshardControlResponse {
   string error = 1;
 }

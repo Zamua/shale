@@ -254,6 +254,22 @@ func (s *Server) ApplyBatch(_ context.Context, req *pb.ApplyBatchRequest) (*pb.A
 	return &pb.ApplyBatchResponse{}, nil
 }
 
+// ReshardControl is the cluster-internal control RPC for the v0.8 multi-node
+// doubling reshard (cluster-wide freeze barrier). The COORDINATOR (the node
+// where Reshard() was called on a multi-node cluster) calls this once per
+// barrier phase (FREEZE / BISECT / FLIP / RESUME / ABORT). The handler delegates
+// to the cluster's idempotent phase handler; a phase that cannot be applied
+// (wrong generation, not frozen, closed) travels back as the response error
+// string so the coordinator ABORTS, rather than as a gRPC error code (matching
+// the CommitCAS / ApplyBatch wire convention of carrying an expected control-
+// flow outcome in the response field). Never called from outside the cluster.
+func (s *Server) ReshardControl(_ context.Context, req *pb.ReshardControlRequest) (*pb.ReshardControlResponse, error) {
+	if err := s.c.ApplyReshardPhase(req.GetPhase(), req.GetTargetGen()); err != nil {
+		return &pb.ReshardControlResponse{Error: err.Error()}, nil
+	}
+	return &pb.ReshardControlResponse{}, nil
+}
+
 // -- Cluster RPCs ----------------------------------------------------
 
 // Topology returns this node's current view of cluster membership.

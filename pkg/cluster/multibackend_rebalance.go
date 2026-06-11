@@ -82,6 +82,18 @@ func (c *Cluster) runReconcile() {
 	}
 	c.reshardMu.Lock()
 	defer c.reshardMu.Unlock()
+	// FREEZE guard (v0.8 multi-node reshard): on a NON-coordinator node the
+	// barrier phase handlers (FREEZE / BISECT / FLIP) run via RPC WITHOUT
+	// holding this node's reshardMu, so reshardMu alone does not exclude the
+	// self-heal reconcile here from the in-flight bisect. While frozen, the
+	// bisect owns the mount map (it transiently mounts the gen-(g+1) children
+	// the live-generation reconcile would otherwise see as mounted-but-not-
+	// desired and RELEASE). Skip the reconcile until RESUME / ABORT unfreezes;
+	// RESUME then bumps the ring generation, which schedules a fresh reconcile
+	// that does the post-flip redistribution against the advanced generation.
+	if c.isFrozen() {
+		return
+	}
 	c.reconcileMu.Lock()
 	defer c.reconcileMu.Unlock()
 	c.reconcileUnits()

@@ -289,19 +289,22 @@ func (c *Cluster) Reshard() error {
 	if !c.multi {
 		return fmt.Errorf("cluster: Reshard is only valid in multi-backend mode")
 	}
-	// v0.8 Phase 4 supports the SINGLE-NODE online reshard, which is gate-
-	// validated lossless under concurrent writes. A multi-node doubling needs
-	// a cluster-wide generation BARRIER: every node must route at one
-	// generation and the write-pause must span the logical key-space, not one
-	// node's local view. Reshard is a purely local trigger with no such
-	// coordination, so a multi-node reshard under concurrent writes can lose
-	// acked writes. Refuse it rather than ship that footgun; the cluster-wide
-	// barrier is a follow-up (see docs/SPEC.md, v0.8 Phase 4 scope).
-	if c.ring != nil && len(c.ring.Members()) > 1 {
-		return fmt.Errorf("cluster: multi-node Reshard is not yet supported (a cluster-wide generation barrier is required for concurrent-write safety); reshard requires a single-node cluster")
-	}
 	c.reshardMu.Lock()
 	defer c.reshardMu.Unlock()
+
+	// MULTI-NODE: a cross-node doubling cannot be made safe by the node-LOCAL
+	// write-pause this single-node path uses (each node advances its generation
+	// independently, so a concurrent write could route at the old generation on
+	// one node while another has flipped, and be lost). Drive the cluster-wide
+	// FREEZE barrier instead: freeze writes everywhere, bisect under the freeze
+	// (a STATIC copy, no catch-up), flip all nodes atomically, resume, then
+	// redistribute the 2N units via the Phase 3 lease handoff. The coordinator
+	// flow lives in multibackend_reshard_barrier.go and is built to the same
+	// NO-ACKED-WRITE-LOST invariant (writes during the freeze are refused with a
+	// retryable error, never acked). The SINGLE-NODE path below stays unchanged.
+	if c.ring != nil && len(c.ring.Members()) > 1 {
+		return c.reshardCoordinated()
+	}
 
 	start := c.genSnapshot()
 	// Reject if a doubling would exceed the unit-count ceiling. Checking up

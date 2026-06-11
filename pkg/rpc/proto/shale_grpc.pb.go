@@ -50,6 +50,7 @@ const (
 	ShaleNode_ProposeRebalance_FullMethodName = "/shale.v1.ShaleNode/ProposeRebalance"
 	ShaleNode_CommitCAS_FullMethodName        = "/shale.v1.ShaleNode/CommitCAS"
 	ShaleNode_ApplyBatch_FullMethodName       = "/shale.v1.ShaleNode/ApplyBatch"
+	ShaleNode_ReshardControl_FullMethodName   = "/shale.v1.ShaleNode/ReshardControl"
 )
 
 // ShaleNodeClient is the client API for ShaleNode service.
@@ -139,6 +140,20 @@ type ShaleNodeClient interface {
 	// owner's fan-out classifies it transient rather than a failure. No
 	// ownership re-check beyond that guard.
 	ApplyBatch(ctx context.Context, in *ApplyBatchRequest, opts ...grpc.CallOption) (*ApplyBatchResponse, error)
+	// ReshardControl is the cluster-internal control RPC for the v0.8
+	// multi-node doubling reshard (cluster-wide freeze barrier). The
+	// COORDINATOR (the node where Reshard() was called on a multi-node
+	// cluster) drives a 4-phase barrier over every node (including itself)
+	// by calling this RPC once per phase: FREEZE -> BISECT -> FLIP ->
+	// RESUME (or ABORT on any failure / timeout / membership change). It is
+	// direct peer RPC, NOT gossip, because a barrier needs a synchronous ack
+	// from every node, which gossip (eventually-consistent broadcast) cannot
+	// give. Each phase handler is idempotent. The receiver acks success with
+	// an empty error string; a phase failure travels as the error string so
+	// the coordinator can ABORT the whole reshard. Never called from outside
+	// the cluster (CLI callers use Reshard via the cluster surface, not this
+	// wire method directly).
+	ReshardControl(ctx context.Context, in *ReshardControlRequest, opts ...grpc.CallOption) (*ReshardControlResponse, error)
 }
 
 type shaleNodeClient struct {
@@ -296,6 +311,16 @@ func (c *shaleNodeClient) ApplyBatch(ctx context.Context, in *ApplyBatchRequest,
 	return out, nil
 }
 
+func (c *shaleNodeClient) ReshardControl(ctx context.Context, in *ReshardControlRequest, opts ...grpc.CallOption) (*ReshardControlResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ReshardControlResponse)
+	err := c.cc.Invoke(ctx, ShaleNode_ReshardControl_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // ShaleNodeServer is the server API for ShaleNode service.
 // All implementations must embed UnimplementedShaleNodeServer
 // for forward compatibility.
@@ -383,6 +408,20 @@ type ShaleNodeServer interface {
 	// owner's fan-out classifies it transient rather than a failure. No
 	// ownership re-check beyond that guard.
 	ApplyBatch(context.Context, *ApplyBatchRequest) (*ApplyBatchResponse, error)
+	// ReshardControl is the cluster-internal control RPC for the v0.8
+	// multi-node doubling reshard (cluster-wide freeze barrier). The
+	// COORDINATOR (the node where Reshard() was called on a multi-node
+	// cluster) drives a 4-phase barrier over every node (including itself)
+	// by calling this RPC once per phase: FREEZE -> BISECT -> FLIP ->
+	// RESUME (or ABORT on any failure / timeout / membership change). It is
+	// direct peer RPC, NOT gossip, because a barrier needs a synchronous ack
+	// from every node, which gossip (eventually-consistent broadcast) cannot
+	// give. Each phase handler is idempotent. The receiver acks success with
+	// an empty error string; a phase failure travels as the error string so
+	// the coordinator can ABORT the whole reshard. Never called from outside
+	// the cluster (CLI callers use Reshard via the cluster surface, not this
+	// wire method directly).
+	ReshardControl(context.Context, *ReshardControlRequest) (*ReshardControlResponse, error)
 	mustEmbedUnimplementedShaleNodeServer()
 }
 
@@ -428,6 +467,9 @@ func (UnimplementedShaleNodeServer) CommitCAS(context.Context, *CommitCASRequest
 }
 func (UnimplementedShaleNodeServer) ApplyBatch(context.Context, *ApplyBatchRequest) (*ApplyBatchResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ApplyBatch not implemented")
+}
+func (UnimplementedShaleNodeServer) ReshardControl(context.Context, *ReshardControlRequest) (*ReshardControlResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ReshardControl not implemented")
 }
 func (UnimplementedShaleNodeServer) mustEmbedUnimplementedShaleNodeServer() {}
 func (UnimplementedShaleNodeServer) testEmbeddedByValue()                   {}
@@ -645,6 +687,24 @@ func _ShaleNode_ApplyBatch_Handler(srv interface{}, ctx context.Context, dec fun
 	return interceptor(ctx, in, info, handler)
 }
 
+func _ShaleNode_ReshardControl_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ReshardControlRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(ShaleNodeServer).ReshardControl(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: ShaleNode_ReshardControl_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(ShaleNodeServer).ReshardControl(ctx, req.(*ReshardControlRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // ShaleNode_ServiceDesc is the grpc.ServiceDesc for ShaleNode service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -687,6 +747,10 @@ var ShaleNode_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ApplyBatch",
 			Handler:    _ShaleNode_ApplyBatch_Handler,
+		},
+		{
+			MethodName: "ReshardControl",
+			Handler:    _ShaleNode_ReshardControl_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

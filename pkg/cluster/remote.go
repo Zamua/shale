@@ -143,6 +143,16 @@ func (c *peerClient) ApplyBatch(ctx context.Context, writes []EnvelopeWrite) err
 	return nil
 }
 
+// ReshardControl drives one barrier phase of the v0.8 multi-node reshard
+// (cluster-wide freeze) to a peer node. Cluster-internal: only the coordinator
+// (the node where Reshard was called on a multi-node cluster) calls it, once
+// per phase per peer. The receiving node's idempotent phase handler acks via an
+// empty response error; a non-empty error string travels back as an ABORT
+// trigger for the coordinator.
+func (c *peerClient) ReshardControl(ctx context.Context, phase pb.ReshardPhase, targetGen uint64) (*pb.ReshardControlResponse, error) {
+	return c.api.ReshardControl(ctx, &pb.ReshardControlRequest{Phase: phase, TargetGen: targetGen})
+}
+
 // txRoutedGet performs the normal single-key routed Get the CAS read-set
 // records against. It reuses Cluster.Get so a read inside a transaction
 // sees exactly what a standalone Get would (same local/remote routing,
