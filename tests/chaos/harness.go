@@ -1,0 +1,462 @@
+//go:build chaos
+
+package chaos
+
+// The workload driver + metrics. M writer goroutines hammer acked Put/Delete/
+// Transact through the routed cluster surface while N reader goroutines verify
+// every read against the oracle, all concurrently with the chaos scheduler. The
+// driver is ORCHESTRATION: it talks to the cluster only through *cluster.Cluster
+// (the application surface) and to the model only through *Oracle (the domain),
+// so the same loops graduate to a real deploy by swapping the adapter.
+//
+// The single load-bearing rule: a write is recorded in the oracle ONLY after the
+// cluster returned success. A retryable error (Unavailable / FailedPrecondition /
+// the freeze refusal) is retried, never acked. That is what makes "no acked write
+// lost" a meaningful, falsifiable claim.
+
+import (
+	"errors"
+	"fmt"
+	"math/rand"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"github.com/Zamua/shale/pkg/backend"
+	"github.com/Zamua/shale/pkg/cluster"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// metrics is the accounting reported at the end. All counters are atomic so the
+// writer/reader goroutines update them lock-free; the chaos scheduler updates the
+// event counters under its own lock and folds them in at report time.
+type metrics struct {
+	ackedPuts        atomic.Int64
+	ackedDeletes     atomic.Int64
+	ackedTransacts   atomic.Int64
+	readsVerified    atomic.Int64
+	retryableRetries atomic.Int64
+	// transientReads counts continuous-reader reads that returned a non-PASS value
+	// on first read but converged to the correct value on re-verify (an expected
+	// mid-cutover artifact, NOT a violation). A high count is informational: it
+	// quantifies how much cutover turbulence the readers actually saw.
+	transientReads atomic.Int64
+
+	// chaos event counts, set by the scheduler.
+	evKill        atomic.Int64
+	evRestart     atomic.Int64
+	evJoin        atomic.Int64
+	evLeave       atomic.Int64
+	evReshard     atomic.Int64
+	evReshardAbrt atomic.Int64
+
+	finalNodes int
+	finalUnits int
+}
+
+// violation is one oracle verdict that failed, captured for the final report.
+type violation struct {
+	verdict Verdict
+	detail  string
+}
+
+// violationLog accumulates violations across all goroutines (continuous readers,
+// writers, and the final sweep). The pass condition is an empty log.
+type violationLog struct {
+	mu   sync.Mutex
+	list []violation
+}
+
+func (vl *violationLog) add(v Verdict, detail string) {
+	vl.mu.Lock()
+	defer vl.mu.Unlock()
+	vl.list = append(vl.list, violation{verdict: v, detail: detail})
+}
+
+func (vl *violationLog) snapshot() []violation {
+	vl.mu.Lock()
+	defer vl.mu.Unlock()
+	return append([]violation(nil), vl.list...)
+}
+
+// config carries the run knobs (seeded from env in chaos_soak_test.go).
+type config struct {
+	seed        int64
+	duration    time.Duration
+	writers     int
+	readers     int
+	nodes       int
+	units       int
+	chaosEvery  time.Duration
+	settleDelay time.Duration
+}
+
+// harness wires the cluster, oracle, metrics, and violation log together and runs
+// the soak.
+type harness struct {
+	cfg  config
+	cl   *inProcCluster
+	or   *Oracle
+	met  *metrics
+	vlog *violationLog
+
+	// ctrExpected maps a per-writer Transact counter key to the number of acked
+	// increments that writer made; the final sweep asserts the stored counter
+	// equals it (the no-lost-update RMW invariant). Guarded by ctrMu since each
+	// writer records its own entry at shutdown.
+	ctrMu       sync.Mutex
+	ctrExpected map[string]int64
+
+	// logf is the test's t.Logf, injected so the harness can report without
+	// importing testing into the non-test logic.
+	logf func(format string, args ...any)
+}
+
+// retryBudget bounds how long a single op retries the retryable signals before
+// giving up (and being reported as a hard failure). Generous so a reshard freeze
+// or a multi-node handoff window is always ridden out.
+const retryBudget = 20 * time.Second
+
+// retryDelay is the per-attempt backoff while retrying a retryable error.
+const retryDelay = 15 * time.Millisecond
+
+// isRetryable reports whether err is a transient cutover/handoff/freeze signal
+// the client is expected to retry (NOT an ack-and-lose). Unavailable is the
+// acquiring-window + freeze refusal; FailedPrecondition is the reshard-cutover
+// re-pin. Anything else (including a closed-cluster error from a node we are
+// mid-killing, which the caller handles by re-selecting an entry node) is not
+// retried here.
+func isRetryable(err error) bool {
+	if err == nil {
+		return false
+	}
+	code := status.Code(err)
+	return code == codes.Unavailable || code == codes.FailedPrecondition
+}
+
+// putAcked issues a Put through entrySel (a function returning a live entry node,
+// re-evaluated each attempt so a killed entry node is replaced), retrying the
+// retryable signals up to retryBudget. Returns nil on a real ack. A nil entry
+// (no live node, transient) is itself retried. Records a retry metric per retry.
+func (h *harness) putAcked(entrySel func() *cluster.Cluster, key, value string) error {
+	deadline := time.Now().Add(retryBudget)
+	for {
+		c := entrySel()
+		if c == nil {
+			if time.Now().After(deadline) {
+				return errors.New("putAcked: no live entry node before deadline")
+			}
+			time.Sleep(retryDelay)
+			continue
+		}
+		err := c.Put([]byte(key), []byte(value))
+		if err == nil {
+			return nil
+		}
+		if isRetryable(err) && time.Now().Before(deadline) {
+			h.met.retryableRetries.Add(1)
+			time.Sleep(retryDelay)
+			continue
+		}
+		// A closed/unavailable-entry-node error (we caught the node mid-kill):
+		// re-select and retry within budget rather than failing the write, since a
+		// different live node owns the key's unit.
+		if isEntryNodeGone(err) && time.Now().Before(deadline) {
+			h.met.retryableRetries.Add(1)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return err
+	}
+}
+
+// deleteAcked is the Delete analogue of putAcked.
+func (h *harness) deleteAcked(entrySel func() *cluster.Cluster, key string) error {
+	deadline := time.Now().Add(retryBudget)
+	for {
+		c := entrySel()
+		if c == nil {
+			if time.Now().After(deadline) {
+				return errors.New("deleteAcked: no live entry node before deadline")
+			}
+			time.Sleep(retryDelay)
+			continue
+		}
+		err := c.Delete([]byte(key))
+		if err == nil {
+			return nil
+		}
+		if (isRetryable(err) || isEntryNodeGone(err)) && time.Now().Before(deadline) {
+			h.met.retryableRetries.Add(1)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return err
+	}
+}
+
+// getObserved issues a Get through entrySel, retrying the retryable signals, and
+// returns the settled Observed (value or not-found). A retry budget overrun
+// returns the last error (the caller logs it as a read-availability violation).
+// Uses the default retryBudget.
+func (h *harness) getObserved(entrySel func() *cluster.Cluster, key string) (Observed, error) {
+	return h.getObservedBudget(entrySel, key, retryBudget)
+}
+
+// getObservedBudget is getObserved with an explicit per-read retry budget. The
+// final sweep uses a SHORTER budget than the in-workload reads: the sweep runs
+// against a cluster WaitSettled has already driven to a fully-mounted, idle
+// state, so a read should resolve almost immediately. A key still failing after
+// the short budget is a genuine availability gap worth reporting as a violation,
+// not a transient handoff window to ride out - and a short budget keeps the sweep
+// from hanging for tens of seconds per key if the cluster did not fully settle.
+func (h *harness) getObservedBudget(entrySel func() *cluster.Cluster, key string, budget time.Duration) (Observed, error) {
+	deadline := time.Now().Add(budget)
+	for {
+		c := entrySel()
+		if c == nil {
+			if time.Now().After(deadline) {
+				return Observed{}, errors.New("getObserved: no live entry node")
+			}
+			time.Sleep(retryDelay)
+			continue
+		}
+		val, err := c.Get([]byte(key))
+		if err == nil {
+			return Observed{Value: string(val)}, nil
+		}
+		if errors.Is(err, errNotFound) {
+			return Observed{NotFound: true}, nil
+		}
+		if (isRetryable(err) || isEntryNodeGone(err)) && time.Now().Before(deadline) {
+			h.met.retryableRetries.Add(1)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return Observed{}, err
+	}
+}
+
+// sweepRead reads key from one specific node for the final sweep. Unlike the
+// workload read it does NOT keep retrying the ownership-disagreement error (a
+// node refusing to route a key it does not own because its ring is momentarily
+// stale): that condition is permanent for THIS read on THIS node, so we return it
+// immediately and let the sweep try the next node, rather than burning the whole
+// per-read budget on a stale node. We still briefly ride out a genuine acquiring
+// window (Unavailable) up to the budget. errNotFound is a settled result.
+func (h *harness) sweepRead(c *cluster.Cluster, key string, budget time.Duration) (Observed, error) {
+	deadline := time.Now().Add(budget)
+	for {
+		val, err := c.Get([]byte(key))
+		if err == nil {
+			return Observed{Value: string(val)}, nil
+		}
+		if errors.Is(err, errNotFound) {
+			return Observed{NotFound: true}, nil
+		}
+		if isOwnershipDisagreement(err) {
+			// Stale ring on this node: do not retry here, surface to the sweep so it
+			// moves to the next node immediately.
+			return Observed{}, err
+		}
+		if isRetryable(err) && time.Now().Before(deadline) {
+			h.met.retryableRetries.Add(1)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return Observed{}, err
+	}
+}
+
+// isOwnershipDisagreement reports whether err is a node refusing to serve/route a
+// key because its view of ownership is stale (post-reshard / post-membership ring
+// lag): the loop-guard "forwarding loop refused" or the "this node does not own
+// the key" precondition. It is NOT a lost write - the owner still serves the key;
+// it just means THIS node's ring has not refreshed yet.
+func isOwnershipDisagreement(err error) bool {
+	if err == nil {
+		return false
+	}
+	if status.Code(err) != codes.FailedPrecondition {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "does not own the key") ||
+		strings.Contains(msg, "forwarding loop refused")
+}
+
+// isEntryNodeGone reports whether err is the symptom of issuing an op through a
+// node we are mid-killing (closed cluster / dial failure to a dead peer). The
+// driver responds by re-selecting a live entry node, NOT by acking-then-losing.
+func isEntryNodeGone(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, backend.ErrClosed) {
+		return true
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "closed") ||
+		strings.Contains(msg, "connection refused") ||
+		strings.Contains(msg, "transport is closing") ||
+		strings.Contains(msg, "the cluster is closed")
+}
+
+// runWriter is one writer goroutine. It owns the disjoint key subspace
+// "w<id>-k<n>" plus a per-writer Transact counter "ctr-w<id>". On each tick it
+// picks an op by the seeded RNG (this writer's own *rand.Rand, derived from the
+// global seed + writer id so the run is reproducible), issues it acked, and
+// records the ack in the oracle. It tracks its own per-key version + the set of
+// keys it has written (for Delete targeting). Stops when stop closes.
+func (h *harness) runWriter(id int, rng *rand.Rand, stop <-chan struct{}, wg *sync.WaitGroup) {
+	defer wg.Done()
+
+	versions := make(map[string]uint64) // per-key monotonic version this writer assigns
+	liveKeys := make([]string, 0)       // keys with a current live (non-deleted) value
+	ctrKey := fmt.Sprintf("ctr-w%d", id)
+	var ctrAcked int64 // count of acked Transact increments (checked at the end)
+
+	entrySel := func() *cluster.Cluster { return h.cl.EntryNode(rng.Intn(1 << 20)) }
+	keyCount := 0
+	// Bound the per-writer key space so the acked dataset stays finite (a finite
+	// dataset keeps the final full sweep tractable) AND so PUTs cycle into
+	// OVERWRITES of existing keys - a strictly stronger oracle test than only ever
+	// writing fresh keys, because an overwrite that loses surfaces as a stale read.
+	const maxKeysPerWriter = 300
+
+	for {
+		select {
+		case <-stop:
+			// Record the writer's final acked-counter expectation into the oracle
+			// as a sentinel value so the final sweep can verify the RMW invariant.
+			h.recordCounter(ctrKey, ctrAcked)
+			return
+		default:
+		}
+
+		roll := rng.Intn(100)
+		switch {
+		case roll < 70 || len(liveKeys) == 0:
+			// PUT. Below the cap, create a fresh key; at the cap, OVERWRITE a random
+			// existing live key with a new version (bounds the dataset + exercises
+			// overwrites). An overwrite of a known key is marked in-flight so a reader
+			// that samples it mid-write tolerates the benign race.
+			var key string
+			overwrite := false
+			if keyCount < maxKeysPerWriter || len(liveKeys) == 0 {
+				key = fmt.Sprintf("w%d-k%d", id, keyCount)
+				keyCount++
+			} else {
+				key = liveKeys[rng.Intn(len(liveKeys))]
+				overwrite = true
+			}
+			versions[key]++
+			ver := versions[key]
+			val := EncodeValue(key, ver, "payload")
+			if overwrite {
+				h.or.BeginOp(key)
+			}
+			err := h.putAcked(entrySel, key, val)
+			if err != nil {
+				if overwrite {
+					h.or.EndOp(key)
+				}
+				h.vlog.add(VerdictLost, fmt.Sprintf("writer %d Put(%q) failed (not an ack, hard error): %v", id, key, err))
+				continue
+			}
+			h.or.RecordPut(key, val, ver)
+			if overwrite {
+				h.or.EndOp(key)
+			} else {
+				liveKeys = append(liveKeys, key)
+			}
+			h.met.ackedPuts.Add(1)
+
+		case roll < 85:
+			// DELETE a random live key. Mark it in-flight so a reader that samples
+			// it WHILE the delete is in transit tolerates the (benign) race where the
+			// tombstone landed durably before Delete() returned. The key is already
+			// in the model (it had an acked Put), so the guard is scoped to exactly
+			// this key; losses elsewhere stay strict.
+			ki := rng.Intn(len(liveKeys))
+			key := liveKeys[ki]
+			versions[key]++
+			ver := versions[key]
+			h.or.BeginOp(key)
+			err := h.deleteAcked(entrySel, key)
+			if err != nil {
+				h.or.EndOp(key)
+				h.vlog.add(VerdictLost, fmt.Sprintf("writer %d Delete(%q) failed (hard error): %v", id, key, err))
+				continue
+			}
+			h.or.RecordDelete(key, ver)
+			h.or.EndOp(key)
+			h.met.ackedDeletes.Add(1)
+			// Remove from liveKeys (swap-delete).
+			liveKeys[ki] = liveKeys[len(liveKeys)-1]
+			liveKeys = liveKeys[:len(liveKeys)-1]
+
+		default:
+			// TRANSACT: read-modify-write the per-writer counter. A successful
+			// Transact is an acked increment. Retries the retryable freeze/handoff
+			// signal internally (Transact already does), so a nil return is a
+			// genuine ack.
+			if err := h.transactInc(entrySel, ctrKey); err != nil {
+				h.vlog.add(VerdictLost, fmt.Sprintf("writer %d Transact(%q) failed (hard error): %v", id, ctrKey, err))
+				continue
+			}
+			ctrAcked++
+			h.met.ackedTransacts.Add(1)
+		}
+	}
+}
+
+// transactInc runs a read-modify-write increment on the counter key under
+// Transact, retrying the entry-node-gone case (Transact handles the freeze/handoff
+// retry itself). The counter value is stored as a plain decimal so the final
+// sweep can compare it to the acked-increment count.
+func (h *harness) transactInc(entrySel func() *cluster.Cluster, ctrKey string) error {
+	deadline := time.Now().Add(retryBudget)
+	for {
+		c := entrySel()
+		if c == nil {
+			if time.Now().After(deadline) {
+				return errors.New("transactInc: no live entry node")
+			}
+			time.Sleep(retryDelay)
+			continue
+		}
+		err := c.Transact([]byte(ctrKey), func(tx backend.Transaction) error {
+			cur, gerr := tx.Get([]byte(ctrKey))
+			if gerr != nil && !errors.Is(gerr, errNotFound) {
+				return gerr
+			}
+			n := int64(0)
+			if len(cur) > 0 {
+				_, _ = fmt.Sscanf(string(cur), "%d", &n)
+			}
+			return tx.Put([]byte(ctrKey), []byte(fmt.Sprintf("%d", n+1)))
+		})
+		if err == nil {
+			return nil
+		}
+		if (isRetryable(err) || isEntryNodeGone(err)) && time.Now().Before(deadline) {
+			h.met.retryableRetries.Add(1)
+			time.Sleep(retryDelay)
+			continue
+		}
+		return err
+	}
+}
+
+// recordCounter stashes a writer's final acked-increment count so the final sweep
+// can assert the on-disk counter equals it (no lost update under Transact). We
+// store it in a side map on the harness rather than the oracle (the oracle models
+// last-writer-wins keys; the counter is an RMW key with different semantics).
+func (h *harness) recordCounter(ctrKey string, acked int64) {
+	h.ctrMu.Lock()
+	defer h.ctrMu.Unlock()
+	h.ctrExpected[ctrKey] = acked
+}
