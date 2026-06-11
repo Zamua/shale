@@ -10,9 +10,14 @@
 // cluster-wide for the (short) reshard, so NO NEW write enters during the
 // reshard. The freeze FLAG is a bool flip (not a synchronous quiesce), so a
 // writer that passed the gate a moment before the flip may still be landing a
-// Put; the per-node bisect closes that window by taking the per-old-unit
-// write-pause WRITE side (draining those in-flight writers) before its copy.
-// With no new writers and the in-flight ones drained, the copy is quiescent -
+// Put. Two layers close that window: (1) the per-node bisect takes the
+// per-old-unit write-pause WRITE side, draining writers that ALREADY hold the
+// pause RLock; (2) a writer that passed the gate but had not yet taken the
+// RLock is caught by a freeze RE-CHECK under that same RLock in the write path
+// (localWriteBackendForKey) - it gets a retryable error, never an ack. Layer
+// (1) alone is not enough (a writer descheduled between the gate and the RLock
+// is invisible to the drain); the re-check is what makes "no new writer lands a
+// write under the freeze" structurally true. With that, the copy is quiescent -
 // the catch-up window that is the single-node bisect's hard part disappears.
 //
 // THE INVARIANT THIS FILE IS BUILT TO:

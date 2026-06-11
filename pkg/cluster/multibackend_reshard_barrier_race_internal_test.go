@@ -288,3 +288,37 @@ func TestBarrier_WriteThatHitsFreezeIsRefusedNotLost(t *testing.T) {
 	}
 	_ = c.reshardAbort(1)
 }
+
+// TestLocalWriteBackend_FreezeRecheckRefusesLateWriter pins the RESIDUAL P1-A
+// window the WRITE-side drain does NOT close on its own: a writer can pass the
+// caller's isFrozen() gate (Put/Delete/CAS), then be descheduled before taking
+// the per-old-unit pause RLock - invisible to bisectUnitStatic's drain (which
+// only blocks RLocks already held). localWriteBackendForKey re-checks isFrozen()
+// AFTER taking that RLock and refuses such a late writer (ok=false -> the
+// retryable acquiring-window error). Without the re-check it would resolve at
+// gen g (FLIP runs after BISECT, so genState is still g), land its Put in the
+// old unit, ack, and be LOST when FLIP retires old-K.
+func TestLocalWriteBackend_FreezeRecheckRefusesLateWriter(t *testing.T) {
+	const n = 4
+	c, _ := openGateReshardCluster(t, n)
+
+	// Not frozen: a write resolves to a mounted, writable backend.
+	_, _, unlock, ok := c.localWriteBackendForKey([]byte("late-writer-key"))
+	unlock()
+	if !ok {
+		t.Fatal("precondition: localWriteBackendForKey should resolve a mounted unit when not frozen")
+	}
+
+	// Freeze, then call localWriteBackendForKey directly: this models the late
+	// writer that already passed the caller's gate and only NOW takes the pause
+	// RLock. The post-RLock re-check must refuse it.
+	if err := c.reshardFreeze(1); err != nil {
+		t.Fatalf("freeze: %v", err)
+	}
+	_, _, unlock2, ok2 := c.localWriteBackendForKey([]byte("late-writer-key"))
+	unlock2()
+	if ok2 {
+		t.Fatal("P1-A RESIDUAL VIOLATED: localWriteBackendForKey resolved a writable backend while frozen. A writer that passed the isFrozen() gate, then took the pause RLock after the bisect drained, would land in the doomed old unit and be LOST at FLIP. The post-RLock freeze re-check must return ok=false.")
+	}
+	_ = c.reshardAbort(1)
+}

@@ -219,6 +219,20 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, gu st
 	oldK := storageunit.UnitForHash(h, c.genSnapshot().count)
 	pause := c.pauseLockFor(oldK)
 	pause.RLock()
+	// Re-check the freeze AFTER taking the pause RLock. The caller checks
+	// isFrozen() first, but a writer can pass that gate and then be descheduled
+	// (GC, preemption, ring-lock contention spanning the ownerOf lookup) before
+	// reaching this RLock. Such a writer is INVISIBLE to bisectUnitStatic's
+	// WRITE-side drain (which only blocks RLocks already held): it would wake
+	// after the bisect copied + released, resolve at gen g (FLIP runs after the
+	// BISECT barrier, so genState is still g), land its Put in the old unit, ack,
+	// and be LOST when FLIP retires old-K. Re-checking under the RLock makes the
+	// drain structural: either the writer holds the RLock when the bisect Locks
+	// (its value is copied) OR it takes the RLock after and is refused here
+	// (ok=false -> the retryable acquiring-window error, never an ack).
+	if c.isFrozen() {
+		return nil, storageunit.GenUnit{}, pause.RUnlock, false
+	}
 	gu = c.genSnapshot().resolveGenUnit(h)
 	c.mountMu.RLock()
 	be, ok = c.mountMap[gu]
