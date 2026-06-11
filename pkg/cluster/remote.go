@@ -320,6 +320,17 @@ func (t *clusterTx) guardShard(key []byte) error {
 	// slatedb engine), not the owner node. A node owns many units, so
 	// comparing owner nodes would admit a cross-unit transaction that then
 	// commits against only the pin unit. Compare units.
+	//
+	// TODO(reshard-tx): pinUnit is captured at pin time and genUnitForKey here
+	// reads the CURRENT genState. If a reshard cut-over for the pin key's old
+	// unit commits between the pin and a later same-shard op, the same shard
+	// key resolves to a different GenUnit and this returns a SPURIOUS
+	// ErrCrossShard, failing a legitimate single-node transaction mid-reshard.
+	// Transactions during a reshard are rare (reshard is an explicit op) and
+	// this is not data-loss, but the fix is to resolve the pin unit and all
+	// guardShard comparisons against the generation captured AT pin time (a
+	// stable snapshot for the tx lifetime) so a mid-tx cut-over does not flip
+	// the comparison. The reshard cut-over should also be made tx-aware.
 	if t.c.multi {
 		if t.c.genUnitForKey(key) != t.pinUnit {
 			return backend.ErrCrossShard

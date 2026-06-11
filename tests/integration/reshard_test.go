@@ -14,11 +14,14 @@ package integration
 // readable, with its exact value, after the cluster reaches the new
 // generation (2N units). The single-node bisect mechanics (copy split by the
 // new hash bit, catch-up drain, atomic cut-over) are pinned white-box in
-// pkg/cluster; this file proves the wired-together multi-node reshard.
+// pkg/cluster; this file proves the wired-together SINGLE-NODE reshard (the
+// supported, concurrent-write-safe surface) and that a multi-node reshard is
+// refused until the cluster-wide generation barrier lands.
 
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -27,20 +30,6 @@ import (
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
 )
-
-// reshardAll runs Cluster.Reshard() on every node, the way an operator drives
-// a fleet-wide doubling: each node bisects the units it locally mounts, and
-// the new gen-(g+1) units redistribute across nodes by the reused Phase 3
-// lease handoff. Order does not matter for correctness (each unit's bisect is
-// independent), but we run the founder last so the others have advanced first.
-func reshardAll(t *testing.T, nodes []*sharedNode) {
-	t.Helper()
-	for _, n := range nodes {
-		if err := n.Cluster.Reshard(); err != nil {
-			t.Fatalf("Reshard on %s: %v", n.ID, err)
-		}
-	}
-}
 
 // TestReshard_SingleNodeNoAckedWriteLost is the simplest reshard gate: a single
 // multi-backend node writes a spread of acked keys, doubles N -> 2N via
@@ -85,12 +74,17 @@ func TestReshard_SingleNodeNoAckedWriteLost(t *testing.T) {
 	}
 }
 
-// TestReshard_TwoNodeNoAckedWriteLost is THE multi-node Phase 4 gate. Two nodes
-// share a backing; they write acked keys across the unit space, then BOTH
-// reshard (N -> 2N). After the reshard + reconcile settle, every acked key must
-// still be readable through the cluster (routing to the new gen-1 unit owner),
-// and the cluster keeps serving new writes at the doubled unit count.
-func TestReshard_TwoNodeNoAckedWriteLost(t *testing.T) {
+// TestReshard_MultiNodeRefused pins the v0.8 Phase 4 scope boundary. The online
+// doubling reshard is supported on a SINGLE-NODE cluster (gate-validated
+// lossless under concurrent writes). A MULTI-NODE reshard needs a cluster-wide
+// generation barrier so every node routes at one generation and the write-pause
+// spans the logical key-space; Reshard is a purely local trigger with no such
+// coordination, so a multi-node reshard under concurrent writes could lose acked
+// writes. Until the barrier lands, Reshard REFUSES on a multi-node cluster
+// rather than ship that footgun. This test proves the refusal is clean: it
+// errors, and the cluster is unharmed (every acked key still readable, still
+// serving writes).
+func TestReshard_MultiNodeRefused(t *testing.T) {
 	const unitCount = 16
 	backing := sharedfactory.NewBacking()
 	n1 := startSharedNode(t, "r2a", "", unitCount, backing)
@@ -99,12 +93,11 @@ func TestReshard_TwoNodeNoAckedWriteLost(t *testing.T) {
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
 	}
-	// Let the join-driven reconcile settle so ownership is stable before we
-	// record the baseline.
+	// Let the join-driven reconcile settle so ownership is stable.
 	time.Sleep(700 * time.Millisecond)
 
 	want := make(map[string][]byte)
-	const nKeys = 400
+	const nKeys = 100
 	for i := 0; i < nKeys; i++ {
 		k := fmt.Sprintf("r2-%05d", i)
 		v := []byte(fmt.Sprintf("rv-%05d", i))
@@ -114,68 +107,36 @@ func TestReshard_TwoNodeNoAckedWriteLost(t *testing.T) {
 		want[k] = v
 	}
 
-	// Operator drives the doubling on every node.
-	nodes := []*sharedNode{n1, n2}
-	reshardAll(t, nodes)
-
-	// After both nodes reshard, the live generation on each is 1 and the unit
-	// space is 2N. The 2N units redistribute by the reused lease handoff
-	// (bumpRingGen -> reconcile). Wait for that to settle: every node's mounted
-	// set should be its OWNED gen-1 set, with the two nodes partitioning the 2N
-	// units (disjoint + complete). This is the same convergence Phase 3 waits
-	// on after a membership change.
-	if !waitUntil(12*time.Second, func() bool {
-		o1 := n1.Handle.OpenUnits()
-		o2 := n2.Handle.OpenUnits()
-		seen := make(map[uint32]int)
-		for _, gu := range o1 {
-			if gu.Gen != 1 {
-				return false
-			}
-			seen[uint32(gu.ID)]++
+	// Reshard must REFUSE on each node of a multi-node cluster.
+	for _, n := range []*sharedNode{n1, n2} {
+		err := n.Cluster.Reshard()
+		if err == nil {
+			t.Fatalf("Reshard on multi-node %s succeeded; want a refusal (multi-node reshard is not yet supported)", n.ID)
 		}
-		for _, gu := range o2 {
-			if gu.Gen != 1 {
-				return false
-			}
-			seen[uint32(gu.ID)]++
+		if !strings.Contains(err.Error(), "multi-node") {
+			t.Fatalf("Reshard on %s error = %q, want a multi-node-not-supported refusal", n.ID, err)
 		}
-		// Every gen-1 unit mounted exactly once (no overlap, no old-gen left).
-		if len(seen) != 2*unitCount {
-			return false
-		}
-		for _, c := range seen {
-			if c != 1 {
-				return false
-			}
-		}
-		return true
-	}) {
-		t.Fatalf("reshard reconcile did not settle to a clean 2N partition: n1=%v n2=%v", n1.Handle.OpenUnits(), n2.Handle.OpenUnits())
 	}
 
-	// Now assert no acked write was lost - read EVERY key from BOTH nodes
-	// (forwarding to the current owner), retrying the transient acquiring-window
-	// error.
+	// The refused reshard left the cluster unharmed: every acked key is still
+	// readable through both nodes, and writes still work.
 	for k, v := range want {
-		for _, n := range nodes {
+		for _, n := range []*sharedNode{n1, n2} {
 			got, err := getWithRetryUnavailable(t, n.Cluster, k, 10*time.Second)
 			if err != nil {
-				t.Fatalf("acked key %q unreadable via %s after reshard: %v (NO ACKED WRITE LOST violated)", k, n.ID, err)
+				t.Fatalf("acked key %q unreadable via %s after refused reshard: %v", k, n.ID, err)
 			}
 			if !bytes.Equal(got, v) {
-				t.Fatalf("acked key %q via %s = %q, want %q after reshard", k, n.ID, got, v)
+				t.Fatalf("acked key %q via %s = %q, want %q", k, n.ID, got, v)
 			}
 		}
 	}
-
-	// The cluster still serves writes at the doubled unit count.
-	if err := putWithRetryUnavailable(t, n2.Cluster, "after-2x", "ok", 8*time.Second); err != nil {
-		t.Fatalf("post-reshard Put on n2: %v", err)
+	if err := putWithRetryUnavailable(t, n2.Cluster, "after-refuse", "ok", 8*time.Second); err != nil {
+		t.Fatalf("Put after refused reshard on n2: %v", err)
 	}
-	got, err := getWithRetryUnavailable(t, n1.Cluster, "after-2x", 8*time.Second)
+	got, err := getWithRetryUnavailable(t, n1.Cluster, "after-refuse", 8*time.Second)
 	if err != nil || !bytes.Equal(got, []byte("ok")) {
-		t.Fatalf("post-reshard read on n1: got=%q err=%v", got, err)
+		t.Fatalf("read after refused reshard on n1: got=%q err=%v", got, err)
 	}
 }
 

@@ -206,6 +206,16 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, gu st
 	// Key the pause by the OLD unit at the CURRENT count. resolveGenUnit (under
 	// genMu) decides old-vs-new; the pause must be on the same K the resharder
 	// pauses, which is the old-count unit id.
+	//
+	// TODO(reshard-toctou): the pause key here and resolveGenUnit below read the
+	// genState via two separate genSnapshot() calls. They can only straddle the
+	// reshard's FINAL count flip (N->2N); a single-node reshard at the final
+	// commit could pause on the gen-N K while the resolve picks the gen-(g+1)
+	// unit. In that window the write still lands in the RESOLVED (correct) unit
+	// and the stale pause is harmless (no cut-over is in flight post-reshard),
+	// which is why the 252k-write gate sees no loss; but the two snapshots
+	// should be unified (derive oldK + the resolve from ONE snapshot taken with
+	// the pause held) so the invariant is structural, not incidental.
 	oldK := storageunit.UnitForHash(h, c.genSnapshot().count)
 	pause := c.pauseLockFor(oldK)
 	pause.RLock()
@@ -278,6 +288,17 @@ func (c *Cluster) Reshard() error {
 	}
 	if !c.multi {
 		return fmt.Errorf("cluster: Reshard is only valid in multi-backend mode")
+	}
+	// v0.8 Phase 4 supports the SINGLE-NODE online reshard, which is gate-
+	// validated lossless under concurrent writes. A multi-node doubling needs
+	// a cluster-wide generation BARRIER: every node must route at one
+	// generation and the write-pause must span the logical key-space, not one
+	// node's local view. Reshard is a purely local trigger with no such
+	// coordination, so a multi-node reshard under concurrent writes can lose
+	// acked writes. Refuse it rather than ship that footgun; the cluster-wide
+	// barrier is a follow-up (see docs/SPEC.md, v0.8 Phase 4 scope).
+	if c.ring != nil && len(c.ring.Members()) > 1 {
+		return fmt.Errorf("cluster: multi-node Reshard is not yet supported (a cluster-wide generation barrier is required for concurrent-write safety); reshard requires a single-node cluster")
 	}
 	c.reshardMu.Lock()
 	defer c.reshardMu.Unlock()
