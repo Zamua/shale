@@ -126,6 +126,8 @@ func unwrapHandle(factory storageunit.BackendFactory) *sharedfactory.Handle {
 		return f
 	case *brokenHandle:
 		return f.Handle
+	case *skipCatchupHandle:
+		return f.Handle
 	default:
 		panic(fmt.Sprintf("unwrapHandle: unsupported factory type %T", factory))
 	}
