@@ -1105,6 +1105,18 @@ One-time, standalone op tool (additive, dry-run on a bucket copy first): read ea
 - Memtable memory dominates per-engine cost (slatedb default 64 MB, tunable). N engines per node = N x memtable, so shrink the memtable for many units. The small-memtable downside (more frequent SST flushes) only bites at high write volume.
 - Single-writer per unit is preserved end to end. Cross-unit transactions are unsupported; ShardKey co-location keeps a transaction inside one unit.
 
+### v0.8 Phase 2: multi-backend node (static routing)
+
+Phase 2 wires the `pkg/storageunit` domain into the cluster as a MULTI-BACKEND node with a STATIC topology. It mirrors how v0.2 did static routing before v0.3 added rebalance: the lease handoff on membership change is OUT of scope (Phase 3).
+
+- **Two config modes, mutually exclusive.** The legacy single `Config.Backend` is the per-node mode and stays the default, unchanged byte-for-byte. Phase 2 adds `Config.BackendFactory` (`storageunit.BackendFactory`) + `Config.UnitCount` (`storageunit.UnitCount`); when BOTH are set the cluster runs in multi-backend mode. `Open` validates the XOR: factory+unitcount OR backend, never both and never neither, erroring clearly otherwise.
+- **Unit ownership via the SAME ring.** Unit U is owned by `ring.LocateKey(unitID-bytes(U)).ID`. A bare unit id carries no `{...}` tag, so it hashes whole; units are fed through the one existing ring (no second ring). The cluster builds a `storageunit.OwnerLookup` from its ring and uses it for every unit owner question.
+- **Mount owned units on Open.** Derive the node's owned units with `storageunit.OwnedUnits(self, UnitCount, ownerLookup)`, then `factory.OpenUnit(u, epoch)` each into a `unit -> backend.Backend` mount map the cluster holds. Real epoch fencing is a Phase-3 concern: Phase 2 opens at a fixed/zero epoch (clear TODO, no durable epoch logic invented here).
+- **Routing: key -> unit -> owner -> mount-or-forward.** For every op (Put/Get/Delete/ScanPrefix and the CAS/commit path): `shardKey = ring.ShardKey(key)` (the SAME extraction the ring uses, so co-location holds), `unit = storageunit.UnitForShardKey(shardKey, UnitCount)`, `owner = ownerLookup(unit)`. If owner == self, apply against `mountMap[unit]` (NOT a single `c.backend`); else forward to the owner over the existing gRPC path. The forwarded op carries the key; the receiver re-derives the unit and applies against its own mount map.
+- **Unit-based owner guard.** The forwarding loop-guard (`OwnsKey` / the forwarded-but-not-mine refusal) becomes unit-based: a forwarded op whose unit this node has not mounted is REFUSED, not re-forwarded. On `Close`, close every mounted unit (`factory.CloseUnit` each) before the node shuts down.
+
+**IN SCOPE: static topology.** The unit set a node owns is fixed at Open. If membership changes mid-run, Phase 2 may serve stale ownership for the moved units; that is acceptable and documented, exactly as v0.2 served stale routing before v0.3. **OUT OF SCOPE (later phases):** rebalance / lease handoff and mount-unmount on membership change (Phase 3); epoch fencing / writer-epoch handoff (Phase 3, opened at a fixed epoch here); doubling / resharding and the migration tool (Phase 4+). The legacy per-node path is untouched.
+
 ---
 
 ## Roadmap
