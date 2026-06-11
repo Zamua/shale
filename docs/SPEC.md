@@ -1107,6 +1107,7 @@ Default `go test ./...` skips both layers (no cgo, no Docker), so the regular de
   - [ ] R=1 path unchanged (raw values, no envelopes, no apply-if-newer, no lock)
   - [ ] `CommitCASApply` releases `casCommitMu` after the owner-local commit, before the fan-out: reordered fan-outs self-resolve via apply-if-newer, restoring "no lock held across the network"
   - [ ] Fixes the read-repair-clobbers-newer-write lost-update bug under `Quorum` / `All`; owner-local validation now sound under every read consistency
+- [ ] **v0.8** (proposed) - per-shard lease-handoff storage: copy-free rebalance + online doubling resharding. Replaces the per-node single-database model (one slatedb per node, rebalance copies keys) with a FIXED pile of self-contained storage-unit databases whose OWNERSHIP is a lease (the ring assigns units to nodes; handoff is close-on-old-owner / open-at-epoch+1-on-new-owner, zero bytes copied). Shard count (routing/co-location) decoupled from storage-unit count (physical/lease, bounded by per-engine memtable memory). Growth by doubling makes resharding an online per-unit bisect with no global re-partition. Full design + the implementation phases in [`per-shard-lease.md`](per-shard-lease.md).
 
 Each version ships independently; users can adopt v0.1 today (functionally equivalent to using their Backend directly, plus the CLI for daily ergonomics) and grow into v0.2+ when their workload demands it.
 
