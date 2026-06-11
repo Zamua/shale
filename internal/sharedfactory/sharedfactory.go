@@ -110,6 +110,45 @@ func (b *Backing) UnitStore(u storageunit.UnitID) (backend.Backend, bool) {
 	return s, ok
 }
 
+// WipeUnit empties u's shared bytes IN PLACE: it deletes every key from the
+// existing shared *memory.Memory rather than swapping in a fresh one, so ANY
+// node that has already opened u (and captured a pointer to that store) sees
+// the data vanish too. This is what makes it a faithful data-loss simulation:
+// a pointer swap would leave an earlier acquirer reading the old populated
+// store, masking the loss. It exists ONLY to let a test simulate a data-loss
+// handoff bug (a release that fails to flush, or bytes otherwise lost) so the
+// lossless-handoff gate test can prove it actually catches a lost write rather
+// than rubber-stamping. NO production code path does this: a real release
+// flushes and never destroys durable bytes. The durable epoch is left
+// untouched so a subsequent acquire still fences correctly; only the data is
+// gone, which is precisely the failure the gate must detect.
+func (b *Backing) WipeUnit(u storageunit.UnitID) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.stores[u]
+	if !ok {
+		return
+	}
+	it, err := s.ScanPrefix(nil)
+	if err != nil {
+		return
+	}
+	var keys [][]byte
+	for {
+		k, _, err := it.Next()
+		if err != nil || k == nil {
+			break
+		}
+		kc := make([]byte, len(k))
+		copy(kc, k)
+		keys = append(keys, kc)
+	}
+	_ = it.Close()
+	for _, k := range keys {
+		_ = s.Delete(k)
+	}
+}
+
 // acquire opens u on behalf of a Handle that does NOT currently hold u (the
 // handoff / cold-acquire case), fencing against the durable epoch. The
 // intended epoch is a best-effort FLOOR from the cluster; the AUTHORITATIVE
