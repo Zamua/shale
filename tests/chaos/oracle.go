@@ -221,19 +221,6 @@ func (o *Oracle) RecordDelete(key string, version uint64) {
 	e.deleted = true
 }
 
-// Expected returns the latest acked state for key: the value, whether it is a
-// tombstone (deleted), the latest acked version, and whether the key is known to
-// the model at all. A reader uses this to know what a correct read should yield.
-func (o *Oracle) Expected(key string) (value string, deleted bool, version uint64, known bool) {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	e := o.model[key]
-	if e == nil {
-		return "", false, 0, false
-	}
-	return e.value, e.deleted, e.version, true
-}
-
 // Observed is what a reader actually saw for a key: the value bytes, and whether
 // the read came back not-found. (A transient retryable error is retried by the
 // reader before it ever builds an Observed; an Observed is a settled, non-error
@@ -361,13 +348,6 @@ func (o *Oracle) Snapshot() map[string]Observed {
 		out[k] = Observed{Value: e.value, NotFound: e.deleted}
 	}
 	return out
-}
-
-// Len reports how many distinct keys have an acked write recorded.
-func (o *Oracle) Len() int {
-	o.mu.RLock()
-	defer o.mu.RUnlock()
-	return len(o.model)
 }
 
 // EncodeValue builds the self-describing value the writer stores: the version is

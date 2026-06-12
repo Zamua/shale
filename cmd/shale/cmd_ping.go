@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 )
@@ -14,20 +13,7 @@ import (
 // distinguish "the node is reachable but slow" from "the node is
 // not reachable at all".
 func runPing(opts globalOpts, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("ping", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() {
-		_, _ = fmt.Fprint(stderr, "Usage: shale ping\n")
-	}
-	if err := fs.Parse(args); err != nil {
-		return exitGeneric
-	}
-	if fs.NArg() != 0 {
-		fs.Usage()
-		return exitGeneric
-	}
-
-	cli, cleanup, code := dial(opts.addr, stderr)
+	_, cli, cleanup, code := setupCmd(opts, "ping", "Usage: shale ping\n", 0, args, stderr)
 	if code != exitOK {
 		return code
 	}
