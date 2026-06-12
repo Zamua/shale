@@ -30,10 +30,15 @@ import (
 // sub-second (the soak needs handoffs to settle within the per-event budgets),
 // and wraps goleak so a regression that leaks a Cluster goroutine (events loop,
 // reconcile, reshard barrier, peer fanout) surfaces as a binary leak. Known
-// third-party background goroutines are ignored via the shared canonical list.
+// third-party background goroutines are ignored via the shared canonical list,
+// plus extraGoleakOptions - which is EMPTY for the default (in-memory) build so
+// the in-memory soak's leak check stays tight, and is populated only under the
+// slatedb tag with the minio-go HTTP keep-alive + slatedb-go rust-runtime
+// background goroutines a real-backend run legitimately leaves at process exit.
 func TestMain(m *testing.M) {
 	rebalance.SetSweepInterval(50 * time.Millisecond)
-	goleak.VerifyTestMain(m, goleakignore.Options()...)
+	opts := append(goleakignore.Options(), extraGoleakOptions...)
+	goleak.VerifyTestMain(m, opts...)
 }
 
 // loadConfig reads the run knobs from the environment. The DEFAULT is a genuine

@@ -175,9 +175,17 @@ func (h *harness) runScheduler(rng *rand.Rand, stop <-chan struct{}, wg *sync.Wa
 		// default DURATION comfortably above the prologue's wall cost so the random
 		// schedule below also gets a turn.
 		prologue := []chaosEventKind{evReshard, evReshardWhileDown, evLeaveMidReshard, evJoin, evKill}
+		if h.cfg.noReshard {
+			// DIAGNOSTIC: membership churn only, no generation change.
+			prologue = []chaosEventKind{evJoin, evKill, evLeave}
+		}
+		if h.cfg.reshardOnly {
+			// DIAGNOSTIC: plain reshards only, no membership churn.
+			prologue = []chaosEventKind{evReshard, evReshard, evReshard}
+		}
 		for _, kind := range prologue {
 			liveGen += h.fireEvent(kind, rng)
-			h.cl.WaitSettled(h.cfg.units<<liveGen, 15*time.Second)
+			h.cl.WaitSettled(h.cfg.units<<liveGen, h.cl.scaled(15*time.Second))
 		}
 	}
 
@@ -209,7 +217,7 @@ func (h *harness) runScheduler(rng *rand.Rand, stop <-chan struct{}, wg *sync.Wa
 		// sweep crawl. Settling between events keeps each event's churn bounded and
 		// keeps the workload (which runs concurrently) reading a mostly-settled ring.
 		// The workload's retries cover the brief windows this does not close.
-		h.cl.WaitSettled(h.cfg.units<<liveGen, 15*time.Second)
+		h.cl.WaitSettled(h.cfg.units<<liveGen, h.cl.scaled(15*time.Second))
 	}
 }
 
@@ -251,7 +259,13 @@ func (h *harness) pickEvent(rng *rand.Rand, liveNodes, liveGen, maxGen int) chao
 	if liveNodes <= 1 {
 		return evJoin
 	}
-	canReshard := liveGen < maxGen
+	// reshardOnly DIAGNOSTIC: only plain reshards (until the ceiling), no membership
+	// churn. Once at the ceiling there is nothing to do, so just reshard-attempt
+	// (the guard refuses + it is a no-op delta).
+	if h.cfg.reshardOnly {
+		return evReshard
+	}
+	canReshard := liveGen < maxGen && !h.cfg.noReshard
 	// Weighted menu. Numbers are relative weights. The per-event SETTLE +
 	// convergence wait dominates wall clock, so a default soak fires only a modest
 	// number of events; we therefore bias toward the RESHARD + the two COMBINATIONS
@@ -365,6 +379,19 @@ func (h *harness) doReshardWhileDown(rng *rand.Rand) bool {
 	// Record that the COMBINATION fired (a node went down with a reshard to follow),
 	// distinct from a plain kill, so the report proves this hard case ran.
 	h.met.evReshardWhileDown.Add(1)
+	// SETTLE the post-kill handoff before resharding: the survivors must have
+	// RE-ACQUIRED (re-mounted) the dead node's units before the reshard, or the
+	// bisect - which only bisects MOUNTED old units (mountedOldUnits) - would skip
+	// the not-yet-reacquired units and their keys would never reach a gen-(g+1)
+	// child, losing them at FLIP. The in-memory double re-mounts instantly so this
+	// is invisible there; a real slatedb re-acquire is an object-store round-trip,
+	// so the harness must wait for the handoff to complete (every unit mounted on
+	// its ring owner) before triggering the reshard. The reshard's freeze barrier
+	// assumes a settled membership+mount; this makes the harness honor that. Pass 0
+	// for expectedUnits: the scheduler's liveGen is not threaded here, but
+	// WaitSettled with 0 still enforces the property we need (every unit mounted on
+	// its ring owner, contiguous, one generation) without asserting an exact count.
+	h.cl.WaitSettled(0, h.cl.scaled(15*time.Second))
 	// Reshard over the survivors while the victim is down.
 	committed := false
 	if err := h.cl.Reshard(); err == nil {
