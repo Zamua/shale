@@ -429,3 +429,84 @@ This is the whole reason the oracle is pure and the cluster is behind an
 interface: the in-process soak is the cheap, fast confidence-builder, and the
 exact same adversarial program graduates to the real deploy when you want to
 prove it against process boundaries and real network faults.
+
+## The real-cluster orchestrator (`//go:build chaosreal`)
+
+The step-2 "prove it on a REAL cluster" validation. It reuses the SAME pure oracle
+(`oracle.go`, no build tag) but drives a deploy of SEPARATE OS PROCESSES instead of
+goroutines: real `shaled-slate` child processes, real gRPC + memberlist over the
+network, a SHARED object-storage bucket (MinIO) as the durable backing. One
+invocation owns the whole lifecycle (launch, kill, restart, teardown):
+
+```sh
+# Build shaled-slate (cgo + the slatedb cdylib on the loader path) from backends/slate:
+CGO_ENABLED=1 CGO_LDFLAGS="-L$HOME/.local/lib" DYLD_LIBRARY_PATH="$HOME/.local/lib" \
+  go build -tags slatedb -o /tmp/shaled-slate ./cmd/shaled-slate
+
+# Stand up MinIO + a FRESH bucket (the shared durable backing), then run the orchestrator:
+SHALE_REAL_BINARY=/tmp/shaled-slate \
+SHALE_REAL_LIBDIR=$HOME/.local/lib \
+SHALE_REAL_ENDPOINT=http://127.0.0.1:9000 \
+SHALE_REAL_BUCKET=shale-real-chaos \
+SHALE_REAL_ACCESS_KEY=admin SHALE_REAL_SECRET_KEY=supersecret \
+  go test -tags chaosreal ./tests/chaos/ -run TestRealClusterChaos -v -timeout 10m
+```
+
+Gated behind `//go:build chaosreal`, so the normal suite AND the in-process chaos
+soak (`//go:build chaos`) are untouched. With no env set, the test SKIPS with a
+precise reason (which piece is missing), never a fake pass. The adapter lives in
+`adapter_real.go` (the `Topology`: launch / SIGKILL / SIGTERM / Reshard-seam over
+`os/exec`) + `realclient.go` (the `ClusterClient`: Put/Get/Delete over the real
+`pkg/rpc` gRPC client); the orchestration + invariants live in `run_real.go` +
+`chaos_real_test.go`.
+
+### What it can and cannot prove (read before trusting a green run)
+
+`shaled-slate` runs the LEGACY per-node backend mode: ONE `slate.Slate` per
+process, the ring routing each key to a single owner. It is NOT wired for
+multi-backend mode (`BackendFactory` + `UnitCount`), because no slatedb
+`BackendFactory` exists and `shaled-slate` exposes no unit-count flag. Two
+consequences bound the orchestrator, both reported honestly rather than faked:
+
+- **Reshard is unavailable.** `Cluster.Reshard` refuses outside multi-backend
+  mode, and there is no operator Reshard RPC on the gRPC surface. The Reshard seam
+  is present and returns a typed "unsupported" error; the report shows
+  `reshard_supported=false`.
+- **Cross-process durability handoff is unavailable.** Each node owns a DISTINCT
+  slatedb instance (a distinct DbName prefix in the shared bucket - two writers on
+  one (bucket, dbName) fence each other). When a node is SIGKILLed, its OWNED keys
+  are durable in ITS OWN instance, but a survivor owns a DIFFERENT instance and
+  legacy mode has no per-unit lease handoff to re-mount the dead node's instance.
+  So a survivor cannot serve a dead owner's keys. Multi-backend mode (one
+  slatedb-per-unit keyed by `GenUnit`, re-mounted by the survivor on lease
+  re-acquire) is what would close this; it is not yet wired for slate.
+
+The run is therefore split into two phases:
+
+- **PHASE 1 - stable-membership durability (HARD-gated).** Seed a dataset against
+  stable membership, then SIGKILL a non-founder node mid-workload and probe the
+  surviving founder for EVERY acked key. Each key is `SURVIVED` (founder serves the
+  correct durable value across the hard process death - the real durable-before-ack
+  win), `UNAVAILABLE` (founder cannot serve it: the owner-killed legacy gap,
+  counted), or a `VIOLATION` (founder serves a WRONG value - stale/corrupt/
+  resurrected). The HARD assertion is wrong-value-only: in a stable-membership kill
+  a survivor either owns the key (correct value) or does not (unavailable), so it
+  can NEVER legitimately serve a wrong value. A wrong value across real process
+  death + real gRPC + a real object-store round-trip is a genuine bug and fails the
+  run. The killed node is then restarted and must rejoin.
+- **PHASE 2 - churn coverage (INFORMATIONAL).** Real joins / leaves / kill+restarts
+  over the real network. Under legacy mode, ring churn with no inter-instance data
+  movement makes resurrection/staleness inherent (a node re-acquiring ownership
+  serves its own stale copy), so phase-2 wrong-value reads + un-acked writes are
+  recorded as METRICS (`churn_wrong_values`, `write_failures`), NOT failures -
+  gating on them would just re-assert the known mode limitation.
+
+A green run means: the real network + real process death + real object storage do
+not lose or corrupt a write the legacy single-owner model is responsible for, and a
+quantified fraction of the acked set provably survives a hard SIGKILL. It does NOT
+mean cross-process durable handoff or reshard works on slate - those need the
+multi-backend slate factory, which is the next step before a prod 2-pod cutover.
+The empirical evidence the durability gap is real (and not a harness artifact): a
+2-node hand smoke writes 20 keys, SIGKILLs the owner of half, and the survivor then
+serves only the keys it owned - the killed owner's keys read back not-found, their
+bytes stranded in the dead node's DbName prefix.
