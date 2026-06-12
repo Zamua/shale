@@ -132,6 +132,23 @@ service ShaleNode {
   // wire method directly).
   rpc ReshardControl(ReshardControlRequest) returns (ReshardControlResponse);
 
+  // Reshard is the OPERATOR-facing trigger for a doubling reshard (N -> 2N)
+  // on a running cluster. It is DISTINCT from ReshardControl: ReshardControl
+  // carries one internal barrier phase between nodes and is never called from
+  // outside the cluster, whereas Reshard is what the `shale reshard` CLI dials
+  // on a single node to KICK OFF the whole reshard. The receiving node becomes
+  // the coordinator: it calls Cluster.TriggerReshard, which drives the
+  // cluster-wide FREEZE -> BISECT -> FLIP -> RESUME barrier (multi-node) or the
+  // single-node bisect path. ReshardRequest is empty: the only supported reshard
+  // is a doubling, so there are no parameters. The response reports the
+  // {from_unit_count, to_unit_count} transition on success; a guard rejection
+  // (legacy mode, a reshard already in flight, membership unstable mid-reshard)
+  // travels as the error string, matching the CommitCAS / ApplyBatch /
+  // ReshardControl convention of carrying an expected control-flow outcome in the
+  // response field rather than a gRPC status code. Safe to retry after a clean
+  // failure: an error path leaves the generation unchanged.
+  rpc Reshard(ReshardRequest) returns (ReshardResponse);
+
   // GenState is the cluster-internal generation-propagation RPC for the
   // v0.8 join-after-reshard fix. A node opening in multi-backend mode WITH
   // seeds (a JOINER, not the founder) calls this on a live seed exactly once
@@ -468,6 +485,27 @@ message ReshardControlRequest {
 // treats as an ABORT trigger.
 message ReshardControlResponse {
   string error = 1;
+}
+
+// -- Reshard (operator trigger) --------------------------------------
+
+// ReshardRequest carries no parameters: the only supported reshard is a
+// doubling N -> 2N, so there is nothing to specify. An operator issuing
+// `shale reshard` against a node sends this empty request; the node it
+// reaches becomes the coordinator for the cluster-wide barrier.
+message ReshardRequest {}
+
+// ReshardResponse reports the outcome of an operator-triggered reshard.
+// On success, from_unit_count + to_unit_count carry the doubling transition
+// (e.g. 2 -> 4) and error is empty. On a guard rejection (legacy mode, a
+// reshard already in flight, membership unstable across the barrier) error is
+// non-empty and the counts are equal (nothing moved). The failure travels in
+// this field, not a gRPC status, so the CLI can distinguish a refused reshard
+// from a transport error.
+message ReshardResponse {
+  uint32 from_unit_count = 1;
+  uint32 to_unit_count = 2;
+  string error = 3;
 }
 
 // -- GenState --------------------------------------------------------

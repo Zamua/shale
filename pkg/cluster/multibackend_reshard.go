@@ -47,6 +47,7 @@
 package cluster
 
 import (
+	"errors"
 	"fmt"
 	"sync"
 
@@ -305,7 +306,75 @@ func (c *Cluster) Reshard() error {
 	}
 	c.reshardMu.Lock()
 	defer c.reshardMu.Unlock()
+	return c.reshardLocked()
+}
 
+// ErrReshardInFlight is returned by TriggerReshard when another reshard already
+// holds reshardMu. It is the typed signal the operator RPC maps to a clean
+// "already in flight, retry later" rather than queuing behind the running one
+// (which would double the generation a SECOND time on top of the first). A
+// clean failure leaves the generation untouched, so a retry after the in-flight
+// one finishes is safe.
+var ErrReshardInFlight = errors.New("cluster: a reshard is already in flight")
+
+// TriggerReshard is the OPERATOR-facing reshard entrypoint (behind the gRPC
+// Reshard RPC + the `shale reshard` CLI). Unlike Reshard, which BLOCKS on
+// reshardMu (the in-process test + library contract), TriggerReshard REJECTS a
+// concurrent reshard with ErrReshardInFlight instead of queuing behind it: an
+// operator who fires two `shale reshard`s in a row must not silently get a
+// double-doubling (N -> 4N). It reports the {from, to} unit counts of the
+// doubling on success so the operator sees the transition.
+//
+// Safety is INHERITED from reshardLocked / reshardCoordinated, not re-built
+// here: the up-front count.Double() ceiling check means a reshard either fully
+// proceeds or fully refuses; the coordinated flow re-checks the member IDENTITY
+// set before BISECT and before FLIP and ABORTs cleanly (staying at gen g) on any
+// drift, so a reshard issued while membership is unstable refuses without
+// hanging. This wrapper adds exactly ONE thing: the non-blocking TryLock so a
+// concurrent call is rejected rather than serialized.
+//
+// Idempotent-safe to retry after a clean failure: on any error path the
+// generation is unchanged (ABORT / ceiling-refuse stay at gen g; ErrReshardInFlight
+// never started), so re-issuing the RPC simply re-attempts from the current
+// generation. A successful return advances the generation by exactly one doubling.
+func (c *Cluster) TriggerReshard() (from uint32, to uint32, err error) {
+	if c.notReady() {
+		return 0, 0, fmt.Errorf("cluster: Reshard on a closed cluster")
+	}
+	if !c.multi {
+		return 0, 0, fmt.Errorf("cluster: Reshard is only valid in multi-backend mode")
+	}
+	// Non-blocking: a second concurrent reshard is REJECTED, not queued. Blocking
+	// here (the Reshard contract) would let two operator calls stack and double
+	// the generation twice; TryLock fails fast so the operator retries instead.
+	if !c.reshardMu.TryLock() {
+		return 0, 0, ErrReshardInFlight
+	}
+	defer c.reshardMu.Unlock()
+
+	from = c.genSnapshot().count.N()
+	if err := c.reshardLocked(); err != nil {
+		// The generation is unchanged on every error path (see reshardLocked /
+		// reshardCoordinated ABORT semantics), so report from==to: nothing moved.
+		return from, from, err
+	}
+	to = c.genSnapshot().count.N()
+	return from, to, nil
+}
+
+// reshardLocked is the reshard body shared by Reshard (blocking) and
+// TriggerReshard (non-blocking). The CALLER must already hold reshardMu; this
+// function neither acquires nor releases it. Splitting the lock acquisition out
+// lets the operator path reject a concurrent reshard via TryLock while the
+// library path keeps its blocking serialize-and-double semantics, with ONE copy
+// of the actual reshard logic.
+func (c *Cluster) reshardLocked() error {
+	// Test-only seam: a hook fires here (reshardMu held, before any work) so a
+	// test can hold the reshard open and prove a concurrent TriggerReshard is
+	// rejected with ErrReshardInFlight rather than queuing. Nil in production.
+	if c.testingReshardEntryHook != nil {
+		c.testingReshardEntryHook()
+	}
 	// MULTI-NODE: a cross-node doubling cannot be made safe by the node-LOCAL
 	// write-pause this single-node path uses (each node advances its generation
 	// independently, so a concurrent write could route at the old generation on

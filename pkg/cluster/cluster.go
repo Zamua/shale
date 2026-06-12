@@ -362,6 +362,14 @@ type Cluster struct {
 	// node join/leave against the phase timing. See TestingSetAfterFreezeHook.
 	testingAfterFreezeHook func()
 
+	// testingReshardEntryHook, when non-nil, runs ONCE at the top of
+	// reshardLocked (with reshardMu already held) before any reshard work. Test-
+	// only seam (nil in every production path): it lets a test hold the reshard
+	// open deterministically so a SECOND, concurrent TriggerReshard observes
+	// reshardMu held and is rejected with ErrReshardInFlight, without racing on
+	// goroutine timing. See TestingSetReshardEntryHook.
+	testingReshardEntryHook func()
+
 	// reconcileMu serializes the Phase 3 lease-handoff reconcile
 	// (multibackend_rebalance.go): at most one reconcile mutates the mount
 	// map at a time, so two membership changes whose settle timers fire

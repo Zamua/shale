@@ -451,6 +451,16 @@ func (c *Cluster) TestingSetAfterFreezeHook(fn func()) {
 	c.testingAfterFreezeHook = fn
 }
 
+// TestingSetReshardEntryHook installs fn (or clears it with nil) as the
+// reshardLocked entry seam (reshardMu held, before any reshard work). Test-only
+// white-box hook: it lets a test HOLD a reshard open so a concurrent
+// TriggerReshard observes reshardMu held and is rejected with ErrReshardInFlight
+// deterministically, without racing on goroutine scheduling. Follows the
+// Testing* convention.
+func (c *Cluster) TestingSetReshardEntryHook(fn func()) {
+	c.testingReshardEntryHook = fn
+}
+
 // TestingSetRingMembers replaces the local node's ring membership with the given
 // members (used to model a count-preserving membership swap mid-reshard: the
 // coordinator's Members() reads the ring, so swapping a member here makes the

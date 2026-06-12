@@ -49,6 +49,7 @@ Subcommands:
   ping                liveness check (exit 0 if up, 3 if not)
   bench               throughput + latency probe (Put/Get workload)
   rebalance           trigger / preview / cancel a rebalance pass (v0.3)
+  reshard             trigger a doubling reshard (unit count N -> 2N)
 
 Global flags:
   --addr host:port    target node's gRPC endpoint (default 127.0.0.1:7947;
@@ -101,6 +102,8 @@ func run(args []string, stdout, stderr io.Writer) int {
 		return runBench(opts, subArgs, stdout, stderr)
 	case "rebalance":
 		return runRebalance(opts, subArgs, stdout, stderr)
+	case "reshard":
+		return runReshard(opts, subArgs, stdout, stderr)
 	default:
 		_, _ = fmt.Fprintf(stderr, "shale: unknown subcommand %q\n", sub)
 		usage(stderr)
