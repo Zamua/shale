@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 )
@@ -12,20 +11,7 @@ import (
 // connection / timeout / generic error goes to stderr + the matching
 // exit code.
 func runPut(opts globalOpts, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("put", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() {
-		_, _ = fmt.Fprint(stderr, "Usage: shale put <key> <value>\n")
-	}
-	if err := fs.Parse(args); err != nil {
-		return exitGeneric
-	}
-	if fs.NArg() != 2 {
-		fs.Usage()
-		return exitGeneric
-	}
-
-	cli, cleanup, code := dial(opts.addr, stderr)
+	fs, cli, cleanup, code := setupCmd(opts, "put", "Usage: shale put <key> <value>\n", 2, args, stderr)
 	if code != exitOK {
 		return code
 	}

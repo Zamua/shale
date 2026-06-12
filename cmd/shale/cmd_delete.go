@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 )
@@ -13,20 +12,7 @@ import (
 // exitOK. Connection / timeout / generic errors map per
 // exitCodeForRPCError.
 func runDelete(opts globalOpts, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("delete", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() {
-		_, _ = fmt.Fprint(stderr, "Usage: shale delete <key>\n")
-	}
-	if err := fs.Parse(args); err != nil {
-		return exitGeneric
-	}
-	if fs.NArg() != 1 {
-		fs.Usage()
-		return exitGeneric
-	}
-
-	cli, cleanup, code := dial(opts.addr, stderr)
+	fs, cli, cleanup, code := setupCmd(opts, "delete", "Usage: shale delete <key>\n", 1, args, stderr)
 	if code != exitOK {
 		return code
 	}

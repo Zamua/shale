@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"encoding/json"
-	"flag"
 	"fmt"
 	"io"
 )
@@ -15,20 +14,7 @@ import (
 // 0); we emit them anyway so the column shape is stable for v0.5
 // when real histograms land.
 func runStats(opts globalOpts, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("stats", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() {
-		_, _ = fmt.Fprint(stderr, "Usage: shale stats\n")
-	}
-	if err := fs.Parse(args); err != nil {
-		return exitGeneric
-	}
-	if fs.NArg() != 0 {
-		fs.Usage()
-		return exitGeneric
-	}
-
-	cli, cleanup, code := dial(opts.addr, stderr)
+	_, cli, cleanup, code := setupCmd(opts, "stats", "Usage: shale stats\n", 0, args, stderr)
 	if code != exitOK {
 		return code
 	}

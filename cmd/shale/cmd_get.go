@@ -2,7 +2,6 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"io"
 )
@@ -12,20 +11,7 @@ import (
 // stdout output (stderr gets a short note). Connection / timeout
 // errors map per exitCodeForRPCError.
 func runGet(opts globalOpts, args []string, stdout, stderr io.Writer) int {
-	fs := flag.NewFlagSet("get", flag.ContinueOnError)
-	fs.SetOutput(stderr)
-	fs.Usage = func() {
-		_, _ = fmt.Fprint(stderr, "Usage: shale get <key>\n")
-	}
-	if err := fs.Parse(args); err != nil {
-		return exitGeneric
-	}
-	if fs.NArg() != 1 {
-		fs.Usage()
-		return exitGeneric
-	}
-
-	cli, cleanup, code := dial(opts.addr, stderr)
+	fs, cli, cleanup, code := setupCmd(opts, "get", "Usage: shale get <key>\n", 1, args, stderr)
 	if code != exitOK {
 		return code
 	}
