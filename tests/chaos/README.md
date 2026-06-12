@@ -407,25 +407,77 @@ backstop that catches a misconfiguration (e.g. a too-short DURATION that cut the
 prologue off, or a future change that broke an event handler) rather than letting
 it pass green.
 
-## Extending to a real N-node deploy later
+## The real-cluster orchestrator (`//go:build chaosreal`)
 
-The driver and oracle depend on a tiny `ClusterClient` adapter
-(`Put/Get/Delete/Transact/Reshard`) and a `Topology` adapter
-(`Members/AddNode/RemoveNode/KillNode/RestartNode`), both implemented in
-`adapter_inproc.go` against the in-process `sharedNode` fixtures. To run the same
-soak against a real N-node `shaled` cluster:
+This is the BUILT step-2 "prove it on a REAL cluster" validation that closes the
+v0.8 deploy gap. It reuses the SAME pure oracle (`oracle.go`, no build tag) but
+drives a deploy of SEPARATE OS PROCESSES instead of goroutines: real `shaled-slate`
+child processes in MULTI-BACKEND mode (`--unit-count > 1`), real gRPC + memberlist
+over the loopback network, a SHARED MinIO bucket + key-prefix as the durable
+object-storage backing, and a real operator Reshard RPC driving an N -> 2N doubling
+on the running cluster. One invocation owns the whole lifecycle (launch, kill,
+restart, reshard, teardown):
 
-1. Implement `ClusterClient` with a real gRPC client (the `pkg/rpc` client
-   already exists) dialing each node's address.
-2. Implement `Topology` with operator actions - `AddNode` = launch a `shaled`
-   process / pod; `KillNode` = `SIGKILL`; `RestartNode` = relaunch; `RemoveNode`
-   = graceful stop / drain; `Reshard` = the admin RPC. On real infra these are
-   orchestrator calls (systemd, k8s, the deploy script), not goroutines.
-3. The oracle, the writer/reader loops, the chaos scheduler, and every invariant
-   above are unchanged. The seed-driven reproducibility carries over; only the
-   adapters change.
+```sh
+# Build shaled-slate (cgo + the slatedb cdylib on the loader path) from backends/slate:
+CGO_ENABLED=1 CGO_LDFLAGS="-L$HOME/.local/lib" DYLD_LIBRARY_PATH="$HOME/.local/lib" \
+  go build -tags slatedb -o /tmp/shaled-slate ./cmd/shaled-slate
 
-This is the whole reason the oracle is pure and the cluster is behind an
-interface: the in-process soak is the cheap, fast confidence-builder, and the
-exact same adversarial program graduates to the real deploy when you want to
-prove it against process boundaries and real network faults.
+# Stand up MinIO + a FRESH bucket (the shared durable backing), then run the orchestrator
+# (the orchestrator itself needs NO cgo - it drives the prebuilt binary over gRPC):
+SHALE_REAL_BINARY=/tmp/shaled-slate \
+SHALE_REAL_LIBDIR=$HOME/.local/lib \
+SHALE_REAL_ENDPOINT=http://127.0.0.1:9000 \
+SHALE_REAL_BUCKET=shale-real-chaos \
+SHALE_REAL_ACCESS_KEY=admin SHALE_REAL_SECRET_KEY=supersecret \
+  go test -tags chaosreal ./tests/chaos/ -run TestRealClusterChaos -v -timeout 15m
+```
+
+Gated behind `//go:build chaosreal`, so the normal suite AND the in-process chaos
+soak (`//go:build chaos`) are untouched. With no env set, the test SKIPS with a
+precise reason (which piece is missing), never a fake pass. The adapter lives in
+`adapter_real.go` (the `Topology`: launch / SIGKILL / SIGTERM / Reshard-RPC over
+`os/exec` + `pkg/rpc`) + `realclient.go` (the `ClusterClient`: Put/Get/Delete over
+the real `pkg/rpc` gRPC client); the orchestration + invariants live in `run_real.go`
++ `chaos_real_test.go`.
+
+### What it proves (read before trusting a green run)
+
+`shaled-slate` runs MULTI-BACKEND mode: every node mounts the SAME shared bucket +
+key-prefix at the same unit count, owning whichever GenUnits the ring leases it,
+each unit a real slatedb LSM in object storage. This is the deployable v0.8 model,
+so the orchestrator gates the FULL no-acked-write-loss story end to end, in three
+phases:
+
+- **PHASE A - durable cross-process handoff (HARD-gated).** Seed a dataset, then
+  SIGKILL a non-founder node mid-workload. Its owned units are real slatedb
+  databases in the shared bucket; a survivor re-acquires those leases (the
+  reconcile-driven copy-free handoff) and re-`OpenUnit`s them, reading the dead
+  node's acked bytes back FROM OBJECT STORAGE. After the handoff settles, the probe
+  reads EVERY acked key from a survivor: a killed owner's keys MUST come back
+  (`survived`), and a key still unreadable past the settle budget is a hard LOSS.
+  This is the durable handoff the legacy single-owner deploy could not do.
+- **PHASE B - operator reshard, N -> 2N (HARD-gated, non-vacuous).** Issue the
+  operator Reshard RPC mid-run. The cluster-wide freeze barrier coordinates the
+  doubling across processes; each unit bisects by copying its keys through object
+  storage into two gen-(g+1) children; routing flips atomically. Every acked write
+  must survive. The run is VACUOUS (a failure) unless a reshard COMMITTED, so a
+  green run proves the reshard actually fired. The smallest doubling the deployable
+  binary supports is N=2 -> N=4 (it reserves `--unit-count 1` for legacy mode); the
+  default run starts at N=2 and reshards to N=4.
+- **PHASE C - churn (HARD-gated).** Real joins / leaves / kill+restarts over the
+  real network for the rest of the window. Multi-backend mode hands off on every
+  membership change, so the SAME hard oracle applies: no acked write may be lost
+  across any of them.
+
+The HARD assertion is the unchanged no-acked-write-loss oracle on EVERY acked key,
+served through the real gRPC client: a WRONG value (stale/corrupt/resurrected) OR a
+key unreadable on every survivor past the retry-plus-settle budget is a violation. A
+read that is transiently unavailable/stale mid-cutover and then converges is the
+expected retryable turbulence (counted as a `transient_read`, never failed) - the
+same transient-vs-persisted rule the in-process soak uses; the difference from the
+old legacy adapter is that "unavailable after settle" is now a HARD loss, not a
+tolerated gap. A green run means: the real network + real process death + the real
+copy-free handoff + a real operator reshard do not lose, corrupt, or resurrect any
+acked write. It is the validation that the v0.8 multi-backend model is actually
+DEPLOYABLE, not merely in-process correct - the gap this harness was built to catch.
