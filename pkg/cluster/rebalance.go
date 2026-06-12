@@ -412,6 +412,24 @@ func (d *clusterDestination) FetchRange(ctx context.Context, peer rebalance.Memb
 		return 0, fmt.Errorf("rebalance: open MigrateRange: %w", err)
 	}
 
+	// At R>1 every migrated value is an LWW Envelope (the identical
+	// bytes a replicated Put fans out), so the apply must route through
+	// applyEnvelopeIfNewer: a reconcile pull that arrives out of order
+	// relative to a live concurrent putReplicated loses the per-key
+	// Stamp compare and is a committed no-op, never a clobber (see
+	// docs/SPEC.md "LWW on write" + the v0.4 R>1 reconcile passage). At
+	// R<=1 there are no envelopes and no live cross-replica writers for
+	// the same partition, so the apply is the unchanged raw Put.
+	//
+	// Rollback (on a bad terminal CRC32 / count) Deletes the keys this
+	// stream landed. It must record ONLY the keys it actually wrote: a
+	// no-op apply-if-newer left a NEWER concurrent value in place, and
+	// deleting that key on rollback would clobber the newer write - the
+	// exact LWW violation apply-if-newer prevents. So under R>1 we add a
+	// key to the rollback set only when applyEnvelopeIfNewerReport says
+	// it applied. The raw R<=1 Put always writes, so it always records.
+	lww := d.c.replicationFactor() > 1
+
 	hasher := crc32.NewIEEE()
 	applied := make([][]byte, 0)
 	rollback := func() {
@@ -438,11 +456,26 @@ func (d *clusterDestination) FetchRange(ctx context.Context, peer rebalance.Memb
 		switch body := msg.GetBody().(type) {
 		case *pb.MigrateChunk_Kv:
 			kv := body.Kv
-			if err := d.c.backend.Put(kv.GetKey(), kv.GetValue()); err != nil {
-				rollback()
-				return 0, fmt.Errorf("rebalance: apply key: %w", err)
+			wrote := true
+			var aerr error
+			if lww {
+				wrote, aerr = d.c.applyEnvelopeIfNewerReport(kv.GetKey(), kv.GetValue())
+			} else {
+				aerr = d.c.backend.Put(kv.GetKey(), kv.GetValue())
 			}
-			applied = append(applied, append([]byte(nil), kv.GetKey()...))
+			if aerr != nil {
+				rollback()
+				return 0, fmt.Errorf("rebalance: apply key: %w", aerr)
+			}
+			if wrote {
+				applied = append(applied, append([]byte(nil), kv.GetKey()...))
+			}
+			// The checksum + count are over the bytes the SOURCE streamed,
+			// independent of whether this node's apply-if-newer accepted
+			// each one. A no-op apply still counts toward the terminal
+			// total (the source sent it); the destination's CRC32 must
+			// match the source's CRC32 over the same wire bytes regardless
+			// of local LWW outcomes.
 			hasher.Write(kv.GetKey())
 			hasher.Write(kv.GetValue())
 			count++

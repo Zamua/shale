@@ -157,6 +157,17 @@ func (s *localSource) OpenRange(partitionIDs []uint64, _ uint64) (<-chan KeyValu
 type inProcessDestination struct {
 	local      backend.Backend
 	peerLookup func(peer Member) (MigrateSource, error)
+	// applyIfNewer, when set, replaces the raw local.Put as the
+	// per-key apply. The cluster layer injects its apply-if-newer
+	// (LWW-on-write) applier here so a migrated value at R>1 lands
+	// through the same Stamp-compare a live replicated write does:
+	// an out-of-order older streamed value loses the compare and is a
+	// committed no-op, never a clobber. It returns (wrote, err) so the
+	// rollback set records ONLY keys it actually wrote (a no-op apply
+	// left a newer concurrent value in place; deleting that key on
+	// rollback would clobber the newer write). Nil keeps the raw-Put
+	// path for R<=1 / non-envelope callers + the existing tests.
+	applyIfNewer func(key, value []byte) (wrote bool, err error)
 }
 
 // NewInProcessDestination is the in-package MigrateDestination used
@@ -164,6 +175,28 @@ type inProcessDestination struct {
 // resolves "this Member -> a MigrateSource I can pull from."
 func NewInProcessDestination(local backend.Backend, peerLookup func(Member) (MigrateSource, error)) MigrateDestination {
 	return &inProcessDestination{local: local, peerLookup: peerLookup}
+}
+
+// NewInProcessDestinationLWW builds an in-process destination whose
+// per-key apply routes through applyIfNewer (apply-if-newer / LWW)
+// instead of a raw Put. Used where the migrated values are LWW
+// envelopes (R>1) so the in-process path matches the gRPC
+// clusterDestination's "never a clobber" apply.
+func NewInProcessDestinationLWW(local backend.Backend, peerLookup func(Member) (MigrateSource, error), applyIfNewer func(key, value []byte) (bool, error)) MigrateDestination {
+	return &inProcessDestination{local: local, peerLookup: peerLookup, applyIfNewer: applyIfNewer}
+}
+
+// applyKV lands one migrated pair, routing through applyIfNewer when
+// set (returns whether the key was actually written so the caller can
+// keep its rollback set honest).
+func (d *inProcessDestination) applyKV(key, value []byte) (wrote bool, err error) {
+	if d.applyIfNewer != nil {
+		return d.applyIfNewer(key, value)
+	}
+	if err := d.local.Put(key, value); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 func (d *inProcessDestination) FetchRange(ctx context.Context, peer Member, partitionIDs []uint64, gen uint64) (int, error) {
@@ -198,11 +231,14 @@ func (d *inProcessDestination) FetchRange(ctx context.Context, peer Member, part
 				kvCh = nil
 				continue
 			}
-			if err := d.local.Put(kv.Key, kv.Value); err != nil {
+			wrote, err := d.applyKV(kv.Key, kv.Value)
+			if err != nil {
 				rollback()
 				return 0, fmt.Errorf("rebalance: apply key: %w", err)
 			}
-			applied = append(applied, append([]byte(nil), kv.Key...))
+			if wrote {
+				applied = append(applied, append([]byte(nil), kv.Key...))
+			}
 			hasher.Write(kv.Key)
 			hasher.Write(kv.Value)
 			count++
@@ -220,11 +256,14 @@ func (d *inProcessDestination) FetchRange(ctx context.Context, peer Member, part
 			// they were buffered before close, then return.
 			if kvCh != nil {
 				for kv := range kvCh {
-					if err := d.local.Put(kv.Key, kv.Value); err != nil {
+					wrote, err := d.applyKV(kv.Key, kv.Value)
+					if err != nil {
 						rollback()
 						return 0, fmt.Errorf("rebalance: apply key: %w", err)
 					}
-					applied = append(applied, append([]byte(nil), kv.Key...))
+					if wrote {
+						applied = append(applied, append([]byte(nil), kv.Key...))
+					}
 					hasher.Write(kv.Key)
 					hasher.Write(kv.Value)
 					count++

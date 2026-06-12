@@ -59,8 +59,24 @@ import "github.com/Zamua/shale/pkg/backend"
 // This is only ever called on the R>1 replica-receiving write paths;
 // callers pass already-Encode()d envelope bytes.
 func (c *Cluster) applyEnvelopeIfNewer(key, incomingEnvBytes []byte) error {
+	_, err := c.applyEnvelopeIfNewerReport(key, incomingEnvBytes)
+	return err
+}
+
+// applyEnvelopeIfNewerReport is applyEnvelopeIfNewer with an extra
+// return value: applied reports whether the incoming envelope actually
+// beat the stored stamp and was written (true) or lost the compare and
+// was a committed no-op (false). The migration receive path needs this
+// to keep its rollback set honest: a stream that fails its terminal
+// CRC32 / count check rolls back by DELETING the keys it landed, so it
+// must record ONLY the keys it actually wrote. A no-op apply-if-newer
+// left a NEWER concurrent value in place; deleting that key on rollback
+// would clobber the newer write, the exact LWW violation apply-if-newer
+// exists to prevent. So FetchRange appends to its rollback set only when
+// applied is true.
+func (c *Cluster) applyEnvelopeIfNewerReport(key, incomingEnvBytes []byte) (applied bool, err error) {
 	if c.notReady() {
-		return backend.ErrClosed
+		return false, backend.ErrClosed
 	}
 
 	incoming, err := Decode(incomingEnvBytes)
@@ -68,7 +84,7 @@ func (c *Cluster) applyEnvelopeIfNewer(key, incomingEnvBytes []byte) error {
 		// Corrupt incoming envelope: refuse the write rather than store
 		// garbage. The originator Encode()d this, so a decode failure is
 		// a real bug, not v0.3 compat data.
-		return err
+		return false, err
 	}
 
 	c.applyMu.Lock()
@@ -76,7 +92,7 @@ func (c *Cluster) applyEnvelopeIfNewer(key, incomingEnvBytes []byte) error {
 
 	tx, err := c.backend.Begin(backend.SnapshotIsolation)
 	if err != nil {
-		return err
+		return false, err
 	}
 	committed := false
 	defer func() {
@@ -87,11 +103,11 @@ func (c *Cluster) applyEnvelopeIfNewer(key, incomingEnvBytes []byte) error {
 
 	apply, aerr := txApplyIfNewer(tx, key, incoming.Stamp)
 	if aerr != nil {
-		return aerr
+		return false, aerr
 	}
 	if apply {
 		if err := tx.Put(key, incomingEnvBytes); err != nil {
-			return err
+			return false, err
 		}
 	}
 	// On the no-apply path we commit the empty tx (no Put) so the newer
@@ -99,8 +115,8 @@ func (c *Cluster) applyEnvelopeIfNewer(key, incomingEnvBytes []byte) error {
 	// tx lifecycle clean. A Rollback would be equally correct since
 	// nothing was written.
 	if err := tx.Commit(); err != nil {
-		return err
+		return false, err
 	}
 	committed = true
-	return nil
+	return apply, nil
 }
