@@ -58,6 +58,7 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rpc"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 )
 
@@ -124,14 +125,31 @@ type RunConfig struct {
 	// (e.g. "memory", "pebble", "slate"). Cosmetic.
 	BackendLabel string
 
-	// Backend is the opened backend.Backend. Run takes ownership for
-	// the lifetime of the process; the Cluster's Close releases it.
+	// Backend is the opened backend.Backend for LEGACY single-backend
+	// mode. Run takes ownership for the lifetime of the process; the
+	// Cluster's Close releases it. Mutually exclusive with
+	// BackendFactory + UnitCount (set EITHER Backend OR the factory
+	// pair, never both - the XOR is enforced by cluster.Open).
 	Backend backend.Backend
+
+	// BackendFactory + UnitCount select MULTI-BACKEND mode (the v0.8
+	// per-shard lease-handoff model). When BOTH are set (and Backend
+	// is nil), Run hands them to cluster.Open instead of a single
+	// Backend, so the node mounts one backend per OWNED storage unit
+	// and serves the lease-handoff + reshard model. A per-backend main
+	// that wants legacy mode leaves these zero; one that wants
+	// multi-backend mode sets both and leaves Backend nil. Setting both
+	// modes (or neither) is a config error surfaced by cluster.Open.
+	BackendFactory storageunit.BackendFactory
+	UnitCount      storageunit.UnitCount
 
 	// CloseBackend, if non-nil, is invoked after the Cluster has
 	// been closed and is the place to release any backend-owned
 	// resources that don't fit inside Backend.Close (file locks,
-	// background goroutines the constructor owns, etc.).
+	// background goroutines the constructor owns, etc.). In
+	// multi-backend mode it releases any Backing-level resources the
+	// factory owns (the Cluster's Close already releases the per-unit
+	// backends the factory mounted).
 	CloseBackend func() error
 
 	// Logger is where startup + shutdown lines are written. Required.
@@ -146,8 +164,9 @@ func Run(cfg RunConfig) error {
 	if cfg.Logger == nil {
 		return errors.New("shaled.Run: Logger required")
 	}
-	if cfg.Backend == nil {
-		return errors.New("shaled.Run: Backend required")
+	multiBackend := cfg.BackendFactory != nil && !cfg.UnitCount.IsZero()
+	if cfg.Backend == nil && !multiBackend {
+		return errors.New("shaled.Run: Backend (legacy) or BackendFactory+UnitCount (multi-backend) required")
 	}
 	logger := cfg.Logger
 
@@ -161,12 +180,19 @@ func Run(cfg RunConfig) error {
 		return fmt.Errorf("listen %s: %w", cfg.Std.GRPCAddr, err)
 	}
 
+	// Forward whichever backend mode the caller populated. The legacy
+	// path sets Backend; the multi-backend path sets BackendFactory +
+	// UnitCount and leaves Backend nil. cluster.Open enforces the XOR
+	// (set both or neither is an error), so Run just forwards both
+	// fields and lets Open decide.
 	c, err := cluster.Open(cluster.Config{
-		NodeID:   cfg.Std.NodeID,
-		Backend:  cfg.Backend,
-		BindAddr: cfg.Std.BindAddr,
-		GRPCAddr: lis.Addr().String(),
-		Seeds:    cfg.Std.Seeds,
+		NodeID:         cfg.Std.NodeID,
+		Backend:        cfg.Backend,
+		BackendFactory: cfg.BackendFactory,
+		UnitCount:      cfg.UnitCount,
+		BindAddr:       cfg.Std.BindAddr,
+		GRPCAddr:       lis.Addr().String(),
+		Seeds:          cfg.Std.Seeds,
 	})
 	if err != nil {
 		_ = lis.Close()
@@ -177,8 +203,13 @@ func Run(cfg RunConfig) error {
 	grpcServer := grpc.NewServer()
 	rpc.NewServer(c).Register(grpcServer)
 
-	logger.Printf("shaled: node=%s grpc=%s backend=%s",
-		cfg.Std.NodeID, lis.Addr().String(), cfg.BackendLabel)
+	if multiBackend {
+		logger.Printf("shaled: node=%s grpc=%s backend=%s mode=multi-backend units=%d",
+			cfg.Std.NodeID, lis.Addr().String(), cfg.BackendLabel, cfg.UnitCount.N())
+	} else {
+		logger.Printf("shaled: node=%s grpc=%s backend=%s mode=legacy",
+			cfg.Std.NodeID, lis.Addr().String(), cfg.BackendLabel)
+	}
 	if cfg.Std.BindAddr != "" {
 		logger.Printf("shaled: bind-addr=%s seeds=%v", cfg.Std.BindAddr, cfg.Std.Seeds)
 		logger.Printf("shaled: joined cluster, members=%d", len(c.Members()))

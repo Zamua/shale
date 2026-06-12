@@ -13,10 +13,19 @@ import (
 	"log"
 
 	"github.com/Zamua/shale/pkg/backend"
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 func openSlateBackend(_ slateConfig, _ *log.Logger) (backend.Backend, func() error, error) {
-	return nil, nil, fmt.Errorf(
+	return nil, nil, errRebuildWithSlatedb()
+}
+
+func openSlateFactory(_ slateConfig, _ *log.Logger) (storageunit.BackendFactory, func() error, error) {
+	return nil, nil, errRebuildWithSlatedb()
+}
+
+func errRebuildWithSlatedb() error {
+	return fmt.Errorf(
 		"shaled-slate: built without -tags slatedb; rebuild via " +
 			"`CGO_ENABLED=1 CGO_LDFLAGS=-L/path/to/slatedb/target/release " +
 			"go build -tags slatedb ./cmd/shaled-slate` " +

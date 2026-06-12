@@ -23,12 +23,28 @@
 // pkg/shaled.BindStdFlags):
 //
 //	--slate-bucket       SHALE_SLATE_BUCKET      S3 bucket name (required)
-//	--slate-db-name      SHALE_SLATE_DB_NAME     logical DB name (required)
+//	--slate-db-name      SHALE_SLATE_DB_NAME     logical DB name (required in legacy mode)
 //	--slate-endpoint     SHALE_SLATE_ENDPOINT    S3-compatible endpoint URL
 //	--slate-region       SHALE_SLATE_REGION      AWS region (default us-east-1)
 //	--slate-access-key   SHALE_SLATE_ACCESS_KEY  access key ID (required)
 //	--slate-secret-key   SHALE_SLATE_SECRET_KEY  secret access key (required)
 //	--slate-use-ssl      SHALE_SLATE_USE_SSL     TLS to endpoint (default true)
+//	--slate-key-prefix   SHALE_SLATE_KEY_PREFIX  bucket key prefix (multi-backend; default empty)
+//	--unit-count         SHALE_UNIT_COUNT        storage units N (power of two; default 1)
+//
+// Two backend modes selected by --unit-count:
+//
+//   - --unit-count=1 (default): LEGACY single-backend mode. Opens ONE
+//     slatedb at --slate-db-name and serves it as the node's single
+//     Backend. Byte-for-byte the established behavior; existing deploys
+//     are unaffected.
+//   - --unit-count>1: MULTI-BACKEND mode (the v0.8 per-shard
+//     lease-handoff model). Constructs a slate Backing over the shared
+//     bucket and mounts one slatedb PER owned storage unit, keyed by
+//     GenUnit. --slate-db-name is IGNORED (per-unit DbNames are derived
+//     from the GenUnit); --slate-key-prefix namespaces the cluster's
+//     units inside the shared bucket. This is the deployable form of the
+//     model that supports cluster-wide doubling reshards.
 package main
 
 import (
@@ -37,9 +53,11 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"strconv"
 	"strings"
 
 	"github.com/Zamua/shale/pkg/shaled"
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 func main() {
@@ -61,6 +79,11 @@ type slateConfig struct {
 	AccessKey string
 	SecretKey string
 	UseSSL    bool
+
+	// KeyPrefix namespaces the cluster's per-unit databases inside the
+	// shared bucket (multi-backend mode only). Empty in legacy mode and
+	// for single-cluster buckets. When set it should end in "/".
+	KeyPrefix string
 }
 
 func run(argv []string, stderr *os.File) error {
@@ -83,12 +106,28 @@ func run(argv []string, stderr *os.File) error {
 		"slate: secret access key (required)")
 	slateUseSSL := fs.String("slate-use-ssl", shaled.EnvOr("SHALE_SLATE_USE_SSL", "true"),
 		"slate: use TLS to reach the endpoint (true|false)")
+	slateKeyPrefix := fs.String("slate-key-prefix", shaled.EnvOr("SHALE_SLATE_KEY_PREFIX", ""),
+		"slate: key prefix namespacing this cluster's units inside the shared bucket (multi-backend mode; default empty)")
+	unitCountRaw := fs.String("unit-count", shaled.EnvOr("SHALE_UNIT_COUNT", "1"),
+		"storage units N (power of two): 1 = legacy single-backend, >1 = multi-backend lease-handoff mode")
 
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
 	if err := std.Validate(); err != nil {
 		return err
+	}
+
+	// Parse + validate the unit count up front (a power of two in range,
+	// enforced by storageunit.NewUnitCount). This decides which backend
+	// mode the node runs.
+	n, err := strconv.Atoi(strings.TrimSpace(*unitCountRaw))
+	if err != nil {
+		return fmt.Errorf("--unit-count %q is not an integer: %w", *unitCountRaw, err)
+	}
+	unitCount, err := storageunit.NewUnitCount(n)
+	if err != nil {
+		return fmt.Errorf("--unit-count invalid: %w", err)
 	}
 
 	cfg := slateConfig{
@@ -99,11 +138,35 @@ func run(argv []string, stderr *os.File) error {
 		AccessKey: *slateAccessKey,
 		SecretKey: *slateSecretKey,
 		UseSSL:    strings.EqualFold(*slateUseSSL, "true"),
+		KeyPrefix: *slateKeyPrefix,
 	}
-	if err := cfg.validate(); err != nil {
+	if err := cfg.validate(unitCount); err != nil {
 		return err
 	}
 
+	// MULTI-BACKEND mode: --unit-count > 1. Construct the slate factory
+	// (one slatedb per owned unit over a SHARED bucket) and hand the
+	// factory + unit count to shaled.Run, which selects multi-backend
+	// mode in cluster.Open. --slate-db-name is ignored here (per-unit
+	// DbNames are factory-derived from the GenUnit).
+	if unitCount.N() > 1 {
+		fac, closeFactory, err := openSlateFactory(cfg, logger)
+		if err != nil {
+			return err
+		}
+		return shaled.Run(shaled.RunConfig{
+			Std:            *std,
+			BackendLabel:   "slate",
+			BackendFactory: fac,
+			UnitCount:      unitCount,
+			CloseBackend:   closeFactory,
+			Logger:         logger,
+		})
+	}
+
+	// LEGACY single-backend mode: --unit-count == 1 (the default).
+	// Unchanged from the established behavior - one slatedb at
+	// --slate-db-name served as the node's single Backend.
 	be, closeBackend, err := openSlateBackend(cfg, logger)
 	if err != nil {
 		return err
@@ -118,12 +181,17 @@ func run(argv []string, stderr *os.File) error {
 	})
 }
 
-func (c slateConfig) validate() error {
+// validate enforces the required config for the selected backend mode.
+// --slate-db-name is required ONLY in legacy mode (unitCount == 1); in
+// multi-backend mode per-unit DbNames are derived from the GenUnit, so a
+// --slate-db-name is ignored and not required. Bucket + credentials are
+// required in both modes.
+func (c slateConfig) validate(unitCount storageunit.UnitCount) error {
 	if c.Bucket == "" {
 		return errors.New("--slate-bucket is required (or set SHALE_SLATE_BUCKET)")
 	}
-	if c.DbName == "" {
-		return errors.New("--slate-db-name is required (or set SHALE_SLATE_DB_NAME)")
+	if unitCount.N() == 1 && c.DbName == "" {
+		return errors.New("--slate-db-name is required in legacy mode (or set SHALE_SLATE_DB_NAME; not needed when --unit-count > 1)")
 	}
 	if c.AccessKey == "" || c.SecretKey == "" {
 		return errors.New("--slate-access-key and --slate-secret-key are required (or set SHALE_SLATE_{ACCESS,SECRET}_KEY)")
@@ -131,15 +199,17 @@ func (c slateConfig) validate() error {
 	return nil
 }
 
-// openSlateBackend is supplied by one of the build-tag-gated
+// openSlateBackend (legacy single-backend mode) and openSlateFactory
+// (multi-backend mode) are each supplied by one of the build-tag-gated
 // sibling files in this directory:
 //
 //   - backend_slatedb.go (//go:build slatedb): opens a real
-//     *slate.Slate against the configured object store.
-//   - backend_default.go (//go:build !slatedb): fails fast with a
-//     "rebuild with -tags slatedb" error so a tag-less build of
-//     this directory still compiles and produces a binary that
-//     refuses to run rather than silently misbehaving.
+//     *slate.Slate (legacy) / a real slate factory Handle over a shared
+//     Backing (multi-backend) against the configured object store.
+//   - backend_default.go (//go:build !slatedb): both fail fast with a
+//     "rebuild with -tags slatedb" error so a tag-less build of this
+//     directory still compiles and produces a binary that refuses to run
+//     rather than silently misbehaving.
 //
-// Only one is in any given build. main.go references the symbol
-// without knowing which file defined it.
+// Only one set is in any given build. main.go references the symbols
+// without knowing which file defined them.
