@@ -263,7 +263,12 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 		TimestampNanos: uint64(time.Now().UnixNano()),
 		NodeID:         c.cfg.NodeID,
 	}
-	envBytes := Encode(Envelope{Stamp: stamp, Payload: append([]byte(nil), value...)})
+	// Encode allocates its own buffer and copies env.Payload into it
+	// (envelope.go: append(out, env.Payload...)); it never retains,
+	// aliases, or mutates the input. The caller does not touch value
+	// after this point. So an inner defensive copy here would be pure
+	// waste (a second O(len) copy + alloc per Put). Pass value directly.
+	envBytes := Encode(Envelope{Stamp: stamp, Payload: value})
 	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))
 
 	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
