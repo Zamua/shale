@@ -101,9 +101,24 @@ func (r *report) String() string {
 	)
 }
 
-// run executes the full soak and returns the report. logf is the test's t.Logf.
+// run executes the full soak against the DEFAULT (in-memory shared-backing)
+// factory provider and returns the report. logf is the test's t.Logf. The
+// slate-backed soak (factory_slate.go) calls runWithProvider directly with the
+// real slatedb provider.
 func run(cfg config, logf func(string, ...any)) (*report, error) {
-	cl, err := newInProcCluster(cfg.nodes, cfg.units, cfg.settleDelay)
+	return runWithProvider(newSharedFactoryProvider(), cfg, logf)
+}
+
+// runWithProvider executes the full soak against the supplied factory provider.
+// It is the single orchestration body; run wraps it with the default in-memory
+// provider, and the slate-backed test wraps it with the real slatedb provider.
+// Reset is called on the provider before the cluster is stood up so a seed starts
+// against a clean backing.
+func runWithProvider(provider factoryProvider, cfg config, logf func(string, ...any)) (*report, error) {
+	if err := provider.Reset(); err != nil {
+		return nil, fmt.Errorf("reset factory provider: %w", err)
+	}
+	cl, err := newInProcCluster(provider, cfg.nodes, cfg.units, cfg.settleDelay)
 	if err != nil {
 		return nil, fmt.Errorf("stand up cluster: %w", err)
 	}
