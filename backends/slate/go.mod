@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
-	github.com/Zamua/shale v0.6.2
+	github.com/Zamua/shale v0.7.0
 	github.com/minio/minio-go/v7 v7.2.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
 	slatedb.io/slatedb-go v0.13.1
@@ -101,9 +101,7 @@ require (
 // that hosts the backends/* split, so per-module builds resolve the
 // core (and the sibling backend module the core's cmd/* transitively
 // references) through the in-repo paths. Removed once both are tagged.
-replace (
-	github.com/Zamua/shale/backends/pebble => ../pebble
-)
+replace github.com/Zamua/shale/backends/pebble => ../pebble
 
 // cockroachdb/errors (transitive via pebble, which slate's
 // cmd/shaled-slate pulls in via github.com/Zamua/shale/pkg/shaled →
