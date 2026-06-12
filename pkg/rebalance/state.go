@@ -105,6 +105,23 @@ type Options struct {
 	// node. Nil is identity (hash whole key), the no-ShardKeyFn default.
 	ShardKeyFn ShardKeyFn
 
+	// ReplicationFactor is the cluster's R: the number of nodes that
+	// physically hold a copy of each key (ring.LocateKeyN(key, R)). It
+	// generalizes the migration unit from a single ring-PRIMARY per
+	// partition to the partition's replica SET, so a node that hands off
+	// PRIMARY ownership but is still a successor replica RETAINS its copy
+	// (sweep skips the delete) and a node newly added to the replica set
+	// RECEIVES the keys (reconcile backfills them). See docs/SPEC.md
+	// "Replica-set placement (the rule for all R)."
+	//
+	// 0 or 1 is the v0.3/v0.4 single-owner behavior, byte-for-byte: at
+	// R<=1 ReplicasForPartition(pid, 1) is exactly the single Owner(pid),
+	// so the old owner leaves the replica set after a primary move (sweep
+	// still deletes) and reconcile candidates are exactly the
+	// primary-owned partitions. The replica-aware branches below are
+	// no-ops at R<=1.
+	ReplicationFactor int
+
 	// Source builds outgoing streams. If nil, the Coordinator
 	// auto-constructs a NewLocalSource(local, ringPartitionFn).
 	Source MigrateSource
@@ -180,7 +197,26 @@ type rangeRecord struct {
 	startedAt   time.Time
 	handedOffAt time.Time
 	err         error
+	// reconcileEmptyTries counts how many times the periodic (sweep-tick)
+	// reconcile pulled this partition and got ZERO keys back. A zero-key
+	// pull is ambiguous: the partition may be genuinely empty (no key ever
+	// hashed into it) OR the chosen source was not yet holding the data
+	// (source-not-ready race on a shrink, where two survivors both newly
+	// enter a partition's replica set and race who has the data first).
+	// reconciledClean retries a zero-key pull up to reconcileEmptyRetryCap
+	// times before accepting it as genuinely empty, so a transient race
+	// self-heals on the sweep-tick reconcile while a permanently empty
+	// partition stops being re-pulled. The settle-timer Evaluate path
+	// never increments this (it treats an empty pull as clean immediately
+	// so a stable ring quiesces); only the periodic retry path does.
+	reconcileEmptyTries int
 }
+
+// reconcileEmptyRetryCap bounds how many zero-key reconcile pulls we
+// retry before treating a partition as genuinely empty. Small: a
+// source-not-ready race resolves within a sweep tick or two; beyond that
+// the partition is almost certainly empty and re-pulling is wasted I/O.
+const reconcileEmptyRetryCap = 8
 
 // Coordinator owns this node's per-range state + drives migrations
 // to completion. Construct one per node; share it across all goroutines
@@ -195,6 +231,13 @@ type Coordinator struct {
 	partFn  PartitionFn
 	stopCh  chan struct{}
 	stopped bool
+
+	// ring + repFactor are captured on each Evaluate so the
+	// replica-aware sweep (DELETE side) + reconcile (DELIVER side) can
+	// ask "is self still a replica of this partition?" without a key.
+	// nil ring / repFactor <= 1 selects the legacy single-owner path.
+	ring      *ring.Ring
+	repFactor int
 
 	mu       sync.Mutex
 	ranges   map[uint64]*rangeRecord
@@ -265,6 +308,11 @@ func (c *Coordinator) Evaluate(oldRing, newRing *ring.Ring, gen uint64) {
 
 	c.mu.Lock()
 	c.gen = gen
+	// Capture the current ring + R so the sweep + reconcile can decide
+	// replica membership per partition. newRing may be nil/empty on a
+	// teardown Evaluate; the helpers guard for that.
+	c.ring = newRing
+	c.repFactor = c.opts.ReplicationFactor
 	// Wire a default source on first use if the caller did not
 	// inject one. We use newRing for the partition function so the
 	// scan filter matches the ring the plan was computed against.
@@ -302,7 +350,19 @@ func (c *Coordinator) Evaluate(oldRing, newRing *ring.Ring, gen uint64) {
 	// the snapshots the node holds); reconcile keys on physical
 	// placement instead and pulls each owned-but-missing partition from
 	// its prior owner. See reconcile.go + docs/SPEC.md "Reconcile."
-	c.reconcile(newRing)
+	c.reconcile(newRing, false)
+
+	// Replica-aware DELETE side (docs/SPEC.md "Replica-set placement"):
+	// the ring-vs-ring plan only schedules a Send when self loses the
+	// PRIMARY of a partition. At R>1 self may hold a partition it was
+	// never primary of (it was a successor replica) and the ring change
+	// can drop self OUT of that partition's replica set without any
+	// handoff event. evictStaleReplicas finds those held-but-not-owned
+	// partitions and registers them for the grace-gated sweep delete, so
+	// the cluster converges to exactly N*R copies (no over-retention).
+	// At R<=1 it is a no-op (the single-owner plan already covers every
+	// shed via Sends).
+	c.evictStaleReplicas(newRing)
 }
 
 // tryRegister adds a Move under state, IFF the partition is not
@@ -518,6 +578,34 @@ func (c *Coordinator) currentGen() uint64 {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	return c.gen
+}
+
+// selfIsPartitionReplica reports whether this node is in the replica set
+// the CURRENT ring assigns to partition pid, i.e. self appears in
+// ReplicasForPartition(pid, R). This is the replica-aware generalization
+// of "Owner(pid) == self": at R=1 the replica set is the single owner so
+// the two coincide exactly (legacy behavior); at R>1 a successor replica
+// also returns true.
+//
+// Returns false when replica-awareness is not configured (repFactor <= 1
+// or no ring captured) so every caller falls back to the legacy
+// single-owner path unchanged. Callers must NOT hold c.mu (this reads the
+// ring snapshot under its own RLock; the captured *ring.Ring pointer is
+// stable once Evaluate set it).
+func (c *Coordinator) selfIsPartitionReplica(pid uint64) bool {
+	c.mu.Lock()
+	r := c.ring
+	rf := c.repFactor
+	c.mu.Unlock()
+	if rf <= 1 || r == nil || r.Empty() {
+		return false
+	}
+	for _, m := range r.ReplicasForPartition(pid, rf) {
+		if m.ID == c.self.ID {
+			return true
+		}
+	}
+	return false
 }
 
 // IsMigrating reports whether key's partition is mid-migration OUT

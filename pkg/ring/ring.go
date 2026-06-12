@@ -219,6 +219,41 @@ func (r *Ring) Owner(partitionID uint64) Member {
 	return r.members[m.String()]
 }
 
+// ReplicasForPartition returns the primary owner of partitionID followed
+// by up to (n-1) successor Members on the ring, in primary-first order.
+// It is the partition-level analogue of LocateKeyN: every key whose
+// PartitionID is partitionID has exactly this replica set (the chain is a
+// property of the partition, not the individual key), so the rebalance
+// layer can decide replica membership per partition without a
+// representative key.
+//
+// Clamping + error handling match LocateKeyN: n <= 0 or an empty ring
+// returns nil; n larger than the live membership returns ALL distinct
+// Members (no duplicates). partitionID out of range returns nil.
+func (r *Ring) ReplicasForPartition(partitionID uint64, n int) []Member {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if n <= 0 || len(r.members) == 0 {
+		return nil
+	}
+	if partitionID >= uint64(partitionCount) {
+		return nil
+	}
+	want := n
+	if want > len(r.members) {
+		want = len(r.members)
+	}
+	raw, err := r.hash.GetClosestNForPartition(int(partitionID), want)
+	if err != nil {
+		return nil
+	}
+	out := make([]Member, 0, len(raw))
+	for _, m := range raw {
+		out = append(out, r.members[m.String()])
+	}
+	return out
+}
+
 // ShardKey extracts the hashed portion of key per the hash-tag rule:
 // if key contains a "{" followed by a "}", everything between the
 // first "{" and the first "}" AFTER it is returned. Empty braces

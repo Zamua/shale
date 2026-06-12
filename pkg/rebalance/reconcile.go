@@ -36,6 +36,8 @@
 package rebalance
 
 import (
+	"time"
+
 	"github.com/Zamua/shale/pkg/ring"
 )
 
@@ -56,7 +58,14 @@ import (
 //   - partFn nil: should not happen (Evaluate wires it before calling
 //     reconcile), but guard so a misordered caller is a no-op, not a
 //     panic.
-func (c *Coordinator) reconcile(newRing *ring.Ring) {
+// reconcile runs one owned-but-missing repair pass. retryEmpty controls
+// whether a partition that previously drained EMPTY (zero keys) is
+// re-pulled: false on the settle-timer Evaluate path (so a stable ring
+// quiesces - no re-pull of genuinely-empty partitions on every tick),
+// true on the periodic sweep-tick path (so a source-not-ready empty pull
+// on a shrink self-heals across a few ticks). The two share all other
+// logic; only the empty-partition skip decision differs.
+func (c *Coordinator) reconcile(newRing *ring.Ring, retryEmpty bool) {
 	if newRing == nil || newRing.Empty() {
 		return
 	}
@@ -91,9 +100,19 @@ func (c *Coordinator) reconcile(newRing *ring.Ring) {
 
 	// Partitions the new ring assigns to self. These are the only
 	// candidates for owned-but-missing repair.
+	//
+	// Replica-aware DELIVER side (docs/SPEC.md "Replica-set placement"):
+	// at R>1 "self owns pid" means self is anywhere in the partition's
+	// replica set (ReplicasForPartition(pid, R)), not just its PRIMARY.
+	// Without this, a fresh joiner only backfills the partitions whose
+	// PRIMARY moved to it and never backfills the partitions where it is
+	// a SUCCESSOR replica (PRIMARY stayed on a peer): at N=2,R=2 that is
+	// exactly the half of keys the joiner must also hold. selfIsReplica
+	// below picks PRIMARY (legacy) at R<=1 and the full replica set at
+	// R>1, so the R=1 candidate set is byte-for-byte the old one.
 	ownedBySelf := make(map[uint64]struct{})
 	for _, pid := range newRing.Partitions() {
-		if newRing.Owner(pid).ID == c.self.ID {
+		if c.selfIsPartitionReplica(pid) || newRing.Owner(pid).ID == c.self.ID {
 			ownedBySelf[pid] = struct{}{}
 		}
 	}
@@ -117,7 +136,7 @@ func (c *Coordinator) reconcile(newRing *ring.Ring) {
 		if _, ok := held[pid]; ok {
 			continue // physically present; nothing to repair.
 		}
-		if c.reconciledClean(pid) {
+		if c.reconciledClean(pid, retryEmpty) {
 			// Already pulled this partition successfully on a prior
 			// tick and it came back empty (no key has ever hashed into
 			// it). Re-pulling would be a harmless but wasteful empty
@@ -128,7 +147,7 @@ func (c *Coordinator) reconcile(newRing *ring.Ring) {
 			// held[pid] true above, so it is skipped there.
 			continue
 		}
-		prior := priorRing.Owner(pid)
+		prior := c.reconcileSource(newRing, priorRing, pid)
 		if prior.ID == "" || prior.ID == c.self.ID {
 			// No distinct prior owner to pull from. Skip; a routed Get
 			// would have nowhere else to go either, so there is no data
@@ -151,6 +170,128 @@ func (c *Coordinator) reconcile(newRing *ring.Ring) {
 	}
 }
 
+// evictStaleReplicas is the replica-aware DELETE-side counterpart to the
+// reconcile DELIVER pass. The ring-vs-ring ComputePlan only schedules a
+// Send (which leads to a sweep delete) when self loses the PRIMARY of a
+// partition. At R>1 that misses a whole class of shed: a node can hold a
+// partition it was a SUCCESSOR replica of (never the primary) and a ring
+// change can drop it OUT of the partition's replica set without producing
+// any handoff event. Those keys must be deleted so the cluster converges
+// to exactly N*R physical copies; otherwise growth leaks copies (a node
+// that left the replica set keeps the data forever = over-retention).
+//
+// The pass scans the local backend once, buckets keys by partition, and
+// for every partition that (a) self physically holds at least one key for
+// and (b) self is NOT in ReplicasForPartition(pid, R) of the current ring
+// and (c) is not already mid-migration, it registers the partition
+// straight into StateHandedOff with handedOffAt=now. The existing sweep
+// then deletes it after the grace window (re-checking selfIsPartitionReplica,
+// which is false here, so it deletes). Routing the delete through the
+// sweep reuses the grace delay: the grace window gives any peer newly in
+// the replica set time to pull its copy (pull-based reconcile) before the
+// source drops it, and at R>1 the data is in any case still on the other
+// R-1 replicas, so an eviction can never drop a key below its replica
+// count.
+//
+// No-op unless replica-awareness is configured (repFactor > 1). At R<=1
+// the single-owner plan's Sends already cover every shed, so this pass
+// would only duplicate work; it short-circuits.
+func (c *Coordinator) evictStaleReplicas(newRing *ring.Ring) {
+	if newRing == nil || newRing.Empty() {
+		return
+	}
+	c.mu.Lock()
+	rf := c.repFactor
+	partFn := c.partFn
+	c.mu.Unlock()
+	if rf <= 1 || partFn == nil {
+		return
+	}
+
+	it, err := c.local.ScanPrefix(nil)
+	if err != nil {
+		// Transient backend error: the next Evaluate retries. Do not
+		// evict off a failed scan.
+		return
+	}
+	held := make(map[uint64]struct{})
+	for {
+		k, _, err := it.Next()
+		if err != nil {
+			_ = it.Close()
+			return
+		}
+		if k == nil {
+			break
+		}
+		held[partFn(k)] = struct{}{}
+	}
+	_ = it.Close()
+
+	for pid := range held {
+		if c.selfIsPartitionReplica(pid) {
+			continue // still a replica-owner: RETAIN.
+		}
+		// Register the stale-replica partition for the grace-gated sweep
+		// delete. tryRegister refuses partitions already in a
+		// non-terminal state, so a Send/Receive the ring-vs-ring plan
+		// already scheduled for this partition wins and we do not race
+		// it. Target the partition's current primary purely for
+		// Snapshot readability; the delete is self-driven via the sweep
+		// and does not depend on the destination.
+		to := newRing.Owner(pid)
+		m := Move{
+			PartitionID: pid,
+			From:        c.self,
+			To:          Member{ID: to.ID, Addr: to.Addr},
+		}
+		if c.tryRegister(m, StateHandedOff) {
+			c.markEvicted(pid)
+		}
+	}
+}
+
+// markEvicted stamps handedOffAt=now on a partition just registered into
+// StateHandedOff by evictStaleReplicas, so the sweep's grace check has a
+// deadline to compare against. Separated from tryRegister because the
+// general registration path (Send/Receive) sets handedOffAt only on the
+// Sending->HandedOff transition, not at registration.
+func (c *Coordinator) markEvicted(pid uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if r, ok := c.ranges[pid]; ok && r.state == StateHandedOff {
+		r.handedOffAt = time.Now()
+	}
+}
+
+// reconcileSource picks the peer to pull partition pid from when self is
+// owned-but-missing. At R<=1 there is exactly one prior owner (the
+// reduced-ring primary, which is where the single copy lived), so it
+// returns priorRing.Owner(pid) - byte-for-byte the legacy behavior.
+//
+// At R>1 the source must be a peer that ACTUALLY holds a replica of the
+// partition, and on a SHRINK that is NOT always the reduced-ring primary:
+// when a holder leaves and self newly enters the replica set, the other
+// surviving holder may be a successor replica, not the primary the
+// reduced ring would name (which might never have held the key). So we
+// prefer a member of the partition's CURRENT replica set
+// (ReplicasForPartition(pid, R) on newRing) other than self - those are
+// exactly the nodes the ring expects to hold it - and fall back to the
+// reduced-ring owner only if the replica set yields no distinct peer.
+func (c *Coordinator) reconcileSource(newRing, priorRing *ring.Ring, pid uint64) ring.Member {
+	c.mu.Lock()
+	rf := c.repFactor
+	c.mu.Unlock()
+	if rf > 1 && newRing != nil && !newRing.Empty() {
+		for _, m := range newRing.ReplicasForPartition(pid, rf) {
+			if m.ID != "" && m.ID != c.self.ID {
+				return m
+			}
+		}
+	}
+	return priorRing.Owner(pid)
+}
+
 // reconciledClean reports whether partition pid is already tracked in a
 // terminal StateDone with no recorded error. The reconcile pass uses
 // this to avoid re-pulling a partition it already drained cleanly
@@ -159,14 +300,35 @@ func (c *Coordinator) reconcile(newRing *ring.Ring) {
 // wasteful empty FetchRange for each such partition. A partition whose
 // last pull FAILED carries an error here, so reconciledClean returns
 // false and the next tick retries it.
-func (c *Coordinator) reconciledClean(pid uint64) bool {
+func (c *Coordinator) reconciledClean(pid uint64, retryEmpty bool) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	r, ok := c.ranges[pid]
 	if !ok {
 		return false
 	}
-	return r.state == StateDone && r.err == nil
+	if r.state != StateDone || r.err != nil {
+		return false
+	}
+	if r.keyCount > 0 {
+		return true // delivered data; genuinely clean.
+	}
+	// Same-gen Done with zero keys: the pull drained empty. On the
+	// settle-timer Evaluate path (retryEmpty == false) we treat that as
+	// clean immediately so a stable ring quiesces - no re-pull of a
+	// genuinely-empty partition on every tick. On the periodic
+	// sweep-tick path (retryEmpty == true) the empty is ambiguous
+	// (genuinely-empty vs source-not-ready race on a shrink), so we
+	// retry a small bounded number of times before accepting it as
+	// empty; each retry burns one of the budget.
+	if !retryEmpty {
+		return true
+	}
+	if r.reconcileEmptyTries >= reconcileEmptyRetryCap {
+		return true // exhausted retries; treat as genuinely empty.
+	}
+	r.reconcileEmptyTries++
+	return false // retry the empty pull (source-not-ready self-heal).
 }
 
 // heldPartitions scans the local backend once and returns the subset

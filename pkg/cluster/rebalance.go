@@ -87,6 +87,14 @@ func (c *Cluster) initRebalance() {
 	// to come from the same ring snapshot the plan was computed
 	// against).
 	opts.Destination = &clusterDestination{c: c}
+	// ReplicationFactor makes the legacy single-backend Coordinator
+	// replica-aware: at R>1 a node that hands off PRIMARY of a partition
+	// but is still a successor replica RETAINS its keys (sweep skips the
+	// delete) and a node newly in a partition's replica set RECEIVES them
+	// (reconcile backfills). At R<=1 this is the v0.3/v0.4 single-owner
+	// behavior unchanged. See pkg/rebalance Options.ReplicationFactor +
+	// docs/SPEC.md "Replica-set placement."
+	opts.ReplicationFactor = c.replicationFactor()
 	// ShardKeyFn makes the auto-wired partition function compute
 	// partitions on the same shard key the cluster routes reads with.
 	// Without it, an app with a custom ShardKeyFn scatters one logical
@@ -596,6 +604,7 @@ func (c *Cluster) replaceCoordinator() {
 		opts.RetryAfterMs = c.cfg.RebalanceRetryAfterMs
 	}
 	opts.Destination = &clusterDestination{c: c}
+	opts.ReplicationFactor = c.replicationFactor()
 	opts.ShardKeyFn = c.cfg.ShardKeyFn
 	opts.AwaitHandoffSignal = true
 	opts.HandoffTimeout = c.handoffTimeout()

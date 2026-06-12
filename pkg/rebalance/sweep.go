@@ -58,8 +58,43 @@ func (c *Coordinator) RunSweep(ctx context.Context) {
 			return
 		case now := <-t.C:
 			c.sweepHandedOff(ctx, now)
+			// Periodic reconcile retry. The settle-timer Evaluate fires
+			// once per membership change (one ring generation), but a
+			// reconcile Receive can come back empty when its source was
+			// itself still settling (source-not-ready race): at R>1 on a
+			// shrink, two survivors can each newly enter a partition's
+			// replica set and briefly race who has the data first. A
+			// single post-leave Evaluate is not enough to converge those.
+			// Re-running reconcile on the sweep tick retries every
+			// still-owned-but-missing partition on a bounded schedule
+			// until the cluster reaches its replica count, with no extra
+			// membership event required. No-op once settled (every owned
+			// partition is held) and at R<=1 (the ring-vs-ring plan
+			// already delivers single-owner moves). See docs/SPEC.md
+			// "Reconcile (owned-but-missing repair)."
+			c.reconcileTick()
 		}
 	}
+}
+
+// reconcileTick re-runs the reconcile + evict passes against the ring
+// captured by the last Evaluate. It is the periodic, gen-independent
+// retry the sweep loop drives so a source-not-ready reconcile pull (or a
+// stale-replica eviction that could not register while a migration was
+// in flight) is retried until the cluster converges, without waiting on
+// another membership change. Guarded so it is a cheap no-op before the
+// first Evaluate (no ring captured) and at R<=1 (single-owner placement
+// is fully handled by the ring-vs-ring plan).
+func (c *Coordinator) reconcileTick() {
+	c.mu.Lock()
+	r := c.ring
+	rf := c.repFactor
+	c.mu.Unlock()
+	if r == nil || r.Empty() || rf <= 1 {
+		return
+	}
+	c.reconcile(r, true)
+	c.evictStaleReplicas(r)
 }
 
 // SweepOnce runs one cleanup pass at time now. Public so tests +
@@ -111,9 +146,40 @@ func (c *Coordinator) sweepHandedOff(ctx context.Context, now time.Time) {
 
 	// Build the partition-id set once so the key-belongs-to-victim
 	// check is a single map lookup.
+	//
+	// Replica-aware DELETE side (docs/SPEC.md "Replica-set placement"):
+	// a handed-off partition's PRIMARY moved to a peer, but at R>1 this
+	// node may still be a SUCCESSOR replica of that partition. If so it
+	// must RETAIN the keys, not delete them: the replica set the current
+	// ring assigns is ReplicasForPartition(pid, R), and this node is in
+	// it. We therefore split victims into "delete" (self no longer a
+	// replica - the legacy single-owner case, and every R=1 case) and
+	// "retain" (self still a replica - keys stay, partition just flips to
+	// Done). At R<=1 selfIsPartitionReplica is always false, so every
+	// victim deletes exactly as before.
 	want := make(map[uint64]struct{}, len(victims))
 	for _, v := range victims {
+		if c.selfIsPartitionReplica(v.pid) {
+			// Still a replica-owner: keep the keys. The partition is
+			// flipped to Done below alongside the deleting victims.
+			continue
+		}
 		want[v.pid] = struct{}{}
+	}
+
+	// Every victim is a retained replica (nothing to delete): skip the
+	// scan entirely and flip them straight to Done. Common at R>1 when a
+	// node that held all keys hands off PRIMARY of some partitions but
+	// stays a replica of them.
+	if len(want) == 0 {
+		c.mu.Lock()
+		for _, v := range victims {
+			if r, ok := c.ranges[v.pid]; ok && r.state == StateHandedOff {
+				r.state = StateDone
+			}
+		}
+		c.mu.Unlock()
+		return
 	}
 
 	it, err := c.local.ScanPrefix(nil)
