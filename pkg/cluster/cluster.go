@@ -452,13 +452,19 @@ type Cluster struct {
 	// every ring change (re)arms the timer; when it fires,
 	// runEvaluate computes the plan. rebalanceCtx / rebalanceCancel
 	// drive the background sweep loop.
-	rebalance       atomic.Pointer[rebalance.Coordinator]
-	ringGen         atomic.Uint64
-	settleMu        sync.Mutex
-	settleTimer     *time.Timer
-	lastEvalRing    *ring.Ring
-	rebalanceCtx    context.Context
-	rebalanceCancel context.CancelFunc
+	rebalance atomic.Pointer[rebalance.Coordinator]
+	ringGen   atomic.Uint64
+	// lastRingChangeNanos is the wall-clock UnixNano of the most recent
+	// ring-shape change (stamped in bumpRingGen). It is read by the
+	// periodic-tick stability guard (membershipStableFor) to enforce guard 1
+	// on the unconditional periodic reshard path. Zero until the first change:
+	// a never-changed ring reads as stable, which is correct.
+	lastRingChangeNanos atomic.Int64
+	settleMu            sync.Mutex
+	settleTimer         *time.Timer
+	lastEvalRing        *ring.Ring
+	rebalanceCtx        context.Context
+	rebalanceCancel     context.CancelFunc
 
 	// repairCtx / repairCancel govern the lifetime of async read-
 	// repair goroutines. Close cancels repairCtx so any in-flight
@@ -670,9 +676,14 @@ func (c *Cluster) runReconcileLoop() {
 				// tick is the backstop for a coordinator handoff that arrives
 				// without a fresh membership event (the prior coordinator left,
 				// the ring already settled, the survivor is now lowest-id).
-				// Idempotent + a no-op on a non-coordinator; called AFTER
-				// runReconcile so it never holds reshardMu when it acquires it.
-				c.reconcileReshard()
+				// This tick fires unconditionally, so it goes through
+				// reconcileReshardIfStable, which enforces guard 1 (membership
+				// stability) explicitly before deciding - the settle pass gets
+				// that guard from its debounce, the periodic tick must establish
+				// it itself. Idempotent + a no-op on a non-coordinator; called
+				// AFTER runReconcile so it never holds reshardMu when it acquires
+				// it.
+				c.reconcileReshardIfStable()
 			}
 		}
 	}

@@ -13,8 +13,10 @@
 // desired); the periodic tick is the backstop for a coordinator handoff that
 // arrives WITHOUT a fresh membership event on the survivor (the dead
 // coordinator left, the next-lowest id is now coordinator, but its ring already
-// settled). Both call the same idempotent reconcileReshard; running it twice is
-// a safe no-op.
+// settled). The periodic tick goes through reconcileReshardIfStable (which
+// enforces guard 1 before calling reconcileReshard); the settle pass calls
+// reconcileReshard directly. Both reach the same idempotent decision; running it
+// twice is a safe no-op.
 //
 // THE COORDINATOR (exactly one). A reshard must be kicked off by exactly ONE
 // node - two nodes both starting a barrier toward g+1 would each freeze the
@@ -28,10 +30,12 @@
 //
 // THE FOUR GUARDS (all must hold). See docs/SPEC.md "Declarative resharding":
 //
-//	(1) membership STABLE (debounced) - inherited from the settle machinery: the
-//	    reconcile pass only fires after membership has been unchanged for the
-//	    settle window, so a mid-roll cluster reporting MIXED desired counts never
-//	    triggers.
+//	(1) membership STABLE (debounced) - enforced on both caller paths: the settle
+//	    pass holds it structurally via the debounce (the pass only fires after
+//	    membership has been unchanged for the settle window), and the periodic tick
+//	    holds it explicitly via reconcileReshardIfStable / membershipStableFor. So
+//	    a mid-roll cluster reporting MIXED desired counts never triggers, and a
+//	    periodic tick mid-roll is skipped until the ring shape has settled.
 //	(2) all live members report the SAME desired count - unanimity. A 0/unknown
 //	    desired (legacy or not-yet-decoded peer) fails this; a half-rolled deploy
 //	    with mixed counts fails this.
@@ -55,6 +59,7 @@ package cluster
 import (
 	"log"
 	"os"
+	"time"
 
 	"github.com/Zamua/shale/pkg/membership"
 )
@@ -172,18 +177,32 @@ func (c *Cluster) reconcileReshard() {
 	if c.notReady() || !c.multi {
 		return
 	}
-	// Guard: only the coordinator decides. A non-coordinator is a passive
-	// barrier participant; it must not also kick off a reshard.
-	if !c.isReshardCoordinator() {
-		reshardDebugf("reconcileReshard: not coordinator (self=%s snap=%v)", c.cfg.NodeID, c.membership.Snapshot())
-		return
+	// Read the membership snapshot ONCE and base the whole decision on that
+	// single local view. Reading it again per-guard would let the
+	// coordinator-check pass against one snapshot while the unanimity read sees
+	// a different one (a membership flux mid-decision), so the decision could
+	// straddle two snapshots and act on neither consistently. A nil membership
+	// (single-node multi) yields an empty snapshot: that node is trivially its
+	// own coordinator (no early-return below) and unanimousDesired(nil) returns
+	// ok=false, so it is a clean no-op - identical to the prior behavior.
+	var snap []membership.Member
+	if c.membership != nil {
+		snap = c.membership.Snapshot()
+		// Guard: only the coordinator decides. A non-coordinator is a passive
+		// barrier participant; it must not also kick off a reshard. (For nil
+		// membership we skip this check: that node IS its own coordinator.)
+		if !lowestIDIsCoordinator(snap, c.cfg.NodeID) {
+			reshardDebugf("reconcileReshard: not coordinator (self=%s snap=%v)", c.cfg.NodeID, snap)
+			return
+		}
 	}
-	// Guard 2: unanimous, non-zero desired across all live members. (Guard 1,
-	// membership stability, is inherited from the settle-debounce machinery
-	// that schedules the pass.)
-	desired, ok := c.unanimousDesiredCount()
+	// Guard 2: unanimous, non-zero desired across all live members, read off the
+	// SAME snapshot as the coordinator check. (Guard 1, membership stability, is
+	// enforced by the caller: the settle pass via its debounce, the periodic tick
+	// via reconcileReshardIfStable.)
+	desired, ok := unanimousDesired(snap)
 	if !ok {
-		reshardDebugf("reconcileReshard: NOT unanimous (self=%s snap=%v)", c.cfg.NodeID, c.membership.Snapshot())
+		reshardDebugf("reconcileReshard: NOT unanimous (self=%s snap=%v)", c.cfg.NodeID, snap)
 		return
 	}
 	// Guards 3 + 4: desired must be strictly above the live count AND a valid
@@ -202,6 +221,34 @@ func (c *Cluster) reconcileReshard() {
 	// (2 -> 8) is reached by successive settled passes, each doubling once.
 	reshardDebugf("reconcileReshard: ALL GUARDS HOLD, triggering %d -> %d", current, desired)
 	c.triggerReshardStep()
+}
+
+// membershipStableFor reports whether the ring shape has been unchanged for at
+// least d. It reads lastRingChangeNanos (stamped by bumpRingGen on every ring-
+// shape change). A zero value means the ring has never changed, which reads as
+// stable (a never-changed ring trivially satisfies any stability window).
+func (c *Cluster) membershipStableFor(d time.Duration) bool {
+	last := c.lastRingChangeNanos.Load()
+	if last == 0 {
+		return true
+	}
+	return time.Since(time.Unix(0, last)) >= d
+}
+
+// reconcileReshardIfStable is the PERIODIC-tick entry to the declarative-reshard
+// decision: it enforces guard 1 (membership stability) explicitly before
+// delegating to reconcileReshard. The periodic tick fires unconditionally every
+// reconcileInterval, so unlike the settle pass it does NOT inherit stability from
+// a debounce; without this gate a tick could evaluate a reshard mid-roll. The
+// gate correctly DELAYS a coordinator-handoff reshard by settleDelay after the
+// triggering membership change (the prior coordinator leaving stamps
+// lastRingChangeNanos), which is desirable - membership should settle first.
+func (c *Cluster) reconcileReshardIfStable() {
+	if !c.membershipStableFor(c.settleDelay()) {
+		reshardDebugf("reconcileReshardIfStable: membership not stable for %s, skipping", c.settleDelay())
+		return
+	}
+	c.reconcileReshard()
 }
 
 // reshardDebugf logs a declarative-reshard diagnostic line when SHALE_RESHARD_DEBUG

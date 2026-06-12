@@ -524,3 +524,29 @@ doubled count (many nodes + many units mid-redistribution), the strict final swe
 a tight `go test -timeout`; the recorded rows use a moderate churn window so the
 sweep completes promptly. The loss oracle is unchanged either way - it never trades
 correctness for speed.
+
+### Runtime / cost notes (for the next real-cluster run)
+
+The real-cluster chaos runs (`go test -tags chaosreal` against real MinIO) dominate
+validation wall time. A full run spins up a live 2-node slatedb cluster, drives
+sustained write churn, fires a reshard, SIGKILLs a node, then reads every acked key
+back. Everything else in the suite (the in-process oracle, the unit tests) is
+sub-second by comparison; the real-cluster path is where the minutes go.
+
+HEAVY sustained phase-C churn makes the final strict full-key sweep exceed a tight
+`go test -timeout`: with many units mid-redistribution the per-key budget piles up,
+so a doomed run can burn its whole 600-1200s timeout before being retried. The
+recorded PASSING runs (the table above) took only ~130-186s each.
+
+Recommendation for future runs:
+
+- Default to a MODERATE churn window (the known-good config that produced the
+  recorded passing rows), not a heavy one. The loss oracle catches the same bugs
+  either way; extra churn only lengthens the final sweep.
+- Use a TIGHTER `-timeout` (~300s) so an over-churned run fails fast instead of
+  burning 1200s before you notice. A healthy run finishes well under 300s; a run
+  that needs more than that is over-churned, not slow-but-correct.
+- The per-seed runs can be parallelized across separate buckets (the harness
+  namespaces buckets per run), but they contend on one MinIO instance plus host
+  CPU, so the wall-time gain is modest. Prefer the tighter-timeout-and-retry loop
+  over fanning out.

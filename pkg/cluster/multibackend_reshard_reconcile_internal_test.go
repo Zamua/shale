@@ -16,6 +16,7 @@ package cluster
 
 import (
 	"testing"
+	"time"
 
 	"github.com/Zamua/shale/pkg/membership"
 )
@@ -95,6 +96,37 @@ func TestLowestIDIsCoordinator_Pure(t *testing.T) {
 	}
 	if lowestIDIsCoordinator(nil, "a") {
 		t.Errorf("empty snapshot has no coordinator")
+	}
+}
+
+// TestMembershipStableFor pins guard 1's PERIODIC-tick enforcement
+// (membershipStableFor). The periodic tick fires unconditionally, so unlike the
+// settle pass it must check stability itself: a ring whose shape changed within
+// the window is NOT stable yet, and reconcileReshardIfStable skips. The three
+// branches:
+//   - a zero lastRingChangeNanos reads as STABLE (a never-changed ring is
+//     trivially settled - it satisfies any window),
+//   - a just-now change is NOT stable within the window,
+//   - a change older than the window IS stable again.
+func TestMembershipStableFor(t *testing.T) {
+	const window = 200 * time.Millisecond
+
+	// Never changed: zero stamp reads as stable for any window.
+	c := &Cluster{}
+	if !c.membershipStableFor(window) {
+		t.Errorf("never-changed ring (lastRingChangeNanos==0) should be stable")
+	}
+
+	// Just-now change: not stable within the window.
+	c.lastRingChangeNanos.Store(time.Now().UnixNano())
+	if c.membershipStableFor(window) {
+		t.Errorf("ring changed just now should NOT be stable within %s", window)
+	}
+
+	// Change older than the window: stable again.
+	c.lastRingChangeNanos.Store(time.Now().Add(-2 * window).UnixNano())
+	if !c.membershipStableFor(window) {
+		t.Errorf("ring changed >%s ago should be stable again", window)
 	}
 }
 

@@ -195,6 +195,12 @@ func (c *Cluster) handoffTimeout() time.Duration {
 // one of these arms the shared settle timer.
 func (c *Cluster) bumpRingGen() {
 	c.ringGen.Add(1)
+	// Stamp the wall-clock time of this ring-shape change. bumpRingGen is the
+	// chokepoint every ring change flows through (membership events loop,
+	// reconcile loop, ProposeRebalance apply), so this is the single place the
+	// periodic-tick stability guard (membershipStableFor) reads to know how long
+	// the ring has been settled.
+	c.lastRingChangeNanos.Store(time.Now().UnixNano())
 	if c.multi {
 		c.scheduleReconcile()
 		return
