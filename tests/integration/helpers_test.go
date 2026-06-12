@@ -80,26 +80,6 @@ type testNode struct {
 	grpcServer *grpc.Server
 }
 
-// KillGRPC force-stops the node's gRPC server WITHOUT waiting for
-// in-flight streams to drain (grpc.Server.Stop, not GracefulStop).
-// Used by the destination-failure tests to interrupt an open
-// MigrateRange stream + verify the source treats it as a failed
-// handoff (does NOT flip Sending -> HandedOff, does NOT delete the
-// source-side keys via the sweep).
-//
-// The membership layer remains untouched: from peers' point of view
-// the killed node is still a ring member (gossip hasn't dropped it
-// yet). That's intentional -- the test wants to simulate a process
-// that lost its gRPC listener but still appears reachable for a
-// brief window, which is the worst-case window for the data-loss
-// path the fix closes.
-func (n *testNode) KillGRPC() {
-	if n.grpcServer != nil {
-		n.grpcServer.Stop()
-		n.grpcServer = nil
-	}
-}
-
 // Close tears the node down: shuts the gRPC server, closes the cluster
 // (which closes membership + backend). Safe to call once.
 func (n *testNode) Close() {

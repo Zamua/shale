@@ -116,25 +116,6 @@ const (
 	evLeaveMidReshard  // combination: membership change mid-reshard -> clean abort
 )
 
-func (k chaosEventKind) String() string {
-	switch k {
-	case evKill:
-		return "kill+restart"
-	case evJoin:
-		return "join"
-	case evLeave:
-		return "leave"
-	case evReshard:
-		return "reshard"
-	case evReshardWhileDown:
-		return "reshard-while-down"
-	case evLeaveMidReshard:
-		return "leave-mid-reshard"
-	default:
-		return "unknown"
-	}
-}
-
 // runScheduler injects chaos events until stop closes. Between events it sleeps a
 // randomized interval around cfg.chaosEvery. It tracks the live node count + the
 // live generation so it can guard events (never drop below one node; serialize a
