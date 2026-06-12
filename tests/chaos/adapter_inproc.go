@@ -24,7 +24,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/ring"
@@ -34,12 +33,14 @@ import (
 )
 
 // node is one in-process shale node: its cluster handle, the shared-backing
-// handle, its memberlist bind address (so a new joiner can seed off it), its
-// gRPC server (so it can be killed hard or shut gracefully).
+// factory handle (the mount/lease seam; an in-memory double or the real slatedb
+// factory, behind the factoryProvider), its memberlist bind address (so a new
+// joiner can seed off it), its gRPC server (so it can be killed hard or shut
+// gracefully).
 type node struct {
 	id         string
 	cl         *cluster.Cluster
-	handle     *sharedfactory.Handle
+	handle     storageunit.BackendFactory
 	bindAddr   string
 	grpcAddr   string
 	grpcServer *grpc.Server
@@ -55,7 +56,7 @@ type node struct {
 // is produced deliberately by the scheduler's combination events, which run the
 // reshard in a goroutine).
 type inProcCluster struct {
-	backing   *sharedfactory.Backing
+	provider  factoryProvider
 	unitCount int
 
 	mu       sync.Mutex // guards nodes + nextID
@@ -64,17 +65,48 @@ type inProcCluster struct {
 	structMu sync.Mutex // serializes structural changes across the harness
 
 	settleDelay time.Duration
+
+	// Convergence + settle budgets, scaled by the config's settleScale so a
+	// slow real backend (slatedb over MinIO) is given proportionally longer to
+	// mount every unit before a wait gives up. At 1x these are the original
+	// in-memory values. memberConverge bounds the per-add/remove member-count
+	// convergence wait; reconcileIdle bounds each WaitSettled per-node
+	// reconcile-idle wait. The WaitSettled timeouts themselves are passed by the
+	// caller (scaled via scaled()).
+	memberConverge time.Duration
+	reconcileIdle  time.Duration
+	scale          float64
 }
 
-// newInProcCluster brings up `count` nodes over a fresh shared backing at
+// scaled returns d multiplied by the cluster's settle scale (>= 1x). Callers use
+// it to stretch the WaitSettled / sweep budgets for a slow backend.
+func (c *inProcCluster) scaled(d time.Duration) time.Duration {
+	if c.scale <= 1 {
+		return d
+	}
+	return time.Duration(float64(d) * c.scale)
+}
+
+// newInProcCluster brings up `count` nodes over the provider's shared backing at
 // unitCount units, waits for ring convergence + reconcile quiescence, and
 // returns the live cluster. It mirrors startReplicatedCluster's settle discipline
-// so the soak starts against a fully-settled cluster.
-func newInProcCluster(count, unitCount int, settleDelay time.Duration) (*inProcCluster, error) {
+// so the soak starts against a fully-settled cluster. The provider supplies every
+// node's per-node factory handle (the in-memory double by default, or the real
+// slatedb factory over a MinIO bucket under -tags slatedb); all handles share one
+// backing, which is what makes a lease handoff copy-free + fence-correct.
+func newInProcCluster(provider factoryProvider, count, unitCount int, settleDelay time.Duration, settleScale float64) (*inProcCluster, error) {
+	scale := settleScale
+	if scale < 1 {
+		scale = 1
+	}
 	c := &inProcCluster{
-		backing:     sharedfactory.NewBacking(),
+		provider:    provider,
 		unitCount:   unitCount,
 		settleDelay: settleDelay,
+		scale:       scale,
+		// Base in-memory budgets, scaled for a slow backend.
+		memberConverge: time.Duration(float64(8*time.Second) * scale),
+		reconcileIdle:  time.Duration(float64(3*time.Second) * scale),
 	}
 	seed := ""
 	for i := 0; i < count; i++ {
@@ -87,7 +119,7 @@ func newInProcCluster(count, unitCount int, settleDelay time.Duration) (*inProcC
 			seed = n.bindAddr
 		}
 	}
-	if err := c.waitConverged(count, 20*time.Second); err != nil {
+	if err := c.waitConverged(count, time.Duration(float64(20*time.Second)*scale)); err != nil {
 		c.CloseAll()
 		return nil, err
 	}
@@ -106,7 +138,7 @@ func (c *inProcCluster) startNode(seedAddr string) (*node, error) {
 	id := "chaos-n" + strconv.Itoa(c.nextID)
 	c.mu.Unlock()
 
-	h := c.backing.Handle()
+	h := c.provider.NewHandle()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -261,7 +293,7 @@ func (c *inProcCluster) AddNode() (string, error) {
 		return "", err
 	}
 	want := len(live) + 1
-	_ = c.waitConverged(want, 8*time.Second)
+	_ = c.waitConverged(want, c.memberConverge)
 	return n.id, nil
 }
 
@@ -333,7 +365,7 @@ func (c *inProcCluster) removeLocked(id string, graceful bool) error {
 	want := liveCount - 1
 	c.mu.Unlock()
 
-	_ = c.waitConverged(want, 8*time.Second)
+	_ = c.waitConverged(want, c.memberConverge)
 	return nil
 }
 
@@ -402,7 +434,7 @@ func (c *inProcCluster) WaitSettled(expectedUnits int, timeout time.Duration) {
 			return
 		}
 		// Force a synchronous reconcile + wait idle on every node.
-		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), c.reconcileIdle)
 		for _, n := range live {
 			n.cl.TestingRunReconcile()
 			_ = n.cl.WaitForRebalanceIdle(ctx)

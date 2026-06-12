@@ -111,6 +111,34 @@ type config struct {
 	units       int
 	chaosEvery  time.Duration
 	settleDelay time.Duration
+	// settleScale multiplies the harness's convergence + settle budgets (member
+	// convergence after add/remove, the inter-event WaitSettled, the final
+	// WaitSettled). The in-memory soak leaves it 0 (treated as 1x): handoffs +
+	// reshards settle in milliseconds there. A REAL-backend soak (slatedb over
+	// MinIO) sets it >1 because each OpenUnit / flush round-trips to object storage
+	// (~100ms+), so a multi-unit cluster needs proportionally longer to mount every
+	// unit on its ring-assigned owner. Scaling the BUDGET (not the workload) is the
+	// difference between "the cluster genuinely lost a write" and "we asked whether
+	// it had finished mounting before it could". A budget too tight for a slow
+	// backend would surface durable-but-not-yet-mounted units as false LOST
+	// verdicts in the final sweep; scaling it lets the cluster actually converge so
+	// the sweep judges real durability.
+	settleScale float64
+	// noReshard, when set, makes the scheduler fire ONLY membership churn
+	// (kill/restart, join, leave) and never a reshard or a reshard-combination. It
+	// is a DIAGNOSTIC isolation knob (not a normal mode): it lets a real-backend
+	// run separate "does a plain lease handoff lose a write" from "does the
+	// doubling reshard lose a write" by removing the generation-changing events.
+	// A real soak leaves it false (the reshard + join-after-reshard path is the
+	// whole point). The vacuous-check tolerates it: a noReshard run is expected to
+	// have zero reshards, so its caller must relax the reshard coverage demand.
+	noReshard bool
+	// reshardOnly, when set, makes the scheduler fire ONLY plain reshards (no
+	// membership churn, no combinations). The complementary DIAGNOSTIC to
+	// noReshard: it isolates "does the doubling reshard bisect alone lose a write"
+	// from "does a reshard RACING a membership change lose one". A real soak leaves
+	// it false. Like noReshard it relaxes the combination-coverage vacuous demand.
+	reshardOnly bool
 	// smoke is set for the fast inner-loop variant (SHALE_CHAOS_SMOKE=1). It runs
 	// few events quickly and RELAXES the vacuous-check so it does not demand the
 	// full combination coverage a real soak proves. The default (smoke=false) is a
@@ -185,10 +213,11 @@ func (h *harness) putAcked(entrySel func() *cluster.Cluster, key, value string) 
 			time.Sleep(retryDelay)
 			continue
 		}
-		// A closed/unavailable-entry-node error (we caught the node mid-kill):
-		// re-select and retry within budget rather than failing the write, since a
-		// different live node owns the key's unit.
-		if isEntryNodeGone(err) && time.Now().Before(deadline) {
+		// A closed/unavailable-entry-node error (we caught the node mid-kill), or a
+		// just-fenced unit (the owning node lost the lease mid-write, so the write
+		// was NOT acked): re-select and retry within budget rather than failing the
+		// write, since a different live node owns the key's unit now.
+		if (isEntryNodeGone(err) || isFenceTransient(err)) && time.Now().Before(deadline) {
 			h.met.retryableRetries.Add(1)
 			time.Sleep(retryDelay)
 			continue
@@ -213,7 +242,7 @@ func (h *harness) deleteAcked(entrySel func() *cluster.Cluster, key string) erro
 		if err == nil {
 			return nil
 		}
-		if (isRetryable(err) || isEntryNodeGone(err)) && time.Now().Before(deadline) {
+		if (isRetryable(err) || isEntryNodeGone(err) || isFenceTransient(err)) && time.Now().Before(deadline) {
 			h.met.retryableRetries.Add(1)
 			time.Sleep(retryDelay)
 			continue
@@ -255,7 +284,7 @@ func (h *harness) getObservedBudget(entrySel func() *cluster.Cluster, key string
 		if errors.Is(err, errNotFound) {
 			return Observed{NotFound: true}, nil
 		}
-		if (isRetryable(err) || isEntryNodeGone(err)) && time.Now().Before(deadline) {
+		if (isRetryable(err) || isEntryNodeGone(err) || isFenceTransient(err)) && time.Now().Before(deadline) {
 			h.met.retryableRetries.Add(1)
 			time.Sleep(retryDelay)
 			continue
@@ -281,9 +310,15 @@ func (h *harness) sweepRead(c *cluster.Cluster, key string, budget time.Duration
 		if errors.Is(err, errNotFound) {
 			return Observed{NotFound: true}, nil
 		}
-		if isOwnershipDisagreement(err) {
-			// Stale ring on this node: do not retry here, surface to the sweep so it
-			// moves to the next node immediately.
+		if isOwnershipDisagreement(err) || isFenceTransient(err) {
+			// Stale ring OR a just-fenced unit on THIS node: do not retry here,
+			// surface to the sweep so it moves to the next node immediately. A fenced
+			// read means this node's lease for the key's unit moved; the NEW owner
+			// (another node the sweep also reads) serves it. Treating it as a
+			// node-skip (like the ownership disagreement) - not a hard error and not a
+			// per-node retry - lets the sweep find the new owner without burning the
+			// budget against a node that will keep returning the fence until its
+			// reconcile unmounts the unit.
 			return Observed{}, err
 		}
 		if isRetryable(err) && time.Now().Before(deadline) {
@@ -327,6 +362,45 @@ func isEntryNodeGone(err error) bool {
 		strings.Contains(msg, "connection refused") ||
 		strings.Contains(msg, "transport is closing") ||
 		strings.Contains(msg, "the cluster is closed")
+}
+
+// isFenceTransient reports whether err is a slatedb WRITER-EPOCH FENCE surfacing
+// on an op against a node that held a unit whose lease just moved: slatedb's
+// engine rejects the op with ErrorClosed{Reason: CloseReasonFenced} ("Closed
+// error: detected newer DB client", rendered "Reason=2"). This is the EXPECTED
+// race in a lease handoff: between the new owner's OpenUnit (which fences) and
+// the old owner's reconcile unmounting the now-fenced unit, an op can briefly
+// hit the fenced instance on the old owner. It is NOT data loss - the data is
+// durable in the bucket and the NEW owner serves it; the op must be RETRIED (it
+// resolves once the old owner's reconcile unmounts the fenced unit and routing
+// follows the new lease). A fenced READ in particular must be retried (route to
+// the new owner), or the reader falsely reports a read-availability loss for a
+// write that is perfectly safe in object storage under a different lease holder.
+//
+// WHY SUBSTRING (and not the typed slate.IsFenced sentinel): the fence is raised
+// on the OWNER node's slatedb engine and travels back to the harness ACROSS A
+// gRPC BOUNDARY (the harness's entry node forwards the op to the owner). By the
+// time it reaches this classifier it is a gRPC status STRING, not the original
+// wrapped *slatedb.ErrorClosed, so errors.As cannot reach the typed Reason. The
+// typed signal IS exposed (slate.IsFenced, unit-tested against the real
+// ErrorClosed), and the slate backend uses it on the local path; here on the
+// far side of the wire we match the STABLE message fragments slatedb emits.
+// We deliberately match the descriptive fragments ("detected newer DB client" /
+// "Closed error" + "newer") FIRST, since those are the human-readable parts of
+// the message and do not depend on how the CloseReason enum renders; the
+// "Reason=2" form is kept only as a belt-and-suspenders fallback (it would break
+// silently if slatedb ever gave CloseReason a String() method - hence it is not
+// the primary signal). The single-instance backend's TestMinIO_WriterEpochFencing
+// + the factory integration tests pin this exact slatedb signature.
+func isFenceTransient(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	return strings.Contains(msg, "detected newer DB client") ||
+		(strings.Contains(msg, "Closed error") && strings.Contains(msg, "newer")) ||
+		(strings.Contains(msg, "Closed:") && strings.Contains(msg, "Reason=2")) ||
+		strings.Contains(msg, "Reason=2")
 }
 
 // runWriter is one writer goroutine. It owns the disjoint key subspace
@@ -481,13 +555,29 @@ func (h *harness) transactInc(entrySel func() *cluster.Cluster, ctrKey string, t
 		if err == nil {
 			return nil
 		}
-		if (isRetryable(err) || isEntryNodeGone(err)) && time.Now().Before(deadline) {
+		if (isRetryable(err) || isEntryNodeGone(err) || isSpuriousCrossShard(err) || isFenceTransient(err)) && time.Now().Before(deadline) {
 			h.met.retryableRetries.Add(1)
 			time.Sleep(retryDelay)
 			continue
 		}
 		return err
 	}
+}
+
+// isSpuriousCrossShard reports whether err is the documented SUT mid-reshard
+// spurious cross-shard conflict (pkg/cluster guardShard "TODO(reshard-tx)"): a
+// single-key Transact whose pin key's unit cuts over to a new generation BETWEEN
+// the pin and a later same-shard op resolves the same shard key to a different
+// GenUnit, so guardShard returns backend.ErrCrossShard even though the
+// transaction touches exactly one shard. The SUT comment is explicit that this is
+// NOT data loss - it is a benign transient that clears once the reshard cut-over
+// completes and the pin re-resolves consistently. So, like ErrCASConflict, the
+// client must RETRY it; treating it as a hard error would falsely flag a lost
+// update. (A GENUINELY cross-shard transaction is impossible here: the harness's
+// transactInc reads + writes exactly ONE counter key, so any ErrCrossShard it
+// sees is necessarily this spurious mid-reshard flavor.)
+func isSpuriousCrossShard(err error) bool {
+	return errors.Is(err, backend.ErrCrossShard)
 }
 
 // recordCounter stashes a writer's final acked-increment count so the final sweep

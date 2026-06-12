@@ -134,6 +134,33 @@ replicas across failure domains helps. See the shale spec under
 "Backend durability is a backend concern" for the cluster-level
 framing: shale notes the recommendation but doesn't enforce it.
 
+## Multi-backend factory (Backing + Handle)
+
+For the v0.8 per-shard lease-handoff + reshard model, this module also
+ships a `storageunit.BackendFactory` whose backing is ONE shared bucket
+and whose per-unit databases are real slatedb instances inside it (see
+the "slatedb BackendFactory" section in the top-level `docs/SPEC.md`).
+It is the deployable version of the in-process `internal/sharedfactory`
+test double the chaos harness validates against.
+
+- `slate.NewBacking(BackingConfig)` opens the shared-bucket connection
+  (one per cluster). `Backing.Handle()` returns a per-node factory
+  (`storageunit.BackendFactory`); many Handles share one Backing.
+- A `GenUnit{Gen, ID}` maps to the slatedb DbName `<KeyPrefix>u/g<gen>/u<id>`
+  inside the bucket, so each unit is its own database and gen-g unit K and
+  gen-(g+1) unit K coexist as distinct databases during a doubling bisect.
+- `OpenUnit(gu, epoch)` opens that unit's database with
+  `AwaitDurable=true`; opening IS the fence (slatedb's writer-epoch
+  protocol locks out any prior writer at a lower epoch). The factory reads
+  the durable manifest writer-epoch via the slatedb `Admin` surface and
+  fences strictly above it, so a stale intended epoch cannot under-fence.
+- `CloseUnit(gu)` flushes + shuts down one unit WITHOUT touching the
+  bucket bytes (data stays durable for the next owner) - a copy-free
+  handoff moves only the open handle, never bytes.
+- `Backing.PresentUnits(ctx)` lists the units whose databases EXIST in the
+  bucket (a minio-go bucket scan, since slatedb-go exposes no list API),
+  distinct from `Handle.OpenUnits()` (the locally-mounted set).
+
 ## Test layers
 
 Two tiers, both opt-in:
@@ -146,7 +173,15 @@ Two tiers, both opt-in:
     the full Slate surface against it. Covers 1k small keys, 10x 1 MiB
     blobs, durability across writer-process reopen, and writer-epoch
     fencing (two writers against the same DB → second fences the
-    first). Requires Docker + the SlateDB shared library.
+    first). The multi-backend factory has its own integration tests in
+    this tier (`factory_minio_integration_test.go`): copy-free fence
+    handoff (a unit handed off A → B lands on the same bytes and fences a
+    stale A writer), independent generations, durability across
+    release/re-acquire, and PresentUnits enumeration. They point at a
+    MinIO reachable at `SLATE_MINIO_ENDPOINT` (default
+    `http://localhost:9000`, creds `SLATE_MINIO_ACCESS` /
+    `SLATE_MINIO_SECRET`) and create a fresh bucket per test. Requires a
+    running MinIO + the SlateDB shared library.
     `make test-slate-minio`.
 
 ## v0.6 readiness

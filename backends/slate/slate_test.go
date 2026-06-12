@@ -5,6 +5,7 @@ package slate_test
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"testing"
 
 	slatedb "slatedb.io/slatedb-go/uniffi"
@@ -452,5 +453,39 @@ func TestConfigWriteOptions_TransactionRollbackUnaffected(t *testing.T) {
 	}
 	if _, err := s.Get([]byte("rb")); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("rolled-back key should be absent, got err=%v", err)
+	}
+}
+
+// TestIsFenced pins the typed fence sentinel (the P3 fix for the chaos
+// harness's brittle substring classification). It constructs the REAL
+// slatedb.ErrorClosed{Reason: CloseReasonFenced} the engine raises on a
+// fence, wraps it the way the slate backend does (fmt.Errorf("...: %w")),
+// and asserts IsFenced recognizes it - while NOT misclassifying a
+// non-fence close (Clean) or an unrelated error. Because it asserts against
+// the binding's OWN typed error, a slatedb binding change that altered the
+// fence representation would FAIL this test instead of silently
+// reclassifying a real fence as a real data loss downstream.
+func TestIsFenced(t *testing.T) {
+	fenced := slatedb.NewErrorClosed(slatedb.CloseReasonFenced, "detected newer DB client").AsError()
+	if !slate.IsFenced(fenced) {
+		t.Fatalf("IsFenced(fenced) = false, want true (err=%v)", fenced)
+	}
+	// Wrapped the way the backend wraps it (%w) must still be recognized.
+	wrapped := fmt.Errorf("slate: put: %w", fenced)
+	if !slate.IsFenced(wrapped) {
+		t.Fatalf("IsFenced(wrapped fenced) = false, want true (err=%v)", wrapped)
+	}
+	// A CLEAN close is not a fence.
+	clean := slatedb.NewErrorClosed(slatedb.CloseReasonClean, "closed cleanly").AsError()
+	if slate.IsFenced(clean) {
+		t.Fatalf("IsFenced(clean close) = true, want false")
+	}
+	// An unrelated error is not a fence.
+	if slate.IsFenced(errors.New("boom")) {
+		t.Fatalf("IsFenced(unrelated) = true, want false")
+	}
+	// nil is not a fence.
+	if slate.IsFenced(nil) {
+		t.Fatalf("IsFenced(nil) = true, want false")
 	}
 }

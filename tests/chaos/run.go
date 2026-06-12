@@ -35,6 +35,14 @@ type report struct {
 	// smoke variant fires too few events to guarantee a combination, so it relaxes
 	// that demand (but still requires acked writes + chaos + retryable turbulence).
 	smoke bool
+	// noReshard records the diagnostic membership-churn-only mode: the vacuous-check
+	// then does NOT demand reshard / combination coverage (there were deliberately
+	// no generation-changing events), but still requires acked writes + chaos.
+	noReshard bool
+	// reshardOnly records the diagnostic reshards-only mode: the vacuous-check still
+	// demands a committed reshard but NOT the membership-change combinations (there
+	// was deliberately no membership churn).
+	reshardOnly bool
 }
 
 // vacuous reports whether the run failed to stress anything: no acked writes, no
@@ -53,7 +61,12 @@ func (r *report) vacuous() (bool, string) {
 	if totalEvents == 0 {
 		return true, "zero chaos events: the scheduler never fired"
 	}
-	if r.retryableRetries == 0 {
+	// A reshard/freeze cutover is what reliably produces a retryable window; a
+	// pure-handoff (noReshard DIAGNOSTIC) run can legitimately ack every write with
+	// zero retries because a lease handoff's acquiring window is brief and the
+	// workload's entry-node reselection rides over it without a codes.Unavailable.
+	// So the retryable-retries demand applies only when reshard events are in play.
+	if r.retryableRetries == 0 && !r.noReshard {
 		return true, "zero retryable retries: the run never hit a cutover/handoff/freeze window (suspiciously quiet - chaos may not have overlapped the workload)"
 	}
 	// A real soak (not the fast smoke variant) MUST reach the generation-changing
@@ -63,15 +76,20 @@ func (r *report) vacuous() (bool, string) {
 	// actually changed generation and a later join/restart had to learn it), and
 	// at least one of EACH combination having fired. The smoke variant fires too
 	// few events to guarantee these, so it skips this gate.
-	if !r.smoke {
+	if !r.smoke && !r.noReshard {
 		if r.events["reshard"] == 0 {
 			return true, "zero committed reshards: the soak never changed generation, so it never exercised reshard or the join-after-reshard path (raise DURATION or lower CHAOS_EVERY)"
 		}
-		if r.combos["reshard_while_down"] == 0 {
-			return true, "the reshard-while-down combination never fired: the soak did not exercise a reshard over reduced membership (raise DURATION)"
-		}
-		if r.combos["leave_mid_reshard"] == 0 {
-			return true, "the leave-mid-reshard combination never fired: the soak did not exercise a membership change racing the freeze barrier (raise DURATION)"
+		// The COMBINATION coverage demand is for a FULL soak only. The reshardOnly
+		// DIAGNOSTIC deliberately fires no membership churn, so it fires no
+		// combinations; it still must commit a reshard (checked just above).
+		if !r.reshardOnly {
+			if r.combos["reshard_while_down"] == 0 {
+				return true, "the reshard-while-down combination never fired: the soak did not exercise a reshard over reduced membership (raise DURATION)"
+			}
+			if r.combos["leave_mid_reshard"] == 0 {
+				return true, "the leave-mid-reshard combination never fired: the soak did not exercise a membership change racing the freeze barrier (raise DURATION)"
+			}
 		}
 	}
 	return false, ""
@@ -101,9 +119,24 @@ func (r *report) String() string {
 	)
 }
 
-// run executes the full soak and returns the report. logf is the test's t.Logf.
+// run executes the full soak against the DEFAULT (in-memory shared-backing)
+// factory provider and returns the report. logf is the test's t.Logf. The
+// slate-backed soak (factory_slate.go) calls runWithProvider directly with the
+// real slatedb provider.
 func run(cfg config, logf func(string, ...any)) (*report, error) {
-	cl, err := newInProcCluster(cfg.nodes, cfg.units, cfg.settleDelay)
+	return runWithProvider(newSharedFactoryProvider(), cfg, logf)
+}
+
+// runWithProvider executes the full soak against the supplied factory provider.
+// It is the single orchestration body; run wraps it with the default in-memory
+// provider, and the slate-backed test wraps it with the real slatedb provider.
+// Reset is called on the provider before the cluster is stood up so a seed starts
+// against a clean backing.
+func runWithProvider(provider factoryProvider, cfg config, logf func(string, ...any)) (*report, error) {
+	if err := provider.Reset(); err != nil {
+		return nil, fmt.Errorf("reset factory provider: %w", err)
+	}
+	cl, err := newInProcCluster(provider, cfg.nodes, cfg.units, cfg.settleDelay, cfg.settleScale)
 	if err != nil {
 		return nil, fmt.Errorf("stand up cluster: %w", err)
 	}
@@ -160,7 +193,7 @@ func run(cfg config, logf func(string, ...any)) (*report, error) {
 	// whole expected space exactly once. This is what keeps the sweep fast - it
 	// reads a settled cluster instead of retrying owner-but-unmounted keys for the
 	// full per-key budget. expectedUnits is the scheduler's live count.
-	cl.WaitSettled(h.met.finalUnits, 45*time.Second)
+	cl.WaitSettled(h.met.finalUnits, cl.scaled(45*time.Second))
 
 	// Final full-sweep verification: read EVERY acked key from EVERY live node and
 	// check it against the model. This is the belt to the continuous readers'
@@ -200,6 +233,8 @@ func run(cfg config, logf func(string, ...any)) (*report, error) {
 		finalGeneration: generationFromUnits(cfg.units, h.met.finalUnits),
 		violations:      h.vlog.snapshot(),
 		smoke:           cfg.smoke,
+		noReshard:       cfg.noReshard,
+		reshardOnly:     cfg.reshardOnly,
 	}
 	return rep, nil
 }
@@ -227,6 +262,11 @@ func (h *harness) finalSweep() {
 	for k := range snap {
 		keys = append(keys, k)
 	}
+	// Per-read sweep budget, scaled for a slow backend: a unit mid-acquire
+	// (OpenUnit in flight against object storage) takes proportionally longer to
+	// become readable, so the budget that absorbs a residual acquiring-window
+	// must stretch with the backend. At 1x this is the in-memory sweepReadBudget.
+	readBudget := h.cl.scaled(sweepReadBudget)
 
 	// The dataset can be large (thousands of acked keys after a long soak) and the
 	// sweep reads every key from every node, so do it with a bounded worker pool
@@ -269,7 +309,7 @@ func (h *harness) finalSweep() {
 				var lastErr error
 				badVerdict := false
 				for _, c := range clusters {
-					obs, err := h.sweepRead(c, key, sweepReadBudget)
+					obs, err := h.sweepRead(c, key, readBudget)
 					if err != nil {
 						lastErr = err
 						continue // stale ring / unavailable on THIS node; try the next
@@ -297,11 +337,12 @@ func (h *harness) finalSweep() {
 	// Stop feeding keys once a generous total budget is exceeded and record one
 	// diagnostic violation (the run then fails, correctly pointing at a cluster
 	// that did not re-settle after chaos) instead of hanging to the test timeout.
-	sweepDeadline := time.Now().Add(90 * time.Second)
+	sweepBudget := h.cl.scaled(90 * time.Second)
+	sweepDeadline := time.Now().Add(sweepBudget)
 	fed := 0
 	for _, k := range keys {
 		if time.Now().After(sweepDeadline) {
-			h.vlog.add(VerdictLost, fmt.Sprintf("final sweep exceeded its %s budget after %d/%d keys: the cluster did not re-settle after chaos (owner-but-unmounted units persisting)", 90*time.Second, fed, len(keys)))
+			h.vlog.add(VerdictLost, fmt.Sprintf("final sweep exceeded its %s budget after %d/%d keys: the cluster did not re-settle after chaos (owner-but-unmounted units persisting)", sweepBudget, fed, len(keys)))
 			break
 		}
 		keyCh <- k
@@ -336,6 +377,7 @@ func (h *harness) verifyCounters() {
 	}
 	h.ctrMu.Unlock()
 
+	readBudget := h.cl.scaled(sweepReadBudget)
 	for ctrKey, want := range expected {
 		if want == 0 {
 			continue
@@ -347,7 +389,7 @@ func (h *harness) verifyCounters() {
 		var err error
 		got := false
 		for _, cc := range clusters {
-			obs, err = h.sweepRead(cc, ctrKey, sweepReadBudget)
+			obs, err = h.sweepRead(cc, ctrKey, readBudget)
 			if err == nil {
 				got = true
 				break
