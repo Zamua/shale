@@ -211,6 +211,16 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 		cancel()
 	}
 
+	// Final gate: prove the routed forwarding path actually round-trips
+	// at the configured WriteConsistency before the test issues its seed
+	// Put. Ring convergence + rebalance-idle prove membership + ownership
+	// stability, but NOT that every peer's gRPC server goroutine is
+	// servicing connections yet - the gap that produces the CI
+	// "write needed N acks, got M" flake. The retry here is scoped to
+	// setup only; once this returns the cluster is write-ready and any
+	// later Unavailable in a test body is a real failure.
+	waitForWriteReady(t, clusters[0], 15*time.Second)
+
 	out := make([]*replicatedNode, 3)
 	for i := range 3 {
 		out[i] = &replicatedNode{

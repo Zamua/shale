@@ -29,6 +29,8 @@ import (
 	"github.com/Zamua/shale/pkg/rpc"
 	"go.uber.org/goleak"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // TestMain shrinks the rebalance package's sweep tick + grace
@@ -388,7 +390,82 @@ func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc clust
 		cs[i] = n.Cluster
 	}
 	waitForClusterReady(t, cs, 15*time.Second)
+	// Final gate: prove the routed forwarding RPC path actually
+	// round-trips at the configured WriteConsistency before any test
+	// issues its seed Put. waitForClusterReady proves membership +
+	// rebalance quiescence, but NOT that every peer's gRPC server
+	// goroutine is servicing connections yet (the listener is bound
+	// eagerly but Serve runs in a goroutine that can lag under CI
+	// starvation). That gap is what produces the "write needed N acks,
+	// got M" flake. The probe write through nodes[0].Cluster drives the
+	// same routed + replicated path the tests use; its retry is scoped to
+	// THIS setup window only.
+	waitForWriteReady(t, nodes[0].Cluster, 15*time.Second)
 	return nodes
+}
+
+// waitForWriteReady gates a freshly-stood-up multi-node cluster on the
+// one condition waitForClusterReady does NOT cover: that the routed
+// forwarding RPC path actually round-trips at the cluster's configured
+// WriteConsistency. Ring convergence proves every node is a MEMBER; it
+// does NOT prove every peer's gRPC HTTP/2 server goroutine is servicing
+// connections yet. Under CI starvation (-race + GOMAXPROCS contention +
+// full-workspace parallelism) the Serve goroutine can lag the listener
+// bind, so the seed Put fans out to a replica whose server isn't
+// accepting yet and the write can't reach quorum acks ("write needed N
+// acks, got M").
+//
+// The gate issues a PROBE write through the public Cluster.Put path -
+// the exact same routed + replicated path the tests use - and retries
+// ONLY on transient warmup errors (Unavailable: refused dial / not
+// enough acks; ResourceExhausted: a partition still mid-migration) until
+// it succeeds or the bounded deadline expires. A non-transient error, or
+// exhausting the deadline, fails the test with a clear message.
+//
+// CRUCIAL: this retry is scoped to SETUP. Once the probe succeeds the
+// cluster is proven write-ready, and any Unavailable a test then sees in
+// the body under assertion is a REAL failure - this helper never wraps
+// those. The probe key is namespaced + tombstoned afterward so it cannot
+// pollute a test that reads replica backends directly.
+func waitForWriteReady(t *testing.T, c *cluster.Cluster, deadline time.Duration) {
+	t.Helper()
+	const probeKey = "__warmup_probe__"
+	end := time.Now().Add(deadline)
+	var lastErr error
+	for time.Now().Before(end) {
+		err := c.Put([]byte(probeKey), []byte("ready"))
+		if err == nil {
+			// Best-effort cleanup so no stray probe key lands on the
+			// replica backends a test might read directly.
+			_ = c.Delete([]byte(probeKey))
+			return
+		}
+		if !isTransientWarmupErr(err) {
+			t.Fatalf("waitForWriteReady: probe write returned a non-transient error (real failure, not a warmup race): %v", err)
+		}
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("waitForWriteReady: cluster never became write-ready within %s; last probe error: %v", deadline, lastErr)
+}
+
+// isTransientWarmupErr reports whether err is one of the transient
+// signals expected while a freshly-joined cluster's gRPC forwarding
+// servers come up: Unavailable (peer's server not accepting yet /
+// connection refused / not enough acks landed) or ResourceExhausted (a
+// partition still mid-migration). Only these are retried during the setup
+// warmup window; everything else is a real failure.
+func isTransientWarmupErr(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch st.Code() {
+	case codes.Unavailable, codes.ResourceExhausted:
+		return true
+	default:
+		return false
+	}
 }
 
 // waitForClusterReady is the canonical "the fixture is done settling"

@@ -247,6 +247,72 @@ func (h *grpcHarness) register(c *cluster.Cluster) {
 	h.started = true
 }
 
+// waitForWriteReady gates a freshly-stood-up multi-node cluster on the
+// one condition the membership + rebalance-idle waits do NOT cover: that
+// the routed forwarding RPC path actually round-trips at the cluster's
+// configured WriteConsistency. Ring convergence proves every node is a
+// MEMBER; it does NOT prove every peer's gRPC HTTP/2 server goroutine is
+// servicing connections yet. Under CI starvation (-race + GOMAXPROCS
+// contention + full-workspace parallelism) the Serve goroutine can lag
+// the listener bind, so the seed Put fans out to a replica whose server
+// isn't accepting yet and the write can't reach quorum acks
+// ("write needed N acks, got M").
+//
+// The gate issues a PROBE write through the public Cluster.Put path -
+// the exact same routed + replicated path the tests use - and retries
+// ONLY on transient warmup errors (Unavailable: refused dial / not
+// enough acks; ResourceExhausted: a partition still mid-migration) until
+// it succeeds or the bounded deadline expires. A non-transient error, or
+// exhausting the deadline, fails the test with a clear message.
+//
+// CRUCIAL: this retry is scoped to SETUP. Once the probe succeeds the
+// cluster is proven write-ready, and any Unavailable a test then sees in
+// the body under assertion is a REAL failure - this helper never wraps
+// those. The probe key is namespaced + tombstoned afterward so it cannot
+// pollute a test that reads replica backends directly.
+func waitForWriteReady(t *testing.T, c *cluster.Cluster, deadline time.Duration) {
+	t.Helper()
+	const probeKey = "__warmup_probe__"
+	end := time.Now().Add(deadline)
+	var lastErr error
+	for time.Now().Before(end) {
+		err := c.Put([]byte(probeKey), []byte("ready"))
+		if err == nil {
+			// Best-effort cleanup: leave no stray probe key on the
+			// replica backends a test might read directly. A transient
+			// failure here is harmless (the key is namespaced + no test
+			// reads it), so we don't gate on the Delete succeeding.
+			_ = c.Delete([]byte(probeKey))
+			return
+		}
+		if !isTransientWarmupErr(err) {
+			t.Fatalf("waitForWriteReady: probe write returned a non-transient error (real failure, not a warmup race): %v", err)
+		}
+		lastErr = err
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("waitForWriteReady: cluster never became write-ready within %s; last probe error: %v", deadline, lastErr)
+}
+
+// isTransientWarmupErr reports whether err is one of the transient
+// signals expected while a freshly-joined cluster's gRPC forwarding
+// servers come up: Unavailable (peer's server not accepting yet /
+// connection refused / not enough acks landed) or ResourceExhausted (a
+// partition is still mid-migration). Only these are retried during the
+// setup warmup window; everything else is a real failure.
+func isTransientWarmupErr(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok {
+		return false
+	}
+	switch st.Code() {
+	case codes.Unavailable, codes.ResourceExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
 // waitForRingSize polls c.Members() until it has want entries or the
 // timeout expires.
 func waitForRingSize(c *cluster.Cluster, want int, timeout time.Duration) error {
