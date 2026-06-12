@@ -82,6 +82,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -612,19 +613,27 @@ func (c *Cluster) bisectUnitStatic(gen storageunit.Generation, k storageunit.Uni
 	lowGU := storageunit.NewGenUnit(gen+1, low)
 	highGU := storageunit.NewGenUnit(gen+1, high)
 
-	// CREATE the two fresh gen-(g+1) children in the SHARED backing (epoch base:
-	// brand-new databases, no prior writer to fence). Mount them so the copy can
-	// write into them AND so routing resolves them once FLIP advances the
-	// generation. Creating in the shared backing is what makes the later
-	// redistribution copy-free: a child this node built is the SAME durable
-	// bytes the eventual ring owner will open.
-	lowBE, err := c.factory.OpenUnit(lowGU, epochAtOpen)
+	// CREATE (or REUSE) the two fresh gen-(g+1) children in the SHARED backing.
+	// Mount them so the copy can write into them AND so routing resolves them once
+	// FLIP advances the generation. Creating in the shared backing is what makes
+	// the later redistribution copy-free: a child this node built is the SAME
+	// durable bytes the eventual ring owner will open.
+	//
+	// IDEMPOTENT ACROSS RETRIES: the declarative reconcile fires the barrier on
+	// every settled pass, so a prior attempt that ABORTED after opening the children
+	// (a transient FREEZE/BISECT failure on a PEER) leaves THIS node's children
+	// already open + mounted on its handle. Re-opening the same unit on the same
+	// handle is refused by the factory ("already open ... CloseUnit first"), which
+	// would wedge every subsequent attempt. So REUSE an already-mounted child rather
+	// than re-open it; the clear-before-copy below wipes its half-built data, making
+	// a retry start from an empty child exactly as a fresh open would. Only OpenUnit
+	// a child this node does not already hold.
+	lowBE, err := c.openOrReuseChild(lowGU)
 	if err != nil {
 		return fmt.Errorf("open child %s: %w", lowGU, err)
 	}
-	highBE, err := c.factory.OpenUnit(highGU, epochAtOpen)
+	highBE, err := c.openOrReuseChild(highGU)
 	if err != nil {
-		_ = c.factory.CloseUnit(lowGU)
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
 	c.mountMu.Lock()
@@ -668,6 +677,24 @@ func (c *Cluster) bisectUnitStatic(gen storageunit.Generation, k storageunit.Uni
 		return fmt.Errorf("copy %s: %w", oldGU, err)
 	}
 	return nil
+}
+
+// openOrReuseChild returns the backend for gen-(g+1) child unit gu, REUSING an
+// already-mounted backend on this node's handle if one exists (a prior aborted
+// bisect attempt opened it) and OPENING it fresh otherwise. This makes the BISECT
+// phase idempotent under the declarative reconcile, which re-fires the barrier on
+// every settled pass: without the reuse, the second attempt's OpenUnit is refused
+// ("unit already open on this handle; CloseUnit first") and the reshard wedges
+// permanently. The caller wipes the returned backend (clear-before-copy), so a
+// reused, half-built child is indistinguishable from a fresh one after the clear.
+func (c *Cluster) openOrReuseChild(gu storageunit.GenUnit) (backend.Backend, error) {
+	c.mountMu.RLock()
+	be, ok := c.mountMap[gu]
+	c.mountMu.RUnlock()
+	if ok {
+		return be, nil
+	}
+	return c.factory.OpenUnit(gu, epochAtOpen)
 }
 
 // -- The coordinator -------------------------------------------------------

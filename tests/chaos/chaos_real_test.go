@@ -32,6 +32,8 @@ package chaos
 //	SHALE_REAL_DURATION   (optional; default 20s workload window)
 //	SHALE_REAL_WRITERS    (optional; default 4)
 //	SHALE_REAL_SEED        (optional; default 1; ALWAYS logged for reproducibility)
+//	SHALE_REAL_LOGDIR     (optional; default the test TempDir) persistent dir for
+//	                      per-node logs so a failed run's logs survive teardown
 //
 // ===========================================================================
 // WHAT THIS DEPLOY PROVES (read before trusting a green run)
@@ -240,7 +242,7 @@ func resolveRealConfig(t *testing.T) (realConfig, bool, string) {
 			secretKey:  secret,
 			region:     region,
 			useSSL:     strings.EqualFold(os.Getenv("SHALE_REAL_USE_SSL"), "true"),
-			logDir:     t.TempDir(),
+			logDir:     logDirReal(t),
 			unitCount:  unitCount,
 			keyPrefix:  keyPrefix,
 		},
@@ -253,6 +255,20 @@ func resolveRealConfig(t *testing.T) (realConfig, bool, string) {
 		cfg.nodes = 2
 	}
 	return cfg, true, ""
+}
+
+// logDirReal returns the directory per-node stdout/stderr logs are written to.
+// Default is the test's TempDir (cleaned up automatically); SHALE_REAL_LOGDIR
+// overrides it with a persistent path so a failed run's node logs can be
+// inspected after the harness tears the processes down.
+func logDirReal(t *testing.T) string {
+	if d := os.Getenv("SHALE_REAL_LOGDIR"); d != "" {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatalf("SHALE_REAL_LOGDIR %q: %v", d, err)
+		}
+		return d
+	}
+	return t.TempDir()
 }
 
 func envIntReal(key string, def int) int {

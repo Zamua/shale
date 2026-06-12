@@ -414,9 +414,11 @@ v0.8 deploy gap. It reuses the SAME pure oracle (`oracle.go`, no build tag) but
 drives a deploy of SEPARATE OS PROCESSES instead of goroutines: real `shaled-slate`
 child processes in MULTI-BACKEND mode (`--unit-count > 1`), real gRPC + memberlist
 over the loopback network, a SHARED MinIO bucket + key-prefix as the durable
-object-storage backing, and a real operator Reshard RPC driving an N -> 2N doubling
-on the running cluster. One invocation owns the whole lifecycle (launch, kill,
-restart, reshard, teardown):
+object-storage backing, and a DECLARATIVE N -> 2N doubling driven from the
+`--unit-count` deploy config (v0.8: there is no operator Reshard RPC; the harness
+bumps the desired count and re-rolls the nodes, and the cluster's coordinator
+reshards itself). One invocation owns the whole lifecycle (launch, kill, restart,
+reshard, teardown):
 
 ```sh
 # Build shaled-slate (cgo + the slatedb cdylib on the loader path) from backends/slate:
@@ -436,8 +438,10 @@ SHALE_REAL_ACCESS_KEY=admin SHALE_REAL_SECRET_KEY=supersecret \
 Gated behind `//go:build chaosreal`, so the normal suite AND the in-process chaos
 soak (`//go:build chaos`) are untouched. With no env set, the test SKIPS with a
 precise reason (which piece is missing), never a fake pass. The adapter lives in
-`adapter_real.go` (the `Topology`: launch / SIGKILL / SIGTERM / Reshard-RPC over
-`os/exec` + `pkg/rpc`) + `realclient.go` (the `ClusterClient`: Put/Get/Delete over
+`adapter_real.go` (the `Topology`: launch / SIGKILL / SIGTERM over `os/exec` +
+`pkg/rpc`, plus the DECLARATIVE reshard seam: bump the desired `--unit-count`,
+re-roll every node, poll `GenState` until the coordinator commits the doubling) +
+`realclient.go` (the `ClusterClient`: Put/Get/Delete over
 the real `pkg/rpc` gRPC client); the orchestration + invariants live in `run_real.go`
 + `chaos_real_test.go`.
 
@@ -457,14 +461,19 @@ phases:
   reads EVERY acked key from a survivor: a killed owner's keys MUST come back
   (`survived`), and a key still unreadable past the settle budget is a hard LOSS.
   This is the durable handoff the legacy single-owner deploy could not do.
-- **PHASE B - operator reshard, N -> 2N (HARD-gated, non-vacuous).** Issue the
-  operator Reshard RPC mid-run. The cluster-wide freeze barrier coordinates the
-  doubling across processes; each unit bisects by copying its keys through object
-  storage into two gen-(g+1) children; routing flips atomically. Every acked write
-  must survive. The run is VACUOUS (a failure) unless a reshard COMMITTED, so a
-  green run proves the reshard actually fired. The smallest doubling the deployable
-  binary supports is N=2 -> N=4 (it reserves `--unit-count 1` for legacy mode); the
-  default run starts at N=2 and reshards to N=4.
+- **PHASE B - declarative reshard, N -> 2N (HARD-gated, non-vacuous).** Bump the
+  desired `--unit-count` (2 -> 4) and RE-ROLL every node (the real redeploy:
+  restart each `shaled-slate` process with the new count). The cluster's
+  deterministic coordinator observes the new desired count once membership settles,
+  and drives the cluster-wide freeze barrier itself: each unit bisects by copying
+  its keys through object storage into two gen-(g+1) children; routing flips
+  atomically. There is NO network trigger - the deploy config is the only input, so
+  there is no unauthenticated reshard RPC. Every acked write must survive. The run
+  is VACUOUS (a failure) unless a reshard COMMITTED, so a green run proves the
+  declarative doubling actually fired. The smallest doubling the deployable binary
+  supports is N=2 -> N=4 (it reserves `--unit-count 1` for legacy mode); the default
+  run starts at N=2 and reshards to N=4. The harness confirms the commit by polling
+  `GenState` on every live node until all report the doubled count.
 - **PHASE C - churn (HARD-gated).** Real joins / leaves / kill+restarts over the
   real network for the rest of the window. Multi-backend mode hands off on every
   membership change, so the SAME hard oracle applies: no acked write may be lost
@@ -478,6 +487,40 @@ expected retryable turbulence (counted as a `transient_read`, never failed) - th
 same transient-vs-persisted rule the in-process soak uses; the difference from the
 old legacy adapter is that "unavailable after settle" is now a HARD loss, not a
 tolerated gap. A green run means: the real network + real process death + the real
-copy-free handoff + a real operator reshard do not lose, corrupt, or resurrect any
+copy-free handoff + a real DECLARATIVE reshard do not lose, corrupt, or resurrect any
 acked write. It is the validation that the v0.8 multi-backend model is actually
 DEPLOYABLE, not merely in-process correct - the gap this harness was built to catch.
+
+### Real-cluster validation (declarative reshard)
+
+Recorded runs against the deployable `shaled-slate` binary (`-tags slatedb`, cgo +
+the slatedb cdylib) over a real MinIO bucket on loopback, driving the DECLARATIVE
+N -> 2N doubling (bump `--unit-count` 2 -> 4, re-roll every node, the coordinator
+reshards itself). Each row is one `TestRealClusterChaos` invocation; the run is
+NON-VACUOUS only if it both COMMITTED a reshard and fired a SIGKILL under load, and
+PASSES only with ZERO acked-write-loss-oracle violations. Reproduce any row by
+re-exporting its seed + knobs (`SHALE_REAL_SEED`, `SHALE_REAL_NODES`,
+`SHALE_REAL_DURATION`, `SHALE_REAL_WRITERS`).
+
+| seed | nodes | acked puts | acked dels | loss (violations) | reshard | survivors after SIGKILL | chaos events | wall |
+| ---: | ----: | ---------: | ---------: | :---------------: | :-----: | :---------------------: | :--- | ---: |
+| 1 | 2 | 1933 | 474 | 0 | 2 -> 4 (committed) | 78 keys re-served | kill:2 restart:2 reshard:1 | 133s |
+| 5 | 2 | 1935 | 507 | 0 | 2 -> 4 (committed) | 89 keys re-served | kill:2 restart:2 reshard:1 | 130s |
+| 1 | 2 | 2861 | 656 | 0 | 2 -> 4 (committed) | 152 keys re-served | kill:3 restart:3 join:1 leave:1 reshard:1 | 186s |
+
+Across every recorded run: `violations=0` (no acked write lost, corrupted, or
+resurrected across the real process death + copy-free handoff + the coordinator-
+driven doubling), the reconciler COMMITTED a real 2 -> 4 reshard (non-vacuous), and
+a SIGKILL fired under load with the dead owner's keys re-served by a survivor off
+object storage. The 2 -> 4 commit is driven ENTIRELY by the deploy config (the
+re-rolled `--unit-count`): there is no reshard RPC anywhere in the path.
+
+**Run-time note.** The declarative trigger re-rolls every node, which sets off a
+unit-lease redistribution; the harness lets each redistribution settle before the
+reshard barrier scans a unit (otherwise the BISECT scan is fenced by a lease still
+moving - "detected newer DB client"). Under heavy, sustained phase-C churn at the
+doubled count (many nodes + many units mid-redistribution), the strict final sweep
+(which reads EVERY acked key with a per-key budget) can take long enough to exceed
+a tight `go test -timeout`; the recorded rows use a moderate churn window so the
+sweep completes promptly. The loss oracle is unchanged either way - it never trades
+correctness for speed.

@@ -91,6 +91,19 @@ func (c *Client) Ping(ctx context.Context) error {
 	return err
 }
 
+// GenState returns the server's live {generation, unit-count}. With
+// declarative resharding (v0.8) there is no operator Reshard RPC; an
+// observer (the chaos harness, an operator dashboard) reads this to
+// learn the cluster's current generation + unit count and to confirm a
+// declarative doubling actually committed (count N -> 2N at gen g -> g+1).
+func (c *Client) GenState(ctx context.Context) (generation uint64, unitCount uint32, err error) {
+	resp, err := c.api.GenState(ctx, &pb.GenStateRequest{})
+	if err != nil {
+		return 0, 0, err
+	}
+	return resp.GetGeneration(), resp.GetUnitCount(), nil
+}
+
 // -- Rebalancing ops (v0.3 scaffold) ---------------------------------
 
 // MigrateRange opens the source-to-destination stream for the v0.3

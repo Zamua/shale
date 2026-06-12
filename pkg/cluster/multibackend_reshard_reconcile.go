@@ -52,7 +52,16 @@
 
 package cluster
 
-import "github.com/Zamua/shale/pkg/membership"
+import (
+	"log"
+	"os"
+
+	"github.com/Zamua/shale/pkg/membership"
+)
+
+// reshardDebugEnabled gates the declarative-reshard diagnostic logging (off unless
+// SHALE_RESHARD_DEBUG is set). Read once at package init.
+var reshardDebugEnabled = os.Getenv("SHALE_RESHARD_DEBUG") != ""
 
 // lowestIDIsCoordinator is the PURE coordinator-selection rule: among the
 // members snapshot (sorted ascending by id, as membership.Snapshot guarantees),
@@ -166,6 +175,7 @@ func (c *Cluster) reconcileReshard() {
 	// Guard: only the coordinator decides. A non-coordinator is a passive
 	// barrier participant; it must not also kick off a reshard.
 	if !c.isReshardCoordinator() {
+		reshardDebugf("reconcileReshard: not coordinator (self=%s snap=%v)", c.cfg.NodeID, c.membership.Snapshot())
 		return
 	}
 	// Guard 2: unanimous, non-zero desired across all live members. (Guard 1,
@@ -173,6 +183,7 @@ func (c *Cluster) reconcileReshard() {
 	// that schedules the pass.)
 	desired, ok := c.unanimousDesiredCount()
 	if !ok {
+		reshardDebugf("reconcileReshard: NOT unanimous (self=%s snap=%v)", c.cfg.NodeID, c.membership.Snapshot())
 		return
 	}
 	// Guards 3 + 4: desired must be strictly above the live count AND a valid
@@ -184,11 +195,22 @@ func (c *Cluster) reconcileReshard() {
 		// desired == current (already at target, idempotent no-op), desired <
 		// current (never shrink), or a non-power-of-two desired: refuse without
 		// touching the generation.
+		reshardDebugf("reconcileReshard: not a valid doubling (current=%d desired=%d)", current, desired)
 		return
 	}
 	// All guards hold: advance ONE doubling toward desired. A multi-step desired
 	// (2 -> 8) is reached by successive settled passes, each doubling once.
+	reshardDebugf("reconcileReshard: ALL GUARDS HOLD, triggering %d -> %d", current, desired)
 	c.triggerReshardStep()
+}
+
+// reshardDebugf logs a declarative-reshard diagnostic line when SHALE_RESHARD_DEBUG
+// is set in the environment. Off (one cheap env read) in every normal run; used to
+// trace which guard blocks a declarative reshard when validating the harness.
+func reshardDebugf(format string, args ...any) {
+	if reshardDebugEnabled {
+		log.Printf("[reshard-debug] "+format, args...)
+	}
 }
 
 // triggerReshardStep runs the barrier ONCE toward the next doubling, NON-
@@ -212,7 +234,9 @@ func (c *Cluster) triggerReshardStep() {
 		return
 	}
 	defer c.reshardMu.Unlock()
-	_ = c.reshardLocked()
+	if err := c.reshardLocked(); err != nil {
+		reshardDebugf("triggerReshardStep: reshardLocked error: %v", err)
+	}
 }
 
 // TestingIsReshardCoordinator exposes the deterministic-coordinator decision to

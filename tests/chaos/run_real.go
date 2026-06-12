@@ -108,10 +108,19 @@ func runReal(cfg realConfig, logf func(string, ...any)) (rep *realReport, err er
 	close(stop)
 	wg.Wait()
 
-	// Final strict sweep: drive the cluster to a stable membership, then read every
-	// acked key. After settle there is no cutover in flight, so any wrong/missing
-	// value is unconditionally a violation.
+	// Final strict sweep: drive the cluster to a stable membership AND wait for the
+	// unit leases to settle, then read every acked key. After settle there is no
+	// cutover in flight, so any wrong/missing value is unconditionally a violation.
+	// The lease-settle gate is load-bearing for the DECLARATIVE reshard: a reshard
+	// that committed late (or a phase-C kill+restart at the doubled count) leaves
+	// several units mid-redistribution, and the per-key sweep below burns its full
+	// retry budget on every key whose unit is still moving. Waiting until a SAMPLE
+	// of acked keys reads back cleanly proves the leases have landed, so the full
+	// sweep is bounded instead of O(keys x budget). It does NOT weaken the oracle:
+	// the sweep still reads + verifies EVERY key strictly; the gate only delays its
+	// start until the cluster is actually serving.
 	rc.waitMembersStable(20 * time.Second)
+	rc.waitClusterReadable(90 * time.Second)
 	rc.finalSweep()
 
 	rep = &realReport{
@@ -469,10 +478,10 @@ func (rc *realHarness) liveEntrySelector() func() *realNode {
 // generation unchanged; it is logged + retried, since the run is vacuous without a
 // committed reshard.
 //
-// NOTE: the Reshard seam is currently a stub (the operator Reshard RPC it used to
-// dial was deleted; the declarative trigger is wired in the Validate phase), so this
-// presently records no reshard and the run reports VACUOUS. See adapter_real.go
-// realTopology.Reshard.
+// The Reshard seam triggers the doubling the DECLARATIVE way (v0.8): it bumps the
+// desired --unit-count and re-rolls the nodes (the rolling redeploy), then polls
+// GenState until the coordinator commits N -> 2N. There is no operator Reshard RPC.
+// See adapter_real.go realTopology.Reshard.
 func (rc *realHarness) runReshard() {
 	const maxAttempts = 3
 	for attempt := 0; attempt < maxAttempts; attempt++ {
@@ -481,7 +490,7 @@ func (rc *realHarness) runReshard() {
 			rc.met.reshardFrom.Store(uint64(from))
 			rc.met.reshardTo.Store(uint64(to))
 			rc.met.evReshard.Add(1)
-			rc.logf("reshard: COMMITTED %d -> %d (operator RPC, real cluster-coordinated doubling)", from, to)
+			rc.logf("reshard: COMMITTED %d -> %d (declarative trigger: --unit-count re-roll, coordinator-driven doubling)", from, to)
 			// Let the post-reshard unit redistribution settle before the churn phase
 			// piles membership changes on top.
 			time.Sleep(3 * time.Second)
@@ -631,6 +640,55 @@ func (rc *realHarness) waitMembersStable(timeout time.Duration) {
 			return
 		}
 		prev = cur
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+// waitClusterReadable blocks until a SAMPLE of acked keys reads back cleanly
+// through a rotating live entry node (proving the unit leases have settled after
+// the last reshard / churn event), or the timeout passes. It samples up to ~40
+// keys from the oracle snapshot and requires the WHOLE sample to be readable in
+// one pass with a short per-key budget; any miss re-arms the loop. This gates the
+// O(keys x budget) final sweep so it does not start while units are still moving.
+// It is purely a settle gate - it records no verdicts and never fails the run; the
+// strict per-key correctness check is the finalSweep that follows.
+func (rc *realHarness) waitClusterReadable(timeout time.Duration) {
+	snap := rc.or.Snapshot()
+	if len(snap) == 0 {
+		return
+	}
+	// Take up to 40 sample keys (deterministic order not needed; map iteration is
+	// fine for a liveness probe).
+	const sampleSize = 40
+	sample := make([]string, 0, sampleSize)
+	for k := range snap {
+		sample = append(sample, k)
+		if len(sample) >= sampleSize {
+			break
+		}
+	}
+	entrySel := rc.liveEntrySelector()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		allReadable := true
+		for _, k := range sample {
+			obs, err := getObservedBudgetReal(entrySel, rc.met, k, 3*time.Second)
+			if err != nil {
+				allReadable = false
+				break
+			}
+			// A not-found is acceptable here only if the oracle expects a delete;
+			// otherwise treat it as not-yet-settled. We do not verify the value (that
+			// is finalSweep's job) - just that the routed unit serves the key.
+			vd, _ := rc.or.Verify(k, obs)
+			if vd == VerdictLost {
+				allReadable = false
+				break
+			}
+		}
+		if allReadable {
+			return
+		}
 		time.Sleep(500 * time.Millisecond)
 	}
 }

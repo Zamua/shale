@@ -19,8 +19,11 @@ package chaos
 //	              them. The killed owner's acked keys SURVIVE on a survivor.
 //	RemoveNode  = graceful stop (SIGTERM -> shaled.Run's signal handler does a
 //	              clean memberlist Leave + backend Close).
-//	Reshard     = dial the founder + issue the operator Reshard RPC, driving a real
-//	              cluster-coordinated doubling (N -> 2N) over the process boundary.
+//	Reshard     = the DECLARATIVE trigger (v0.8): bump the desired --unit-count
+//	              (N -> 2N) and re-roll every node, the rolling-deploy a
+//	              `kubectl set env` + `kubectl rollout restart` performs. The
+//	              cluster's deterministic coordinator then reshards itself to match
+//	              the new desired count. There is NO operator Reshard RPC anymore.
 //
 // Every node runs `--unit-count > 1` (multi-backend mode) against the SAME bucket
 // + the SAME `--slate-key-prefix`, so the cluster shares ONE durable backing and a
@@ -58,11 +61,12 @@ import (
 // multi-backend mode there is no per-node DbName: every node shares the one bucket
 // + key-prefix and owns whichever GenUnits the ring leases to it.
 type realNode struct {
-	id       string
-	grpcAddr string
-	bindAddr string
-	cmd      *exec.Cmd
-	logPath  string
+	id        string
+	grpcAddr  string
+	bindAddr  string
+	cmd       *exec.Cmd
+	logPath   string
+	unitCount int // the --unit-count (desired) this process was launched with
 
 	mu     sync.Mutex
 	client *rpc.Client
@@ -119,11 +123,17 @@ type realClusterConfig struct {
 type realTopology struct {
 	cfg realClusterConfig
 
-	mu       sync.Mutex
-	nodes    []*realNode
-	nextID   int
-	founder  *realNode // first-launched node; the stable seed + entry anchor
-	structMu sync.Mutex
+	mu     sync.Mutex
+	nodes  []*realNode
+	nextID int
+	// desiredCount is the DECLARATIVE desired unit count every node is launched
+	// with (the --unit-count deploy config). It starts at cfg.unitCount and the
+	// declarative-reshard seam BUMPS it (N -> 2N) before re-rolling the nodes, so
+	// a freshly launched / re-rolled node advertises the new desired count and the
+	// cluster's coordinator reshards itself to match. Read in launchNode under mu.
+	desiredCount int
+	founder      *realNode // first-launched node; the stable seed + entry anchor
+	structMu     sync.Mutex
 }
 
 // newRealTopology launches `count` shaled-slate processes in MULTI-BACKEND mode
@@ -134,7 +144,7 @@ type realTopology struct {
 // off the same unit, NOT a per-node DbName. Returns a live topology or an error
 // (after cleaning up).
 func newRealTopology(cfg realClusterConfig, count int) (*realTopology, error) {
-	t := &realTopology{cfg: cfg}
+	t := &realTopology{cfg: cfg, desiredCount: cfg.unitCount}
 	var seed string
 	for i := 0; i < count; i++ {
 		n, err := t.launchNode(seed)
@@ -164,6 +174,7 @@ func (t *realTopology) launchNode(seedAddr string) (*realNode, error) {
 	t.mu.Lock()
 	t.nextID++
 	id := "real-n" + strconv.Itoa(t.nextID)
+	desired := t.desiredCount
 	t.mu.Unlock()
 
 	const maxAttempts = 6
@@ -186,7 +197,7 @@ func (t *realTopology) launchNode(seedAddr string) (*realNode, error) {
 		// key-prefix is what makes the handoff copy-free across the process boundary.
 		args := []string{
 			"--node-id", id,
-			"--unit-count", strconv.Itoa(t.cfg.unitCount),
+			"--unit-count", strconv.Itoa(desired),
 			"--slate-key-prefix", t.cfg.keyPrefix,
 			"--grpc-addr", grpcAddr,
 			"--bind-addr", bindAddr,
@@ -223,11 +234,12 @@ func (t *realTopology) launchNode(seedAddr string) (*realNode, error) {
 		}
 
 		n := &realNode{
-			id:       id,
-			grpcAddr: grpcAddr,
-			bindAddr: bindAddr,
-			cmd:      cmd,
-			logPath:  logPath,
+			id:        id,
+			grpcAddr:  grpcAddr,
+			bindAddr:  bindAddr,
+			cmd:       cmd,
+			logPath:   logPath,
+			unitCount: desired,
 		}
 
 		// Wait until the node's gRPC answers a Ping (process up + listener bound).
@@ -464,21 +476,265 @@ func (t *realTopology) teardown(id string, graceful bool) error {
 	return nil
 }
 
-// Reshard is the real-cluster reshard seam. The operator Reshard RPC it used to
-// dial was DELETED: resharding is now DECLARATIVE (v0.8), driven from the
-// --unit-count desired-state config rather than an imperative RPC (see
-// docs/SPEC.md "Declarative resharding"). The Validate phase RE-POINTS this seam
-// to the declarative trigger: bump the desired --unit-count env (2 -> 4) on every
-// node, re-roll them, and poll the live count (GenState / Topology) until the
-// cluster's coordinator drives the barrier to completion.
+// Reshard is the real-cluster reshard seam, RE-POINTED to the DECLARATIVE
+// trigger. The operator Reshard RPC it used to dial was DELETED: resharding is
+// now driven from the --unit-count desired-state config rather than an imperative
+// RPC (see docs/SPEC.md "Declarative resharding"). This seam reproduces the real
+// redeploy flow that scales a running cluster:
 //
-// TODO(declarative-reshard-validate): wire the desired-count bump + re-roll +
-// poll here. Until then this returns a clear "not yet wired" error so the harness
-// compiles and reports a VACUOUS run (no reshard committed) rather than dialing a
-// deleted RPC. The reconcile loop the bump drives is itself a later plumbing
-// phase; this seam follows it.
+//  1. Read the cluster's CURRENT count off GenState (the founder's live state).
+//     That is `from`. The declarative target is the doubling `to = from*2`.
+//  2. BUMP the desired --unit-count (the deploy config) to `to`, then RE-ROLL every
+//     live node: restart each shaled-slate process with --unit-count = to, exactly
+//     the rolling-deploy a `kubectl set env` + `kubectl rollout restart` performs.
+//     Each re-rolled node rejoins via a live seed and advertises the new desired
+//     count via its membership Meta; durable units stay in the shared bucket so a
+//     restarted founder DERIVES the still-live count from durable state (it does
+//     NOT re-init at the new desired) and joiners learn it from a seed - so no node
+//     orphans the count-`from` data on restart.
+//  3. POLL GenState until the coordinator's reconcile loop observes a STABLE
+//     membership where ALL live members report the same desired count `to` > the
+//     current count, and drives the freeze barrier to commit `from -> to`. The live
+//     GenState count flipping to `to` is the commit signal.
+//
+// There is NO network reshard RPC: the only trigger is the deploy config, gated by
+// the deploy pipeline (k8s RBAC), which is the whole security point of v0.8.
+// Serialized behind structMu so a concurrent chaos event never re-rolls mid-reshard.
 func (t *realTopology) Reshard() (from, to uint32, err error) {
-	return 0, 0, fmt.Errorf("real-cluster Reshard: declarative trigger not yet wired (operator RPC removed; see docs/SPEC.md Declarative resharding)")
+	t.structMu.Lock()
+	defer t.structMu.Unlock()
+
+	cur, err := t.liveGenCount()
+	if err != nil {
+		return 0, 0, fmt.Errorf("declarative reshard: read current count: %w", err)
+	}
+	if cur < 2 || (cur&(cur-1)) != 0 {
+		return 0, 0, fmt.Errorf("declarative reshard: current count %d is not a power of two > 1", cur)
+	}
+	target := cur * 2
+	from, to = uint32(cur), uint32(target)
+
+	// IDEMPOTENT RE-ROLL: if a prior call already bumped the desired count past the
+	// live count (an earlier attempt re-rolled but its commit-poll timed out), do
+	// NOT re-roll again - the nodes already carry the new --unit-count. Re-rolling a
+	// second time only widens the disruption window. Just (re-)poll for the commit.
+	t.mu.Lock()
+	alreadyRolled := t.desiredCount == int(target)
+	t.desiredCount = int(target)
+	t.mu.Unlock()
+
+	if !alreadyRolled {
+		// Bump the deploy config + re-roll every live node to the new desired count
+		// (the rolling redeploy). Roll the non-founder nodes first (each seeded at the
+		// still-live founder), then the founder last, seeded at an already-re-rolled
+		// peer, so a live seed always exists for the rejoin and the cluster never
+		// drops below one member.
+		if err := t.rollDeploy(int(target)); err != nil {
+			return from, to, fmt.Errorf("declarative reshard: re-roll to --unit-count %d: %w", target, err)
+		}
+	}
+
+	// The coordinator's reconcile fires only once membership is STABLE (debounced)
+	// AND every live member reports the new desired count. Back-to-back re-rolls
+	// keep re-arming that debounce, so let membership QUIESCE after the last roll
+	// before polling for the commit - otherwise the very first poll deadline can
+	// straddle the still-settling window. This mirrors a real deploy: the rollout
+	// completes, then the cluster settles, then the controller reshards.
+	t.quiesceMembership(30 * time.Second)
+	// Final lease-settle: the founder's re-roll (the last one) triggered one more
+	// unit redistribution. Give it a beat to land so the reshard BISECT scans
+	// settled units, not a lease mid-move (the "detected newer DB client" fence).
+	time.Sleep(8 * time.Second)
+
+	// Poll GenState until the coordinator commits the doubling. The reconcile loop
+	// flips the live count to `target` on its own once stable+unanimous. Generous
+	// deadline: a real bisect copies each unit's keys through object storage.
+	if err := t.waitGenCount(int(target), 120*time.Second); err != nil {
+		return from, to, fmt.Errorf("declarative reshard: coordinator did not commit %d -> %d: %w", cur, target, err)
+	}
+	return from, to, nil
+}
+
+// quiesceMembership waits until the founder's live member count is steady across a
+// short window (no joins/leaves), so the coordinator's membership-stable debounce
+// can elapse and its declarative reconcile can fire. Bounded by timeout.
+func (t *realTopology) quiesceMembership(timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	prev, stableSince := -1, time.Now()
+	for time.Now().Before(deadline) {
+		cur := t.MemberCount()
+		if cur != prev {
+			prev = cur
+			stableSince = time.Now()
+		} else if cur > 0 && time.Since(stableSince) >= 4*time.Second {
+			return
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+}
+
+// liveGenCount returns the cluster's current unit count via the founder's GenState
+// RPC (the live {gen,count} every node converges to). The founder is the stable
+// anchor, so this is the authoritative current count for the declarative target.
+func (t *realTopology) liveGenCount() (int, error) {
+	c, err := t.FounderClient()
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	_, count, err := c.GenState(ctx)
+	if err != nil {
+		return 0, err
+	}
+	return int(count), nil
+}
+
+// waitGenCount polls every live node's GenState until ALL of them report the given
+// unit count (the reshard has committed and propagated cluster-wide), or the
+// deadline passes. Requiring agreement across all live nodes - not just the founder
+// - confirms the barrier's FLIP reached every participant, not a straddle.
+func (t *realTopology) waitGenCount(want int, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		live := t.liveNodes()
+		all := len(live) > 0
+		for _, n := range live {
+			n.mu.Lock()
+			c, cerr := n.clientLocked()
+			n.mu.Unlock()
+			if cerr != nil {
+				all = false
+				lastErr = cerr
+				break
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			_, count, gerr := c.GenState(ctx)
+			cancel()
+			if gerr != nil {
+				all = false
+				lastErr = gerr
+				break
+			}
+			if int(count) != want {
+				all = false
+				lastErr = fmt.Errorf("node %s at count %d, want %d", n.id, count, want)
+				break
+			}
+		}
+		if all {
+			return nil
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no live nodes")
+	}
+	return fmt.Errorf("not all live nodes reached count %d within %s (last: %v)", want, timeout, lastErr)
+}
+
+// rollDeploy re-rolls every live node onto the new desired unit count, one at a
+// time, the way a rolling deploy restarts pods. Non-founder nodes roll first (each
+// re-launched seeded at the founder); the founder rolls LAST, seeded at an
+// already-re-rolled peer so a live, already-bumped seed exists for its rejoin. Each
+// re-rolled node carries the new --unit-count (read from t.desiredCount in
+// launchNode), so after the roll every live member advertises desired == target and
+// the coordinator's reconcile loop can fire. Caller holds structMu.
+func (t *realTopology) rollDeploy(target int) error {
+	t.mu.Lock()
+	order := append([]*realNode(nil), t.nodes...)
+	founder := t.founder
+	t.mu.Unlock()
+
+	// Roll non-founder nodes first, founder last.
+	rollOne := func(n *realNode, seed string) error {
+		newNode, err := t.relaunchNode(n, seed)
+		if err != nil {
+			return err
+		}
+		if n == founder {
+			t.mu.Lock()
+			t.founder = newNode
+			t.mu.Unlock()
+		}
+		// Let the rejoin + reconcile settle before rolling the next node, so the
+		// membership-stable debounce the coordinator waits on is not perpetually
+		// reset by back-to-back restarts.
+		if err := t.waitConverged(len(order), 25*time.Second); err != nil {
+			return fmt.Errorf("post-reroll convergence: %w", err)
+		}
+		// LEASE-SETTLE pause. Each restart triggers a unit-lease redistribution
+		// (the Phase 3 copy-free handoff): the rejoined node re-acquires its units
+		// at a higher epoch, fencing the prior holder. Until that quiesces, a unit's
+		// lease is MOVING, and a reshard BISECT that scans a unit mid-move is fenced
+		// ("detected newer DB client"). Rolling the next node immediately would pile
+		// a fresh redistribution on top, so the leases never settle and the eventual
+		// reshard keeps getting fenced. Pause so each node's redistribution lands
+		// before the next restart - the real deploy's per-pod readiness gate.
+		time.Sleep(6 * time.Second)
+		return nil
+	}
+
+	for _, n := range order {
+		if n == founder {
+			continue
+		}
+		if err := rollOne(n, founder.bindAddr); err != nil {
+			return err
+		}
+	}
+	// Founder last: seed it at any other live node (already re-rolled).
+	if len(order) > 1 {
+		live := t.liveNodes()
+		var seed string
+		for _, ln := range live {
+			if ln != founder {
+				seed = ln.bindAddr
+				break
+			}
+		}
+		if seed == "" {
+			return fmt.Errorf("rollDeploy: no live peer to seed the founder's re-roll")
+		}
+		if err := rollOne(founder, seed); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// relaunchNode stops node n (graceful: a clean Leave + slatedb flush, the way a
+// deploy drains a pod before replacing it) and launches a replacement seeded at
+// seedAddr, carrying the current t.desiredCount. The durable units stay in the
+// shared bucket, so the replacement re-OpenUnits the same data (copy-free); it does
+// NOT start fresh. Returns the replacement node. The old node is dropped from the
+// slice and the new one appended. Caller holds structMu.
+func (t *realTopology) relaunchNode(n *realNode, seedAddr string) (*realNode, error) {
+	// Graceful stop (SIGTERM): clean Leave + backend Close so slatedb flushes.
+	n.closeClient()
+	_ = n.cmd.Process.Signal(syscall.SIGTERM)
+	if !waitExit(n.cmd, 10*time.Second) {
+		_ = killProcess(n.cmd)
+	}
+	_ = n.cmd.Wait()
+	n.mu.Lock()
+	n.down = true
+	n.mu.Unlock()
+
+	// Drop the stopped node from the live set.
+	t.mu.Lock()
+	kept := t.nodes[:0]
+	for _, x := range t.nodes {
+		if x != n {
+			kept = append(kept, x)
+		}
+	}
+	t.nodes = kept
+	t.mu.Unlock()
+
+	// Launch the replacement (it reads the bumped t.desiredCount in launchNode).
+	return t.launchNode(seedAddr)
 }
 
 // CloseAll tears down every node (end of run / setup failure). Idempotent.

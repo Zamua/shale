@@ -172,6 +172,63 @@ func TestBisectStatic_AbortThenRetryDoesNotResurrectDeletedKey(t *testing.T) {
 	_ = c.reshardAbort(1) // leave the cluster clean
 }
 
+// TestBisectStatic_RetryReusesAlreadyOpenChild pins the declarative-trigger
+// idempotency fix. Under the DECLARATIVE reshard trigger the coordinator re-fires
+// the barrier on every settled reconcile pass until it commits. A prior BISECT
+// that aborted because a PEER failed can leave THIS node's gen-(g+1) children
+// already OPEN + mounted on its factory handle WITHOUT a local abort having closed
+// them (the abort is best-effort across nodes and may not reach / fully close every
+// node). On the next pass, reshardBisect must NOT fail trying to re-OpenUnit a unit
+// the handle already holds (the factory fences it: "already open ... CloseUnit
+// first"), which would WEDGE the reshard permanently. It must REUSE the mounted
+// child. We reproduce the wedge by driving reshardBisect TWICE with NO intervening
+// abort (so the children stay open on the handle) and assert the second bisect
+// succeeds and the children are correct.
+//
+// Reverting openOrReuseChild (re-opening unconditionally) makes the second
+// reshardBisect fail with the memfactory "already open" error - the wedge this
+// test guards against.
+func TestBisectStatic_RetryReusesAlreadyOpenChild(t *testing.T) {
+	const n = 4
+	c, _ := openReshardCluster(t, n)
+	oldCount := storageunit.MustUnitCount(n)
+
+	const nKeys = 80
+	keys := make([]string, nKeys)
+	for i := 0; i < nKeys; i++ {
+		k := fmt.Sprintf("idem-%04d", i)
+		keys[i] = k
+		if err := c.Put([]byte(k), []byte("v1")); err != nil {
+			t.Fatalf("seed Put %q: %v", k, err)
+		}
+	}
+
+	// Pass 1: FREEZE + BISECT. The children are opened + mounted on the handle.
+	if err := c.reshardFreeze(1); err != nil {
+		t.Fatalf("freeze pass1: %v", err)
+	}
+	if err := c.reshardBisect(1); err != nil {
+		t.Fatalf("bisect pass1: %v", err)
+	}
+	victim := keys[0]
+	if !barrierChildHas(t, c, 0, victim, oldCount) {
+		t.Fatalf("precondition: %q absent from its gen-1 child after pass1 bisect", victim)
+	}
+
+	// Pass 2: BISECT AGAIN with NO intervening abort, so the children are STILL
+	// open on the handle (the peer-abort-did-not-close-locally case). Before the
+	// fix this fails with the factory "already open" fence; with the fix it reuses
+	// the mounted child and succeeds.
+	if err := c.reshardBisect(1); err != nil {
+		t.Fatalf("bisect pass2 (idempotent retry) failed - reshard would wedge: %v", err)
+	}
+	// The rebuilt child is correct: the seeded key is present.
+	if !barrierChildHas(t, c, 0, victim, oldCount) {
+		t.Fatalf("seeded key %q absent from its gen-1 child after the idempotent retry", victim)
+	}
+	_ = c.reshardAbort(1) // leave the cluster clean
+}
+
 // TestReshardFreeze_TakesOverStrandedFreeze is the P1-C re-freeze fix: a node
 // that FLIPPED to gen g+1 but stayed frozen (a dropped RESUME) must let a NEW
 // reshard toward g+2 freeze it, rather than refuse because it is "already frozen

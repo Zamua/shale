@@ -206,17 +206,10 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, gu st
 	h := storageunit.HashShardKey(c.shardKey(key))
 	// Key the pause by the OLD unit at the CURRENT count. resolveGenUnit (under
 	// genMu) decides old-vs-new; the pause must be on the same K the resharder
-	// pauses, which is the old-count unit id.
-	//
-	// TODO(reshard-toctou): the pause key here and resolveGenUnit below read the
-	// genState via two separate genSnapshot() calls. They can only straddle the
-	// reshard's FINAL count flip (N->2N); a single-node reshard at the final
-	// commit could pause on the gen-N K while the resolve picks the gen-(g+1)
-	// unit. In that window the write still lands in the RESOLVED (correct) unit
-	// and the stale pause is harmless (no cut-over is in flight post-reshard),
-	// which is why the 252k-write gate sees no loss; but the two snapshots
-	// should be unified (derive oldK + the resolve from ONE snapshot taken with
-	// the pause held) so the invariant is structural, not incidental.
+	// pauses, which is the old-count unit id. We need oldK to SELECT the pause
+	// lock, which forces one snapshot read before the lock is held; correctness
+	// then comes from re-deriving oldK and the resolve from ONE snapshot taken
+	// WHILE the pause RLock is held (see below).
 	oldK := storageunit.UnitForHash(h, c.genSnapshot().count)
 	pause := c.pauseLockFor(oldK)
 	pause.RLock()
@@ -234,7 +227,19 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, gu st
 	if c.isFrozen() {
 		return nil, storageunit.GenUnit{}, pause.RUnlock, false
 	}
-	gu = c.genSnapshot().resolveGenUnit(h)
+	// TOCTOU FIX (P2): take the authoritative genState snapshot ONCE here, under
+	// the pause RLock, and derive the resolve from it - so the SAME snapshot whose
+	// count would key the pause also governs the resolve. The lock-selection oldK
+	// above was read from a PRIOR snapshot purely to pick which lock to wait on; if
+	// the count flipped between that pre-lock read and this one (only possible
+	// across a reshard's FINAL N->2N commit, the documented harmless window), the
+	// lock we hold is for the gen-N K while this snapshot already routes to the
+	// gen-(g+1) child. We route by the AUTHORITATIVE under-lock snapshot, so the
+	// write always lands in the RESOLVED (correct) unit; and because that snapshot
+	// is also the one whose count re-derives oldK, the cut-over boundary is
+	// structural - there is no second genState read for the routing to straddle.
+	snap := c.genSnapshot()
+	gu = snap.resolveGenUnit(h)
 	c.mountMu.RLock()
 	be, ok = c.mountMap[gu]
 	c.mountMu.RUnlock()
