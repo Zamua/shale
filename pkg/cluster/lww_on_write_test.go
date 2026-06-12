@@ -62,7 +62,7 @@ func runConcurrentIncrements(t *testing.T, nodes []*replicatedNode, key []byte, 
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	errs := make(chan error, workers)
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			err := oc.Transact(key, func(tx backend.Transaction) error {
@@ -72,7 +72,7 @@ func runConcurrentIncrements(t *testing.T, nodes []*replicatedNode, key []byte, 
 				}
 				var n int
 				_, _ = fmt.Sscanf(string(cur), "%d", &n)
-				return tx.Put(key, []byte(fmt.Sprintf("%d", n+1)))
+				return tx.Put(key, fmt.Appendf(nil, "%d", n+1))
 			})
 			if err != nil {
 				errs <- err
@@ -98,7 +98,7 @@ func assertCounterConverged(t *testing.T, nodes []*replicatedNode, oc *cluster.C
 	if string(got) != fmt.Sprintf("%d", want) {
 		t.Fatalf("counter: got %q want %d (lost update: a stale read-repair clobbered the owner-local copy and a CAS commit missed the conflict)", got, want)
 	}
-	wantBytes := []byte(fmt.Sprintf("%d", want))
+	wantBytes := fmt.Appendf(nil, "%d", want)
 	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
 		return present && bytes.Equal(env.Payload, wantBytes)
 	})

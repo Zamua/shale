@@ -74,7 +74,7 @@ func TestReplication_R3_WriteQuorum_ToleratesOneDown(t *testing.T) {
 	// node[0] + node[1] should have the value (we don't assert which
 	// specific two; with R=3 + 3 members, all three are replicas).
 	gotCount := 0
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		raw, err := nodes[i].mem.Get([]byte("q-key"))
 		if err != nil {
 			continue
@@ -161,12 +161,12 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 	bindPorts := []int{freePort(t), freePort(t), freePort(t)}
 	grpcHarnesses := make([]*grpcHarness, 3)
 	grpcStops := make([]func(), 3)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		grpcHarnesses[i], grpcStops[i] = startGRPC(t)
 	}
 
 	clusters := make([]*cluster.Cluster, 3)
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		cfg := cluster.Config{
 			NodeID:               fmt.Sprintf("rep-n%d", i+1),
 			Backend:              mems[i],
@@ -212,8 +212,7 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 	}
 
 	out := make([]*replicatedNode, 3)
-	for i := 0; i < 3; i++ {
-		i := i
+	for i := range 3 {
 		out[i] = &replicatedNode{
 			cluster: clusters[i],
 			mem:     mems[i],

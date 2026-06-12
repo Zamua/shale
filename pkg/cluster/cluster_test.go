@@ -182,7 +182,7 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 // on collision.
 func freePort(t *testing.T) int {
 	t.Helper()
-	for attempt := 0; attempt < 16; attempt++ {
+	for range 16 {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			continue
@@ -270,7 +270,7 @@ func findKeyOwnedBy(t *testing.T, c *cluster.Cluster, wantOwner string, maxProbe
 	if len(c.Members()) < 2 {
 		t.Fatalf("findKeyOwnedBy: ring needs >=2 members, got %v", c.Members())
 	}
-	for i := 0; i < maxProbes; i++ {
+	for i := range maxProbes {
 		k := fmt.Sprintf("probe-%d", i)
 		if ownerFor(c, k) == wantOwner {
 			return k
@@ -328,7 +328,7 @@ func TestAggregate_SingleNode(t *testing.T) {
 // no race-detector warning. Closed-after-start ops return
 // backend.ErrClosed; ops that landed before Close succeed.
 func TestCloseRace(t *testing.T) {
-	for iter := 0; iter < 100; iter++ {
+	for range 100 {
 		c, err := cluster.Open(cluster.Config{NodeID: "n1", Backend: memory.New()})
 		if err != nil {
 			t.Fatalf("Open: %v", err)
@@ -561,7 +561,7 @@ func TestTransact_RemoteContention(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(2 * perNode)
-	for i := 0; i < perNode; i++ {
+	for range perNode {
 		go inc(c1, &wg) // forwards CommitCAS to n2
 		go inc(c2, &wg) // in-process fast-path on n2
 	}
@@ -698,7 +698,7 @@ func TestTwoNode_RebalanceOnMembershipGrowth(t *testing.T) {
 	}
 
 	keys := make([]string, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		k := fmt.Sprintf("rb-%04d", i)
 		if err := putWithMigrationRetry(n1Cluster, []byte(k), []byte("v")); err != nil {
 			t.Fatalf("Put %s: %v", k, err)
@@ -810,7 +810,7 @@ func TestFounderGrows_RebalanceReachesEveryKey(t *testing.T) {
 	}
 
 	keys := make([]string, 100)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		k := fmt.Sprintf("fg-%04d", i)
 		if err := putWithMigrationRetry(founder, []byte(k), []byte("v")); err != nil {
 			t.Fatalf("Put %s: %v", k, err)
@@ -921,7 +921,7 @@ func openClusterNodeAt(t *testing.T, id, bindAddr, seedBindAddr string, mem *mem
 // transient (which uses ResourceExhausted as of v0.4).
 func putWithMigrationRetry(c *cluster.Cluster, key, value []byte) error {
 	var lastErr error
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		err := c.Put(key, value)
 		if err == nil {
 			return nil

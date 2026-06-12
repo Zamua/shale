@@ -155,10 +155,7 @@ func (r *Ring) LocateKeyN(key []byte, n int) []Member {
 	if n <= 0 || len(r.members) == 0 {
 		return nil
 	}
-	want := n
-	if want > len(r.members) {
-		want = len(r.members)
-	}
+	want := min(n, len(r.members))
 	raw, err := r.hash.GetClosestN(ShardKey(key), want)
 	if err != nil {
 		// GetClosestN's only documented failure is "count > members",
@@ -192,7 +189,7 @@ func (r *Ring) PartitionID(key []byte) uint64 {
 // partitionCount of zero; today the slice is always non-empty.
 func (r *Ring) Partitions() []uint64 {
 	out := make([]uint64, partitionCount)
-	for i := 0; i < partitionCount; i++ {
+	for i := range partitionCount {
 		out[i] = uint64(i)
 	}
 	return out
@@ -239,10 +236,7 @@ func (r *Ring) ReplicasForPartition(partitionID uint64, n int) []Member {
 	if partitionID >= uint64(partitionCount) {
 		return nil
 	}
-	want := n
-	if want > len(r.members) {
-		want = len(r.members)
-	}
+	want := min(n, len(r.members))
 	raw, err := r.hash.GetClosestNForPartition(int(partitionID), want)
 	if err != nil {
 		return nil

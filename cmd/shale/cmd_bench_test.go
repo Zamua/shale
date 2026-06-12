@@ -91,10 +91,8 @@ func TestCounterDistributionExactCount(t *testing.T) {
 		var next int64
 		var done int64
 		var wg sync.WaitGroup
-		for w := 0; w < workers; w++ {
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
+		for range workers {
+			wg.Go(func() {
 				for {
 					idx := atomic.AddInt64(&next, 1) - 1
 					if idx >= int64(total) {
@@ -102,7 +100,7 @@ func TestCounterDistributionExactCount(t *testing.T) {
 					}
 					atomic.AddInt64(&done, 1)
 				}
-			}()
+			})
 		}
 		wg.Wait()
 		if got := atomic.LoadInt64(&done); got != total {

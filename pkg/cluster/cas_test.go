@@ -212,7 +212,7 @@ func TestTransact_RetriesToConvergence(t *testing.T) {
 	const workers = 20
 	var wg sync.WaitGroup
 	wg.Add(workers)
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			err := c.Transact([]byte("counter"), func(tx backend.Transaction) error {
@@ -222,7 +222,7 @@ func TestTransact_RetriesToConvergence(t *testing.T) {
 				}
 				var n int
 				_, _ = fmt.Sscanf(string(cur), "%d", &n)
-				return tx.Put([]byte("counter"), []byte(fmt.Sprintf("%d", n+1)))
+				return tx.Put([]byte("counter"), fmt.Appendf(nil, "%d", n+1))
 			})
 			if err != nil {
 				t.Errorf("Transact: %v", err)
@@ -278,7 +278,7 @@ func TestTransact_ExhaustsBudget(t *testing.T) {
 			return err
 		}
 		// Foreign change AFTER the read guarantees the commit conflicts.
-		_ = c.Put([]byte("k"), []byte(fmt.Sprintf("%d", attempts)))
+		_ = c.Put([]byte("k"), fmt.Appendf(nil, "%d", attempts))
 		return tx.Put([]byte("k"), []byte("mine"))
 	})
 	if !errors.Is(err, backend.ErrCASConflict) {

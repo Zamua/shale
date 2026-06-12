@@ -138,7 +138,7 @@ func gen0UnitBytes(u storageunit.UnitID) []byte {
 // current ring. Fails the test if none is found in a reasonable search.
 func keyForOwner(t *testing.T, c *cluster.Cluster, unitCount int, wantOwner string) string {
 	t.Helper()
-	for i := 0; i < 1000; i++ {
+	for i := range 1000 {
 		k := fmt.Sprintf("mb-key-%04d", i)
 		if unitOwnerID(c, k, unitCount) == wantOwner {
 			return k

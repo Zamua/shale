@@ -401,7 +401,7 @@ func TestCASReplicate_R3_NoLostUpdate(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	errs := make(chan error, workers)
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			err := oc.Transact(key, func(tx backend.Transaction) error {
@@ -411,7 +411,7 @@ func TestCASReplicate_R3_NoLostUpdate(t *testing.T) {
 				}
 				var n int
 				_, _ = fmt.Sscanf(string(cur), "%d", &n)
-				return tx.Put(key, []byte(fmt.Sprintf("%d", n+1)))
+				return tx.Put(key, fmt.Appendf(nil, "%d", n+1))
 			})
 			if err != nil {
 				errs <- err
@@ -435,7 +435,7 @@ func TestCASReplicate_R3_NoLostUpdate(t *testing.T) {
 
 	// Durability: the final total must (eventually) land on every replica as
 	// a stamped envelope carrying the counter value.
-	want := []byte(fmt.Sprintf("%d", workers))
+	want := fmt.Appendf(nil, "%d", workers)
 	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
 		return present && bytes.Equal(env.Payload, want)
 	})
@@ -475,7 +475,7 @@ func TestCASReplicate_R3_NoLostUpdate_ReadQuorum(t *testing.T) {
 	var wg sync.WaitGroup
 	wg.Add(workers)
 	errs := make(chan error, workers)
-	for i := 0; i < workers; i++ {
+	for range workers {
 		go func() {
 			defer wg.Done()
 			err := oc.Transact(key, func(tx backend.Transaction) error {
@@ -485,7 +485,7 @@ func TestCASReplicate_R3_NoLostUpdate_ReadQuorum(t *testing.T) {
 				}
 				var n int
 				_, _ = fmt.Sscanf(string(cur), "%d", &n)
-				return tx.Put(key, []byte(fmt.Sprintf("%d", n+1)))
+				return tx.Put(key, fmt.Appendf(nil, "%d", n+1))
 			})
 			if err != nil {
 				errs <- err
@@ -506,7 +506,7 @@ func TestCASReplicate_R3_NoLostUpdate_ReadQuorum(t *testing.T) {
 		t.Fatalf("counter: got %q want %d (lost update: a stale read-repair clobbered the owner-local copy and a CAS commit missed the conflict)", got, workers)
 	}
 
-	want := []byte(fmt.Sprintf("%d", workers))
+	want := fmt.Appendf(nil, "%d", workers)
 	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
 		return present && bytes.Equal(env.Payload, want)
 	})

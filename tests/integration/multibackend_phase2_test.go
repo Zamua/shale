@@ -110,7 +110,7 @@ func TestMBPhase2_SingleNodeMultiUnitPlacement(t *testing.T) {
 	// A spread of keys; with 16 units and varied keys these cover several
 	// distinct units (asserted at the end).
 	keys := make([]string, 0, 50)
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		keys = append(keys, fmt.Sprintf("rec-%04d", i))
 	}
 
@@ -198,7 +198,7 @@ func TestMBPhase2_ForwardingAndCoLocation(t *testing.T) {
 	}
 
 	const colocated = 30
-	for i := 0; i < colocated; i++ {
+	for i := range colocated {
 		k := fmt.Sprintf("{%s}/item/%03d", tag, i)
 		// Write via the NON-owner node so the routing/forwarding handles
 		// placement, not the test.
@@ -213,7 +213,7 @@ func TestMBPhase2_ForwardingAndCoLocation(t *testing.T) {
 
 	// Every co-located key is in the owner's wantUnit backend, and the
 	// non-owner holds none of them.
-	for i := 0; i < colocated; i++ {
+	for i := range colocated {
 		k := fmt.Sprintf("{%s}/item/%03d", tag, i)
 		gotUnit := unitForKeyTest(k, unitCount)
 		if gotUnit != wantUnit {

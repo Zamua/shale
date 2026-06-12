@@ -22,11 +22,11 @@ func seedKeysOwnedBy(t *testing.T, be backend.Backend, r *ring.Ring, owner strin
 	t.Helper()
 	var got [][2][]byte
 	for i := 0; len(got) < n && i < 200000; i++ {
-		k := []byte(fmt.Sprintf("seed-%d", i))
+		k := fmt.Appendf(nil, "seed-%d", i)
 		if r.LocateKey(k).ID != owner {
 			continue
 		}
-		v := []byte(fmt.Sprintf("value-%d", i))
+		v := fmt.Appendf(nil, "value-%d", i)
 		if err := be.Put(k, v); err != nil {
 			t.Fatalf("seed put: %v", err)
 		}

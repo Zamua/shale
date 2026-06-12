@@ -143,7 +143,7 @@ func TestReconcileIdempotent(t *testing.T) {
 	// Capture the epoch each owned unit was opened at; a second reconcile
 	// must NOT re-open (which would bump the epoch).
 	e0, _ := c.factory.CurrentEpoch(gu0(0))
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		c.reconcileUnits()
 	}
 	if got := mountedUnits(c); len(got) != len(first) || got[0] != first[0] || got[1] != first[1] {

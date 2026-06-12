@@ -32,7 +32,6 @@ func TestExitCodeForRPCError(t *testing.T) {
 		{"plain-error-is-generic", errors.New("something broke"), exitGeneric},
 	}
 	for _, c := range cases {
-		c := c
 		t.Run(c.name, func(t *testing.T) {
 			got := exitCodeForRPCError(c.err)
 			if got != c.want {

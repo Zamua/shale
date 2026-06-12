@@ -67,7 +67,7 @@ func deleteWithRetryUnavailable(t *testing.T, c *cluster.Cluster, key string, ti
 // FORWARDS to a peer, exercising the remote (RPC) commit path's freeze gate.
 func remoteKeyFor(t *testing.T, n *sharedNode, unitCount int) string {
 	t.Helper()
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		k := fmt.Sprintf("rk-%d", i)
 		if unitOwnerOnRing(n.Cluster, k, unitCount) != n.ID {
 			return k
@@ -101,9 +101,9 @@ func TestMultiNodeReshard_AbortThenRetryDoesNotResurrectDeletedKey(t *testing.T)
 	// Seed a dataset spanning every unit.
 	want := make(map[string][]byte)
 	const nKeys = 200
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("res-%05d", i)
-		v := []byte(fmt.Sprintf("rv-%05d", i))
+		v := fmt.Appendf(nil, "rv-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 10*time.Second); err != nil {
 			t.Fatalf("seed Put %q: %v", k, err)
 		}
@@ -208,7 +208,7 @@ func TestMultiNodeReshard_DroppedResumeSelfHealsUnfreeze(t *testing.T) {
 	time.Sleep(900 * time.Millisecond)
 
 	// Seed so every unit has data to bisect.
-	for i := 0; i < 120; i++ {
+	for i := range 120 {
 		k := fmt.Sprintf("sh-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, fmt.Sprintf("v-%05d", i), 10*time.Second); err != nil {
 			t.Fatalf("seed Put %q: %v", k, err)
@@ -296,7 +296,7 @@ func TestMultiNodeReshard_TransactUnderFreezeIsRetryableThenCommits(t *testing.T
 	time.Sleep(900 * time.Millisecond)
 
 	// Seed so every unit has data to bisect.
-	for i := 0; i < 120; i++ {
+	for i := range 120 {
 		k := fmt.Sprintf("tx-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, fmt.Sprintf("sv-%05d", i), 10*time.Second); err != nil {
 			t.Fatalf("seed Put %q: %v", k, err)
@@ -381,7 +381,7 @@ func TestMultiNodeReshard_TransactUnderFreezeIsRetryableThenCommits(t *testing.T
 
 	// === ASSERTION (P2-A): both Transacts COMMITTED (no hard failure across the
 	// freeze). ===
-	for i := 0; i < 2; i++ {
+	for range 2 {
 		select {
 		case r := <-results:
 			if r.err != nil {
@@ -426,9 +426,9 @@ func TestMultiNodeReshard_MembershipSwapAcrossBarrierAborts(t *testing.T) {
 
 	// Seed a dataset spanning every unit.
 	want := make(map[string][]byte)
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		k := fmt.Sprintf("ms-%05d", i)
-		v := []byte(fmt.Sprintf("mv-%05d", i))
+		v := fmt.Appendf(nil, "mv-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 10*time.Second); err != nil {
 			t.Fatalf("seed Put %q: %v", k, err)
 		}

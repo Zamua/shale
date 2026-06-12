@@ -30,7 +30,7 @@ func TestCopyFreeHandoff(t *testing.T) {
 	if err != nil {
 		t.Fatalf("A.OpenUnit: %v", err)
 	}
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		k := []byte{byte('k'), byte('0' + i)}
 		if err := ba.Put(k, []byte("acked")); err != nil {
 			t.Fatalf("A.Put %q: %v", k, err)
@@ -47,7 +47,7 @@ func TestCopyFreeHandoff(t *testing.T) {
 	}
 
 	// B sees all 5 acked keys WITHOUT any copy - it opened the same store.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		k := []byte{byte('k'), byte('0' + i)}
 		got, err := bb.Get(k)
 		if err != nil {

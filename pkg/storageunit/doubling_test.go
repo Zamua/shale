@@ -52,7 +52,7 @@ func TestChildUnit_LandsInExactlyKOrKPlusN(t *testing.T) {
 		// For each parent K, collect the set of children seen across all
 		// hashes whose parent is K.
 		childrenSeen := make(map[storageunit.UnitID]map[storageunit.UnitID]bool)
-		for k := 0; k < n; k++ {
+		for k := range n {
 			childrenSeen[storageunit.UnitID(k)] = make(map[storageunit.UnitID]bool)
 		}
 
@@ -76,7 +76,7 @@ func TestChildUnit_LandsInExactlyKOrKPlusN(t *testing.T) {
 		// Every parent must have reached BOTH of its children (the bisect is
 		// total: a unit with only one observed child would be a broken
 		// split that happens to stay in range).
-		for k := 0; k < n; k++ {
+		for k := range n {
 			got := childrenSeen[storageunit.UnitID(k)]
 			wantLow := storageunit.UnitID(k)
 			wantHigh := storageunit.UnitID(k + n)
@@ -137,7 +137,7 @@ func TestChildUnits_PartitionsTheChildSpace(t *testing.T) {
 	for _, n := range []int{4, 8, 16} {
 		old := storageunit.MustUnitCount(n)
 		covered := make(map[storageunit.UnitID]int)
-		for k := 0; k < n; k++ {
+		for k := range n {
 			low, high, err := storageunit.ChildUnits(storageunit.UnitID(k), old)
 			if err != nil {
 				t.Fatalf("ChildUnits(%d, N=%d): %v", k, n, err)
@@ -172,7 +172,7 @@ func TestParentUnit_InvertsChildUnits(t *testing.T) {
 	for _, n := range []int{2, 4, 8, 16} {
 		old := storageunit.MustUnitCount(n)
 		newCount, _ := old.Double()
-		for k := 0; k < n; k++ {
+		for k := range n {
 			low, high, err := storageunit.ChildUnits(storageunit.UnitID(k), old)
 			if err != nil {
 				t.Fatalf("ChildUnits(%d, N=%d): %v", k, n, err)
@@ -205,8 +205,8 @@ func TestParentUnit_MinCannotHalve(t *testing.T) {
 func TestDoubling_CoLocationStableUnderGrowth(t *testing.T) {
 	old := storageunit.MustUnitCount(8)
 	newCount, _ := old.Double()
-	for i := 0; i < 10000; i++ {
-		h := storageunit.HashShardKey([]byte(fmt.Sprintf("k-%d", i)))
+	for i := range 10000 {
+		h := storageunit.HashShardKey(fmt.Appendf(nil, "k-%d", i))
 		parent := storageunit.UnitForHash(h, old)
 		afterDouble := storageunit.UnitForHash(h, newCount)
 		low, high, err := storageunit.ChildUnits(parent, old)

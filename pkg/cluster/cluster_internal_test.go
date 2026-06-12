@@ -262,7 +262,7 @@ func TestPut_DuringMigrationReturnsUnavailable(t *testing.T) {
 	// Seed enough keys that any randomly migrating partition holds
 	// at least one. 200 spreads across 271 partitions ~uniformly.
 	var keys [][]byte
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		k := []byte("rb-" + strconv.Itoa(i))
 		if err := c.Put(k, []byte("v")); err != nil {
 			t.Fatalf("seed put: %v", err)
@@ -372,7 +372,7 @@ func TestOpen_RebalanceInitBeforeEventsLoop(t *testing.T) {
 	// Hammer Open a few times in a row. With the bug, even one of
 	// these is enough for -race to fire; the loop just shortens the
 	// odds when run on a quiet machine.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		joiner := startInternalNode(t, "race-joiner-"+strconv.Itoa(i), seed.bindAddr)
 		// Wait for the joiner to converge on the seed's membership so
 		// any race in the bootstrap Evaluate has a fair chance to fire.

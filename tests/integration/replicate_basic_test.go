@@ -27,9 +27,9 @@ func TestReplicate_R2_KeyLandsOnBothReplicas(t *testing.T) {
 	nodes := startReplicatedCluster(t, 3, 2, cluster.WriteQuorum, cluster.ReadNearest)
 
 	const n = 100
-	for i := 0; i < n; i++ {
-		key := []byte(fmt.Sprintf("rep2-%04d", i))
-		val := []byte(fmt.Sprintf("v-%04d", i))
+	for i := range n {
+		key := fmt.Appendf(nil, "rep2-%04d", i)
+		val := fmt.Appendf(nil, "v-%04d", i)
 		if err := nodes[0].Cluster.Put(key, val); err != nil {
 			t.Fatalf("Put %s via N1: %v", key, err)
 		}
@@ -49,9 +49,9 @@ func TestReplicate_R2_KeyLandsOnBothReplicas(t *testing.T) {
 		byID[nd.ID] = nd
 	}
 
-	for i := 0; i < n; i++ {
-		key := []byte(fmt.Sprintf("rep2-%04d", i))
-		want := []byte(fmt.Sprintf("v-%04d", i))
+	for i := range n {
+		key := fmt.Appendf(nil, "rep2-%04d", i)
+		want := fmt.Appendf(nil, "v-%04d", i)
 		replicas := r.LocateKeyN(key, 2)
 		if len(replicas) != 2 {
 			t.Fatalf("LocateKeyN(%s, 2) returned %d members", key, len(replicas))
@@ -92,9 +92,9 @@ func TestReplicate_R2_KeyLandsOnBothReplicas(t *testing.T) {
 	// replicas own them. ReadNearest hops to the primary; even when N3
 	// is the primary itself the local-replica fast-path serves the
 	// envelope.
-	for i := 0; i < n; i++ {
-		key := []byte(fmt.Sprintf("rep2-%04d", i))
-		want := []byte(fmt.Sprintf("v-%04d", i))
+	for i := range n {
+		key := fmt.Appendf(nil, "rep2-%04d", i)
+		want := fmt.Appendf(nil, "v-%04d", i)
 		got, err := nodes[2].Cluster.Get(key)
 		if err != nil {
 			t.Fatalf("N3.Get %s: %v", key, err)

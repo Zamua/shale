@@ -185,9 +185,9 @@ func TestLosslessHandoffGate(t *testing.T) {
 	want := make(map[string][]byte) // the recorded dataset: key -> exact value
 
 	const nPlain = 400
-	for i := 0; i < nPlain; i++ {
+	for i := range nPlain {
 		k := fmt.Sprintf("rec-%05d", i)
-		v := []byte(fmt.Sprintf("val-%05d-payload", i))
+		v := fmt.Appendf(nil, "val-%05d-payload", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 8*time.Second); err != nil {
 			t.Fatalf("baseline Put %q: %v", k, err)
 		}
@@ -199,12 +199,12 @@ func TestLosslessHandoffGate(t *testing.T) {
 	// node will later own.
 	const nTags, perTag = 12, 8
 	tagSets := make(map[string][]string) // tag -> its keys
-	for ti := 0; ti < nTags; ti++ {
+	for ti := range nTags {
 		tag := fmt.Sprintf("acct%02d", ti)
 		set := make([]string, 0, perTag)
-		for mi := 0; mi < perTag; mi++ {
+		for mi := range perTag {
 			k := fmt.Sprintf("{%s}/field-%d", tag, mi)
-			v := []byte(fmt.Sprintf("co-%s-%d", tag, mi))
+			v := fmt.Appendf(nil, "co-%s-%d", tag, mi)
 			if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 8*time.Second); err != nil {
 				t.Fatalf("co-located Put %q: %v", k, err)
 			}
@@ -321,7 +321,7 @@ func TestLosslessHandoffGate(t *testing.T) {
 	// resolution (unit = hash(shardKey) & (N-1)) lands them in probeUnit's
 	// store. We synthesize a {tag} that maps to probeUnit and use it for both.
 	tagForProbe := tagWithUnit(probeUnit, unitCount)
-	sentinelKey := []byte(fmt.Sprintf("{%s}/copyfree-direct", tagForProbe))
+	sentinelKey := fmt.Appendf(nil, "{%s}/copyfree-direct", tagForProbe)
 	sentinelVal := []byte("written-straight-to-shared-backing")
 	if err := sharedStore.Put(sentinelKey, sentinelVal); err != nil {
 		t.Fatalf("COPY-FREE check: direct write to shared backing for unit %d: %v", probeUnit, err)
@@ -433,7 +433,7 @@ func unitsOwnedInTwoNodeRing(target, founderID string, unitCount int) []storageu
 // a power-of-two unit count well below the label space size).
 func tagWithUnit(target storageunit.UnitID, unitCount int) string {
 	uc := storageunit.MustUnitCount(unitCount)
-	for i := 0; i < 1_000_000; i++ {
+	for i := range 1_000_000 {
 		tag := fmt.Sprintf("probe%d", i)
 		if storageunit.UnitForShardKey([]byte(tag), uc) == target {
 			return tag
@@ -595,9 +595,9 @@ func TestGateCatchesLostWrite(t *testing.T) {
 	// Write acked keys spread across units. Record key -> value.
 	want := make(map[string][]byte)
 	const nKeys = 200
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("brk-%04d", i)
-		v := []byte(fmt.Sprintf("bval-%04d", i))
+		v := fmt.Appendf(nil, "bval-%04d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 8*time.Second); err != nil {
 			t.Fatalf("Put %q: %v", k, err)
 		}

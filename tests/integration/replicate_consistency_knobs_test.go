@@ -191,7 +191,7 @@ func startCountingCluster(t *testing.T, count, r int, wc cluster.WriteConsistenc
 	t.Helper()
 	nodes := make([]*countingTestNode, 0, count)
 	seed := ""
-	for i := 0; i < count; i++ {
+	for i := range count {
 		n := startCountingNode(t, fmt.Sprintf("cnt-n%d", i+1), seed, r, wc, rc)
 		if i == 0 {
 			seed = n.BindAddr

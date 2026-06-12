@@ -267,7 +267,7 @@ func TestDropCountObservable(t *testing.T) {
 	// here + poke the delegate via the same path it does internally.
 	// Sending more than channel-buffer-size with no reader forces
 	// drops; the counter should reflect them.
-	for i := 0; i < 256; i++ {
+	for range 256 {
 		ev := Event{Type: EventJoin, Member: Member{ID: "x"}}
 		m.events.mu.RLock()
 		select {

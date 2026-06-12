@@ -45,9 +45,9 @@ func TestReshard_SingleNodeNoAckedWriteLost(t *testing.T) {
 
 	want := make(map[string][]byte)
 	const nKeys = 300
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("rs-%04d", i)
-		v := []byte(fmt.Sprintf("v-%04d", i))
+		v := fmt.Appendf(nil, "v-%04d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 5*time.Second); err != nil {
 			t.Fatalf("Put %q: %v", k, err)
 		}
@@ -102,9 +102,9 @@ func TestReshard_MultiNodeFreezeBarrier(t *testing.T) {
 
 	want := make(map[string][]byte)
 	const nKeys = 300
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("fb-%05d", i)
-		v := []byte(fmt.Sprintf("fv-%05d", i))
+		v := fmt.Appendf(nil, "fv-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 8*time.Second); err != nil {
 			t.Fatalf("baseline Put %q: %v", k, err)
 		}
@@ -151,7 +151,7 @@ func TestReshard_MultiNodeFreezeBarrier(t *testing.T) {
 	// new generation's unit space is live cluster-wide.
 	newCount := storageunit.MustUnitCount(2 * unitCount)
 	var highKey string
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		k := fmt.Sprintf("hi-%d", i)
 		u := storageunit.UnitForShardKey(ring.ShardKey([]byte(k)), newCount)
 		if uint32(u) >= unitCount {
@@ -274,7 +274,7 @@ func putWithRetryReshard(t *testing.T, c *cluster.Cluster, key, val string, time
 // write path (and thus the local freeze gate), not a forward to a peer.
 func localKeyFor(t *testing.T, n *sharedNode, unitCount int) string {
 	t.Helper()
-	for i := 0; i < 100000; i++ {
+	for i := range 100000 {
 		k := fmt.Sprintf("lk-%d", i)
 		if unitOwnerOnRing(n.Cluster, k, unitCount) == n.ID {
 			return k
@@ -296,7 +296,7 @@ func TestReshard_ConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	n1 := startSharedNode(t, "rc1", "", unitCount, backing)
 
 	// Seed so every unit has data.
-	for i := 0; i < 150; i++ {
+	for i := range 150 {
 		k := fmt.Sprintf("cseed-%04d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, "s", 5*time.Second); err != nil {
 			t.Fatalf("seed Put: %v", err)
@@ -308,14 +308,14 @@ func TestReshard_ConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const writers = 4
-	for w := 0; w < writers; w++ {
+	for w := range writers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			i := 0
 			for !stop.Load() {
 				k := fmt.Sprintf("chot-%d-%06d", w, i)
-				v := []byte(fmt.Sprintf("cv-%d-%06d", w, i))
+				v := fmt.Appendf(nil, "cv-%d-%06d", w, i)
 				// Retry the transient acquiring-window error; any other error is
 				// a real failure. A write only counts as acked once Put returns
 				// nil.
@@ -376,7 +376,7 @@ func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	time.Sleep(700 * time.Millisecond)
 
 	// Seed so every unit has data to bisect.
-	for i := 0; i < 150; i++ {
+	for i := range 150 {
 		k := fmt.Sprintf("mcseed-%04d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, "s", 8*time.Second); err != nil {
 			t.Fatalf("seed Put: %v", err)
@@ -388,7 +388,7 @@ func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const writers = 4
-	for w := 0; w < writers; w++ {
+	for w := range writers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
@@ -403,7 +403,7 @@ func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 					entry = n2
 				}
 				k := fmt.Sprintf("mchot-%d-%07d", w, i)
-				v := []byte(fmt.Sprintf("mcv-%d-%07d", w, i))
+				v := fmt.Appendf(nil, "mcv-%d-%07d", w, i)
 				if err := putWithRetryReshard(t, entry.Cluster, k, string(v), 10*time.Second); err != nil {
 					t.Errorf("concurrent Put %q during multi-node reshard: %v", k, err)
 					return

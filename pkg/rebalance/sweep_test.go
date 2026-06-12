@@ -43,10 +43,10 @@ func TestSweep_DeletesHandedOffKeysAfterGrace(t *testing.T) {
 		if i > 50000 {
 			t.Fatalf("could not seed enough moving/stable keys")
 		}
-		k := []byte(fmt.Sprintf("k-%d", i))
+		k := fmt.Appendf(nil, "k-%d", i)
 		oldOwner := old.LocateKey(k).ID
 		newOwner := next.LocateKey(k).ID
-		v := []byte(fmt.Sprintf("v-%d", i))
+		v := fmt.Appendf(nil, "v-%d", i)
 		switch {
 		case oldOwner == "n1" && newOwner == "n2" && len(moving) < 5:
 			if err := be.Put(k, v); err != nil {
@@ -115,8 +115,8 @@ func TestSweep_PreGraceRangesUntouched(t *testing.T) {
 
 	// Seed a moving key so there is something the sweep could delete.
 	var moving []byte
-	for i := 0; i < 5000; i++ {
-		k := []byte(fmt.Sprintf("k-%d", i))
+	for i := range 5000 {
+		k := fmt.Appendf(nil, "k-%d", i)
 		if old.LocateKey(k).ID == "n1" && next.LocateKey(k).ID == "n2" {
 			moving = k
 			if err := be.Put(k, []byte("v")); err != nil {

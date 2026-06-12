@@ -90,7 +90,6 @@ func fanout(
 	var wg sync.WaitGroup
 	wg.Add(n)
 	for _, r := range replicas {
-		r := r
 		go func() {
 			defer wg.Done()
 			v, err := op(ctx, r)
@@ -231,10 +230,7 @@ func requiredReadReplicas(rc ReadConsistency, r int) int {
 // Clamping against the live ring size happens at fan-out time inside
 // ring.LocateKeyN, not here.
 func (c *Cluster) replicationFactor() int {
-	r := c.cfg.ReplicationFactor
-	if r < 1 {
-		r = 1
-	}
+	r := max(c.cfg.ReplicationFactor, 1)
 	return r
 }
 
@@ -354,10 +350,7 @@ func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 		return nil, status.Error(codes.Unavailable, "shale: no replicas available for key")
 	}
 	rc := c.cfg.ReadConsistency
-	n := requiredReadReplicas(rc, len(allReplicas))
-	if n > len(allReplicas) {
-		n = len(allReplicas)
-	}
+	n := min(requiredReadReplicas(rc, len(allReplicas)), len(allReplicas))
 	// Dispatch to every replica, not just the first N. requiredAcks
 	// stays at n so the fanout signals "decided" once we have enough
 	// successful responses; surplus dispatches keep running so they
@@ -535,12 +528,9 @@ func (c *Cluster) scheduleReadRepair(key []byte, winnerEnv Envelope, gathered []
 		return
 	}
 	for _, m := range laggers {
-		m := m
-		c.repairWG.Add(1)
-		go func() {
-			defer c.repairWG.Done()
+		c.repairWG.Go(func() {
 			_ = c.dispatchReplicaPut(c.repairCtx, m, key, winnerBytes)
-		}()
+		})
 	}
 }
 

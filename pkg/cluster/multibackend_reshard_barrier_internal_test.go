@@ -33,8 +33,8 @@ func TestBisectStatic_DrainsInFlightWriterViaWritePause(t *testing.T) {
 	c, _ := openReshardCluster(t, n)
 
 	// Seed so every unit has data to bisect.
-	for i := 0; i < 40; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("k-%03d", i)), []byte("v")); err != nil {
+	for i := range 40 {
+		if err := c.Put(fmt.Appendf(nil, "k-%03d", i), []byte("v")); err != nil {
 			t.Fatalf("seed Put: %v", err)
 		}
 	}
@@ -56,15 +56,13 @@ func TestBisectStatic_DrainsInFlightWriterViaWritePause(t *testing.T) {
 
 	var bisectDone atomic.Bool
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		// bisectUnitStatic for unit k must block on pause.Lock() until the
 		// "writer" releases. (reshardBisect bisects every mounted old unit; the
 		// one for k blocks the whole pass.)
 		_ = c.reshardBisect(1)
 		bisectDone.Store(true)
-	}()
+	})
 
 	// Give the bisect time to reach (and block on) the WRITE-lock for k.
 	time.Sleep(80 * time.Millisecond)
@@ -122,7 +120,7 @@ func TestBisectStatic_AbortThenRetryDoesNotResurrectDeletedKey(t *testing.T) {
 	// Seed keys spanning the unit space.
 	const nKeys = 80
 	keys := make([]string, nKeys)
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("res-%04d", i)
 		keys[i] = k
 		if err := c.Put([]byte(k), []byte("v1")); err != nil {

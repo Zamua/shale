@@ -55,8 +55,8 @@ func (b *blockingSource) release() {
 // in oldR and n2 owns in newR, so the move shows up in n1's plan.
 func findSendingKey(t *testing.T, oldR, newR *ring.Ring, sender, receiver string) []byte {
 	t.Helper()
-	for i := 0; i < 5000; i++ {
-		k := []byte(fmt.Sprintf("k-%d", i))
+	for i := range 5000 {
+		k := fmt.Appendf(nil, "k-%d", i)
 		if oldR.LocateKey(k).ID == sender && newR.LocateKey(k).ID == receiver {
 			return k
 		}
@@ -98,8 +98,8 @@ func TestIsMigrating_TrueDuringSending(t *testing.T) {
 	}
 
 	// Pick a key that never moves; IsMigrating should be false.
-	for i := 0; i < 5000; i++ {
-		k := []byte(fmt.Sprintf("stable-%d", i))
+	for i := range 5000 {
+		k := fmt.Appendf(nil, "stable-%d", i)
 		if old.LocateKey(k).ID == next.LocateKey(k).ID {
 			if c.IsMigrating(k) {
 				t.Fatalf("IsMigrating should be false for stable key %q; snapshot: %+v", k, c.Snapshot())

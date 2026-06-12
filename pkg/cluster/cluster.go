@@ -1452,10 +1452,7 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 	results := make([]AggregateResult, len(members))
 	var wg sync.WaitGroup
 	for i, m := range members {
-		i, m := i, m
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+		wg.Go(func() {
 			if m.ID == c.cfg.NodeID {
 				if c.multi {
 					// Multi-backend: no single c.backend. Give fn a
@@ -1482,7 +1479,7 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 			// (fn iterates it), so close only after fn returns.
 			defer func() { _ = snap.Close() }()
 			results[i] = AggregateResult{Value: fn(snap)}
-		}()
+		})
 	}
 	wg.Wait()
 	return results

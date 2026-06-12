@@ -32,7 +32,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -207,10 +207,8 @@ func runPhase(name string, cli *rpc.Client, concurrency, total int, prefix strin
 	var wg sync.WaitGroup
 
 	start := time.Now()
-	for w := 0; w < concurrency; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range concurrency {
+		wg.Go(func() {
 			for {
 				idx := atomic.AddInt64(&next, 1) - 1
 				if idx >= int64(total) {
@@ -235,7 +233,7 @@ func runPhase(name string, cli *rpc.Client, concurrency, total int, prefix strin
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	dur := time.Since(start)
@@ -266,7 +264,7 @@ func runPhase(name string, cli *rpc.Client, concurrency, total int, prefix strin
 // space. Width is 8 to keep keys lexically sortable up to 99999999 ops
 // (more than this bench would ever issue in one run).
 func keyAt(prefix string, i int64) []byte {
-	return []byte(fmt.Sprintf("%s%08d", prefix, i))
+	return fmt.Appendf(nil, "%s%08d", prefix, i)
 }
 
 // percentile sorts xs in place and returns the q-th percentile via
@@ -278,7 +276,7 @@ func percentile(xs []time.Duration, q float64) time.Duration {
 	if n == 0 {
 		return 0
 	}
-	sort.Slice(xs, func(i, j int) bool { return xs[i] < xs[j] })
+	slices.Sort(xs)
 	if q <= 0 {
 		return xs[0]
 	}
@@ -286,13 +284,7 @@ func percentile(xs []time.Duration, q float64) time.Duration {
 		return xs[n-1]
 	}
 	// Nearest-rank: index = ceil(q * n) - 1, clamped.
-	idx := int(q*float64(n) + 0.999999999)
-	if idx < 1 {
-		idx = 1
-	}
-	if idx > n {
-		idx = n
-	}
+	idx := min(max(int(q*float64(n)+0.999999999), 1), n)
 	return xs[idx-1]
 }
 

@@ -142,7 +142,7 @@ func TestReplication_R3_ReadNearest_NoReadRepair(t *testing.T) {
 	// A Nearest read from any node touches only one replica. Run a
 	// few + then verify node[2]'s poisoned bytes are still present
 	// (no read-repair fired).
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		_, _ = nodes[i%3].cluster.Get([]byte("nr"))
 	}
 	time.Sleep(100 * time.Millisecond)

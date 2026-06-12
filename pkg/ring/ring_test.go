@@ -45,7 +45,7 @@ func TestLocateKey_Deterministic(t *testing.T) {
 		r.Add(ring.Member{ID: id, Addr: "host:" + id})
 	}
 	first := r.LocateKey([]byte("repeatable-key"))
-	for i := 0; i < 50; i++ {
+	for i := range 50 {
 		got := r.LocateKey([]byte("repeatable-key"))
 		if got != first {
 			t.Fatalf("LocateKey is not deterministic: first=%+v iter %d=%+v", first, i, got)
@@ -135,8 +135,8 @@ func TestRemove_DropsMember(t *testing.T) {
 	}
 
 	// LocateKey must never return n2 for any sampled key.
-	for i := 0; i < 1000; i++ {
-		got := r.LocateKey([]byte(fmt.Sprintf("key-%d", i)))
+	for i := range 1000 {
+		got := r.LocateKey(fmt.Appendf(nil, "key-%d", i))
 		if got.ID == "n2" {
 			t.Fatalf("LocateKey returned removed member n2 for key-%d", i)
 		}
@@ -185,7 +185,7 @@ func TestPartitions_FixedCount(t *testing.T) {
 	}
 	// Partitions are ascending ids starting at 0; the count is the
 	// ring's configured partitionCount (271 at the time of writing).
-	for i := 0; i < len(parts); i++ {
+	for i := range parts {
 		if parts[i] != uint64(i) {
 			t.Fatalf("Partitions[%d] = %d, want %d", i, parts[i], i)
 		}
@@ -205,8 +205,8 @@ func TestOwner_AgreesWithLocateKey(t *testing.T) {
 	for _, id := range []string{"a", "b", "c", "d"} {
 		r.Add(ring.Member{ID: id, Addr: "h:" + id})
 	}
-	for i := 0; i < 50; i++ {
-		k := []byte(fmt.Sprintf("k-%d", i))
+	for i := range 50 {
+		k := fmt.Appendf(nil, "k-%d", i)
 		want := r.LocateKey(k)
 		got := r.Owner(r.PartitionID(k))
 		if got != want {
@@ -233,14 +233,14 @@ func TestDistribution_BoundedByLoadFactor(t *testing.T) {
 		loadFact = 1.25 // matches ring.go's loadFactor
 	)
 	r := ring.New()
-	for i := 0; i < members; i++ {
+	for i := range members {
 		id := fmt.Sprintf("n%d", i)
 		r.Add(ring.Member{ID: id, Addr: "h:" + id})
 	}
 
 	counts := make(map[string]int, members)
-	for i := 0; i < keys; i++ {
-		m := r.LocateKey([]byte(fmt.Sprintf("key-%d", i)))
+	for i := range keys {
+		m := r.LocateKey(fmt.Appendf(nil, "key-%d", i))
 		counts[m.ID]++
 	}
 	if len(counts) != members {

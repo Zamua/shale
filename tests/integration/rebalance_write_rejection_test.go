@@ -75,7 +75,7 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 	}
 
 	var target string
-	for i := 0; i < 5000; i++ {
+	for i := range 5000 {
 		candidate := fmt.Sprintf("wr-target-%05d", i)
 		oldOwner := currentRing.LocateKey([]byte(candidate)).ID
 		newOwner := futureRing.LocateKey([]byte(candidate)).ID

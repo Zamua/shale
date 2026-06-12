@@ -58,6 +58,7 @@ import (
 //   - partFn nil: should not happen (Evaluate wires it before calling
 //     reconcile), but guard so a misordered caller is a no-op, not a
 //     panic.
+//
 // reconcile runs one owned-but-missing repair pass. retryEmpty controls
 // whether a partition that previously drained EMPTY (zero keys) is
 // re-pulled: false on the settle-timer Evaluate path (so a stable ring

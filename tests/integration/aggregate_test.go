@@ -23,7 +23,7 @@ func TestThreeNode_AggregateFansOutPerNode(t *testing.T) {
 
 	const n = 300
 	written := make(map[string]bool, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := fmt.Sprintf("agg-%04d", i)
 		written[k] = true
 		if err := f.N1.Cluster.Put([]byte(k), []byte("v")); err != nil {
@@ -130,7 +130,7 @@ func TestThreeNode_StatsKeysHeldIsPerNode(t *testing.T) {
 	f := newThreeNodeFixture(t)
 
 	const n = 300
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := fmt.Sprintf("stats-%04d", i)
 		if err := f.N1.Cluster.Put([]byte(k), []byte("v")); err != nil {
 			t.Fatalf("Put %s: %v", k, err)

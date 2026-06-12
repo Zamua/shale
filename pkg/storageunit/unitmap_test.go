@@ -14,8 +14,8 @@ func TestUnitForHash_InRange(t *testing.T) {
 	// Every hash must land in [0, N) for several power-of-two counts.
 	for _, n := range []int{1, 2, 4, 8, 16, 256, 1024} {
 		c := storageunit.MustUnitCount(n)
-		for i := 0; i < 5000; i++ {
-			h := storageunit.HashShardKey([]byte(fmt.Sprintf("key-%d", i)))
+		for i := range 5000 {
+			h := storageunit.HashShardKey(fmt.Appendf(nil, "key-%d", i))
 			u := storageunit.UnitForHash(h, c)
 			if !c.Contains(u) {
 				t.Fatalf("UnitForHash landed out of range: hash=%d N=%d unit=%d", h, n, u)
@@ -28,7 +28,7 @@ func TestUnitForHash_Deterministic(t *testing.T) {
 	c := storageunit.MustUnitCount(16)
 	h := storageunit.HashShardKey([]byte("repeatable"))
 	first := storageunit.UnitForHash(h, c)
-	for i := 0; i < 100; i++ {
+	for i := range 100 {
 		if got := storageunit.UnitForHash(h, c); got != first {
 			t.Fatalf("UnitForHash not deterministic: first=%d iter %d=%d", first, i, got)
 		}
@@ -100,8 +100,8 @@ func TestColocation_SameHashSameUnit(t *testing.T) {
 // ring's live partition routing (which v0.8 re-keys onto unit ids anyway).
 func TestUnitMap_HashesRingShardKeyWithXXHash(t *testing.T) {
 	c := storageunit.MustUnitCount(32)
-	for i := 0; i < 200; i++ {
-		key := []byte(fmt.Sprintf("{user%d}/payload/%d", i, i))
+	for i := range 200 {
+		key := fmt.Appendf(nil, "{user%d}/payload/%d", i, i)
 		shardKey := ring.ShardKey(key)
 		// The hash the ring uses on the shard key.
 		ringHash := xxhash.Sum64(shardKey)
@@ -119,8 +119,8 @@ func TestUnitMap_HashesRingShardKeyWithXXHash(t *testing.T) {
 func TestUnitForHash_DistributesAcrossUnits(t *testing.T) {
 	c := storageunit.MustUnitCount(16)
 	seen := make(map[storageunit.UnitID]int)
-	for i := 0; i < 100000; i++ {
-		u := storageunit.UnitForShardKey([]byte(fmt.Sprintf("key-%d", i)), c)
+	for i := range 100000 {
+		u := storageunit.UnitForShardKey(fmt.Appendf(nil, "key-%d", i), c)
 		seen[u]++
 	}
 	if len(seen) != 16 {

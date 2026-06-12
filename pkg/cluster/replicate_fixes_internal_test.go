@@ -131,7 +131,7 @@ func TestPutReplicated_HungPeer_DeadlineCancelsDispatch(t *testing.T) {
 	// `phase2puts`; the per-connection overhead is constant.
 	const warmupPuts = 5
 	const phase2Puts = 10
-	for i := 0; i < warmupPuts; i++ {
+	for i := range warmupPuts {
 		if err := c.Put([]byte{'w', byte('0' + i)}, []byte("v")); err != nil {
 			t.Fatalf("warmup Put %d: %v", i, err)
 		}
@@ -141,7 +141,7 @@ func TestPutReplicated_HungPeer_DeadlineCancelsDispatch(t *testing.T) {
 	time.Sleep(3 * writeTimeout)
 	pre := numGoroutinesSettled()
 
-	for i := 0; i < phase2Puts; i++ {
+	for i := range phase2Puts {
 		if err := c.Put([]byte{'k', byte('0' + i)}, []byte("v")); err != nil {
 			t.Fatalf("phase2 Put %d: %v", i, err)
 		}

@@ -332,7 +332,7 @@ func openClusterRetryBind(t *testing.T, cfg cluster.Config) (*cluster.Cluster, s
 	t.Helper()
 	const maxAttempts = 8
 	var lastErr error
-	for attempt := 0; attempt < maxAttempts; attempt++ {
+	for range maxAttempts {
 		bindAddr := hostPort(freePort(t))
 		cfg.BindAddr = bindAddr
 		c, err := cluster.Open(cfg)
@@ -376,7 +376,7 @@ func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc clust
 	}
 	nodes := make([]*testNode, 0, count)
 	seed := ""
-	for i := 0; i < count; i++ {
+	for i := range count {
 		n := startTestNodeWithReplication(t, fmt.Sprintf("rn%d", i+1), seed, replicationFactor, wc, rc)
 		if i == 0 {
 			seed = n.BindAddr

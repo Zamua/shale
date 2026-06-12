@@ -43,7 +43,7 @@ func newTwoNodeFixture(t *testing.T) *twoNodeFixture {
 // findKeyOwnedBy but uses tests/integration's own ownerOf helper.
 func keyOwnedBy(t *testing.T, c *cluster.Cluster, wantOwner string, maxProbes int) string {
 	t.Helper()
-	for i := 0; i < maxProbes; i++ {
+	for i := range maxProbes {
 		k := fmt.Sprintf("cas-probe-%d", i)
 		if ownerOf(c, k) == wantOwner {
 			return k
@@ -309,7 +309,7 @@ func TestCAS_TransactRetry_NoLostUpdate(t *testing.T) {
 
 	var wg sync.WaitGroup
 	wg.Add(2 * perNode)
-	for i := 0; i < perNode; i++ {
+	for range perNode {
 		go inc(f.N1.Cluster, &wg) // remote: forwards CommitCAS to N2
 		go inc(f.N2.Cluster, &wg) // local fast-path on the N2 owner
 	}

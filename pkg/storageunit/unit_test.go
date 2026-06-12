@@ -73,7 +73,7 @@ func TestUnitCount_ZeroValue(t *testing.T) {
 
 func TestUnitCount_Contains(t *testing.T) {
 	c := storageunit.MustUnitCount(8)
-	for u := storageunit.UnitID(0); u < 8; u++ {
+	for u := range storageunit.UnitID(8) {
 		if !c.Contains(u) {
 			t.Errorf("Contains(%d) = false, want true for N=8", u)
 		}

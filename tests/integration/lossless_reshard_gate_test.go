@@ -57,6 +57,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -151,9 +152,9 @@ func TestLosslessReshardGate(t *testing.T) {
 	want := make(map[string][]byte) // the recorded dataset: key -> exact value
 
 	const nPlain = 500
-	for i := 0; i < nPlain; i++ {
+	for i := range nPlain {
 		k := fmt.Sprintf("rec-%05d", i)
-		v := []byte(fmt.Sprintf("val-%05d-payload", i))
+		v := fmt.Appendf(nil, "val-%05d-payload", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 8*time.Second); err != nil {
 			t.Fatalf("baseline Put %q: %v", k, err)
 		}
@@ -164,12 +165,12 @@ func TestLosslessReshardGate(t *testing.T) {
 	// MUST share a unit, before AND after the bisect.
 	const nTags, perTag = 12, 8
 	tagSets := make(map[string][]string) // tag -> its keys
-	for ti := 0; ti < nTags; ti++ {
+	for ti := range nTags {
 		tag := fmt.Sprintf("acct%02d", ti)
 		set := make([]string, 0, perTag)
-		for mi := 0; mi < perTag; mi++ {
+		for mi := range perTag {
 			k := fmt.Sprintf("{%s}/field-%d", tag, mi)
-			v := []byte(fmt.Sprintf("co-%s-%d", tag, mi))
+			v := fmt.Appendf(nil, "co-%s-%d", tag, mi)
 			if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 8*time.Second); err != nil {
 				t.Fatalf("co-located Put %q: %v", k, err)
 			}
@@ -221,14 +222,14 @@ func TestLosslessReshardGate(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const probeWriters = 4
-	for w := 0; w < probeWriters; w++ {
+	for w := range probeWriters {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			i := 0
 			for !stop.Load() {
 				k := fmt.Sprintf("probe-%d-%07d", w, i)
-				v := []byte(fmt.Sprintf("pv-%d-%07d", w, i))
+				v := fmt.Appendf(nil, "pv-%d-%07d", w, i)
 				// Retry the transient acquiring-window error; any other error is a
 				// real failure. Record the key ONLY after Put returns nil.
 				if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 5*time.Second); err != nil {
@@ -266,9 +267,7 @@ func TestLosslessReshardGate(t *testing.T) {
 	t.Logf("concurrent probe acked %d keys across the reshard", len(probeAcked))
 	// Snapshot the probe set so we can assert without holding the lock.
 	probeSnapshot := make(map[string][]byte, len(probeAcked))
-	for k, v := range probeAcked {
-		probeSnapshot[k] = v
-	}
+	maps.Copy(probeSnapshot, probeAcked)
 	probeMu.Unlock()
 
 	newCount := 2 * unitCount
@@ -500,7 +499,7 @@ func TestReshardGateCatchesLostWrite(t *testing.T) {
 	// Seed so every unit has data to bulk-copy (and so the catch-up has a
 	// non-trivial frozen old unit to re-scan).
 	const nSeed = 400
-	for i := 0; i < nSeed; i++ {
+	for i := range nSeed {
 		k := fmt.Sprintf("seed-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, fmt.Sprintf("sv-%05d", i), 8*time.Second); err != nil {
 			t.Fatalf("seed Put %q: %v", k, err)
@@ -514,14 +513,14 @@ func TestReshardGateCatchesLostWrite(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const probeWriters = 6
-	for w := 0; w < probeWriters; w++ {
+	for w := range probeWriters {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			i := 0
 			for !stop.Load() {
 				k := fmt.Sprintf("probe-%d-%07d", w, i)
-				v := []byte(fmt.Sprintf("pv-%d-%07d", w, i))
+				v := fmt.Appendf(nil, "pv-%d-%07d", w, i)
 				if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 5*time.Second); err != nil {
 					// A dropped write is silent (Put still returns nil); a real
 					// transport error here would be a different failure.
@@ -546,9 +545,7 @@ func TestReshardGateCatchesLostWrite(t *testing.T) {
 
 	probeMu.Lock()
 	snapshot := make(map[string][]byte, len(probeAcked))
-	for k, v := range probeAcked {
-		snapshot[k] = v
-	}
+	maps.Copy(snapshot, probeAcked)
 	probeMu.Unlock()
 	if len(snapshot) < probeWriters {
 		t.Fatalf("only %d probe writes acked; the concurrent writer did not run", len(snapshot))

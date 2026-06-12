@@ -218,14 +218,14 @@ func TestMultiBackendScanPrefixSpansUnits(t *testing.T) {
 
 	// Co-located keys via a shared hash tag land on one unit, so a
 	// ScanPrefix on the tag returns all of them.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		k := []byte("{grp}-" + string(rune('a'+i)))
 		if err := c.Put(k, []byte("x")); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
 	}
 	// A few keys outside the group, on (likely) other units.
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		if err := c.Put([]byte("other-"+string(rune('a'+i))), []byte("y")); err != nil {
 			t.Fatalf("Put other: %v", err)
 		}
@@ -287,7 +287,7 @@ func TestMultiBackendTransact(t *testing.T) {
 	}
 	// Increment via Transact a few times; each commit validates + applies
 	// on the pin key's unit.
-	for i := 0; i < 3; i++ {
+	for i := range 3 {
 		err := c.Transact(pin, func(tx backend.Transaction) error {
 			v, err := tx.Get(pin)
 			if err != nil {
@@ -386,7 +386,7 @@ func TestMultiBackendTransact_CrossUnitSameNodeRejected(t *testing.T) {
 	k1 := []byte("nokey-0")
 	var k2 []byte
 	for i := 1; i < 10000; i++ {
-		cand := []byte(fmt.Sprintf("nokey-%d", i))
+		cand := fmt.Appendf(nil, "nokey-%d", i)
 		if c.genUnitForKey(cand) != c.genUnitForKey(k1) {
 			k2 = cand
 			break

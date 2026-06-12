@@ -64,9 +64,9 @@ func TestJoinAfterReshard_JoinerLearnsGenerationNoLoss(t *testing.T) {
 	// --- Write a recorded dataset spanning many units. ---
 	want := make(map[string][]byte)
 	const nKeys = 300
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("rec-%05d", i)
-		v := []byte(fmt.Sprintf("val-%05d-payload", i))
+		v := fmt.Appendf(nil, "val-%05d-payload", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 10*time.Second); err != nil {
 			t.Fatalf("baseline Put %q: %v", k, err)
 		}

@@ -277,11 +277,11 @@ func waitForReplicaCount(t *testing.T, nodes []*testNode, keys []string, want in
 func seedN(t *testing.T, c *cluster.Cluster, prefix string, n int) []string {
 	t.Helper()
 	keys := make([]string, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := fmt.Sprintf("%s-%04d", prefix, i)
 		var lastErr error
 		ok := false
-		for try := 0; try < 100; try++ {
+		for range 100 {
 			err := c.Put([]byte(k), []byte(expectedValue(k)))
 			if err == nil {
 				ok = true

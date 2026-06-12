@@ -44,7 +44,7 @@ func TestResolveGenUnit_SteadyAndMidReshard(t *testing.T) {
 	next := storageunit.MustUnitCount(8)
 	gs := genState{gen: 3, count: count, nextCount: next, cutOver: map[storageunit.UnitID]struct{}{}}
 
-	for h := storageunit.ShardHash(0); h < 64; h++ {
+	for h := range storageunit.ShardHash(64) {
 		k := storageunit.UnitForHash(h, count)
 		got := gs.resolveGenUnit(h)
 		want := storageunit.NewGenUnit(3, k)
@@ -55,7 +55,7 @@ func TestResolveGenUnit_SteadyAndMidReshard(t *testing.T) {
 
 	// Cut unit 1 over: keys whose old unit is 1 now resolve to gen-4 children.
 	gs.cutOver[1] = struct{}{}
-	for h := storageunit.ShardHash(0); h < 64; h++ {
+	for h := range storageunit.ShardHash(64) {
 		oldK := storageunit.UnitForHash(h, count)
 		got := gs.resolveGenUnit(h)
 		if oldK == 1 {
@@ -92,9 +92,9 @@ func TestReshard_DoublesUnitsAndPreservesData(t *testing.T) {
 
 	want := make(map[string][]byte)
 	const nKeys = 500
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("rec-%05d", i)
-		v := []byte(fmt.Sprintf("val-%05d", i))
+		v := fmt.Appendf(nil, "val-%05d", i)
 		if err := c.Put([]byte(k), v); err != nil {
 			t.Fatalf("Put %q: %v", k, err)
 		}
@@ -169,15 +169,15 @@ func TestReshard_TwiceQuadruples(t *testing.T) {
 	const n = 4
 	c, _ := openReshardCluster(t, n)
 	want := make(map[string][]byte)
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		k := fmt.Sprintf("q-%04d", i)
-		v := []byte(fmt.Sprintf("qv-%04d", i))
+		v := fmt.Appendf(nil, "qv-%04d", i)
 		if err := c.Put([]byte(k), v); err != nil {
 			t.Fatalf("Put %q: %v", k, err)
 		}
 		want[k] = v
 	}
-	for step := 0; step < 2; step++ {
+	for step := range 2 {
 		if err := c.Reshard(); err != nil {
 			t.Fatalf("Reshard step %d: %v", step, err)
 		}
@@ -205,7 +205,7 @@ func TestReshard_ConcurrentWritesNotLost(t *testing.T) {
 	c, _ := openReshardCluster(t, n)
 
 	// Seed a baseline so every unit has data to bisect.
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		k := fmt.Sprintf("seed-%04d", i)
 		if err := c.Put([]byte(k), []byte("seed")); err != nil {
 			t.Fatalf("seed Put: %v", err)
@@ -220,14 +220,14 @@ func TestReshard_ConcurrentWritesNotLost(t *testing.T) {
 	var wg sync.WaitGroup
 
 	const writers = 6
-	for w := 0; w < writers; w++ {
+	for w := range writers {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
 			i := 0
 			for !stop.Load() {
 				k := fmt.Sprintf("hot-%d-%06d", w, i)
-				v := []byte(fmt.Sprintf("hv-%d-%06d", w, i))
+				v := fmt.Appendf(nil, "hv-%d-%06d", w, i)
 				if err := c.Put([]byte(k), v); err != nil {
 					// A reshard never makes a single-node write fail (the write-
 					// pause only blocks, the unit is always mounted locally).
@@ -287,7 +287,7 @@ func TestReshard_DeletesDuringReshardHonored(t *testing.T) {
 	// Seed keys, then we will delete half of them DURING the reshard.
 	const nKeys = 100
 	keys := make([]string, nKeys)
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("d-%04d", i)
 		keys[i] = k
 		if err := c.Put([]byte(k), []byte("v")); err != nil {
@@ -299,9 +299,7 @@ func TestReshard_DeletesDuringReshardHonored(t *testing.T) {
 	var mu sync.Mutex
 	var stop atomic.Bool
 	var wg sync.WaitGroup
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
+	wg.Go(func() {
 		i := 0
 		for !stop.Load() && i < nKeys/2 {
 			k := keys[i]
@@ -314,7 +312,7 @@ func TestReshard_DeletesDuringReshardHonored(t *testing.T) {
 			mu.Unlock()
 			i++
 		}
-	}()
+	})
 
 	if err := c.Reshard(); err != nil {
 		stop.Store(true)

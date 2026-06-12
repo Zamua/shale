@@ -70,6 +70,7 @@ package integration
 import (
 	"bytes"
 	"fmt"
+	"maps"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -168,9 +169,9 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	want := make(map[string][]byte)
 
 	const nPlain = 400
-	for i := 0; i < nPlain; i++ {
+	for i := range nPlain {
 		k := fmt.Sprintf("rec-%05d", i)
-		v := []byte(fmt.Sprintf("val-%05d-payload", i))
+		v := fmt.Appendf(nil, "val-%05d-payload", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 10*time.Second); err != nil {
 			t.Fatalf("baseline Put %q: %v", k, err)
 		}
@@ -181,12 +182,12 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	// MUST share a unit before AND after the bisect.
 	const nTags, perTag = 12, 8
 	tagSets := make(map[string][]string)
-	for ti := 0; ti < nTags; ti++ {
+	for ti := range nTags {
 		tag := fmt.Sprintf("acct%02d", ti)
 		set := make([]string, 0, perTag)
-		for mi := 0; mi < perTag; mi++ {
+		for mi := range perTag {
 			k := fmt.Sprintf("{%s}/field-%d", tag, mi)
-			v := []byte(fmt.Sprintf("co-%s-%d", tag, mi))
+			v := fmt.Appendf(nil, "co-%s-%d", tag, mi)
 			if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 10*time.Second); err != nil {
 				t.Fatalf("co-located Put %q: %v", k, err)
 			}
@@ -231,7 +232,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const probeWriters = 6
-	for w := 0; w < probeWriters; w++ {
+	for w := range probeWriters {
 		wg.Add(1)
 		go func(w int) {
 			defer wg.Done()
@@ -239,7 +240,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 			i := 0
 			for !stop.Load() {
 				k := fmt.Sprintf("probe-%d-%07d", w, i)
-				v := []byte(fmt.Sprintf("pv-%d-%07d", w, i))
+				v := fmt.Appendf(nil, "pv-%d-%07d", w, i)
 				// Retry the freeze-window + handoff-window retryable signals; any
 				// other error is a real failure. Record only after Put returns nil.
 				if err := putWithRetryReshard(t, entry.Cluster, k, string(v), 15*time.Second); err != nil {
@@ -267,9 +268,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	var sawFrozen atomic.Bool // observed at least one node frozen during the run
 	var readOKWhileFrozen atomic.Bool
 	var readWg sync.WaitGroup
-	readWg.Add(1)
-	go func() {
-		defer readWg.Done()
+	readWg.Go(func() {
 		for !stop.Load() {
 			frozen := n1.Cluster.TestingIsFrozen() || n2.Cluster.TestingIsFrozen() || n3.Cluster.TestingIsFrozen()
 			if frozen {
@@ -284,7 +283,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 			}
 			time.Sleep(2 * time.Millisecond)
 		}
-	}()
+	})
 
 	// === Step 4b (req 3, the FLIP-window read model): RETRYABLE-AVAILABLE ACROSS
 	// THE WHOLE RESHARD. Reads are STRICTLY served during FREEZE/BISECT but only
@@ -296,9 +295,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	// node so the read routes both locally and forwarded. A read that fails even
 	// after the retry budget, or returns a wrong value, is a violation. ===
 	var flipReadViolation atomic.Value // stores a string describing the first violation
-	readWg.Add(1)
-	go func() {
-		defer readWg.Done()
+	readWg.Go(func() {
 		i := 0
 		for !stop.Load() {
 			entry := nodes[i%len(nodes)]
@@ -317,7 +314,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 			i++
 			time.Sleep(2 * time.Millisecond)
 		}
-	}()
+	})
 
 	// === Step 3: trigger the coordinated multi-node reshard on n1 (coordinator).
 	// It drives FREEZE -> BISECT -> FLIP -> RESUME across all three nodes. ===
@@ -343,9 +340,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	}
 	t.Logf("concurrent probe acked %d keys across the multi-node reshard", len(probeAcked))
 	probeSnapshot := make(map[string][]byte, len(probeAcked))
-	for k, v := range probeAcked {
-		probeSnapshot[k] = v
-	}
+	maps.Copy(probeSnapshot, probeAcked)
 	probeMu.Unlock()
 
 	// === ASSERTION (req 6): a read succeeded while the cluster was frozen. We
@@ -426,7 +421,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	// 2N is >= N (a unit that does not exist before the doubling) must round-trip
 	// through every node and physically land in its gen-1 store. ===
 	var highKey string
-	for i := 0; i < 1_000_000; i++ {
+	for i := range 1_000_000 {
 		k := fmt.Sprintf("hi-%d", i)
 		u := storageunit.UnitForShardKey(ring.ShardKey([]byte(k)), newUC)
 		if uint32(u) >= unitCount {
@@ -510,7 +505,7 @@ func TestMultiNodeReshardGateCatchesLostWrite(t *testing.T) {
 	time.Sleep(900 * time.Millisecond)
 
 	// Seed so every unit has gen-g data to bisect.
-	for i := 0; i < 200; i++ {
+	for i := range 200 {
 		k := fmt.Sprintf("seed-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, fmt.Sprintf("sv-%05d", i), 10*time.Second); err != nil {
 			t.Fatalf("seed Put %q: %v", k, err)
@@ -635,9 +630,9 @@ func TestMultiNodeReshardAbortStaysAtGenG(t *testing.T) {
 
 	// Record a dataset spanning every unit.
 	want := make(map[string][]byte)
-	for i := 0; i < 300; i++ {
+	for i := range 300 {
 		k := fmt.Sprintf("ab-%05d", i)
-		v := []byte(fmt.Sprintf("abv-%05d", i))
+		v := fmt.Appendf(nil, "abv-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 10*time.Second); err != nil {
 			t.Fatalf("baseline Put %q: %v", k, err)
 		}

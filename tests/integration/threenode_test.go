@@ -52,17 +52,17 @@ func TestThreeNode_PutGetForwarding(t *testing.T) {
 	f := newThreeNodeFixture(t)
 
 	const n = 1000
-	for i := 0; i < n; i++ {
-		key := []byte(fmt.Sprintf("key-%04d", i))
-		val := []byte(fmt.Sprintf("val-%04d", i))
+	for i := range n {
+		key := fmt.Appendf(nil, "key-%04d", i)
+		val := fmt.Appendf(nil, "val-%04d", i)
 		if err := f.N1.Cluster.Put(key, val); err != nil {
 			t.Fatalf("Put %s via N1: %v", key, err)
 		}
 	}
 
-	for i := 0; i < n; i++ {
-		key := []byte(fmt.Sprintf("key-%04d", i))
-		want := []byte(fmt.Sprintf("val-%04d", i))
+	for i := range n {
+		key := fmt.Appendf(nil, "key-%04d", i)
+		want := fmt.Appendf(nil, "val-%04d", i)
 		got, err := f.N3.Cluster.Get(key)
 		if err != nil {
 			t.Fatalf("Get %s via N3: %v", key, err)
@@ -118,8 +118,8 @@ func TestThreeNode_HashTagLocality(t *testing.T) {
 
 	expectedOwner := ownerOf(f.N2.Cluster, "{"+tag+"}/anything")
 
-	for i := 0; i < n; i++ {
-		key := []byte(fmt.Sprintf("{%s}/item/%03d", tag, i))
+	for i := range n {
+		key := fmt.Appendf(nil, "{%s}/item/%03d", tag, i)
 		if err := f.N2.Cluster.Put(key, []byte("v")); err != nil {
 			t.Fatalf("Put %s via N2: %v", key, err)
 		}
@@ -208,7 +208,7 @@ func TestThreeNode_ScanPrefixSingleShard(t *testing.T) {
 
 	// Write through whichever node we like; routing handles placement.
 	expected := make(map[string]string, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := fmt.Sprintf("{%s}/x/%03d", tag, i)
 		v := fmt.Sprintf("v-%03d", i)
 		expected[k] = v
@@ -271,7 +271,7 @@ func TestThreeNode_LeaveSurvives(t *testing.T) {
 	// cluster.
 	const attempts = 500
 	wrote := 0
-	for i := 0; i < attempts; i++ {
+	for i := range attempts {
 		k := fmt.Sprintf("survivor-%04d", i)
 		owner := ownerOf(f.N1.Cluster, k)
 		if owner != "n1" && owner != "n2" {
@@ -301,7 +301,7 @@ func TestThreeNode_LeaveSurvives(t *testing.T) {
 // the remote-forwarding path on a specific node.
 func findKeyNotOwnedBy(t *testing.T, c *cluster.Cluster, avoid string, maxProbes int) string {
 	t.Helper()
-	for i := 0; i < maxProbes; i++ {
+	for i := range maxProbes {
 		k := fmt.Sprintf("probe-%d", i)
 		if ownerOf(c, k) != avoid {
 			return k

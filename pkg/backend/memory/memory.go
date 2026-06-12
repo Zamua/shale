@@ -6,6 +6,7 @@ package memory
 
 import (
 	"bytes"
+	"maps"
 	"sort"
 	"sync"
 
@@ -242,9 +243,7 @@ func (t *transaction) Commit() error {
 	if t.parent.closed {
 		return backend.ErrClosed
 	}
-	for k, v := range t.writes {
-		t.parent.data[k] = v
-	}
+	maps.Copy(t.parent.data, t.writes)
 	for k := range t.deletes {
 		delete(t.parent.data, k)
 	}

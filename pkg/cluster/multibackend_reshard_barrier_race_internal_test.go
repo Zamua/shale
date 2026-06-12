@@ -167,8 +167,8 @@ func TestBarrier_InFlightWritePastFreezeIsCapturedNotLost(t *testing.T) {
 	oldCount := storageunit.MustUnitCount(n)
 
 	// Seed so every unit has gen-0 data to bisect.
-	for i := 0; i < 40; i++ {
-		if err := c.Put([]byte(fmt.Sprintf("seed-%03d", i)), []byte("s")); err != nil {
+	for i := range 40 {
+		if err := c.Put(fmt.Appendf(nil, "seed-%03d", i), []byte("s")); err != nil {
 			t.Fatalf("seed Put: %v", err)
 		}
 	}
@@ -189,14 +189,12 @@ func TestBarrier_InFlightWritePastFreezeIsCapturedNotLost(t *testing.T) {
 	// in-flight window the freeze flag flip alone cannot quiesce.
 	var putErr atomic.Value // error or nil
 	var writerDone sync.WaitGroup
-	writerDone.Add(1)
-	go func() {
-		defer writerDone.Done()
+	writerDone.Go(func() {
 		err := c.Put(raceKey, raceVal)
 		if err != nil {
 			putErr.Store(err)
 		}
-	}()
+	})
 
 	// Wait until the Put is genuinely suspended inside the backend (pause
 	// read-lock held).
@@ -214,12 +212,10 @@ func TestBarrier_InFlightWritePastFreezeIsCapturedNotLost(t *testing.T) {
 
 	var bisectDone atomic.Bool
 	var bisectWG sync.WaitGroup
-	bisectWG.Add(1)
-	go func() {
-		defer bisectWG.Done()
+	bisectWG.Go(func() {
 		_ = c.reshardBisect(1)
 		bisectDone.Store(true)
-	}()
+	})
 
 	// The bisect must NOT complete while the in-flight writer still holds the
 	// pause read-lock (suspended mid-Put). If it does, the WRITE-side drain is

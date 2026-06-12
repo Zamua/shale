@@ -40,9 +40,9 @@ func TestReplicate_R2_TolerateOneNodeDown(t *testing.T) {
 	nodes := startReplicatedCluster(t, 3, 2, cluster.WriteQuorum, cluster.ReadQuorum)
 
 	const n = 100
-	for i := 0; i < n; i++ {
-		key := []byte(fmt.Sprintf("nd-%04d", i))
-		val := []byte(fmt.Sprintf("v-%04d", i))
+	for i := range n {
+		key := fmt.Appendf(nil, "nd-%04d", i)
+		val := fmt.Appendf(nil, "v-%04d", i)
 		if err := nodes[0].Cluster.Put(key, val); err != nil {
 			t.Fatalf("seed Put %s: %v", key, err)
 		}
@@ -60,9 +60,9 @@ func TestReplicate_R2_TolerateOneNodeDown(t *testing.T) {
 	}
 
 	// Every seed key remains readable through N1 or N3.
-	for i := 0; i < n; i++ {
-		key := []byte(fmt.Sprintf("nd-%04d", i))
-		want := []byte(fmt.Sprintf("v-%04d", i))
+	for i := range n {
+		key := fmt.Appendf(nil, "nd-%04d", i)
+		want := fmt.Appendf(nil, "v-%04d", i)
 		// Read from N1 first; if that fails, fall back to N3. With R=2
 		// and one survivor still holding each key (since every key was
 		// replicated on TWO of the three nodes, and only one is gone),
@@ -87,9 +87,9 @@ func TestReplicate_R2_TolerateOneNodeDown(t *testing.T) {
 	// Fresh writes with N2 down must still succeed (WriteQuorum on R=2
 	// needs 1 ack; we have 2 reachable replicas, of which any single
 	// one suffices).
-	for i := 0; i < 20; i++ {
-		key := []byte(fmt.Sprintf("post-down-%04d", i))
-		val := []byte(fmt.Sprintf("pd-%04d", i))
+	for i := range 20 {
+		key := fmt.Appendf(nil, "post-down-%04d", i)
+		val := fmt.Appendf(nil, "pd-%04d", i)
 		if err := nodes[0].Cluster.Put(key, val); err != nil {
 			t.Fatalf("post-down Put %s: %v", key, err)
 		}

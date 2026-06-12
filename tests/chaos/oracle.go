@@ -125,7 +125,7 @@ func (e *entry) recordEver(value string, version uint64) {
 	}
 	sort.Slice(all, func(i, j int) bool { return all[i].ver < all[j].ver })
 	drop := len(all) - everValuesCap
-	for i := 0; i < drop; i++ {
+	for i := range drop {
 		delete(e.everValues, all[i].val)
 	}
 	e.everMinVer = all[drop].ver

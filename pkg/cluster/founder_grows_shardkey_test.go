@@ -45,8 +45,8 @@ func slugShardKey(key []byte) []byte {
 }
 
 func firstSeg(s []byte) []byte {
-	if i := bytes.IndexByte(s, '/'); i >= 0 {
-		return s[:i]
+	if before, _, ok := bytes.Cut(s, []byte{'/'}); ok {
+		return before
 	}
 	return s
 }
@@ -126,13 +126,13 @@ func TestFounderGrows_MultiKeyShard_ReachesEveryKey(t *testing.T) {
 		keys [][]byte
 	}
 	all := make([]subject, 0, subjects)
-	for i := 0; i < subjects; i++ {
+	for i := range subjects {
 		slug := fmt.Sprintf("slug%04d", i)
 		keys := [][]byte{
 			[]byte("pastes/" + slug),
-			[]byte(fmt.Sprintf("versions/%s/0001", slug)),
-			[]byte(fmt.Sprintf("versions/%s/0002", slug)),
-			[]byte(fmt.Sprintf("versions/%s/0003", slug)),
+			fmt.Appendf(nil, "versions/%s/0001", slug),
+			fmt.Appendf(nil, "versions/%s/0002", slug),
+			fmt.Appendf(nil, "versions/%s/0003", slug),
 		}
 		for _, k := range keys {
 			if err := putWithMigrationRetry(founder, k, []byte("v-"+slug)); err != nil {

@@ -214,7 +214,7 @@ func TestRebalance_SourceDoesNotDeleteOnDestinationCrash(t *testing.T) {
 		bigValue[i] = byte('A' + (i % 26))
 	}
 	keys := make([]string, total)
-	for i := 0; i < total; i++ {
+	for i := range total {
 		k := fmt.Sprintf("crash-%05d", i)
 		if err := putWithRetry(n1.Cluster, []byte(k), bigValue); err != nil {
 			t.Fatalf("Put %s: %v", k, err)

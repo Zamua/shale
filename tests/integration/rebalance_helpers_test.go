@@ -143,7 +143,7 @@ func waitForRebalanceIdle(t *testing.T, ref *cluster.Cluster, nodes []*testNode,
 func putN(t *testing.T, c *cluster.Cluster, prefix string, n int) []string {
 	t.Helper()
 	keys := make([]string, n)
-	for i := 0; i < n; i++ {
+	for i := range n {
 		k := fmt.Sprintf("%s-%04d", prefix, i)
 		if err := putWithRetry(c, []byte(k), []byte(expectedValue(k))); err != nil {
 			t.Fatalf("Put %s: %v", k, err)
@@ -167,7 +167,7 @@ func putN(t *testing.T, c *cluster.Cluster, prefix string, n int) []string {
 // mid-handoff" (skip) from "this replica is dead" (count as failure).
 func putWithRetry(c *cluster.Cluster, key, value []byte) error {
 	var lastErr error
-	for i := 0; i < 50; i++ {
+	for range 50 {
 		err := c.Put(key, value)
 		if err == nil {
 			return nil

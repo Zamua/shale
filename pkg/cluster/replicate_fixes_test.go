@@ -125,7 +125,7 @@ func TestWriteQuorum_LiveClampedR5_On2Nodes(t *testing.T) {
 	bindPorts := []int{freePort(t), freePort(t)}
 	harnesses := make([]*grpcHarness, 2)
 	stops := make([]func(), 2)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		harnesses[i], stops[i] = startGRPC(t)
 	}
 	defer func() {
@@ -134,7 +134,7 @@ func TestWriteQuorum_LiveClampedR5_On2Nodes(t *testing.T) {
 		}
 	}()
 	clusters := make([]*cluster.Cluster, 2)
-	for i := 0; i < 2; i++ {
+	for i := range 2 {
 		cfg := cluster.Config{
 			NodeID:               fmt.Sprintf("lc-n%d", i+1),
 			Backend:              mems[i],

@@ -61,7 +61,7 @@ func TestRebalance_ReadDuringReceiveForwardsToSource(t *testing.T) {
 	}
 
 	var tag string
-	for i := 0; i < 5000; i++ {
+	for i := range 5000 {
 		candidate := fmt.Sprintf("u%05d", i)
 		probe := "{" + candidate + "}/probe"
 		if currentRing.LocateKey([]byte(probe)).ID != futureRing.LocateKey([]byte(probe)).ID &&
@@ -88,7 +88,7 @@ func TestRebalance_ReadDuringReceiveForwardsToSource(t *testing.T) {
 		val[i] = byte('A' + (i % 26))
 	}
 	seedKeys := make([]string, seedCount)
-	for i := 0; i < seedCount; i++ {
+	for i := range seedCount {
 		k := fmt.Sprintf("{%s}/item/%05d", tag, i)
 		if err := putWithRetry(n1.Cluster, []byte(k), val); err != nil {
 			t.Fatalf("seed %s: %v", k, err)

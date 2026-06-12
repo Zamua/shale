@@ -27,7 +27,7 @@ func TestThreeNode_PeerCrashForwardingReturnsError(t *testing.T) {
 	// Find a key owned by N3 (per the still-stale ring view on N1).
 	const maxProbes = 1000
 	var target string
-	for i := 0; i < maxProbes; i++ {
+	for i := range maxProbes {
 		k := probeKey(i)
 		if ownerOf(f.N1.Cluster, k) == "n3" {
 			target = k

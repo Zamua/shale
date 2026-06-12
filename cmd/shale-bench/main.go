@@ -52,7 +52,7 @@ import (
 	"io"
 	"net"
 	"os"
-	"sort"
+	"slices"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -612,10 +612,8 @@ func runPhase(name string, target putGetter, concurrency, total int, payload []b
 	var wg sync.WaitGroup
 
 	start := time.Now()
-	for w := 0; w < concurrency; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range concurrency {
+		wg.Go(func() {
 			for {
 				idx := atomic.AddInt64(&next, 1) - 1
 				if idx >= int64(total) {
@@ -638,7 +636,7 @@ func runPhase(name string, target putGetter, concurrency, total int, payload []b
 					return
 				}
 			}
-		}()
+		})
 	}
 	wg.Wait()
 	dur := time.Since(start)
@@ -665,7 +663,7 @@ func runPhase(name string, target putGetter, concurrency, total int, payload []b
 // keyAt formats the i-th key in the bench keyspace. Width 8 keeps keys
 // sorted up to 99999999 ops (well past anything this harness produces).
 func keyAt(prefix string, i int64) []byte {
-	return []byte(fmt.Sprintf("%s%08d", prefix, i))
+	return fmt.Appendf(nil, "%s%08d", prefix, i)
 }
 
 // percentile sorts xs in place and returns the q-th percentile via
@@ -676,20 +674,14 @@ func percentile(xs []time.Duration, q float64) time.Duration {
 	if n == 0 {
 		return 0
 	}
-	sort.Slice(xs, func(i, j int) bool { return xs[i] < xs[j] })
+	slices.Sort(xs)
 	if q <= 0 {
 		return xs[0]
 	}
 	if q >= 1 {
 		return xs[n-1]
 	}
-	idx := int(q*float64(n) + 0.999999999)
-	if idx < 1 {
-		idx = 1
-	}
-	if idx > n {
-		idx = n
-	}
+	idx := min(max(int(q*float64(n)+0.999999999), 1), n)
 	return xs[idx-1]
 }
 

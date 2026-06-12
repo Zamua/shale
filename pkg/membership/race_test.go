@@ -104,10 +104,8 @@ func TestMembers_NoRaceWithMemberlistInternal(t *testing.T) {
 	// readers than peers we keep the cache read path saturated while
 	// the gossip-driven write path fires.
 	const readers = 8
-	for i := 0; i < readers; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
+	for range readers {
+		wg.Go(func() {
 			for {
 				select {
 				case <-stop:
@@ -118,7 +116,7 @@ func TestMembers_NoRaceWithMemberlistInternal(t *testing.T) {
 					snapshots.Add(1)
 				}
 			}
-		}()
+		})
 	}
 
 	// Drive UpdateNode() on each peer at a 50ms cadence. UpdateNode

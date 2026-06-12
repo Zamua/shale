@@ -160,7 +160,7 @@ func TestLeaseHandoff_NoAckedWriteLost(t *testing.T) {
 	// Founder owns the whole unit space; write a spread of acked keys.
 	const nKeys = 200
 	keys := make([]string, 0, nKeys)
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("rec-%04d", i)
 		if err := n1.Cluster.Put([]byte(k), []byte("v-"+k)); err != nil {
 			t.Fatalf("founder Put %q: %v", k, err)
@@ -264,7 +264,7 @@ func TestLeaseHandoff_NodeLeaveSurvivorReacquires(t *testing.T) {
 	// Write acked keys whose units are spread across all three nodes.
 	const nKeys = 150
 	keys := make([]string, 0, nKeys)
-	for i := 0; i < nKeys; i++ {
+	for i := range nKeys {
 		k := fmt.Sprintf("lv-%04d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, "v-"+k, 5*time.Second); err != nil {
 			t.Fatalf("Put %q: %v", k, err)
