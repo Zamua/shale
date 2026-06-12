@@ -59,7 +59,22 @@ func (c *Cluster) scheduleReconcile() {
 	if c.settleTimer != nil {
 		c.settleTimer.Stop()
 	}
-	c.settleTimer = time.AfterFunc(c.settleDelay(), c.runReconcile)
+	c.settleTimer = time.AfterFunc(c.settleDelay(), c.reconcileAndMaybeReshard)
+}
+
+// reconcileAndMaybeReshard is what the multi-mode settle timer fires once
+// membership has been stable for the settle window. It runs the lease-handoff
+// unit reconcile, then - on the coordinator - evaluates the declarative
+// resharding decision (reconcileReshard). Splitting it out (rather than calling
+// runReconcile directly) is what folds the desired-state reshard trigger into
+// the SAME membership-settle debounce that drives the unit reconcile: a settled
+// pass is exactly the moment a rolling deploy has finished and every node
+// reports the new desired count, so it is the right place to (re)evaluate a
+// reshard. reconcileReshard is called AFTER runReconcile returns, so it never
+// holds reshardMu / reconcileMu when it acquires reshardMu via TryLock.
+func (c *Cluster) reconcileAndMaybeReshard() {
+	c.runReconcile()
+	c.reconcileReshard()
 }
 
 // runReconcile fires when the settle timer elapses in multi-backend mode (and

@@ -664,6 +664,15 @@ func (c *Cluster) runReconcileLoop() {
 				// drifted unit. This runs inside the loopWG-tracked loop, so
 				// Close awaits it.
 				c.runReconcile()
+				// Declarative resharding (v0.8): after the lease-handoff
+				// reconcile, the coordinator evaluates whether the cluster
+				// should reshard toward its desired unit count. This periodic
+				// tick is the backstop for a coordinator handoff that arrives
+				// without a fresh membership event (the prior coordinator left,
+				// the ring already settled, the survivor is now lowest-id).
+				// Idempotent + a no-op on a non-coordinator; called AFTER
+				// runReconcile so it never holds reshardMu when it acquires it.
+				c.reconcileReshard()
 			}
 		}
 	}
