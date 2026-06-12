@@ -1477,6 +1477,10 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 				results[i] = AggregateResult{Err: err}
 				return
 			}
+			// snap is a streaming view holding a live gRPC stream/ctx;
+			// Close tears it down. The stream MUST stay open across fn
+			// (fn iterates it), so close only after fn returns.
+			defer func() { _ = snap.Close() }()
 			results[i] = AggregateResult{Value: fn(snap)}
 		}()
 	}
@@ -1484,37 +1488,59 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 	return results
 }
 
-// snapshotPeer pulls the full keyspace from a peer's LOCAL backend
-// into a transient in-process backend. Used by Aggregate. The
-// snapshot is local to one fn invocation; the backend is not exposed
-// beyond it.
+// snapshotPeer returns a streaming read-only view of a peer's LOCAL
+// backend for Aggregate's scan/count fns. It does NOT drain the peer's
+// keyspace into memory: each ScanPrefix the fn issues opens a fresh
+// LocalScan stream and pulls pairs straight off the wire, so peak
+// memory is one in-flight pair per peer rather than the peer's whole
+// keyspace (with all peers concurrent, the old path's peak was the SUM
+// of every peer's keyspace resident at once). The view holds a live
+// gRPC stream context; the caller MUST Close it after fn returns.
 //
 // Uses LocalScan (admin path) rather than ScanPrefix so the receiving
 // node hands us its own keys directly. ScanPrefix would route the
-// empty prefix through ownerOf - hashing nil to whichever shard owns
-// it - and we'd get a single shard back N times instead of each
-// shard's slice once.
+// prefix through ownerOf - hashing it to whichever shard owns it - and
+// we'd get a single shard back N times instead of each shard's slice
+// once. The peer applies the prefix filter server-side, so the view
+// replays the same key/value pairs in the same key-ascending order the
+// old materializing path observed; scan/count fns are unaffected.
+//
+// Consumers needing random-access Get are not supported here (a stream
+// cannot seek); such a caller must switch to the materializing
+// snapshotBackend path. All current Aggregate consumers scan only.
+//
+// snapshotPeer opens the full-keyspace LocalScan stream eagerly and
+// primes its first Recv before returning. This preserves the documented
+// Aggregate contract that a dial / transport failure surfaces as the
+// peer's AggregateResult.Err (set "if shale couldn't even run fn"),
+// independent of whether fn happens to scan: gRPC dial is lazy, so the
+// transport error only materializes on the first Recv, and the old
+// materializing path caught it during its eager drain. The primed first
+// message is replayed by the view's initial full-keyspace ScanPrefix.
 func (c *Cluster) snapshotPeer(addr string) (backend.Backend, error) {
 	cli, err := c.clientFor(addr)
 	if err != nil {
 		return nil, err
 	}
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	stream, err := cli.LocalScan(ctx, nil)
 	if err != nil {
+		cancel()
 		return nil, err
 	}
-	snap := newSnapshotBackend()
-	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
-			}
-			return nil, err
-		}
-		_ = snap.Put(msg.GetKey(), msg.GetValue())
+	// Prime: force the first round-trip so dial / transport failures
+	// surface here rather than (silently) inside fn.
+	first, firstErr := stream.Recv()
+	if firstErr != nil && !errors.Is(firstErr, io.EOF) {
+		cancel()
+		return nil, firstErr
 	}
-	return snap, nil
+	primed := &primedStream{stream: stream}
+	if errors.Is(firstErr, io.EOF) {
+		primed.done = true
+	} else {
+		primed.first = first
+		primed.hasFirst = true
+	}
+	return &streamBackend{cli: cli, ctx: ctx, cancel: cancel, primed: primed}, nil
 }
