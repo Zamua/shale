@@ -270,25 +270,13 @@ func (s *Server) ReshardControl(_ context.Context, req *pb.ReshardControlRequest
 	return &pb.ReshardControlResponse{}, nil
 }
 
-// Reshard is the OPERATOR-facing trigger for a doubling reshard (N -> 2N) on a
-// running cluster, dialed by `shale reshard`. The receiving node becomes the
-// coordinator: it delegates to the cluster's TriggerReshard, which drives the
-// cluster-wide FREEZE -> BISECT -> FLIP -> RESUME barrier (multi-node) or the
-// single-node bisect, and REJECTS a second concurrent reshard (ErrReshardInFlight)
-// rather than queuing it. The from/to unit counts of the doubling come back in
-// the response; a guard rejection (legacy mode, in-flight, membership unstable
-// across the barrier) travels as the response error string (matching the
-// CommitCAS / ApplyBatch / ReshardControl convention) so the CLI can tell a
-// refused reshard from a transport failure. Idempotent-safe to retry after a
-// clean failure: every error path leaves the generation untouched.
-func (s *Server) Reshard(_ context.Context, _ *pb.ReshardRequest) (*pb.ReshardResponse, error) {
-	from, to, err := s.c.TriggerReshard()
-	resp := &pb.ReshardResponse{FromUnitCount: from, ToUnitCount: to}
-	if err != nil {
-		resp.Error = err.Error()
-	}
-	return resp, nil
-}
+// NOTE: there is NO operator-facing Reshard handler. Resharding is DECLARATIVE
+// (v0.8): the desired unit count rides the deploy config (--unit-count) and the
+// cluster's deterministic coordinator reshards itself toward it via the
+// ReshardControl barrier above. The prior Server.Reshard handler + its proto
+// messages + the `shale reshard` CLI were deleted because the trigger is now
+// config (k8s RBAC / CI), not a network RPC that would need its own authz. See
+// docs/SPEC.md "Declarative resharding".
 
 // GenState is the cluster-internal generation-propagation RPC for the v0.8
 // join-after-reshard fix. A node opening in multi-backend mode WITH seeds (a

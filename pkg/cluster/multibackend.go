@@ -179,14 +179,23 @@ func (c *Cluster) initMultiBackend() error {
 	// BEFORE it derives or mounts any unit below, or it routes / owns keys at
 	// gen 0 and orphans acked writes after the cluster has resharded. Query a
 	// seed and commit the live generation here, ahead of the mount loop, so
-	// there is NO window in which this node serves at gen 0. The founder /
-	// single-node / legacy paths have no seeds and keep initGenState's gen-0
-	// default. Fail closed: a seed that cannot be reached fails Open rather
-	// than leaving the joiner at the wrong generation.
+	// there is NO window in which this node serves at gen 0.
+	//
+	// The FOUNDER (no seeds) has no seed to ask, so it derives the live
+	// {gen, count} from DURABLE STATE instead (the units present in the shared
+	// backing): a founder restarting a previously-resharded cluster must NOT
+	// re-init at the desired count (--unit-count is now DESIRED, not initial),
+	// which would orphan the existing units' acked keys. A fresh cluster (no
+	// durable units) keeps initGenState's gen-0/desired default. Both paths run
+	// BEFORE the mount loop so this node never derives or mounts a unit at the
+	// wrong generation. Fail closed: an unreachable seed (joiner) or an
+	// enumeration error (founder) fails Open rather than serving at gen 0.
 	if len(c.cfg.Seeds) > 0 {
 		if err := c.learnGenerationFromSeed(); err != nil {
 			return err
 		}
+	} else if err := c.deriveGenerationFromDurableState(); err != nil {
+		return err
 	}
 
 	c.mountMap = make(map[storageunit.GenUnit]backend.Backend)

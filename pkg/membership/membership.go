@@ -7,7 +7,12 @@
 //
 // Each node advertises its gRPC listen address via memberlist's
 // per-node Meta bytes; peers decode that on receipt so they know
-// where to forward requests. The format is a plain UTF-8 string.
+// where to forward requests. The payload is "<grpcAddr>|<desiredCount>"
+// when the node carries a desired unit count (the v0.8 declarative
+// resharding trigger), or just "<grpcAddr>" when it does not - the
+// latter is byte-for-byte the original format, so a node with no
+// desired count broadcasts exactly what it always did and a mixed
+// cluster decodes cleanly. See encodeMeta / decodeMeta.
 package membership
 
 import (
@@ -45,6 +50,15 @@ type Member struct {
 	ID string
 	// Addr is the node's gRPC host:port, as broadcast via Config.GRPCAddr.
 	Addr string
+	// DesiredCount is the node's DESIRED unit count (v0.8 declarative
+	// resharding), decoded from the second segment of the Meta payload.
+	// It is 0 ("unknown / not yet agreed") for a peer whose Meta carries
+	// no count segment (a legacy single-backend node, or one running an
+	// older revision that broadcasts only its addr). The declarative
+	// reconciler treats 0 as "not unanimous" and never reshards toward
+	// it; only a unanimous non-zero count across all live members is a
+	// candidate trigger.
+	DesiredCount uint32
 }
 
 // Event is one membership change notification.
@@ -69,6 +83,15 @@ type Config struct {
 	// to peers as the node's Meta payload so they can forward
 	// requests here. Format: "host:port".
 	GRPCAddr string
+	// DesiredCount is this node's DESIRED unit count (the v0.8
+	// declarative resharding trigger), set from the operator's
+	// --unit-count. When > 0 it is appended to the Meta payload after
+	// the gRPC addr ("<addr>|<count>") so peers can read it off the
+	// snapshot. 0 (the default) means "no desired count": the Meta
+	// payload is just the addr, byte-for-byte the legacy format. Only
+	// the multi-backend path sets this; the legacy single-backend path
+	// leaves it 0.
+	DesiredCount uint32
 	// LogOutput is where memberlist's internal logger writes. nil
 	// means stderr (memberlist's default). Tests pass io.Discard to
 	// stay quiet.
@@ -118,6 +141,40 @@ func (d *metaDelegate) GetBroadcasts(int, int) [][]byte { return nil }
 func (d *metaDelegate) LocalState(bool) []byte          { return nil }
 func (d *metaDelegate) MergeRemoteState([]byte, bool)   {}
 
+// encodeMeta builds the per-node Meta payload from this node's gRPC addr +
+// desired unit count. When desiredCount is 0 (the legacy / no-desired case)
+// the payload is just the addr, byte-for-byte the original format, so a
+// node that does not participate in declarative resharding broadcasts
+// exactly what it always did. When desiredCount > 0 the payload is
+// "<addr>|<count>". A gRPC addr is "host:port" and never contains '|', so
+// decodeMeta can split on the first '|' unambiguously.
+func encodeMeta(grpcAddr string, desiredCount uint32) []byte {
+	if desiredCount == 0 {
+		return []byte(grpcAddr)
+	}
+	return []byte(grpcAddr + "|" + strconv.FormatUint(uint64(desiredCount), 10))
+}
+
+// decodeMeta parses a Meta payload back into (addr, desiredCount). It is the
+// inverse of encodeMeta and tolerant of the legacy format: a payload with no
+// '|' is a bare addr (desiredCount 0). A payload "<addr>|<count>" yields the
+// addr + the parsed count; an unparseable / negative count segment decodes
+// to 0 (unknown) rather than failing, so a malformed peer Meta never breaks
+// the snapshot - the reconciler treats 0 as "not yet agreed" and refuses to
+// reshard toward it. Split on the FIRST '|' (the addr cannot contain one).
+func decodeMeta(meta []byte) (addr string, desiredCount uint32) {
+	s := string(meta)
+	addr, countSeg, found := strings.Cut(s, "|")
+	if !found {
+		return s, 0
+	}
+	n, err := strconv.ParseUint(countSeg, 10, 32)
+	if err != nil {
+		return addr, 0
+	}
+	return addr, uint32(n)
+}
+
 // eventDelegate forwards memberlist's join/leave/update callbacks
 // into the Membership's events channel as Event values. It uses a
 // non-blocking send: if no consumer is reading, the event is dropped.
@@ -158,9 +215,11 @@ type eventDelegate struct {
 func nodeToMember(n *memberlist.Node) Member {
 	name := strings.Clone(n.Name)
 	meta := append([]byte(nil), n.Meta...)
+	addr, desiredCount := decodeMeta(meta)
 	return Member{
-		ID:   name,
-		Addr: string(meta),
+		ID:           name,
+		Addr:         addr,
+		DesiredCount: desiredCount,
 	}
 }
 
@@ -280,7 +339,7 @@ func Open(cfg Config) (*Membership, error) {
 	}
 	mlCfg.BindPort = bindPort
 	mlCfg.AdvertisePort = bindPort
-	mlCfg.Delegate = &metaDelegate{meta: []byte(cfg.GRPCAddr)}
+	mlCfg.Delegate = &metaDelegate{meta: encodeMeta(cfg.GRPCAddr, cfg.DesiredCount)}
 	mlCfg.Events = events
 	if cfg.LogOutput != nil {
 		mlCfg.LogOutput = cfg.LogOutput

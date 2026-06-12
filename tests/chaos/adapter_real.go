@@ -52,12 +52,6 @@ import (
 	"github.com/Zamua/shale/pkg/rpc"
 )
 
-// reshardRPCTimeout bounds the operator Reshard RPC. A real cluster-coordinated
-// doubling copies every unit's keys through object storage (each new gen-(g+1)
-// unit is a fresh slatedb LSM filled by a scan of the old unit), so it is far
-// slower than the in-process bisect - the deadline is generous accordingly.
-const reshardRPCTimeout = 180 * time.Second
-
 // realNode is one shaled-slate child process: its node id, the OS process, the
 // ports it bound, a pooled gRPC client to its own gRPC address, and a down flag
 // (true after a hard kill / graceful stop, until a fresh process is launched). In
@@ -470,30 +464,21 @@ func (t *realTopology) teardown(id string, graceful bool) error {
 	return nil
 }
 
-// Reshard drives a real cluster-coordinated doubling (N -> 2N) by dialing the
-// founder and issuing the OPERATOR Reshard RPC - the exact surface `shale reshard`
-// uses. It returns the {from, to} unit counts on a committed doubling, or an error
-// if the RPC failed (transport) or the cluster refused it (a non-empty response
-// error: in-flight, ceiling, or membership-unstable). A refused reshard leaves the
-// generation unchanged, so the caller may retry. This is the deployable v0.8
-// reshard end to end: the bisect copies each unit's keys through object storage,
-// the cluster-wide freeze barrier coordinates the doubling, and acked writes
-// survive (the oracle asserts it).
+// Reshard is the real-cluster reshard seam. The operator Reshard RPC it used to
+// dial was DELETED: resharding is now DECLARATIVE (v0.8), driven from the
+// --unit-count desired-state config rather than an imperative RPC (see
+// docs/SPEC.md "Declarative resharding"). The Validate phase RE-POINTS this seam
+// to the declarative trigger: bump the desired --unit-count env (2 -> 4) on every
+// node, re-roll them, and poll the live count (GenState / Topology) until the
+// cluster's coordinator drives the barrier to completion.
+//
+// TODO(declarative-reshard-validate): wire the desired-count bump + re-roll +
+// poll here. Until then this returns a clear "not yet wired" error so the harness
+// compiles and reports a VACUOUS run (no reshard committed) rather than dialing a
+// deleted RPC. The reconcile loop the bump drives is itself a later plumbing
+// phase; this seam follows it.
 func (t *realTopology) Reshard() (from, to uint32, err error) {
-	c, err := t.FounderClient()
-	if err != nil {
-		return 0, 0, fmt.Errorf("real-cluster Reshard: founder client: %w", err)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), reshardRPCTimeout)
-	defer cancel()
-	resp, err := c.Reshard(ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("real-cluster Reshard: RPC: %w", err)
-	}
-	if e := resp.GetError(); e != "" {
-		return resp.GetFromUnitCount(), resp.GetToUnitCount(), fmt.Errorf("real-cluster Reshard: refused: %s", e)
-	}
-	return resp.GetFromUnitCount(), resp.GetToUnitCount(), nil
+	return 0, 0, fmt.Errorf("real-cluster Reshard: declarative trigger not yet wired (operator RPC removed; see docs/SPEC.md Declarative resharding)")
 }
 
 // CloseAll tears down every node (end of run / setup failure). Idempotent.

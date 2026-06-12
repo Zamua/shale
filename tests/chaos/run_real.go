@@ -457,15 +457,22 @@ func (rc *realHarness) liveEntrySelector() func() *realNode {
 	}
 }
 
-// runReshard issues the operator Reshard RPC (N -> 2N) against the live workload -
-// the deploy-gap proof. It drives a real cluster-coordinated doubling over the
-// process boundary: the freeze barrier coordinates across nodes, each unit bisects
-// by copying its keys through object storage, routing flips atomically. The workload
-// keeps running; the writers' freeze-window refusals are retried (not acked-then-
-// lost). On a committed doubling it records the {from, to} transition + bumps the
-// reshard event count (which the vacuous-check requires). A refused reshard (in-
-// flight / ceiling / unstable membership) leaves the generation unchanged; it is
-// logged + retried once, since the run is vacuous without a committed reshard.
+// runReshard drives a real cluster-coordinated doubling (N -> 2N) against the live
+// workload via the topology's Reshard seam - the deploy-gap proof. With declarative
+// resharding (v0.8) that seam triggers the doubling by bumping the desired
+// --unit-count and re-rolling the nodes; the cluster's coordinator drives the freeze
+// barrier to completion (each unit bisects by copying its keys through object
+// storage, routing flips atomically). The workload keeps running; the writers'
+// freeze-window refusals are retried (not acked-then-lost). On a committed doubling
+// it records the {from, to} transition + bumps the reshard event count (which the
+// vacuous-check requires). A refused / not-yet-committed reshard leaves the
+// generation unchanged; it is logged + retried, since the run is vacuous without a
+// committed reshard.
+//
+// NOTE: the Reshard seam is currently a stub (the operator Reshard RPC it used to
+// dial was deleted; the declarative trigger is wired in the Validate phase), so this
+// presently records no reshard and the run reports VACUOUS. See adapter_real.go
+// realTopology.Reshard.
 func (rc *realHarness) runReshard() {
 	const maxAttempts = 3
 	for attempt := 0; attempt < maxAttempts; attempt++ {

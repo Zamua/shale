@@ -489,6 +489,18 @@ func (h *Handle) OpenUnits() []storageunit.GenUnit {
 	return out
 }
 
+// PresentUnits enumerates the GenUnits whose databases EXIST in the shared
+// bucket this handle's backing points at (regardless of mount), delegating
+// to Backing.PresentUnits. It is the durable-state view, DISTINCT from
+// OpenUnits (this handle's locally-mounted set). The cluster type-asserts
+// this method off the BackendFactory to run founder-restart derivation: a
+// founder restarting a previously-resharded cluster reads the live
+// {gen, count} from the units present in the bucket instead of re-init'ing
+// at the desired count and orphaning the existing data.
+func (h *Handle) PresentUnits(ctx context.Context) ([]storageunit.GenUnit, error) {
+	return h.backing.PresentUnits(ctx)
+}
+
 // Close releases every unit this handle still has mounted (best-effort
 // flush + shutdown). Used on node shutdown; idempotent.
 func (h *Handle) Close() error {

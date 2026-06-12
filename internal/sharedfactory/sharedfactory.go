@@ -39,6 +39,7 @@
 package sharedfactory
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"sort"
@@ -115,6 +116,33 @@ func (b *Backing) UnitStore(gu storageunit.GenUnit) (backend.Backend, bool) {
 	defer b.mu.Unlock()
 	s, ok := b.stores[gu]
 	return s, ok
+}
+
+// PresentUnits enumerates every GenUnit whose durable bytes EXIST in the
+// shared backing (regardless of which handle currently has it open),
+// ascending by (Generation, UnitID). It is the in-process analogue of the
+// slate Backing's bucket scan: the cluster's founder-restart path uses it to
+// derive the live {gen, count} from durable state instead of re-initializing
+// at the desired count and orphaning an existing resharded cluster's data. A
+// unit is "present" once it has been opened at least once (storeFor created
+// its entry); a never-touched backing returns an empty slice (the fresh
+// cluster case). The ctx is unused here (no I/O) but matches the slate
+// signature so both satisfy the cluster's optional presentUnitsProvider
+// interface.
+func (b *Backing) PresentUnits(_ context.Context) ([]storageunit.GenUnit, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]storageunit.GenUnit, 0, len(b.stores))
+	for gu := range b.stores {
+		out = append(out, gu)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Gen != out[j].Gen {
+			return out[i].Gen < out[j].Gen
+		}
+		return out[i].ID < out[j].ID
+	})
+	return out, nil
 }
 
 // WipeUnit empties u's shared bytes IN PLACE: it deletes every key from the
@@ -275,6 +303,16 @@ func (h *Handle) OpenUnits() []storageunit.GenUnit {
 		return out[i].ID < out[j].ID
 	})
 	return out
+}
+
+// PresentUnits enumerates the GenUnits present in the SHARED backing this
+// handle references, delegating to Backing.PresentUnits. It is the
+// durable-state view (every unit any node ever opened), NOT this handle's
+// locally-mounted set (OpenUnits). The cluster type-asserts this method off
+// the BackendFactory to run founder-restart derivation; a factory without it
+// keeps the gen-0/desired default.
+func (h *Handle) PresentUnits(ctx context.Context) ([]storageunit.GenUnit, error) {
+	return h.backing.PresentUnits(ctx)
 }
 
 // fencedBackend wraps the shared *memory.Memory for one unit, captured at

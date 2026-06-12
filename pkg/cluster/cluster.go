@@ -529,6 +529,13 @@ func Open(cfg Config) (*Cluster, error) {
 		GRPCAddr:  cfg.GRPCAddr,
 		Seeds:     cfg.Seeds,
 		LogOutput: cfg.LogOutput,
+		// Broadcast this node's DESIRED unit count (the v0.8 declarative
+		// resharding trigger) via the membership Meta payload. In multi-backend
+		// mode it is the configured UnitCount; in legacy mode UnitCount.IsZero()
+		// so N() is 0 and the node advertises no desired count (bare-addr Meta).
+		// The deterministic coordinator's reconcile loop (a later phase) reads
+		// every member's DesiredCount off the snapshot to decide a reshard.
+		DesiredCount: cfg.UnitCount.N(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cluster: membership: %w", err)

@@ -122,16 +122,11 @@ func (c *Client) ProposeRebalance(ctx context.Context, dryRun, apply, cancel boo
 	})
 }
 
-// Reshard is the CLI-side caller for `shale reshard`: it triggers a doubling
-// reshard (N -> 2N) on the dialed node, which becomes the coordinator. The
-// response carries the {from, to} unit counts on success or a non-empty error
-// string on a guard rejection (legacy mode, a reshard already in flight,
-// membership unstable mid-reshard). A refused reshard is reported in the
-// response.Error field, NOT as a gRPC status, so the caller distinguishes it
-// from a transport failure (which surfaces as the returned error).
-func (c *Client) Reshard(ctx context.Context) (*pb.ReshardResponse, error) {
-	return c.api.Reshard(ctx, &pb.ReshardRequest{})
-}
+// NOTE: there is NO Client.Reshard. Resharding is DECLARATIVE (v0.8): the
+// desired unit count is set via the deploy config (--unit-count) and the
+// cluster reshards itself, so there is no operator RPC to dial. The prior
+// Client.Reshard + the `shale reshard` CLI were deleted. See docs/SPEC.md
+// "Declarative resharding".
 
 // -- CAS transaction (v0.6) ------------------------------------------
 

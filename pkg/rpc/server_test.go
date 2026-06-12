@@ -6,7 +6,6 @@ import (
 	"errors"
 	"io"
 	"net"
-	"sync"
 	"testing"
 	"time"
 
@@ -575,98 +574,10 @@ func TestCommitCAS_FrozenIsRetryableUnavailableOverWire(t *testing.T) {
 	}
 }
 
-// TestReshardRPC_AdvancesGeneration: the operator-facing Reshard RPC against a
-// multi-backend node doubles the unit count + advances the generation, and
-// reports the {from, to} counts in the response with an empty error.
-func TestReshardRPC_AdvancesGeneration(t *testing.T) {
-	addr, c, cleanup := newMultiBackendServer(t)
-	defer cleanup()
-	cli := newTestClient(t, addr)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := cli.Reshard(ctx)
-	if err != nil {
-		t.Fatalf("Reshard RPC: %v", err)
-	}
-	if resp.GetError() != "" {
-		t.Fatalf("Reshard RPC returned error string %q, want empty (success)", resp.GetError())
-	}
-	if resp.GetFromUnitCount() != 4 || resp.GetToUnitCount() != 8 {
-		t.Fatalf("Reshard RPC reported from=%d to=%d, want from=4 to=8", resp.GetFromUnitCount(), resp.GetToUnitCount())
-	}
-	if _, count := c.GenStateSnapshot(); count != 8 {
-		t.Fatalf("cluster unit count = %d after Reshard RPC, want 8", count)
-	}
-}
-
-// TestReshardRPC_LegacyModeRefusedInResponse: the Reshard RPC against a LEGACY
-// single-Backend node carries the refusal in the response Error string (NOT a
-// gRPC status), matching the CommitCAS / ApplyBatch convention so the CLI can
-// distinguish a refused reshard from a transport failure. This is the
-// "malformed / again request is handled cleanly" path: a reshard against a node
-// that cannot reshard returns a clean typed refusal, not a panic or hang.
-func TestReshardRPC_LegacyModeRefusedInResponse(t *testing.T) {
-	addr, cleanup := newTestServer(t) // legacy single-Backend memory cluster
-	defer cleanup()
-	cli := newTestClient(t, addr)
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := cli.Reshard(ctx)
-	if err != nil {
-		t.Fatalf("Reshard RPC (legacy) returned a transport error %v, want a clean response with Error set", err)
-	}
-	if resp.GetError() == "" {
-		t.Fatal("Reshard RPC against a legacy node returned empty Error, want a refusal string")
-	}
-	if resp.GetFromUnitCount() != 0 || resp.GetToUnitCount() != 0 {
-		t.Fatalf("legacy refusal reported from=%d to=%d, want 0,0 (nothing moved)", resp.GetFromUnitCount(), resp.GetToUnitCount())
-	}
-}
-
-// TestReshardRPC_ConcurrentRejectedInResponse: while one reshard is in flight
-// (held open via the cluster's entry hook), a SECOND Reshard RPC is rejected
-// with the in-flight refusal in the response Error string, rather than queuing
-// behind the first. Deterministic via the entry hook.
-func TestReshardRPC_ConcurrentRejectedInResponse(t *testing.T) {
-	addr, c, cleanup := newMultiBackendServer(t)
-	defer cleanup()
-	cli := newTestClient(t, addr)
-
-	inReshard := make(chan struct{})
-	release := make(chan struct{})
-	var once sync.Once
-	c.TestingSetReshardEntryHook(func() {
-		once.Do(func() { close(inReshard) })
-		<-release
-	})
-
-	// First reshard via a direct cluster call so it parks in the hook holding
-	// reshardMu (driving it over the wire too would need a second client; the
-	// in-flight guard is identical whichever caller holds the lock).
-	firstDone := make(chan error, 1)
-	go func() {
-		_, _, err := c.TriggerReshard()
-		firstDone <- err
-	}()
-	<-inReshard
-
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	resp, err := cli.Reshard(ctx)
-	if err != nil {
-		t.Fatalf("concurrent Reshard RPC returned a transport error %v, want a clean in-flight refusal", err)
-	}
-	if resp.GetError() == "" {
-		t.Fatal("concurrent Reshard RPC returned empty Error, want the in-flight refusal string")
-	}
-
-	close(release)
-	if err := <-firstDone; err != nil {
-		t.Fatalf("first reshard: %v", err)
-	}
-}
+// NOTE: the operator-facing Reshard RPC was DELETED (resharding is declarative,
+// driven from --unit-count desired-state config; see docs/SPEC.md "Declarative
+// resharding"). Its server/client/CLI tests went with it. The in-process
+// reshard mechanism + the TriggerReshard concurrent-reject guard are still
+// covered by pkg/cluster (multibackend_trigger_reshard_internal_test.go +
+// multibackend_reshard*_test.go); the cluster-internal ReshardControl barrier
+// is covered above (TestReshardControl* in this file).

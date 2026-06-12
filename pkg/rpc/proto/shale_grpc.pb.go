@@ -51,7 +51,6 @@ const (
 	ShaleNode_CommitCAS_FullMethodName        = "/shale.v1.ShaleNode/CommitCAS"
 	ShaleNode_ApplyBatch_FullMethodName       = "/shale.v1.ShaleNode/ApplyBatch"
 	ShaleNode_ReshardControl_FullMethodName   = "/shale.v1.ShaleNode/ReshardControl"
-	ShaleNode_Reshard_FullMethodName          = "/shale.v1.ShaleNode/Reshard"
 	ShaleNode_GenState_FullMethodName         = "/shale.v1.ShaleNode/GenState"
 )
 
@@ -156,22 +155,6 @@ type ShaleNodeClient interface {
 	// the cluster (CLI callers use Reshard via the cluster surface, not this
 	// wire method directly).
 	ReshardControl(ctx context.Context, in *ReshardControlRequest, opts ...grpc.CallOption) (*ReshardControlResponse, error)
-	// Reshard is the OPERATOR-facing trigger for a doubling reshard (N -> 2N)
-	// on a running cluster. It is DISTINCT from ReshardControl: ReshardControl
-	// carries one internal barrier phase between nodes and is never called from
-	// outside the cluster, whereas Reshard is what the `shale reshard` CLI dials
-	// on a single node to KICK OFF the whole reshard. The receiving node becomes
-	// the coordinator: it calls Cluster.TriggerReshard, which drives the
-	// cluster-wide FREEZE -> BISECT -> FLIP -> RESUME barrier (multi-node) or the
-	// single-node bisect path. ReshardRequest is empty: the only supported reshard
-	// is a doubling, so there are no parameters. The response reports the
-	// {from_unit_count, to_unit_count} transition on success; a guard rejection
-	// (legacy mode, a reshard already in flight, membership unstable mid-reshard)
-	// travels as the error string, matching the CommitCAS / ApplyBatch /
-	// ReshardControl convention of carrying an expected control-flow outcome in the
-	// response field rather than a gRPC status code. Safe to retry after a clean
-	// failure: an error path leaves the generation unchanged.
-	Reshard(ctx context.Context, in *ReshardRequest, opts ...grpc.CallOption) (*ReshardResponse, error)
 	// GenState is the cluster-internal generation-propagation RPC for the
 	// v0.8 join-after-reshard fix. A node opening in multi-backend mode WITH
 	// seeds (a JOINER, not the founder) calls this on a live seed exactly once
@@ -355,16 +338,6 @@ func (c *shaleNodeClient) ReshardControl(ctx context.Context, in *ReshardControl
 	return out, nil
 }
 
-func (c *shaleNodeClient) Reshard(ctx context.Context, in *ReshardRequest, opts ...grpc.CallOption) (*ReshardResponse, error) {
-	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	out := new(ReshardResponse)
-	err := c.cc.Invoke(ctx, ShaleNode_Reshard_FullMethodName, in, out, cOpts...)
-	if err != nil {
-		return nil, err
-	}
-	return out, nil
-}
-
 func (c *shaleNodeClient) GenState(ctx context.Context, in *GenStateRequest, opts ...grpc.CallOption) (*GenStateResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GenStateResponse)
@@ -476,22 +449,6 @@ type ShaleNodeServer interface {
 	// the cluster (CLI callers use Reshard via the cluster surface, not this
 	// wire method directly).
 	ReshardControl(context.Context, *ReshardControlRequest) (*ReshardControlResponse, error)
-	// Reshard is the OPERATOR-facing trigger for a doubling reshard (N -> 2N)
-	// on a running cluster. It is DISTINCT from ReshardControl: ReshardControl
-	// carries one internal barrier phase between nodes and is never called from
-	// outside the cluster, whereas Reshard is what the `shale reshard` CLI dials
-	// on a single node to KICK OFF the whole reshard. The receiving node becomes
-	// the coordinator: it calls Cluster.TriggerReshard, which drives the
-	// cluster-wide FREEZE -> BISECT -> FLIP -> RESUME barrier (multi-node) or the
-	// single-node bisect path. ReshardRequest is empty: the only supported reshard
-	// is a doubling, so there are no parameters. The response reports the
-	// {from_unit_count, to_unit_count} transition on success; a guard rejection
-	// (legacy mode, a reshard already in flight, membership unstable mid-reshard)
-	// travels as the error string, matching the CommitCAS / ApplyBatch /
-	// ReshardControl convention of carrying an expected control-flow outcome in the
-	// response field rather than a gRPC status code. Safe to retry after a clean
-	// failure: an error path leaves the generation unchanged.
-	Reshard(context.Context, *ReshardRequest) (*ReshardResponse, error)
 	// GenState is the cluster-internal generation-propagation RPC for the
 	// v0.8 join-after-reshard fix. A node opening in multi-backend mode WITH
 	// seeds (a JOINER, not the founder) calls this on a live seed exactly once
@@ -556,9 +513,6 @@ func (UnimplementedShaleNodeServer) ApplyBatch(context.Context, *ApplyBatchReque
 }
 func (UnimplementedShaleNodeServer) ReshardControl(context.Context, *ReshardControlRequest) (*ReshardControlResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ReshardControl not implemented")
-}
-func (UnimplementedShaleNodeServer) Reshard(context.Context, *ReshardRequest) (*ReshardResponse, error) {
-	return nil, status.Error(codes.Unimplemented, "method Reshard not implemented")
 }
 func (UnimplementedShaleNodeServer) GenState(context.Context, *GenStateRequest) (*GenStateResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GenState not implemented")
@@ -797,24 +751,6 @@ func _ShaleNode_ReshardControl_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
-func _ShaleNode_Reshard_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
-	in := new(ReshardRequest)
-	if err := dec(in); err != nil {
-		return nil, err
-	}
-	if interceptor == nil {
-		return srv.(ShaleNodeServer).Reshard(ctx, in)
-	}
-	info := &grpc.UnaryServerInfo{
-		Server:     srv,
-		FullMethod: ShaleNode_Reshard_FullMethodName,
-	}
-	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
-		return srv.(ShaleNodeServer).Reshard(ctx, req.(*ReshardRequest))
-	}
-	return interceptor(ctx, in, info, handler)
-}
-
 func _ShaleNode_GenState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GenStateRequest)
 	if err := dec(in); err != nil {
@@ -879,10 +815,6 @@ var ShaleNode_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ReshardControl",
 			Handler:    _ShaleNode_ReshardControl_Handler,
-		},
-		{
-			MethodName: "Reshard",
-			Handler:    _ShaleNode_Reshard_Handler,
 		},
 		{
 			MethodName: "GenState",
