@@ -1,6 +1,8 @@
 module github.com/Zamua/shale/backends/pebble
 
-go 1.25.4
+go 1.26.0
+
+toolchain go1.26.4
 
 require (
 	github.com/Zamua/shale v0.0.0
