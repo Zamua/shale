@@ -32,16 +32,22 @@
 // joiner's gRPC server only after Open returns, so no external request can
 // reach the joiner before its generation is correct.
 //
-// FAIL CLOSED. If the seed query fails (seed unreachable, RPC error), Open
-// FAILS rather than falling back to gen 0: a joiner that cannot learn the
-// generation must not serve at the wrong one. The same retry-on-bind-conflict
-// loop that already wraps Open can retry the join.
+// FAIL CLOSED. The joiner tries EVERY visible non-self peer's GenState in turn;
+// only if they ALL fail (each seed unreachable / rejecting) does Open FAIL
+// rather than fall back to gen 0, so one momentarily-down peer does not fail a
+// join when another healthy seed exists. A joiner that cannot learn the
+// generation from anyone must not serve at the wrong one. A failed Open is
+// surfaced to the caller for a supervised restart (the bind-conflict retry
+// wrapper only retries bind errors, not a gen-query failure).
 //
 // STABLE MEMBERSHIP. A membership change mid-reshard ABORTS the reshard (the
 // coordinator's identity-set re-check), so a join only ever lands at a STABLE
 // generation - between reshards, never mid-FLIP. The seed's {gen, count} is
 // therefore a single coherent value (nextCount zero, cutOver empty); the
-// joiner does not reason about a mid-cutover straddle.
+// joiner does not reason about a mid-cutover straddle. (This stable-generation
+// guarantee rests on the MULTI-node barrier's abort; the single-node bisect
+// path has no membership re-check, so a join racing it is the same out-of-scope
+// window, narrowed but not eliminated.)
 
 package cluster
 
@@ -78,54 +84,64 @@ func (c *Cluster) GenStateSnapshot() (gen uint64, count uint32) {
 // Fails closed: a seed that is unreachable or rejects the query makes this
 // (and therefore Open) fail rather than silently leaving the joiner at gen 0.
 func (c *Cluster) learnGenerationFromSeed() error {
-	addr, err := c.pickSeedGRPCAddr()
-	if err != nil {
-		return err
+	addrs := c.seedGRPCAddrs()
+	if len(addrs) == 0 {
+		return fmt.Errorf("cluster: no live peer to query for the cluster generation (seeds=%v)", c.cfg.Seeds)
 	}
-	cli, err := c.clientFor(addr)
-	if err != nil {
-		return fmt.Errorf("cluster: dial seed %s for generation query: %w", addr, err)
+	// Try each visible peer in turn. A momentarily-unreachable peer must not
+	// fail the join while another healthy seed exists (e.g. a node joins while
+	// one of two existing nodes is briefly down). Fail closed only if EVERY
+	// peer fails: never fall back to gen 0.
+	var lastErr error
+	for _, addr := range addrs {
+		cli, err := c.clientFor(addr)
+		if err != nil {
+			lastErr = fmt.Errorf("cluster: dial seed %s for generation query: %w", addr, err)
+			continue
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), genQueryTimeout)
+		resp, err := cli.GenState(ctx)
+		cancel()
+		if err != nil {
+			lastErr = fmt.Errorf("cluster: query seed %s generation: %w", addr, err)
+			continue
+		}
+		count, err := storageunit.NewUnitCount(int(resp.GetUnitCount()))
+		if err != nil {
+			lastErr = fmt.Errorf("cluster: seed %s reported invalid unit count %d: %w", addr, resp.GetUnitCount(), err)
+			continue
+		}
+		// Commit the live generation BEFORE any unit is derived or mounted.
+		// cutOver is empty and nextCount zero: a join only lands at a STABLE
+		// generation (mid-reshard membership change aborts the reshard), so
+		// there is no in-flight cut-over to carry. From this store on,
+		// genSnapshot() returns the live generation, so the mount loop and
+		// every later routable op resolve at the right generation.
+		c.commitGenState(genState{
+			gen:     storageunit.Generation(resp.GetGeneration()),
+			count:   count,
+			cutOver: make(map[storageunit.UnitID]struct{}),
+		})
+		return nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), genQueryTimeout)
-	defer cancel()
-	resp, err := cli.GenState(ctx)
-	if err != nil {
-		return fmt.Errorf("cluster: query seed %s generation: %w", addr, err)
-	}
-
-	count, err := storageunit.NewUnitCount(int(resp.GetUnitCount()))
-	if err != nil {
-		return fmt.Errorf("cluster: seed %s reported invalid unit count %d: %w", addr, resp.GetUnitCount(), err)
-	}
-	// Commit the live generation BEFORE any unit is derived or mounted. cutOver
-	// is empty and nextCount zero: a join only lands at a STABLE generation
-	// (mid-reshard membership change aborts the reshard), so there is no
-	// in-flight cut-over to carry. From this store on, genSnapshot() returns
-	// the live generation, so the mount loop and every later routable op
-	// resolve at the right generation.
-	c.commitGenState(genState{
-		gen:     storageunit.Generation(resp.GetGeneration()),
-		count:   count,
-		cutOver: make(map[storageunit.UnitID]struct{}),
-	})
-	return nil
+	return fmt.Errorf("cluster: could not learn the cluster generation from any of %d visible peer(s): %w", len(addrs), lastErr)
 }
 
-// pickSeedGRPCAddr resolves the gRPC address of a live peer to query for the
-// generation. The join handshake (membership.Open -> Join) has already
-// populated the membership cache with every currently-known node and its gRPC
-// Addr (broadcast as the memberlist Meta payload), so Members() here includes
-// the seed(s) the joiner contacted. Returns the first peer that is not this
-// node. An empty result (no peer visible) is an error: a joiner with seeds
-// that sees no peer cannot learn the generation and must fail closed rather
-// than serve at gen 0.
-func (c *Cluster) pickSeedGRPCAddr() (string, error) {
+// seedGRPCAddrs returns the gRPC addresses of every visible non-self peer, for
+// learnGenerationFromSeed to query in turn. The join handshake (membership.Open
+// -> Join) has already populated the membership cache with every currently-
+// known node and its gRPC Addr (broadcast as the memberlist Meta payload), so
+// Members() here includes the seed(s) the joiner contacted. An empty result
+// (no peer visible) makes the join fail closed: a joiner that cannot learn the
+// generation must not serve at gen 0.
+func (c *Cluster) seedGRPCAddrs() []string {
 	self := c.cfg.NodeID
+	var addrs []string
 	for _, m := range c.Members() {
 		if m.ID == self || m.Addr == "" {
 			continue
 		}
-		return m.Addr, nil
+		addrs = append(addrs, m.Addr)
 	}
-	return "", fmt.Errorf("cluster: no live peer to query for the cluster generation (seeds=%v)", c.cfg.Seeds)
+	return addrs
 }
