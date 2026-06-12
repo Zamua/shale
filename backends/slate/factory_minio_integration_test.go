@@ -181,9 +181,32 @@ func TestFactory_CopyFreeFenceHandoff(t *testing.T) {
 		t.Fatalf("A close: %v", err)
 	}
 
-	// B acquires at a higher epoch off the SAME backing. The intended
-	// floor is 2; the factory fences authoritatively above the durable
-	// manifest epoch.
+	// Simulate a STALE A that came back not knowing about the impending
+	// handoff: open A's database DIRECTLY (a raw slate.New, the legacy
+	// single-instance path) at the current manifest epoch, BEFORE B fences.
+	// This is the "old owner still holds a live writer" we must fence. We
+	// open it here so that B's subsequent higher-epoch open is what locks it
+	// out - the natural, single-direction handoff fence (no in-process
+	// reopen-after-fence, which real slatedb does not support: a db prefix
+	// fenced FORWARD by another in-process writer cannot be safely re-opened
+	// in the SAME process - it trips slatedb's local-epoch assertion).
+	staleA, err := slate.New(slate.Config{
+		Bucket:    fx.Bucket,
+		DbName:    backingDbName(unit),
+		Endpoint:  fx.Endpoint,
+		Region:    "us-east-1",
+		AccessKey: fx.AccessKey,
+		SecretKey: fx.SecretKey,
+		UseSSL:    false,
+	})
+	if err != nil {
+		t.Fatalf("open stale-A direct: %v", err)
+	}
+	t.Cleanup(func() { _ = staleA.Close() })
+
+	// B acquires at a higher epoch off the SAME backing. The intended floor
+	// is 2; the factory fences authoritatively above the durable manifest
+	// epoch. Opening B FENCES the staleA writer that opened just above.
 	beB, err := nodeB.OpenUnit(unit, storageunit.Epoch(2))
 	if err != nil {
 		t.Fatalf("B open: %v", err)
@@ -203,32 +226,8 @@ func TestFactory_CopyFreeFenceHandoff(t *testing.T) {
 		}
 	}
 
-	// Fence: a stale A writer (re-opened at the now-stale epoch, simulating
-	// an A that did not observe the handoff) must be locked out. We re-open
-	// A's instance directly against the same db at the stale epoch and
-	// confirm its write fails once B holds the unit at a higher epoch.
-	staleA, err := slate.New(slate.Config{
-		Bucket:    fx.Bucket,
-		DbName:    backingDbName(unit),
-		Endpoint:  fx.Endpoint,
-		Region:    "us-east-1",
-		AccessKey: fx.AccessKey,
-		SecretKey: fx.SecretKey,
-		UseSSL:    false,
-	})
-	if err != nil {
-		t.Fatalf("reopen stale-A direct: %v", err)
-	}
-	t.Cleanup(func() { _ = staleA.Close() })
-
-	// Opening staleA bumps the epoch above B; to test the fence in the
-	// handoff direction, re-acquire on B at a still-higher epoch so B is
-	// the live writer and staleA is the one fenced.
-	if _, err := nodeB.OpenUnit(unit, storageunit.Epoch(5)); err != nil {
-		t.Fatalf("B re-acquire higher: %v", err)
-	}
-	// staleA is now below B's epoch; its writes must fail. slatedb's fence
-	// propagates through background tasks, so poll a bounded window.
+	// Fence: staleA is now below B's epoch; its writes must fail. slatedb's
+	// fence propagates through background tasks, so poll a bounded window.
 	deadline := time.Now().Add(30 * time.Second)
 	var lastErr error
 	for time.Now().Before(deadline) {
@@ -239,7 +238,10 @@ func TestFactory_CopyFreeFenceHandoff(t *testing.T) {
 		time.Sleep(250 * time.Millisecond)
 	}
 	if lastErr == nil {
-		t.Fatalf("stale A writer was NOT fenced after B re-acquired at a higher epoch: two writers could both write the unit")
+		t.Fatalf("stale A writer was NOT fenced after B acquired at a higher epoch: two writers could both write the unit")
+	}
+	if !slate.IsFenced(lastErr) {
+		t.Fatalf("stale A write failed but not with a writer-epoch fence (IsFenced=false): %v", lastErr)
 	}
 	t.Logf("stale A fenced as expected: %v", lastErr)
 
@@ -372,8 +374,12 @@ func TestFactory_CurrentEpochAndOpenUnits(t *testing.T) {
 }
 
 // TestFactory_DoubleOpenRejected pins the one-live-writer-per-handle
-// guard: re-opening a unit this handle already holds at an equal-or-lower
-// epoch is an error.
+// guard: re-opening a unit this handle ALREADY holds is an error at ANY
+// epoch (equal, lower, OR higher). The caller must CloseUnit first. The
+// strictly-higher same-node re-open the sharedfactory double permits is NOT
+// supported here: closing + reopening the same slatedb db in-process panics
+// a slatedb async task ("stored epoch is lower than local epoch"), and the
+// SUT never needs it (the reconcile always releases before re-acquiring).
 func TestFactory_DoubleOpenRejected(t *testing.T) {
 	fx := startFactoryMinIO(t)
 	b := newBacking(t, fx)
@@ -389,11 +395,98 @@ func TestFactory_DoubleOpenRejected(t *testing.T) {
 	if _, err := h.OpenUnit(unit, storageunit.Epoch(4)); err == nil {
 		t.Fatalf("re-open at a lower epoch should be rejected, got nil")
 	}
-	// A strictly-higher re-open is allowed (same node bumping its epoch).
-	if _, err := h.OpenUnit(unit, storageunit.Epoch(6)); err != nil {
-		t.Fatalf("strictly-higher re-open should be allowed: %v", err)
+	// A strictly-higher re-open WITHOUT a prior close is ALSO rejected now.
+	if _, err := h.OpenUnit(unit, storageunit.Epoch(6)); err == nil {
+		t.Fatalf("re-open at a higher epoch (without CloseUnit) should be rejected, got nil")
 	}
-	_ = h.CloseUnit(unit)
+	// After CloseUnit the held-state is cleared, so the held-check no longer
+	// rejects: a fresh ON-A-DIFFERENT-PROCESS open (the deployable handoff)
+	// would succeed. We do NOT re-open the same prefix in THIS process here -
+	// real slatedb does not support re-opening a db prefix in the same
+	// process after it has been opened (process-local epoch state), so the
+	// re-open-after-close path is exercised cross-process by the chaosreal
+	// adapter, not here. Closing simply must succeed and clear the slot.
+	if err := h.CloseUnit(unit); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if _, ok := h.CurrentEpoch(unit); ok {
+		t.Fatalf("CurrentEpoch ok=true after CloseUnit; the slot was not cleared")
+	}
+}
+
+// TestFactory_FenceEpochArithmetic pins the FACTORY's own epoch arithmetic
+// (fenceEpoch's max(intended, durableEpoch+1)) directly, so a regression in
+// the factory's math FAILS a test rather than hiding behind slatedb's own
+// monotonic manifest. The plain fence-handoff test always passes a generous
+// intended floor (already above the durable epoch), so it would still pass
+// even if fenceEpoch were neutered to return `intended` verbatim - slatedb
+// would advance the manifest regardless. This test passes an INTENTIONALLY
+// STALE intended floor (at or below the durable epoch) and asserts, via
+// Backing.DurableEpoch before + after, that the open landed STRICTLY above
+// the durable epoch: only correct factory arithmetic can satisfy that, since
+// a neutered fenceEpoch would try to open at the stale floor.
+func TestFactory_FenceEpochArithmetic(t *testing.T) {
+	fx := startFactoryMinIO(t)
+	b := newBacking(t, fx)
+	unit := gu(0, 8)
+
+	// Seed the unit so its durable manifest exists and has advanced an epoch
+	// or two: open + write + close a couple of times on a first handle.
+	h1 := b.Handle()
+	for i := 0; i < 2; i++ {
+		be, err := h1.OpenUnit(unit, storageunit.Epoch(1))
+		if err != nil {
+			t.Fatalf("seed open %d: %v", i, err)
+		}
+		if err := be.Put([]byte("seed"), []byte("x")); err != nil {
+			t.Fatalf("seed put %d: %v", i, err)
+		}
+		if err := h1.CloseUnit(unit); err != nil {
+			t.Fatalf("seed close %d: %v", i, err)
+		}
+	}
+
+	durableBefore, err := b.DurableEpoch(unit)
+	if err != nil {
+		t.Fatalf("durable before: %v", err)
+	}
+	if durableBefore == 0 {
+		t.Fatalf("expected a non-zero durable epoch after seeding, got 0")
+	}
+
+	// Acquire on a FRESH handle (cold acquire: it never held the unit, so it
+	// cannot consult a local epoch) with an INTENTIONALLY STALE intended
+	// floor: epoch 1, which is <= durableBefore. A correct factory ignores
+	// this stale floor and opens at durableBefore+1; a neutered fenceEpoch
+	// that returned `intended` would try to open at 1 and the durable epoch
+	// would NOT advance past durableBefore.
+	stale := storageunit.Epoch(1)
+	if stale > durableBefore {
+		t.Fatalf("test bug: intended floor %d is not stale relative to durable %d", stale, durableBefore)
+	}
+	h2 := b.Handle()
+	be, err := h2.OpenUnit(unit, stale)
+	if err != nil {
+		t.Fatalf("cold acquire with stale floor: %v", err)
+	}
+	// A write forces the open's higher writer-epoch to be durably committed
+	// to the manifest, so DurableEpoch observes the advance.
+	if err := be.Put([]byte("after"), []byte("y")); err != nil {
+		t.Fatalf("post-acquire put: %v", err)
+	}
+
+	durableAfter, err := b.DurableEpoch(unit)
+	if err != nil {
+		t.Fatalf("durable after: %v", err)
+	}
+	if durableAfter <= durableBefore {
+		t.Fatalf("factory under-fenced: durable epoch %d did not advance above %d (intended floor was a stale %d). A neutered fenceEpoch would open at the stale floor instead of max(intended, durable+1).", durableAfter, durableBefore, stale)
+	}
+	// And the opened epoch the handle recorded is strictly above durableBefore.
+	if e, ok := h2.CurrentEpoch(unit); !ok || e <= durableBefore {
+		t.Fatalf("CurrentEpoch = (%d, %v), want > durableBefore=%d", e, ok, durableBefore)
+	}
+	_ = h2.CloseUnit(unit)
 }
 
 // TestFactory_PresentUnits enumerates units present in the bucket after

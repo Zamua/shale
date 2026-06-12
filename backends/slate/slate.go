@@ -270,6 +270,33 @@ func (s *Slate) Close() error {
 	return nil
 }
 
+// IsFenced reports whether err is a slatedb WRITER-EPOCH FENCE: the engine
+// rejecting an operation because a NEWER writer opened the same (bucket,
+// dbName) and bumped the manifest writer-epoch, locking this (now-stale)
+// writer out. It is the typed, binding-stable way to recognize the fence
+// the v0.8 lease-handoff model relies on (a handed-off unit's old owner is
+// fenced the instant the new owner opens it), instead of matching the
+// error's rendered string.
+//
+// It matches via errors.As against slatedb.ErrorClosed with
+// Reason == CloseReasonFenced. The slate backend wraps every slatedb error
+// with %w, so a fence surfacing from Put/Delete/Get/Commit/ScanPrefix on a
+// *Slate is reachable here. A nil error is not a fence.
+//
+// NOTE this typed check only works IN-PROCESS, where the wrapped Go error
+// is intact. A fence that has crossed a gRPC boundary arrives as a status
+// STRING and is no longer an *ErrorClosed; a caller on the far side of the
+// wire must match the stable message fragments (e.g. "detected newer DB
+// client") instead. The slate-backed chaos harness does exactly that for
+// gRPC-transported fences; this helper is for the local path.
+func IsFenced(err error) bool {
+	if err == nil {
+		return false
+	}
+	var closed *slatedb.ErrorClosed
+	return errors.As(err, &closed) && closed.Reason == slatedb.CloseReasonFenced
+}
+
 // -- iterator -------------------------------------------------------
 
 // iterator wraps a *slatedb.DbIterator, translating its (KeyValue,

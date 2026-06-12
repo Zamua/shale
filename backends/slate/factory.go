@@ -160,6 +160,18 @@ func (b *Backing) resolveStore() (*slatedb.ObjectStore, error) {
 	return store, nil
 }
 
+// DurableEpoch is the exported view of durableEpoch: it reads the unit's
+// durable manifest writer-epoch (the cross-node source of truth a handoff
+// fences against) WITHOUT opening the database. Exposed so a test can pin
+// the factory's epoch arithmetic directly - read the durable epoch, drive
+// an acquire with a deliberately-stale intended floor, and assert the open
+// landed strictly above the durable epoch (proving fenceEpoch's
+// max(intended, durable+1) and not relying on slatedb's own fencing to mask
+// a regression). Returns (0, nil) when the db does not yet exist.
+func (b *Backing) DurableEpoch(gu storageunit.GenUnit) (storageunit.Epoch, error) {
+	return b.durableEpoch(gu)
+}
+
 // durableEpoch reads the unit's durable manifest writer-epoch WITHOUT
 // opening the database (hence without fencing). It is the cross-node
 // source of truth a handoff fences against. A nil manifest means the unit
@@ -293,6 +305,14 @@ type Handle struct {
 
 	mu   sync.Mutex
 	open map[storageunit.GenUnit]*mountedUnit // units THIS handle has open
+	// openLatch holds a per-GenUnit mutex so the WHOLE open of one unit
+	// (held-check, durable-manifest fence read, slatedb open, map insert)
+	// runs in a single critical section per unit. Without it OpenUnit would
+	// release h.mu around the slow slatedb open, leaving a window where two
+	// goroutines opening the SAME unit could both pass the held-check and
+	// both open. Keyed per unit so opens of DIFFERENT units still proceed
+	// concurrently (the slatedb open is the slow part and is unit-local).
+	openLatch map[storageunit.GenUnit]*sync.Mutex
 }
 
 // mountedUnit bundles a unit's live slatedb instance with the epoch this
@@ -306,9 +326,25 @@ type mountedUnit struct {
 // cluster gets its own Handle; they all share b.
 func (b *Backing) Handle() *Handle {
 	return &Handle{
-		backing: b,
-		open:    make(map[storageunit.GenUnit]*mountedUnit),
+		backing:   b,
+		open:      make(map[storageunit.GenUnit]*mountedUnit),
+		openLatch: make(map[storageunit.GenUnit]*sync.Mutex),
 	}
+}
+
+// latchFor returns the per-GenUnit open latch, creating it on first use. The
+// latch map itself is guarded by h.mu (briefly), so two goroutines opening
+// the same unit get the SAME *sync.Mutex and serialize on it; goroutines
+// opening different units get distinct latches and do not contend.
+func (h *Handle) latchFor(gu storageunit.GenUnit) *sync.Mutex {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	l, ok := h.openLatch[gu]
+	if !ok {
+		l = &sync.Mutex{}
+		h.openLatch[gu] = l
+	}
+	return l
 }
 
 // OpenUnit opens (mounts) the slatedb instance for gu in the shared
@@ -317,31 +353,37 @@ func (b *Backing) Handle() *Handle {
 // still holding the unit at a lower epoch is locked out (its next
 // Put/Delete/Commit fails with CloseReasonFenced).
 //
-//   - This handle ALREADY holds gu open: re-opening at an equal-or-lower
-//     epoch is a double-open error (one live writer per handle); reject. A
-//     strictly-higher re-open is allowed (the same node bumping its epoch);
-//     it closes the old instance and reopens (which fences the old one).
+//   - This handle ALREADY holds gu open: a double-open error at ANY epoch
+//     (one live writer per handle). The caller must CloseUnit(gu) first,
+//     then OpenUnit again. We do NOT support a strictly-higher same-node
+//     re-open by closing + reopening the same slatedb db in-process: that
+//     trips an internal "stored epoch is lower than local epoch" assertion
+//     in a slatedb async task (a process-level panic), and the SUT never
+//     needs it (the reconcile RELEASEs before any same-node re-acquire). So
+//     we reject it closed.
 //   - This handle does NOT hold gu (the cold-acquire / handoff case): the
 //     intended epoch is a best-effort floor; the factory fences
 //     AUTHORITATIVELY against the durable manifest at
-//     max(intended, durableEpoch+1). This NEVER rejects - a new owner must
-//     always be able to take the lease.
+//     max(intended, durableEpoch+1). This NEVER rejects for being too low -
+//     a new owner must always be able to take the lease.
+//
+// The whole open runs under a per-gu latch so a same-unit concurrent open
+// SERIALIZES (the second caller sees the unit held and is rejected) rather
+// than both passing a stale held-check around the slow slatedb open.
 func (h *Handle) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
+	latch := h.latchFor(gu)
+	latch.Lock()
+	defer latch.Unlock()
+
+	// Held-check under the latch: a concurrent same-unit open holds the latch,
+	// so by the time we get here either it finished (unit held -> we reject) or
+	// it has not started (unit not held -> we proceed and it rejects).
 	h.mu.Lock()
-	if cur, held := h.open[gu]; held {
-		if epoch <= cur.epoch {
-			h.mu.Unlock()
-			return nil, fmt.Errorf("slate: unit %s already open on this handle at epoch %d, refusing open at %d", gu, cur.epoch, epoch)
-		}
-		// Strictly-higher same-node re-open: close the old instance first
-		// so the reopen genuinely advances the writer epoch.
-		old := cur
-		delete(h.open, gu)
-		h.mu.Unlock()
-		_ = old.slate.Close()
-		h.mu.Lock()
-	}
+	cur, held := h.open[gu]
 	h.mu.Unlock()
+	if held {
+		return nil, fmt.Errorf("slate: unit %s already open on this handle at epoch %d; CloseUnit first to re-open", gu, cur.epoch)
+	}
 
 	// Fence authoritatively above the durable manifest epoch. The intended
 	// epoch is only a floor; the durable manifest governs so a stale floor

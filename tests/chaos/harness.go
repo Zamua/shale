@@ -367,27 +367,40 @@ func isEntryNodeGone(err error) bool {
 // isFenceTransient reports whether err is a slatedb WRITER-EPOCH FENCE surfacing
 // on an op against a node that held a unit whose lease just moved: slatedb's
 // engine rejects the op with ErrorClosed{Reason: CloseReasonFenced} ("Closed
-// error: detected newer DB client", "Reason=2"), which over gRPC arrives as
-// codes.Unknown wrapping that string. This is the EXPECTED race in a lease
-// handoff: between the new owner's OpenUnit (which fences) and the old owner's
-// reconcile unmounting the now-fenced unit, an op can briefly hit the fenced
-// instance on the old owner. It is NOT data loss - the data is durable in the
-// bucket and the NEW owner serves it; the op must be RETRIED (it resolves once
-// the old owner's reconcile unmounts the fenced unit and routing follows the new
-// lease). The single-instance backend's TestMinIO_WriterEpochFencing + the
-// factory integration tests pin this exact slatedb signature, so matching the
-// string here is matching a stable, tested contract - not a fragile guess. A
-// fenced READ in particular must be retried (route to the new owner), or the
-// reader falsely reports a read-availability loss for a write that is perfectly
-// safe in object storage under a different lease holder.
+// error: detected newer DB client", rendered "Reason=2"). This is the EXPECTED
+// race in a lease handoff: between the new owner's OpenUnit (which fences) and
+// the old owner's reconcile unmounting the now-fenced unit, an op can briefly
+// hit the fenced instance on the old owner. It is NOT data loss - the data is
+// durable in the bucket and the NEW owner serves it; the op must be RETRIED (it
+// resolves once the old owner's reconcile unmounts the fenced unit and routing
+// follows the new lease). A fenced READ in particular must be retried (route to
+// the new owner), or the reader falsely reports a read-availability loss for a
+// write that is perfectly safe in object storage under a different lease holder.
+//
+// WHY SUBSTRING (and not the typed slate.IsFenced sentinel): the fence is raised
+// on the OWNER node's slatedb engine and travels back to the harness ACROSS A
+// gRPC BOUNDARY (the harness's entry node forwards the op to the owner). By the
+// time it reaches this classifier it is a gRPC status STRING, not the original
+// wrapped *slatedb.ErrorClosed, so errors.As cannot reach the typed Reason. The
+// typed signal IS exposed (slate.IsFenced, unit-tested against the real
+// ErrorClosed), and the slate backend uses it on the local path; here on the
+// far side of the wire we match the STABLE message fragments slatedb emits.
+// We deliberately match the descriptive fragments ("detected newer DB client" /
+// "Closed error" + "newer") FIRST, since those are the human-readable parts of
+// the message and do not depend on how the CloseReason enum renders; the
+// "Reason=2" form is kept only as a belt-and-suspenders fallback (it would break
+// silently if slatedb ever gave CloseReason a String() method - hence it is not
+// the primary signal). The single-instance backend's TestMinIO_WriterEpochFencing
+// + the factory integration tests pin this exact slatedb signature.
 func isFenceTransient(err error) bool {
 	if err == nil {
 		return false
 	}
 	msg := err.Error()
 	return strings.Contains(msg, "detected newer DB client") ||
-		strings.Contains(msg, "Reason=2") ||
-		(strings.Contains(msg, "Closed error") && strings.Contains(msg, "newer"))
+		(strings.Contains(msg, "Closed error") && strings.Contains(msg, "newer")) ||
+		(strings.Contains(msg, "Closed:") && strings.Contains(msg, "Reason=2")) ||
+		strings.Contains(msg, "Reason=2")
 }
 
 // runWriter is one writer goroutine. It owns the disjoint key subspace
