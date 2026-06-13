@@ -164,6 +164,14 @@ func TestCASReplicate_R3_WriteQuorum_ToleratesOneReplicaDown(t *testing.T) {
 // best-effort-to-W after the local tx commits), so we assert the value IS
 // present on the owner's backend even though the commit reported an error.
 func TestCASReplicate_R3_WriteAll_FailsWhenOneReplicaDown(t *testing.T) {
+	// The down replica makes the under-W commit return a PERMANENT
+	// codes.Unavailable, which Transact treats as retryable. Without a short
+	// deadline it would re-run fn for the full production transactUnavailableTimeout
+	// (30s) before surfacing the error. The assertions below only care about the
+	// error code + the durable local commit, not the deadline length, so shrink it.
+	prevTO := cluster.SetTransactUnavailableTimeout(50 * time.Millisecond)
+	defer cluster.SetTransactUnavailableTimeout(prevTO)
+
 	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadQuorum)
 
 	key := []byte("all-cas")
