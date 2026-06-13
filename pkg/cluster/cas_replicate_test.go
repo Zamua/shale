@@ -342,6 +342,14 @@ func TestCASReplicate_WriteOne_SucceedsWithOwnerOnly(t *testing.T) {
 // even though the owner's local commit already happened. The error is the
 // best-effort-to-W signal, NOT a conflict.
 func TestCASReplicate_WriteAll_FailsWhenReplicaDown(t *testing.T) {
+	// The down replica makes the under-W commit return a PERMANENT
+	// codes.Unavailable, which Transact treats as retryable. Without a short
+	// deadline it would re-run fn for the full production transactUnavailableTimeout
+	// (30s) before surfacing the error. The assertion below only cares THAT the
+	// error is a non-conflict failure, not how long the deadline is, so shrink it.
+	prevTO := cluster.SetTransactUnavailableTimeout(50 * time.Millisecond)
+	defer cluster.SetTransactUnavailableTimeout(prevTO)
+
 	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadNearest)
 
 	nodes[2].stopGRPC()
