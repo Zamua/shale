@@ -20,9 +20,19 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/hashicorp/memberlist"
 )
+
+// leaveTimeout bounds the wait for the graceful-leave broadcast in
+// Close. memberlist.Leave(0) waits forever for the leave broadcast to
+// be gossiped out, which blocks indefinitely when a peer is still
+// alive but the broadcast does not complete promptly (slow or
+// unreachable peer). A bounded timeout lets Close fall through to
+// Shutdown; the remaining peers still observe the departure via
+// failure detection even if the graceful broadcast did not land.
+const leaveTimeout = 5 * time.Second
 
 // EventType distinguishes the kinds of membership change Events
 // subscribers can observe.
@@ -396,7 +406,10 @@ func (m *Membership) Close() error {
 	m.mu.Unlock()
 
 	// Best-effort graceful leave; ignore errors so Shutdown still runs.
-	_ = m.ml.Leave(0)
+	// A bounded timeout (not 0) is load-bearing: Leave(0) blocks forever
+	// waiting for the leave broadcast when a peer is still alive but the
+	// broadcast does not complete promptly. See leaveTimeout.
+	_ = m.ml.Leave(leaveTimeout)
 	err := m.ml.Shutdown()
 	m.events.shutdown()
 	return err

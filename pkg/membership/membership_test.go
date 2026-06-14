@@ -170,6 +170,61 @@ func TestLeaveEmitsEvent(t *testing.T) {
 	}
 }
 
+// TestCloseReturnsWithPeerAlive pins the bounded graceful-leave fix:
+// Close on a node whose peer is still alive must return promptly
+// rather than blocking forever on the leave broadcast. Before the fix,
+// Membership.Close called memberlist.Leave(0), whose nil timeout
+// channel made the wait-for-leave-broadcast a receive on a nil channel
+// that blocks indefinitely when a peer is still alive. We assert Close
+// returns inside a window well under any reasonable hang (and under the
+// 5s bounded leaveTimeout itself).
+func TestCloseReturnsWithPeerAlive(t *testing.T) {
+	n1Port := ephemeralPort(t)
+	n2Port := ephemeralPort(t)
+
+	m1 := openTestMembership(t, Config{
+		NodeID:   "alpha",
+		BindAddr: bindAddr(n1Port),
+		GRPCAddr: "127.0.0.1:19101",
+	})
+	m2 := openTestMembership(t, Config{
+		NodeID:   "beta",
+		BindAddr: bindAddr(n2Port),
+		GRPCAddr: "127.0.0.1:19102",
+		Seeds:    []string{bindAddr(n1Port)},
+	})
+
+	want := map[string]string{
+		"alpha": "127.0.0.1:19101",
+		"beta":  "127.0.0.1:19102",
+	}
+	if err := waitForMembers(m2, want, 5*time.Second); err != nil {
+		t.Fatalf("beta convergence: %v", err)
+	}
+
+	// Close beta while alpha is still alive. With the unbounded Leave(0)
+	// this never returns; with the bounded leaveTimeout it returns once
+	// the broadcast lands (fast, peer is local) or the timeout elapses.
+	done := make(chan error, 1)
+	go func() { done <- m2.Close() }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("beta Close: %v", err)
+		}
+	case <-time.After(leaveTimeout + 3*time.Second):
+		t.Fatalf("Close did not return within %s; graceful leave hung", leaveTimeout+3*time.Second)
+	}
+
+	// alpha (m1) is the still-alive peer; sanity-check it remains usable
+	// after beta's graceful leave (it observes beta's departure rather
+	// than hanging the cluster).
+	if got := m1.Members(); len(got) == 0 {
+		t.Fatalf("alpha lost all members after beta Close: %v", got)
+	}
+}
+
 // waitForMembers polls until m.Members() matches want or the deadline
 // expires.
 func waitForMembers(m *Membership, want map[string]string, timeout time.Duration) error {
