@@ -593,6 +593,8 @@ When `Membership` reports a join or leave, the node records the event and schedu
 
 The settling delay collapses bursts (rolling restart, several nodes joining within a second, a flapping peer) into one rebalance pass instead of thrashing the cluster through intermediate ring shapes. It also gives the existing membership reconciler (~5s) time to absorb missed events, so by the time `Evaluate` runs, every node tends to have the same view of who is in the cluster.
 
+A node is considered *rebalance-idle* only when no settle-timer evaluation is pending (scheduled but not yet fired) and every tracked migration has reached a terminal state. `WaitForRebalanceIdle` blocks until both hold, so a caller that observes idle immediately after a membership change is guaranteed the debounced evaluation has already run and drained, not merely that nothing has been scheduled yet. A pending debounce timer therefore counts as not-idle even while the Coordinator's range table is still empty.
+
 There is no consensus and no coordinator election. Each node independently decides what to send and what to receive based on its local view of membership. Because memberlist converges in bounded time and each node uses the same ring algorithm against the same member list, peers reach the same migration decisions without negotiation. Disagreement during convergence is handled by the existing forwarding loop-guard plus the per-range cutover below.
 
 An operator can also trigger evaluation explicitly:

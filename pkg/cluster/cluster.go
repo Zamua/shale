@@ -444,10 +444,22 @@ type Cluster struct {
 	// every ring change (re)arms the timer; when it fires,
 	// runEvaluate computes the plan. rebalanceCtx / rebalanceCancel
 	// drive the background sweep loop.
-	rebalance       atomic.Pointer[rebalance.Coordinator]
-	ringGen         atomic.Uint64
-	settleMu        sync.Mutex
-	settleTimer     *time.Timer
+	rebalance   atomic.Pointer[rebalance.Coordinator]
+	ringGen     atomic.Uint64
+	settleMu    sync.Mutex
+	settleTimer *time.Timer
+	// settlePending counts debounce-scheduled evaluations that have
+	// been armed but not yet completed (the timer is live, or its
+	// AfterFunc callback is running but has not yet returned). It makes
+	// a scheduled-but-unrun evaluation visible to WaitForRebalanceIdle:
+	// a node with settlePending > 0 is NOT rebalance-idle even though
+	// the Coordinator's range table may still be empty. Incremented when
+	// arming a FRESH timer (decided under settleMu so the "was there a
+	// live timer" read pairs atomically with the increment), decremented
+	// in a defer at the end of the runEvaluate / runReconcile callback
+	// once the Coordinator has registered its ranges. A re-arm of a
+	// still-live timer does NOT double-count. See docs/SPEC.md "Trigger".
+	settlePending   atomic.Int64
 	lastEvalRing    *ring.Ring
 	rebalanceCtx    context.Context
 	rebalanceCancel context.CancelFunc
@@ -920,7 +932,15 @@ func (c *Cluster) Close() error {
 	// with scheduleEvaluate.
 	c.settleMu.Lock()
 	if c.settleTimer != nil {
-		c.settleTimer.Stop()
+		// A live timer owns one pending obligation that will now never
+		// fire its callback (which is what would otherwise decrement).
+		// Stop returns true iff we stopped it before it fired; in that
+		// case release the obligation here so settlePending does not
+		// leak past Close. If Stop returns false the callback already
+		// fired and runEvaluate / runReconcile owns the decrement.
+		if c.settleTimer.Stop() {
+			c.settlePending.Add(-1)
+		}
 		c.settleTimer = nil
 	}
 	c.settleMu.Unlock()

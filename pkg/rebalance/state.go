@@ -692,6 +692,16 @@ func (c *Coordinator) WaitForIdle(ctx context.Context) error {
 	}
 }
 
+// Idle reports, without blocking, whether every tracked range is in a
+// terminal state (StateDone). It is the non-blocking counterpart of
+// WaitForIdle, exported so the Cluster layer can AND Coordinator range-
+// quiescence with its own debounce-quiescence (settlePending) inside
+// Cluster.WaitForRebalanceIdle without the Coordinator needing to know
+// about the Cluster's settle timer.
+func (c *Coordinator) Idle() bool {
+	return c.idle()
+}
+
 func (c *Coordinator) idle() bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

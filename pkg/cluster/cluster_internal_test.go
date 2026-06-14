@@ -6,6 +6,7 @@ package cluster
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net"
 	"strconv"
@@ -445,4 +446,92 @@ func (s *blockingTestSource) OpenRange(_ []uint64, _ uint64) (<-chan rebalance.K
 		errCh <- nil
 	}()
 	return out, errCh
+}
+
+// TestWaitForRebalanceIdle_BlocksWhileDebouncePending pins the
+// pending-aware contract added for the test-sync rework: a node with a
+// settle-timer evaluation SCHEDULED-but-not-yet-fired is NOT
+// rebalance-idle, even though the Coordinator's range table is still
+// empty. Before the fix, WaitForRebalanceIdle delegated straight to the
+// Coordinator, which saw zero non-terminal ranges during the debounce
+// window and returned "idle" prematurely; the evaluation then fired
+// mid-assertion. This test arms a pending evaluation with a settle
+// delay long enough that it cannot fire on its own, and asserts the
+// wait blocks until the evaluation is forced to run + drain.
+func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
+	port := freeTCPPort(t)
+	be := memory.New()
+	c, err := Open(Config{
+		NodeID:    "rb-pending",
+		Backend:   be,
+		BindAddr:  hp(port),
+		GRPCAddr:  "127.0.0.1:1",
+		LogOutput: io.Discard,
+		// Long delay: the armed timer must NOT fire on its own during
+		// the test. We drive the firing explicitly below.
+		RebalanceSettleDelay: time.Hour,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+
+	if !waitForLocalInRing(c, 2*time.Second) {
+		t.Fatalf("local member never landed in ring")
+	}
+
+	// Sanity: a quiescent node is idle immediately (no pending, no
+	// in-flight ranges).
+	if c.settlePending.Load() != 0 {
+		t.Fatalf("expected settlePending==0 at rest, got %d", c.settlePending.Load())
+	}
+	ctxFast, cancelFast := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancelFast()
+	if err := c.WaitForRebalanceIdle(ctxFast); err != nil {
+		t.Fatalf("quiescent node should be idle immediately, got %v", err)
+	}
+
+	// Arm a pending evaluation directly (mirrors what a membership event
+	// does via bumpRingGen -> scheduleEvaluate). The long settle delay
+	// means the AfterFunc will not fire during the test window.
+	c.scheduleEvaluate()
+	if got := c.settlePending.Load(); got != 1 {
+		t.Fatalf("expected settlePending==1 after scheduleEvaluate, got %d", got)
+	}
+
+	// WaitForRebalanceIdle MUST block now: the evaluation is scheduled
+	// but unrun, so the node is not idle even though no range is in
+	// flight yet. A bounded wait should time out (ctx deadline), proving
+	// it did not return early.
+	ctxBlock, cancelBlock := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancelBlock()
+	if err := c.WaitForRebalanceIdle(ctxBlock); err == nil {
+		t.Fatal("WaitForRebalanceIdle returned nil while a debounce was pending; expected it to block")
+	} else if err != context.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded while pending, got %v", err)
+	}
+
+	// Re-arming a still-live timer must NOT double-count the pending
+	// obligation.
+	c.scheduleEvaluate()
+	if got := c.settlePending.Load(); got != 1 {
+		t.Fatalf("expected settlePending to stay 1 on re-arm, got %d", got)
+	}
+
+	// Force the pending evaluation to run + drain. runEvaluateNow stops
+	// the live timer, adopts its pending obligation, runs the evaluate,
+	// and the runEvaluate defer releases it. With a single-node ring the
+	// plan is empty, so the Coordinator registers no in-flight ranges
+	// and settles immediately.
+	c.runEvaluateNow()
+
+	// Now the node is idle: pending drained AND no non-terminal range.
+	ctxIdle, cancelIdle := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelIdle()
+	if err := c.WaitForRebalanceIdle(ctxIdle); err != nil {
+		t.Fatalf("WaitForRebalanceIdle should return after the evaluation drained, got %v", err)
+	}
+	if got := c.settlePending.Load(); got != 0 {
+		t.Fatalf("expected settlePending==0 after the evaluation drained, got %d", got)
+	}
 }

@@ -57,9 +57,37 @@ func (c *Cluster) scheduleReconcile() {
 	c.settleMu.Lock()
 	defer c.settleMu.Unlock()
 	if c.settleTimer != nil {
+		// Re-arm: a still-live (or already-firing) timer already owns a
+		// pending obligation; the replacement inherits it. Do NOT
+		// double-count. Mirrors scheduleEvaluate.
 		c.settleTimer.Stop()
+	} else {
+		// Fresh arm: this reconcile is pending until the timer callback
+		// below releases it, so WaitForRebalanceIdle blocks through it.
+		c.settlePending.Add(1)
 	}
-	c.settleTimer = time.AfterFunc(c.settleDelay(), c.runReconcile)
+	c.settleTimer = time.AfterFunc(c.settleDelay(), c.runScheduledReconcile)
+}
+
+// runScheduledReconcile is the settle-timer callback for multi-backend
+// mode. It captures-and-clears the timer reference (so a concurrent
+// scheduleReconcile whose re-arm Stop() raced this firing treats itself
+// as a FRESH arm with its own pending increment), runs ONE reconcile
+// pass, then releases the pending obligation this firing owned. The
+// decrement lives here, NOT in runReconcile, because runReconcile is
+// also invoked directly (the self-heal loop, TestingRunReconcile) by
+// callers that never armed a pending obligation. By the time we
+// decrement, reconcileUnits has synchronously applied the acquire/
+// release set, so the settlePending -> applied-mounts handoff is
+// seamless for a WaitForRebalanceIdle poller.
+func (c *Cluster) runScheduledReconcile() {
+	defer c.settlePending.Add(-1)
+	c.settleMu.Lock()
+	if c.settleTimer != nil {
+		c.settleTimer = nil
+	}
+	c.settleMu.Unlock()
+	c.runReconcile()
 }
 
 // runReconcile fires when the settle timer elapses in multi-backend mode (and

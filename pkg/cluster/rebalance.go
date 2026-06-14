@@ -219,7 +219,18 @@ func (c *Cluster) scheduleEvaluate() {
 	c.settleMu.Lock()
 	defer c.settleMu.Unlock()
 	if c.settleTimer != nil {
+		// Re-arm: a still-live timer (or one whose callback already
+		// began) already owns a pending obligation, so do NOT
+		// double-count. The replacement timer inherits that same
+		// obligation. (A callback that has already started running
+		// captures-and-clears c.settleTimer under settleMu at its top,
+		// so if we observe a non-nil timer here it is one whose pending
+		// obligation has not yet been released.)
 		c.settleTimer.Stop()
+	} else {
+		// Fresh arm: this evaluation is now pending until runEvaluate's
+		// defer releases it.
+		c.settlePending.Add(1)
 	}
 	d := c.settleDelay()
 	c.settleTimer = time.AfterFunc(d, c.runEvaluate)
@@ -232,6 +243,31 @@ func (c *Cluster) scheduleEvaluate() {
 // founder/joiner branches in initRebalance), so by the time
 // runEvaluate first runs there is always a valid baseline.
 func (c *Cluster) runEvaluate() {
+	// Release the pending obligation this callback owns when it returns.
+	// By the time we decrement, rb.Evaluate (below) has synchronously
+	// registered every move in the Coordinator's range table in a
+	// non-terminal state (see Coordinator.Evaluate's contract), so a
+	// WaitForRebalanceIdle poller never sees a gap between "pending"
+	// dropping to zero and the in-flight ranges appearing: the handoff
+	// from settlePending to the Coordinator's non-terminal ranges is
+	// seamless. The defer also balances the count on the early-return
+	// paths (closed / single-node) where no Evaluate runs.
+	defer c.settlePending.Add(-1)
+
+	// Capture-and-clear the timer reference so a concurrent
+	// scheduleEvaluate (whose own re-arm Stop() raced this firing) sees
+	// settleTimer == nil and treats itself as a FRESH arm with its own
+	// pending increment. This callback still owns the increment it was
+	// armed with and releases it via the defer above; the freshly-armed
+	// timer owns a new one. Two pending obligations may briefly coexist,
+	// which is correct: there genuinely are two evaluations a waiter
+	// must see through.
+	c.settleMu.Lock()
+	if c.settleTimer != nil {
+		c.settleTimer = nil
+	}
+	c.settleMu.Unlock()
+
 	if c.closed.Load() {
 		return
 	}
@@ -275,10 +311,23 @@ func ringMinus(src *ring.Ring, omit string) *ring.Ring {
 // has already decided they want the migration, no need to wait the
 // debounce window.
 func (c *Cluster) runEvaluateNow() {
+	// runEvaluate's defer always decrements settlePending once, so this
+	// path must hand it exactly one obligation to release. If a live
+	// settle timer is pending we adopt ITS obligation (stop the timer so
+	// its callback never fires + double-decrements); otherwise we mint a
+	// fresh one. Either way a concurrent WaitForRebalanceIdle stays
+	// blocked across the immediate evaluate.
 	c.settleMu.Lock()
 	if c.settleTimer != nil {
-		c.settleTimer.Stop()
+		if !c.settleTimer.Stop() {
+			// Callback already fired and owns its own decrement; mint a
+			// fresh obligation for this immediate evaluate.
+			c.settlePending.Add(1)
+		}
+		// else: the stopped live timer's pending obligation is now ours.
 		c.settleTimer = nil
+	} else {
+		c.settlePending.Add(1)
 	}
 	c.settleMu.Unlock()
 	c.runEvaluate()
@@ -300,19 +349,57 @@ func (c *Cluster) snapshotRing() *ring.Ring {
 	return r
 }
 
-// WaitForRebalanceIdle blocks until every in-flight migration on this
-// node has reached a terminal state (StateDone) or ctx is canceled.
+// WaitForRebalanceIdle blocks until this node is rebalance-idle or ctx
+// is canceled. Per docs/SPEC.md "Trigger", a node is rebalance-idle
+// only when BOTH hold:
+//
+//   - no settle-timer evaluation is pending (settlePending == 0): no
+//     debounce-scheduled Evaluate/reconcile is armed-but-unrun or
+//     mid-callback. This is the Cluster's debounce-quiescence half.
+//   - every tracked migration has reached a terminal state: the
+//     Coordinator's range-quiescence half (Coordinator.Idle).
+//
+// Tightening "idle" to include the pending half closes the race where a
+// caller polls immediately after a membership change, BEFORE the
+// debounce fires: the Coordinator's range table is still empty so the
+// old pass-through returned "idle" prematurely and the evaluation then
+// fired mid-assertion. Now the wait blocks through the debounce so an
+// observed idle guarantees the evaluation has run AND drained.
+//
 // Used by tests + by the operator-facing --apply path so callers can
 // report "rebalance complete" with confidence.
 //
-// In single-node mode there is no Coordinator; the call returns
-// immediately with nil.
+// Single-node mode has no Coordinator (rb == nil) and never schedules
+// an evaluation, so settlePending stays 0 and Idle() is trivially true:
+// the call returns on the first poll. Multi-backend mode also has no
+// Coordinator but DOES schedule reconciles, so the settlePending half
+// still blocks correctly through a pending unit-reconcile.
 func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
+	ticker := time.NewTicker(10 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if c.settlePending.Load() == 0 && c.coordinatorIdle() {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// coordinatorIdle reports whether the legacy single-backend Coordinator
+// has no in-flight (non-terminal) ranges. Returns true when there is no
+// Coordinator (single-node or multi-backend mode): in those modes range
+// quiescence is not the Coordinator's concern, and WaitForRebalanceIdle
+// relies on the settlePending half instead.
+func (c *Cluster) coordinatorIdle() bool {
 	rb := c.rebalance.Load()
 	if rb == nil {
-		return nil
+		return true
 	}
-	return rb.WaitForIdle(ctx)
+	return rb.Idle()
 }
 
 // migrationGuardError builds the error returned to a Put/Delete that
