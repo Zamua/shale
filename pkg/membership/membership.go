@@ -34,6 +34,22 @@ import (
 // failure detection even if the graceful broadcast did not land.
 const leaveTimeout = 5 * time.Second
 
+// gossipConfig returns the memberlist preset used for every new node.
+// It defaults to DefaultLANConfig, which is correct for the real
+// cross-host VPS cluster (conservative probe/suspicion timings tuned for
+// a real network). Tests call UseLocalGossipForTests to swap in the much
+// tighter loopback preset so in-process clusters converge in
+// milliseconds instead of seconds.
+var gossipConfig = memberlist.DefaultLANConfig
+
+// UseLocalGossipForTests switches new memberlist instances to the
+// loopback (DefaultLocalConfig) preset, whose probe/gossip/suspicion
+// timings are an order of magnitude tighter than LAN. TEST-ONLY: call it
+// once from a test package's init() so that package's in-process
+// clusters converge fast. It is never called in production, so prod
+// nodes keep the LAN preset.
+func UseLocalGossipForTests() { gossipConfig = memberlist.DefaultLocalConfig }
+
 // EventType distinguishes the kinds of membership change Events
 // subscribers can observe.
 type EventType int
@@ -282,7 +298,7 @@ func Open(cfg Config) (*Membership, error) {
 	}
 	events.parent = m
 
-	mlCfg := memberlist.DefaultLANConfig()
+	mlCfg := gossipConfig()
 	mlCfg.Name = cfg.NodeID
 	if bindHost != "" {
 		mlCfg.BindAddr = bindHost

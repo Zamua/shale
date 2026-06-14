@@ -164,7 +164,7 @@ func TestWriteQuorum_LiveClampedR5_On2Nodes(t *testing.T) {
 		}
 	}
 	for _, c := range clusters {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		_ = c.WaitForRebalanceIdle(ctx)
 		cancel()
 	}

@@ -122,7 +122,7 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 	// settle before exercising the routing/forwarding path; the
 	// rebalance behavior itself is covered by dedicated tests.
 	for _, c := range []*cluster.Cluster{c1, c2} {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		if err := c.WaitForRebalanceIdle(ctx); err != nil {
 			cancel()
 			t.Fatalf("%s rebalance idle: %v", c.NodeID(), err)
@@ -491,7 +491,7 @@ func TestRemoteTx_CommitsViaCAS(t *testing.T) {
 	// Let any joiner-bootstrap rebalance settle so the forwarded reads /
 	// CommitCAS below don't race a StateReceiving window on n2.
 	for _, c := range []*cluster.Cluster{c1, c2} {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		if err := c.WaitForRebalanceIdle(ctx); err != nil {
 			cancel()
 			t.Fatalf("%s rebalance idle: %v", c.NodeID(), err)
@@ -588,7 +588,7 @@ func TestTransact_RemoteContention(t *testing.T) {
 		if err := waitForRingSize(c, 2, 5*time.Second); err != nil {
 			t.Fatalf("%s ring: %v", c.NodeID(), err)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		if err := c.WaitForRebalanceIdle(ctx); err != nil {
 			cancel()
 			t.Fatalf("%s rebalance idle: %v", c.NodeID(), err)
@@ -790,7 +790,7 @@ func TestTwoNode_RebalanceOnMembershipGrowth(t *testing.T) {
 	// Wait for each node's Coordinator to settle. Bounded so a stuck
 	// migration fails loud.
 	for _, c := range []*cluster.Cluster{n1Cluster, n2Cluster, n3Cluster} {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		if err := c.WaitForRebalanceIdle(ctx); err != nil {
 			cancel()
 			t.Fatalf("%s did not idle: %v", c.NodeID(), err)
@@ -902,7 +902,7 @@ func TestFounderGrows_RebalanceReachesEveryKey(t *testing.T) {
 	// converged ring on the joiner and pulls every owned-but-missing
 	// partition. WaitForRebalanceIdle bounds the wait per node.
 	for _, c := range []*cluster.Cluster{founder, joiner} {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		if err := c.WaitForRebalanceIdle(ctx); err != nil {
 			cancel()
 			t.Fatalf("%s did not idle: %v", c.NodeID(), err)

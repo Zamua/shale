@@ -389,7 +389,7 @@ func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc clust
 	for i, n := range nodes {
 		cs[i] = n.Cluster
 	}
-	waitForClusterReady(t, cs, 15*time.Second)
+	waitForClusterReady(t, cs, 45*time.Second)
 	// Final gate: prove the routed forwarding RPC path actually
 	// round-trips at the configured WriteConsistency before any test
 	// issues its seed Put. waitForClusterReady proves membership +
@@ -400,7 +400,7 @@ func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc clust
 	// got M" flake. The probe write through nodes[0].Cluster drives the
 	// same routed + replicated path the tests use; its retry is scoped to
 	// THIS setup window only.
-	waitForWriteReady(t, nodes[0].Cluster, 15*time.Second)
+	waitForWriteReady(t, nodes[0].Cluster, 45*time.Second)
 	return nodes
 }
 

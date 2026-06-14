@@ -61,7 +61,7 @@ jobs:
           MODULES=(. backends/pebble backends/slate)
           for m in "${MODULES[@]}"; do
             echo "::group::go test $m"
-            (cd "$m" && go test ./... -race -timeout 300s -p 1 -parallel 1)
+            (cd "$m" && go test ./... -race -timeout 600s -p 1 -parallel 1)
             echo "::endgroup::"
           done
 

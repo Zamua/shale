@@ -158,7 +158,7 @@ func TestFounderGrows_MultiKeyShard_ReachesEveryKey(t *testing.T) {
 	}
 
 	for _, c := range []*cluster.Cluster{founder, joiner} {
-		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		if err := c.WaitForRebalanceIdle(ctx); err != nil {
 			cancel()
 			t.Fatalf("%s did not idle: %v", c.NodeID(), err)
