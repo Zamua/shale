@@ -207,7 +207,42 @@ func startCountingCluster(t *testing.T, count, r int, wc cluster.WriteConsistenc
 	// bootstrap migration is still routing through the source's
 	// runSend / sweep window.
 	waitForClusterReady(t, cs, 15*time.Second)
+	// Prove the cluster can actually satisfy its configured write
+	// consistency before any test seeds data. waitForClusterReady
+	// confirms ring convergence + rebalance-idle, but under heavy host
+	// load a fresh WriteAll/WriteQuorum write can still momentarily
+	// fall short of R acks while the peer gRPC links finish warming up
+	// (seen as "needed N acks, got 1" mid-test). Retry a throwaway
+	// write until it lands, then zero the counters so the probe stays
+	// invisible to the per-backend Put/Get/Delete deltas the tests
+	// assert on.
+	probeWriteReady(t, nodes, 10*time.Second)
 	return nodes
+}
+
+// probeWriteReady blocks until a write through nodes[0] succeeds under
+// the cluster's configured write consistency, then resets every
+// backend's operation counters. It converts a transient setup-time ack
+// shortfall (under load) from a confusing mid-test failure into either
+// a retried success or a clear setup-time error.
+func probeWriteReady(t *testing.T, nodes []*countingTestNode, budget time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(budget)
+	var lastErr error
+	for {
+		if lastErr = nodes[0].Cluster.Put([]byte("__write_ready_probe__"), []byte("ready")); lastErr == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("write-readiness probe never succeeded within %s: %v", budget, lastErr)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	for _, n := range nodes {
+		n.Backend.puts.Store(0)
+		n.Backend.gets.Store(0)
+		n.Backend.dels.Store(0)
+	}
 }
 
 // TestReplicate_WriteOne_AcksOnPrimaryAlone pins WriteOne: a Put
