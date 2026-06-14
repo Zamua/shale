@@ -475,7 +475,7 @@ func isTransientWarmupErr(err error) bool {
 // write into a freshly-joined cluster hits a partition mid-migration
 // or a node that hasn't yet noticed its new peers.
 //
-// Three-phase wait:
+// Two-phase wait:
 //
 //  1. Ring convergence: every node's Members() reports len(clusters)
 //     entries. Under SWIM gossip this is sub-second on loopback but
@@ -485,33 +485,32 @@ func isTransientWarmupErr(err error) bool {
 //     returns. This closes the debounced-Evaluate -> Send -> Receive
 //     -> sweep cycle that fires on each Notify*Join, so the in-flight
 //     bootstrap migrations + their grace-window sweeps are all
-//     complete before the test starts writing.
-//  3. A small belt-and-suspenders sleep to let any async events
-//     (delete-after-send sweep ticks, cache invalidation, etc.) drain.
+//     complete before the test starts writing. WaitForIdle is
+//     deterministic across the debounce window: a scheduled-but-unrun
+//     evaluation counts as not-idle, so it blocks until the evaluation
+//     fires and drains rather than returning a premature "idle".
 //
-// The deadline argument is the wall-clock budget for ALL three steps;
-// each phase consumes part of it. On timeout we fail with a clear
-// per-phase diagnostic so a real cluster bug is easy to spot vs a
-// transient slow-CI hiccup.
+// The deadline argument is the wall-clock budget for BOTH steps; each
+// phase consumes part of it. On timeout we fail with a clear per-phase
+// diagnostic so a real cluster bug is easy to spot vs a transient
+// slow-CI hiccup.
 func waitForClusterReady(t *testing.T, clusters []*cluster.Cluster, deadline time.Duration) {
 	t.Helper()
 	start := time.Now()
 	if err := waitForMembersAll(clusters, len(clusters), deadline); err != nil {
 		t.Fatalf("waitForClusterReady: ring convergence: %v", err)
 	}
-	// Pre-WaitForIdle sleep: the seed node's Coordinator debounces
-	// each NotifyJoin behind RebalanceSettleDelay (500ms in the
-	// integration fixture). If we call WaitForIdle before that timer
-	// fires, the Coordinator has nothing pending + returns "idle"
-	// immediately - then the Evaluate fires while the test is already
-	// putting, and we are back to the original flake. Sleeping past
-	// the settle window ensures Evaluate has run and the post-Evaluate
-	// Sending/Receiving entries exist for WaitForIdle to actually
-	// observe.
-	time.Sleep(700 * time.Millisecond)
+	// WaitForRebalanceIdle is now deterministic across the debounce
+	// window: a debounce-scheduled-but-unrun evaluation counts as
+	// not-idle (settlePending > 0), so calling WaitForIdle before the
+	// settle timer fires blocks until the evaluation has fired AND
+	// drained rather than returning a premature "idle". The old
+	// pre-idle settle sleep + post-idle drain sleep are no longer
+	// needed: WaitForIdle alone closes the debounced-Evaluate -> Send
+	// -> Receive -> sweep cycle.
 	remaining := deadline - time.Since(start)
 	if remaining <= 0 {
-		t.Fatalf("waitForClusterReady: pre-idle waits consumed the entire %s budget", deadline)
+		t.Fatalf("waitForClusterReady: ring convergence consumed the entire %s budget", deadline)
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), remaining)
 	defer cancel()
@@ -520,10 +519,4 @@ func waitForClusterReady(t *testing.T, clusters []*cluster.Cluster, deadline tim
 			t.Fatalf("waitForClusterReady: rebalance idle wait on cluster %d (%s): %v", i, c.NodeID(), err)
 		}
 	}
-	// Small drain window after Coordinator-reported idle so any async
-	// side effects (grace-window sweep ticks, ring-rebuild fan-outs,
-	// peer client cache invalidations) settle before the test starts
-	// writing. 50ms is well under any test's per-step budget but is
-	// long enough to consistently clear the post-idle backlog.
-	time.Sleep(50 * time.Millisecond)
 }

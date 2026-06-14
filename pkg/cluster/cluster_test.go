@@ -326,6 +326,26 @@ func waitForRingSize(c *cluster.Cluster, want int, timeout time.Duration) error 
 	return fmt.Errorf("ring size %d != want %d (members=%v)", len(c.Members()), want, c.Members())
 }
 
+// pollUntil polls cond every interval until it returns true or the
+// timeout elapses. Returns true on success, false on timeout. Use this
+// to gate an assertion on a condition the test drives toward
+// asynchronously (a reconcile tick landing, a source-side sweep
+// dropping a stale copy) instead of a fixed settle sleep: the loop
+// returns the instant the condition holds, and only burns the full
+// budget when something is genuinely wrong.
+func pollUntil(timeout, interval time.Duration, cond func() bool) bool {
+	deadline := time.Now().Add(timeout)
+	for {
+		if cond() {
+			return true
+		}
+		if time.Now().After(deadline) {
+			return false
+		}
+		time.Sleep(interval)
+	}
+}
+
 // findKeyOwnedBy scans synthetic keys until it finds one whose owner
 // (as the given cluster sees it) is wantOwner. The lookup uses the
 // public Members() snapshot + a freshly-constructed ring, so it sees
@@ -696,8 +716,21 @@ func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
 	// snapshotPeer for n2 will hit a transport error.
 	n2GRPC.server.Stop()
 	<-n2GRPC.done
-	// Brief settle so subsequent dials see a definite refused.
-	time.Sleep(100 * time.Millisecond)
+	// Poll until a fresh dial to n2's gRPC address is actually refused
+	// (the OS tears the listener down asynchronously after Stop), so
+	// the Aggregate below sees a definite transport error rather than
+	// racing the teardown. Deterministic replacement for a fixed settle
+	// sleep: returns the instant the port stops accepting.
+	if !pollUntil(5*time.Second, 20*time.Millisecond, func() bool {
+		conn, err := net.DialTimeout("tcp", n2GRPC.addr, 100*time.Millisecond)
+		if err != nil {
+			return true
+		}
+		_ = conn.Close()
+		return false
+	}) {
+		t.Fatalf("n2 gRPC listener at %s never stopped accepting after Stop", n2GRPC.addr)
+	}
 
 	results := c1.Aggregate(func(_ backend.Backend) any {
 		return "fn-ran"
@@ -798,14 +831,14 @@ func TestTwoNode_RebalanceOnMembershipGrowth(t *testing.T) {
 		cancel()
 	}
 
-	// Give the sweep one more cycle so any HandedOff source ranges
-	// hand their keys back through Delete + transition Done. Without
-	// this, the source-side stale copies linger past idle.
-	time.Sleep(500 * time.Millisecond)
-
 	// Verify physical placement matches the 3-node ring. For every
 	// key, the node the ring assigns must be the only physical
-	// holder. Sweep removes the source-side copy after grace.
+	// holder. WaitForRebalanceIdle above blocks through the
+	// HandedOff -> sweep -> Done cycle (HandedOff is non-terminal), so
+	// the source-side copies are already dropped by the time it
+	// returns; no settle sleep is needed. We still poll the placement
+	// check briefly so a late reconcile re-arm cannot race the
+	// assertion, but the loop returns the instant placement is correct.
 	r := ring.New()
 	for _, m := range n1Cluster.Members() {
 		r.Add(m)
@@ -817,22 +850,25 @@ func TestTwoNode_RebalanceOnMembershipGrowth(t *testing.T) {
 	}
 	missing := 0
 	wrong := 0
-	for _, k := range keys {
-		owner := r.LocateKey([]byte(k)).ID
-		// The owner's backend must have the key.
-		got, err := backends[owner].Get([]byte(k))
-		if err != nil {
-			missing++
-			continue
+	placed := pollUntil(5*time.Second, 50*time.Millisecond, func() bool {
+		missing, wrong = 0, 0
+		for _, k := range keys {
+			owner := r.LocateKey([]byte(k)).ID
+			got, err := backends[owner].Get([]byte(k))
+			if err != nil {
+				missing++
+				continue
+			}
+			if string(got) != "v" {
+				wrong++
+			}
 		}
-		if string(got) != "v" {
-			wrong++
+		return missing == 0 && wrong == 0
+	})
+	if !placed {
+		if missing > 0 {
+			t.Fatalf("%d/%d keys missing on the ring-owner's backend", missing, len(keys))
 		}
-	}
-	if missing > 0 {
-		t.Fatalf("%d/%d keys missing on the ring-owner's backend", missing, len(keys))
-	}
-	if wrong > 0 {
 		t.Fatalf("%d/%d keys had wrong value on the ring-owner's backend", wrong, len(keys))
 	}
 }
@@ -910,16 +946,15 @@ func TestFounderGrows_RebalanceReachesEveryKey(t *testing.T) {
 		cancel()
 	}
 
-	// The reconcile pass + the ring-vs-ring plan can both be re-armed
-	// by the ~membership reconcile loop; give one extra settle window so
-	// any owned-but-missing partition detected on a later tick lands +
-	// the source-side sweep drops stale copies.
-	time.Sleep(1500 * time.Millisecond)
-
 	// Verify physical placement matches the 2-node ring: every key must
 	// be physically present on the backend of the node the ring routes
 	// it to. A key the ring sends to the joiner that still lives only on
-	// the founder is the founder-grows orphan this fix closes.
+	// the founder is the founder-grows orphan this fix closes. The
+	// reconcile pass + ring-vs-ring plan can be re-armed by a late
+	// membership reconcile tick, so we poll the placement check rather
+	// than asserting once: the loop returns the instant every owned key
+	// has landed on its owner, and only burns the budget if a partition
+	// is genuinely stranded.
 	r := ring.New()
 	for _, m := range founder.Members() {
 		r.Add(m)
@@ -930,16 +965,20 @@ func TestFounderGrows_RebalanceReachesEveryKey(t *testing.T) {
 	}
 	missing := 0
 	var firstMissing string
-	for _, k := range keys {
-		owner := r.LocateKey([]byte(k)).ID
-		if _, err := backends[owner].Get([]byte(k)); err != nil {
-			if missing == 0 {
-				firstMissing = fmt.Sprintf("%s -> owner %s", k, owner)
+	placed := pollUntil(5*time.Second, 50*time.Millisecond, func() bool {
+		missing, firstMissing = 0, ""
+		for _, k := range keys {
+			owner := r.LocateKey([]byte(k)).ID
+			if _, err := backends[owner].Get([]byte(k)); err != nil {
+				if missing == 0 {
+					firstMissing = fmt.Sprintf("%s -> owner %s", k, owner)
+				}
+				missing++
 			}
-			missing++
 		}
-	}
-	if missing > 0 {
+		return missing == 0
+	})
+	if !placed {
 		t.Fatalf("%d/%d keys missing on the ring-owner's backend (first: %s); founder-grows orphan not repaired",
 			missing, len(keys), firstMissing)
 	}

@@ -165,27 +165,14 @@ func TestFounderGrows_MultiKeyShard_ReachesEveryKey(t *testing.T) {
 		}
 		cancel()
 	}
-	// One extra settle window so a late reconcile tick lands + the
-	// source sweep drops stale copies.
-	time.Sleep(1500 * time.Millisecond)
-
-	// --- Assertion A: routed Get for every raw key via BOTH nodes. The
-	// non-owning node forwards over gRPC; both must return the value.
-	for _, s := range all {
-		for _, k := range s.keys {
-			if _, err := founder.Get(k); err != nil {
-				t.Fatalf("DATA LOSS: Get(%q) via founder after rebalance: %v", k, err)
-			}
-			if _, err := joiner.Get(k); err != nil {
-				t.Fatalf("DATA LOSS: Get(%q) via joiner (forwarded) after rebalance: %v", k, err)
-			}
-		}
-	}
-
 	// --- Assertion B: physical co-location matches the ring. Every key
 	// of a subject must live on the single node the ring routes that
 	// subject's shard to (a subject's keys must not be split across
-	// nodes, and must not be stranded on the non-owner).
+	// nodes, and must not be stranded on the non-owner). The reconcile
+	// pass can be re-armed by a late membership reconcile tick, so we
+	// poll the placement check rather than asserting once after a fixed
+	// settle sleep: the loop returns the instant every subject's keys
+	// have landed on the subject's ring-owner.
 	r := ring.New()
 	for _, m := range founder.Members() {
 		r.Add(m)
@@ -196,20 +183,39 @@ func TestFounderGrows_MultiKeyShard_ReachesEveryKey(t *testing.T) {
 	}
 	splitOrStranded := 0
 	var firstBad string
-	for _, s := range all {
-		owner := r.LocateKey(slugShardKey([]byte("pastes/" + s.slug))).ID
-		for _, k := range s.keys {
-			if _, err := backends[owner].Get(k); err != nil {
-				if firstBad == "" {
-					firstBad = fmt.Sprintf("%q (subject %s -> ring-owner %s) missing on owner backend", k, s.slug, owner)
+	placed := pollUntil(5*time.Second, 50*time.Millisecond, func() bool {
+		splitOrStranded, firstBad = 0, ""
+		for _, s := range all {
+			owner := r.LocateKey(slugShardKey([]byte("pastes/" + s.slug))).ID
+			for _, k := range s.keys {
+				if _, err := backends[owner].Get(k); err != nil {
+					if firstBad == "" {
+						firstBad = fmt.Sprintf("%q (subject %s -> ring-owner %s) missing on owner backend", k, s.slug, owner)
+					}
+					splitOrStranded++
 				}
-				splitOrStranded++
 			}
 		}
-	}
-	if splitOrStranded > 0 {
+		return splitOrStranded == 0
+	})
+	if !placed {
 		t.Fatalf("%d/%d keys not on their subject's ring-owner backend (first: %s); "+
 			"founder-grows multi-key handoff did not honor ShardKeyFn",
 			splitOrStranded, wantKeys, firstBad)
+	}
+
+	// --- Assertion A: routed Get for every raw key via BOTH nodes. The
+	// non-owning node forwards over gRPC; both must return the value.
+	// Checked after physical placement has converged above, so a
+	// forwarded Get cannot race a still-migrating partition.
+	for _, s := range all {
+		for _, k := range s.keys {
+			if _, err := founder.Get(k); err != nil {
+				t.Fatalf("DATA LOSS: Get(%q) via founder after rebalance: %v", k, err)
+			}
+			if _, err := joiner.Get(k); err != nil {
+				t.Fatalf("DATA LOSS: Get(%q) via joiner (forwarded) after rebalance: %v", k, err)
+			}
+		}
 	}
 }
