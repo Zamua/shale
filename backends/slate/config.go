@@ -86,6 +86,25 @@ type Config struct {
 	// though doing so races with concurrent writes and is not
 	// recommended.
 	WriteOptions *slatedb.WriteOptions
+
+	// Cache, if non-nil, is the slatedb SST block + metadata cache the
+	// DbBuilder is given via WithDbCache before Build. Nil = slatedb's
+	// default (NO block cache: every read re-fetches SST blocks from the
+	// object store). On an object-store backend that is pathological -
+	// repeated point reads of the same hot SSTs each pay an object GET -
+	// so any latency-sensitive deployment should pass a cache here.
+	//
+	// Build one with slatedb.DbCacheNewMokaCache (in-memory) or
+	// DbCacheNewFoyerCache (in-memory + local-disk spill); a Moka cache
+	// of a few hundred MiB holds the hot SST working set in RAM and
+	// eliminates the steady re-read storm against the object store.
+	//
+	// Shale never reads, mutates, copies, or validates this handle: the
+	// operator owns its lifecycle (same as Settings / WriteOptions). The
+	// binding's WithDbCache clones the underlying Arc, so ONE cache may
+	// be shared across multiple slate backends / Db handles on a node;
+	// the operator keeps the original and Destroys it once on shutdown.
+	Cache *slatedb.DbCache
 }
 
 func (c Config) validate() error {

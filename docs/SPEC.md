@@ -146,6 +146,18 @@ type Config struct {
     // configuration (WriteOptions, applied per call); slate's
     // pass-through mirrors that separation.
     WriteOptions *slatedb.WriteOptions
+
+    // Cache, if non-nil, is the slatedb SST block + metadata cache handed
+    // to the DbBuilder via WithDbCache. Nil = slatedb default: NO block
+    // cache, so every read re-fetches SST blocks from the object store. On
+    // an object-store backend that is a steady self-inflicted read storm
+    // (the same hot SSTs fetched repeatedly), so any latency-sensitive
+    // deployment should pass a cache. Build one with
+    // slatedb.DbCacheNewMokaCache (in-memory) or DbCacheNewFoyerCache
+    // (memory + local-disk); WithDbCache clones the Arc so ONE cache may be
+    // shared across a node's backends. Operator owns the handle's lifecycle,
+    // same as Settings / WriteOptions.
+    Cache *slatedb.DbCache
 }
 
 // backends/pebble

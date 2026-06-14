@@ -77,7 +77,7 @@ func New(cfg Config) (*Slate, error) {
 	if err != nil {
 		return nil, fmt.Errorf("slate: resolve object store %q: %w", url, err)
 	}
-	db, err := buildDb(cfg.DbName, store, cfg.Settings)
+	db, err := buildDb(cfg.DbName, store, cfg.Settings, cfg.Cache)
 	if err != nil {
 		store.Destroy()
 		return nil, fmt.Errorf("slate: open db %q: %w", cfg.DbName, err)
@@ -114,13 +114,23 @@ func NewWithStore(dbName string, store *slatedb.ObjectStore, settings ...*slated
 // stores without the AWS_* env-var dance. New is the production entry
 // point.
 func NewWithStoreOpts(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, writeOpts *slatedb.WriteOptions) (*Slate, error) {
+	return NewWithStoreCache(dbName, store, settings, writeOpts, nil)
+}
+
+// NewWithStoreCache is NewWithStoreOpts plus an explicit slatedb DbCache
+// (the SST block + metadata cache) handed to the DbBuilder via
+// WithDbCache. nil cache leaves slatedb's default (no block cache: every
+// read re-fetches SST blocks from the store). Same store-ownership and
+// pass-through semantics as NewWithStoreOpts; useful for memory:/// stores
+// in tests that want to exercise the cache path.
+func NewWithStoreCache(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, writeOpts *slatedb.WriteOptions, cache *slatedb.DbCache) (*Slate, error) {
 	if dbName == "" {
 		return nil, errors.New("slate: dbName required")
 	}
 	if store == nil {
 		return nil, errors.New("slate: store required")
 	}
-	db, err := buildDb(dbName, store, settings)
+	db, err := buildDb(dbName, store, settings, cache)
 	if err != nil {
 		return nil, fmt.Errorf("slate: open db %q: %w", dbName, err)
 	}
@@ -139,13 +149,22 @@ func defaultPutOptions() slatedb.PutOptions {
 
 // buildDb runs the DbBuilder pipeline shared by New + NewWithStore.
 // settings is forwarded verbatim to WithSettings if non-nil; absent
-// settings, slatedb's own defaults apply.
-func buildDb(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings) (*slatedb.Db, error) {
+// settings, slatedb's own defaults apply. cache, if non-nil, is handed
+// to WithDbCache so the SST block + metadata cache is shared by this Db
+// (and any other Db built with the same handle); nil leaves slatedb's
+// default (no block cache - every read re-fetches SST blocks from the
+// object store).
+func buildDb(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, cache *slatedb.DbCache) (*slatedb.Db, error) {
 	builder := slatedb.NewDbBuilder(dbName, store)
 	defer builder.Destroy()
 	if settings != nil {
 		if err := builder.WithSettings(settings); err != nil {
 			return nil, fmt.Errorf("apply settings: %w", err)
+		}
+	}
+	if cache != nil {
+		if err := builder.WithDbCache(cache); err != nil {
+			return nil, fmt.Errorf("apply db cache: %w", err)
 		}
 	}
 	db, err := builder.Build()

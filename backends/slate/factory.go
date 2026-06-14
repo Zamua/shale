@@ -91,6 +91,14 @@ type BackingConfig struct {
 	// (e.g. a small memtable so many units fit one node). Nil = slatedb
 	// defaults. Same pass-through semantics as slate.Config.Settings.
 	Settings *slatedb.Settings
+
+	// Cache, if non-nil, is the slatedb SST block + metadata cache shared
+	// by EVERY unit this Backing opens (WithDbCache clones the Arc, so one
+	// cache fronts all units' reads). Nil = no block cache (every read
+	// re-fetches SST blocks from the object store). See slate.Config.Cache
+	// for how to build one; the operator owns its lifecycle and Destroys
+	// it once on shutdown.
+	Cache *slatedb.DbCache
 }
 
 func (c BackingConfig) validate() error {
@@ -430,12 +438,12 @@ func (b *Backing) openSlate(gu storageunit.GenUnit) (*Slate, error) {
 	// ack, per unit. Pinned here (not operator-tunable) because the
 	// multi-backend model is R=1; relaxed durability needs R>=2.
 	wopts := &slatedb.WriteOptions{AwaitDurable: true}
-	s, err := NewWithStoreOpts(b.cfg.dbName(gu), store, b.cfg.Settings, wopts)
+	db, err := buildDb(b.cfg.dbName(gu), store, b.cfg.Settings, b.cfg.Cache)
 	if err != nil {
 		store.Destroy()
 		return nil, fmt.Errorf("slate: open unit %s: %w", gu, err)
 	}
-	return s, nil
+	return &Slate{db: db, store: store, writeOpts: wopts}, nil
 }
 
 // CloseUnit releases gu from THIS handle: flushes (Db.Shutdown forces
