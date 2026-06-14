@@ -205,7 +205,11 @@ func (c *Cluster) commitCAS(pinKey []byte, level backend.IsolationLevel, reads [
 	for i, w := range writes {
 		req.Writes[i] = &pb.WriteOp{Key: w.Key, Value: w.Value, Delete: w.Del}
 	}
-	resp, err := cli.CommitCAS(context.Background(), req)
+	// Bound the forwarded commit so an unresponsive owner times out rather
+	// than wedging the caller (same rationale as cluster.go's forwarded RPCs).
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
+	defer cancel()
+	resp, err := cli.CommitCAS(ctx, req)
 	if err != nil {
 		return err
 	}

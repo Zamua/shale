@@ -1191,7 +1191,7 @@ func (c *Cluster) Put(key, value []byte) error {
 		if err != nil {
 			return err
 		}
-		return cli.PutForwarded(context.Background(), key, value)
+		return c.putForwarded(cli, key, value)
 	}
 	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
 		return c.putReplicated(key, value)
@@ -1207,7 +1207,7 @@ func (c *Cluster) Put(key, value []byte) error {
 	if err != nil {
 		return err
 	}
-	return cli.PutForwarded(context.Background(), key, value)
+	return c.putForwarded(cli, key, value)
 }
 
 // Get returns the value for key, routing to the owning node.
@@ -1270,7 +1270,12 @@ func (c *Cluster) forwardGet(addr string, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	val, found, err := cli.GetForwarded(context.Background(), key)
+	// Bound the forwarded read: a peer that is alive-but-frozen (or whose
+	// link is half-open) must surface a deadline error the caller can act
+	// on, not block this goroutine forever. Mirrors replicate.go's pattern.
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
+	defer cancel()
+	val, found, err := cli.GetForwarded(ctx, key)
 	if err != nil {
 		return nil, err
 	}
@@ -1278,6 +1283,21 @@ func (c *Cluster) forwardGet(addr string, key []byte) ([]byte, error) {
 		return nil, backend.ErrNotFound
 	}
 	return val, nil
+}
+
+// putForwarded / deleteForwarded wrap the forwarded write RPCs with a bounded
+// context, for the same reason as forwardGet: an unresponsive-but-alive peer
+// must time out rather than wedge the caller indefinitely.
+func (c *Cluster) putForwarded(cli *peerClient, key, value []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
+	defer cancel()
+	return cli.PutForwarded(ctx, key, value)
+}
+
+func (c *Cluster) deleteForwarded(cli *peerClient, key []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
+	defer cancel()
+	return cli.DeleteForwarded(ctx, key)
 }
 
 // Delete removes key, routing to the owning node.
@@ -1325,7 +1345,7 @@ func (c *Cluster) Delete(key []byte) error {
 		if err != nil {
 			return err
 		}
-		return cli.DeleteForwarded(context.Background(), key)
+		return c.deleteForwarded(cli, key)
 	}
 	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
 		return c.putReplicated(key, nil)
@@ -1341,7 +1361,7 @@ func (c *Cluster) Delete(key []byte) error {
 	if err != nil {
 		return err
 	}
-	return cli.DeleteForwarded(context.Background(), key)
+	return c.deleteForwarded(cli, key)
 }
 
 // ScanPrefix returns an iterator over keys with the given prefix on
