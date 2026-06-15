@@ -100,18 +100,35 @@ func (c *Cluster) initReplicatedFactory() {
 // self's index in that set. Static-topology only (the cluster's generation is
 // fixed at Open in Phase 2b), so this is computed once at mount time. It is
 // the R>1 analogue of desiredGenUnits, generation-aware via genSnapshot.
+//
+// The per-unit enumeration + position-finding is the pure domain function
+// storageunit.OwnedReplicaUnits: this method just supplies the ring-backed
+// replica set (a ReplicaLookupFunc adapter over unitReplicas) and qualifies
+// each returned OwnedReplica with the live generation. UNLIKE its R=1 sibling
+// desiredGenUnits (which CANNOT use the pure storageunit.OwnedUnits because it
+// must also handle reshard cutover: hasCutOver + the gen-(g+1) children),
+// Phase 2b is STATIC topology with no cutover, so the unit set maps cleanly
+// onto the single-generation pure function.
 func (c *Cluster) desiredReplicaUnits() []storageunit.ReplicaUnit {
 	gs := c.genSnapshot()
-	self := c.cfg.NodeID
-	out := make([]storageunit.ReplicaUnit, 0)
-	for _, u := range gs.count.IDs() {
-		gu := storageunit.NewGenUnit(gs.gen, u)
-		for pos, m := range c.unitReplicas(gu) {
-			if m.ID == self {
-				out = append(out, storageunit.NewReplicaUnit(gu, uint8(pos)))
-				break
-			}
+	self := storageunit.NodeID(c.cfg.NodeID)
+
+	// Adapt the ring-backed replica lookup to the pure ReplicaLookup contract:
+	// map a UnitID to its replica nodes at the live generation, projecting each
+	// ring member id into a storageunit.NodeID.
+	replicas := storageunit.ReplicaLookupFunc(func(u storageunit.UnitID) []storageunit.NodeID {
+		set := c.unitReplicas(storageunit.NewGenUnit(gs.gen, u))
+		nodes := make([]storageunit.NodeID, len(set))
+		for i, m := range set {
+			nodes[i] = storageunit.NodeID(m.ID)
 		}
+		return nodes
+	})
+
+	owned := storageunit.OwnedReplicaUnits(self, gs.count, replicas)
+	out := make([]storageunit.ReplicaUnit, 0, len(owned))
+	for _, o := range owned {
+		out = append(out, storageunit.NewReplicaUnit(storageunit.NewGenUnit(gs.gen, o.Unit), o.Replica))
 	}
 	return out
 }

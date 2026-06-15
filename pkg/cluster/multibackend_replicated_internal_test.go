@@ -130,6 +130,53 @@ func TestDesiredReplicaUnits_UnionCoversEveryUnitRTimes(t *testing.T) {
 	}
 }
 
+// TestDesiredReplicaUnits_Characterization pins the EXACT ordered
+// []ReplicaUnit that desiredReplicaUnits returns for a fixed small topology
+// (a deterministic 3-node ring, R=2, N=8, self=n1). It is a refactor guard:
+// desiredReplicaUnits was reworked to derive its result from the pure
+// storageunit.OwnedReplicaUnits (via a ReplicaLookupFunc adapter) instead of
+// an inline ring loop, and this test pins that the observable output is
+// byte-for-byte unchanged across that refactor. The golden slice below was
+// captured from the pre-refactor inline implementation; if the ring hashing
+// ever changes, regenerate it deliberately (do not loosen the assertion).
+//
+// Because the refactored desiredReplicaUnits now routes through
+// storageunit.OwnedReplicaUnits, this test also exercises the pure-domain
+// derivation end to end (the cluster supplies the ring-backed ReplicaLookup,
+// the pure function enumerates + positions, the cluster qualifies with the
+// live generation).
+func TestDesiredReplicaUnits_Characterization(t *testing.T) {
+	const n, r = 8, 2
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", n, r, backing, "n1", "n2", "n3")
+
+	got := c.desiredReplicaUnits()
+
+	// Golden: the exact ordered (gen, unitID, replicaPos) n1 holds at gen 0.
+	type want struct {
+		unit storageunit.UnitID
+		pos  uint8
+	}
+	golden := []want{
+		{0, 1},
+		{3, 1},
+		{5, 0},
+		{6, 1},
+	}
+	if len(got) != len(golden) {
+		t.Fatalf("desiredReplicaUnits len = %d, want %d; got = %v", len(got), len(golden), got)
+	}
+	for i, g := range got {
+		if g.Unit.Gen != 0 {
+			t.Fatalf("entry %d: gen = %d, want 0 (static topology)", i, g.Unit.Gen)
+		}
+		if g.Unit.ID != golden[i].unit || g.Replica != golden[i].pos {
+			t.Fatalf("entry %d: got (u%d r%d), want (u%d r%d)",
+				i, g.Unit.ID, g.Replica, golden[i].unit, golden[i].pos)
+		}
+	}
+}
+
 // TestReplicasForKey_CoLocatedKeysShareReplicaSet: keys in the same {tag} set
 // resolve to one unit and therefore one replica set.
 func TestReplicasForKey_CoLocatedKeysShareReplicaSet(t *testing.T) {
