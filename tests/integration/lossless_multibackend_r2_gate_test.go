@@ -5,11 +5,15 @@ package integration
 // A 3-node multi-backend cluster at R=2 on the per-replica shared-backing
 // factory. Each unit's R=2 replicas are INDEPENDENT durable databases mounted
 // on two different nodes (the unit's replica set = LocateKeyN over the unit
-// id). The gate writes a recorded dataset spanning many units (including
-// co-located {tag} sets), then asserts:
+// id). The gate writes a recorded BASELINE dataset spanning many units
+// (including co-located {tag} sets), then runs a CONCURRENT PROBE that keeps
+// acking new keys through the FULL ROUTED SURFACE (writers rotate the entry
+// node so writes route both locally and forwarded; a key is recorded ONLY once
+// its Put returns nil), folds the acked keys into the recorded set, and
+// asserts:
 //
-//  1. THE ORACLE: every acked key is readable with its EXACT value from EVERY
-//     node (forwarding to a replica), zero loss.
+//  1. THE ORACLE: every baseline key AND every acked probe key is readable with
+//     its EXACT value from EVERY node (forwarding to a replica), zero loss.
 //  2. Each unit is mounted on EXACTLY R=2 distinct nodes (the replica set), and
 //     a write landed on BOTH replicas (the per-replica independent stores).
 //  3. Co-located {tag} sets share one unit hence one replica set.
@@ -30,6 +34,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -167,6 +172,46 @@ func writeRecordedDataset(t *testing.T, originator *cluster.Cluster) (map[string
 	return want, tagSets
 }
 
+// runAckedProbe writes new keys THROUGH THE FULL ROUTED SURFACE for probeDur,
+// rotating the entry node per writer so writes route both locally and
+// forwarded, and records ONLY the keys whose Put returned nil (the acked set).
+// An acked key the readback later loses is a genuine violation; an unacked key
+// is not owed durability, so recording acked-only is what keeps the oracle
+// honest. Returns the acked key -> value map for folding into the gate dataset.
+func runAckedProbe(t *testing.T, nodes []*sharedNode, probeDur time.Duration) map[string][]byte {
+	t.Helper()
+	var mu sync.Mutex
+	acked := make(map[string][]byte)
+	var stop atomic.Bool
+	var wg sync.WaitGroup
+	const probeWriters = 6
+	for w := range probeWriters {
+		wg.Add(1)
+		go func(w int) {
+			defer wg.Done()
+			entry := nodes[w%len(nodes)] // route both locally and forwarded
+			for i := 0; !stop.Load(); i++ {
+				k := fmt.Sprintf("probe-%d-%07d", w, i)
+				v := fmt.Appendf(nil, "pv-%d-%07d", w, i)
+				if err := putWithRetryUnavailable(t, entry.Cluster, k, string(v), 10*time.Second); err != nil {
+					t.Errorf("probe Put %q: %v", k, err)
+					return
+				}
+				mu.Lock()
+				acked[k] = v // recorded ONLY after the ack
+				mu.Unlock()
+			}
+		}(w)
+	}
+	time.Sleep(probeDur)
+	stop.Store(true)
+	wg.Wait()
+	if len(acked) == 0 {
+		t.Fatalf("concurrent probe acked zero keys")
+	}
+	return acked
+}
+
 // TestLosslessMultibackendR2Gate is THE data-loss oracle for v0.8 Phase 2b.
 func TestLosslessMultibackendR2Gate(t *testing.T) {
 	const unitCount, r = 16, 2
@@ -174,6 +219,13 @@ func TestLosslessMultibackendR2Gate(t *testing.T) {
 	nodes := start3NodeR2(t, unitCount, backing)
 
 	want, tagSets := writeRecordedDataset(t, nodes[0].Cluster)
+
+	// Concurrent probe: keep acking new keys through the full routed surface
+	// (alternating entry node), record ONLY acked keys, and fold them into the
+	// recorded dataset so the oracle covers both baseline and probe writes.
+	for k, v := range runAckedProbe(t, nodes, 400*time.Millisecond) {
+		want[k] = v
+	}
 
 	// (1) THE ORACLE: every acked key readable with its exact value from EVERY
 	// node (each routes to a replica via forwarding).
@@ -263,10 +315,16 @@ func TestR2GateCatchesLostWrite(t *testing.T) {
 	nodes := start3NodeR2(t, unitCount, backing)
 
 	want, _ := writeRecordedDataset(t, nodes[0].Cluster)
+	// Fold in acked probe keys so the break operates on the full routed surface.
+	probeAcked := runAckedProbe(t, nodes, 400*time.Millisecond)
+	for k, v := range probeAcked {
+		want[k] = v
+	}
 
-	// Pick a key and wipe BOTH replica copies of its unit: a genuine total loss.
+	// Pick an ACKED probe key and wipe BOTH replica copies of its unit: a key the
+	// cluster acknowledged through the routed surface, so its loss is genuine.
 	var victim string
-	for k := range want {
+	for k := range probeAcked {
 		victim = k
 		break
 	}
