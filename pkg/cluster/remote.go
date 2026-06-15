@@ -76,6 +76,44 @@ func (c *peerClient) ScanPrefixForwarded(ctx context.Context, prefix []byte) (gr
 	return c.api.ScanPrefix(ctx, &pb.ScanPrefixRequest{Prefix: prefix, Forwarded: true})
 }
 
+// The *AtReplica variants are the POSITION-ADDRESSED overlap forward (v0.8
+// Phase 2e): they carry the EXPLICIT ReplicaUnit on the wire so the predecessor
+// (which no longer holds the moving position at its own ring index) resolves
+// mountMap[ru] DIRECTLY and serves the Draining entry, rather than re-resolving
+// the position from the key against its live ring. The new (Acquiring) owner
+// forwards routed ops here while it mounts. Forwarded stays true so the
+// receiving server treats it as a peer-to-peer op (no re-routing); ru carries
+// the position. See multibackend_overlap_forward.go.
+
+func replicaUnitRef(ru storageunit.ReplicaUnit) *pb.ReplicaUnitRef {
+	return &pb.ReplicaUnitRef{
+		Gen:     uint64(ru.Unit.Gen),
+		Unit:    uint32(ru.Unit.ID),
+		Replica: uint32(ru.Replica),
+	}
+}
+
+func (c *peerClient) PutAtReplica(ctx context.Context, ru storageunit.ReplicaUnit, key, value []byte) error {
+	_, err := c.api.Put(ctx, &pb.PutRequest{Key: key, Value: value, Forwarded: true, Ru: replicaUnitRef(ru)})
+	return err
+}
+
+func (c *peerClient) GetAtReplica(ctx context.Context, ru storageunit.ReplicaUnit, key []byte) ([]byte, bool, error) {
+	resp, err := c.api.Get(ctx, &pb.GetRequest{Key: key, Forwarded: true, Ru: replicaUnitRef(ru)})
+	if err != nil {
+		return nil, false, err
+	}
+	if resp.GetNotFound() {
+		return nil, false, nil
+	}
+	return resp.GetValue(), true, nil
+}
+
+func (c *peerClient) DeleteAtReplica(ctx context.Context, ru storageunit.ReplicaUnit, key []byte) error {
+	_, err := c.api.Delete(ctx, &pb.DeleteRequest{Key: key, Forwarded: true, Ru: replicaUnitRef(ru)})
+	return err
+}
+
 // The plain (non-forwarded) variants are still here for tests +
 // future non-routed call sites; they leave Forwarded=false so the
 // server treats them as a first-hop request and routes normally.

@@ -28,14 +28,15 @@ func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfa
 		rg.Add(ring.Member{ID: id, Addr: id + ":0"})
 	}
 	c := &Cluster{
-		cfg:        Config{NodeID: self, ReplicationFactor: r},
-		multi:      true,
-		factory:    h,
-		unitCount:  storageunit.MustUnitCount(n),
-		mountMap:   make(map[storageunit.ReplicaUnit]backend.Backend),
-		pauseUnits: make(map[storageunit.UnitID]*sync.RWMutex),
-		ring:       rg,
-		closeCh:    make(chan struct{}),
+		cfg:          Config{NodeID: self, ReplicationFactor: r},
+		multi:        true,
+		factory:      h,
+		unitCount:    storageunit.MustUnitCount(n),
+		mountMap:     make(map[storageunit.ReplicaUnit]backend.Backend),
+		handoffPhase: make(map[storageunit.ReplicaUnit]storageunit.HandoffState),
+		pauseUnits:   make(map[storageunit.UnitID]*sync.RWMutex),
+		ring:         rg,
+		closeCh:      make(chan struct{}),
 	}
 	c.genOwner = c.genUnitOwner
 	c.initGenState()

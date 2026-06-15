@@ -330,6 +330,41 @@ type Cluster struct {
 	mountMu   sync.RWMutex
 	mountMap  map[storageunit.ReplicaUnit]backend.Backend
 
+	// handoffPhase holds, per IN-FLIGHT ReplicaUnit, the pure
+	// ownership-transition state of an overlap handoff (v0.8 Phase 2e,
+	// Option B). Absence means steady state: Owned if mountMap[ru] is present,
+	// Absent otherwise. Only positions mid-transition carry a HandoffState:
+	//
+	//   - on the GAINER (taking over a position): PhaseAcquiring -> PhaseReady.
+	//     While Acquiring the new owner is still mounting and FORWARDS routed
+	//     ops to the recorded Predecessor (the position-addressed forward); at
+	//     Ready its mountMap[ru] entry is inserted (the mount flip) and it
+	//     serves locally.
+	//   - on the LOSER (giving up a position): PhaseDraining -> PhaseReleasing.
+	//     While Draining the old owner KEEPS SERVING (directly and for the new
+	//     owner's forwards); at Releasing it tears down its mount exactly once
+	//     after the new owner is proven Ready via the durable serving marker.
+	//
+	// Guarded by mountMu (the same lock as mountMap), so the phase value + the
+	// mount entry move together: the complete state of an in-flight position is
+	// the phase value + the mount entry + (Acquiring) the recorded predecessor,
+	// all keyed by ReplicaUnit. NO scattered isDraining/hasFlipped booleans.
+	// Nil outside the R>1 (multiReplicated) paths.
+	handoffPhase map[storageunit.ReplicaUnit]storageunit.HandoffState
+
+	// priorDesiredReplicas is the DESIRED replica sets as of the ring the LAST
+	// reconcile acted on: a map from GenUnit to the ordered NodeIDs that held
+	// each replica position. It is the multi-backend analogue of the legacy
+	// per-node path's lastEvalRing (cluster.go's lastEvalRing field), captured
+	// at the END of each reconcileReplicaUnitsOverlap run, BEFORE the next run
+	// can read it. It is consulted ONLY to identify a moving position's
+	// predecessor (predecessor = prior-holder of the position \ live-holder),
+	// NEVER for routing (routing is always live-ring-derived). Guarded by
+	// mountMu (taken inside the reconcileMu-held reconcile). Nil until the first
+	// reconcile; an empty/missing entry yields no predecessor (the Option-A
+	// fallback). See docs/design/overlap-handoff.md "Predecessor identification".
+	priorDesiredReplicas map[storageunit.GenUnit][]storageunit.NodeID
+
 	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
 	// capability view of factory: non-nil iff the factory implements
 	// ReplicaBackendFactory AND R>1. The replicated paths open each owned unit

@@ -209,6 +209,12 @@ func (c *Cluster) initMultiBackend() error {
 	}
 
 	c.mountMap = make(map[storageunit.ReplicaUnit]backend.Backend)
+	// handoffPhase (v0.8 Phase 2e, Option B) tracks in-flight overlap-handoff
+	// transitions per ReplicaUnit, guarded by mountMu alongside mountMap. Empty
+	// at Open (no transition in flight); populated by reconcileReplicaUnitsOverlap
+	// when a position moves. priorDesiredReplicas is filled at the END of the
+	// first overlap reconcile.
+	c.handoffPhase = make(map[storageunit.ReplicaUnit]storageunit.HandoffState)
 
 	// R>1 (replicated multi-backend, v0.8 Phase 2b): mount each owned unit at
 	// its replica POSITION (an independent durable database) via the per-replica
@@ -324,6 +330,22 @@ func (c *Cluster) localBackendForKey(key []byte) (backend.Backend, bool) {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
 	b, ok := c.mountMap[storageunit.NewReplicaUnit(gu, pos)]
+	return b, ok
+}
+
+// localBackendForReplicaUnit resolves the mounted backend for an EXPLICIT
+// ReplicaUnit, bypassing the live-ring-index resolver (localReplicaPos). It is
+// the POSITION-ADDRESSED path the overlap-handoff predecessor's forwarded-op
+// handler uses (v0.8 Phase 2e): the moving position is no longer this node's
+// own ring index (the ring rotated it away), so localBackendForKey would not
+// find it - but the position is still mounted in a Draining handoffPhase entry,
+// reachable only by its explicit ru. ok=false means this node does not have ru
+// mounted (it already released, or never held it), in which case the caller
+// refuses with the loop-guard rather than re-forwarding. Multi-backend mode only.
+func (c *Cluster) localBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backend.Backend, bool) {
+	c.mountMu.RLock()
+	defer c.mountMu.RUnlock()
+	b, ok := c.mountMap[ru]
 	return b, ok
 }
 

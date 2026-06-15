@@ -195,7 +195,15 @@ func (c *Cluster) reconcileUnits() {
 		// lease handoff at R>1 yet - a later phase). It diffs desired-vs-mounted
 		// the same way, opening each newly-desired unit at its replica POSITION
 		// (an independent durable database) and releasing ones no longer desired.
-		c.reconcileReplicaUnits()
+		//
+		// v0.8 Phase 2e (Option B): the position-MOVE branch is the overlap
+		// handoff controller (acquire-then-release, sequenced by the per-
+		// ReplicaUnit FSM), and every Draining position is polled for release on
+		// this same cadence (drainCheck reads the durable serving marker). The
+		// initial-convergence pure-new-mount and plain drop-out cases stay the
+		// clean-cut acquire/release. See multibackend_overlap.go.
+		c.reconcileReplicaUnitsOverlap()
+		c.runDrainChecks()
 		return
 	}
 	desired := c.desiredGenUnits()

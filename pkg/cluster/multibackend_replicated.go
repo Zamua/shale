@@ -206,58 +206,6 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 	return nil
 }
 
-// reconcileReplicaUnits is the R>1 (v0.8 Phase 2b) anti-entropy mount: it
-// makes this node's mounted unit set match the units it REPLICATES under the
-// current ring, each opened at its replica POSITION (an independent durable
-// database). It runs on the INITIAL multi-node convergence (the ring fills
-// with peers after a join, changing which units this node replicates and at
-// what position). The topology is otherwise STATIC: there is no byte handoff
-// at R>1 (the replicas are independent), so a node simply mounts the replica
-// copies it should hold and releases ones it should not.
-//
-// A unit whose desired replica POSITION changed (e.g. this node went from
-// successor to primary as a peer left) is released and re-acquired at the new
-// position, so it mounts the correct per-replica database. Idempotent +
-// self-healing. Caller MUST hold reconcileMu; mount mutations take mountMu.
-func (c *Cluster) reconcileReplicaUnits() {
-	desired := c.desiredReplicaUnits()
-	desiredSet := make(map[storageunit.ReplicaUnit]struct{}, len(desired))
-	for _, ru := range desired {
-		desiredSet[ru] = struct{}{}
-	}
-
-	c.mountMu.RLock()
-	mounted := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
-	for ru := range c.mountMap {
-		mounted = append(mounted, ru)
-	}
-	c.mountMu.RUnlock()
-
-	// RELEASE: ReplicaUnits no longer desired here. A position shuffle of the
-	// same unit appears as "old ReplicaUnit not desired" (released) plus "new
-	// ReplicaUnit not mounted" (acquired below). Behavior-preserving clean-cut:
-	// a node holds at most one position per unit, so the old position is the
-	// only mounted entry for the unit and is released before the new one is
-	// acquired.
-	for _, ru := range mounted {
-		if _, ok := desiredSet[ru]; !ok {
-			c.releaseReplicaUnit(ru)
-		}
-	}
-
-	// ACQUIRE: desired ReplicaUnits not currently mounted.
-	mountedSet := make(map[storageunit.ReplicaUnit]struct{}, len(mounted))
-	for _, ru := range mounted {
-		mountedSet[ru] = struct{}{}
-	}
-	for _, ru := range desired {
-		if _, ok := mountedSet[ru]; ok {
-			continue
-		}
-		c.acquireReplicaUnit(ru)
-	}
-}
-
 // acquireReplicaUnit mounts replica position ru.Replica of unit ru.Unit via
 // the per-replica factory, opening at a strictly higher epoch than this node's
 // current durable lease for that replica position (the fence). On error the
@@ -401,6 +349,16 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 // replica returns the transient code the fan-out tolerates.
 func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Member, key, envBytes []byte) error {
 	if replica.ID == c.cfg.NodeID {
+		// v0.8 Phase 2e (overlap forward): if this node is GAINING the key's
+		// position (PhaseAcquiring with a recorded predecessor), forward the
+		// write to the predecessor (the OLD owner still serving the Draining
+		// entry) addressed by the explicit ru, instead of applying locally
+		// against an absent mount. handled=false means no overlap forward (apply
+		// locally as before, which yields errUnitAcquiring if mid-mount with no
+		// predecessor - the Option-A belt).
+		if handled, ferr := c.forwardPutToPredecessor(key, envBytes); handled {
+			return ferr
+		}
 		return c.applyEnvelopeIfNewerToUnit(key, envBytes)
 	}
 	cli, err := c.clientFor(replica.Addr)
@@ -502,6 +460,12 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 // returns the transient acquiring-window error the read fan-out skips.
 func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Member, key []byte) ([]byte, error) {
 	if replica.ID == c.cfg.NodeID {
+		// v0.8 Phase 2e (overlap forward): GAINING this position -> forward the
+		// read to the predecessor (Draining, still serving) addressed by the
+		// explicit ru. handled=false means no overlap forward (read locally).
+		if handled, v, ferr := c.forwardGetToPredecessor(key); handled {
+			return v, ferr
+		}
 		b, ok := c.localBackendForKey(key)
 		if !ok {
 			return nil, errUnitAcquiring("Get")

@@ -1,7 +1,7 @@
 // Write-availability through an R>1 multi-backend membership change
 // (v0.8 Phase 2d, "Option A: retry-on-acquiring").
 //
-// During an R>1 membership change reconcileReplicaUnits re-mounts units whose
+// During an R>1 membership change reconcileReplicaUnitsOverlap re-mounts units whose
 // replica assignment moved. Until a re-mount finishes, a routed op for that
 // replica returns the acquiring-window refusal (errUnitAcquiring). Layer 1
 // (the errAcquiringSentinel tag + recodeForwardedReplicaErr) already makes a
