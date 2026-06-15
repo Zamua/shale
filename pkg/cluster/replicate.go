@@ -177,9 +177,22 @@ func fanout(
 // (ResourceExhausted) so isTransientReplicaErr can distinguish "this
 // replica is mid-handoff, try another" from "this replica is dead,
 // count it as failure." See docs/SPEC.md "Cutover" for the rationale.
+//
+// v0.8 Phase 2d: the multi-backend acquiring-window refusal
+// (errUnitAcquiring) travels client-facing as codes.Unavailable but is
+// tagged with errAcquiringSentinel. On the IN-PROCESS local-self fan-out
+// leg the sentinel survives, so this classifier skips it (isAcquiringErr).
+// On the cross-node forwarded leg the sentinel cannot cross gRPC, so that
+// leg is re-coded to codes.ResourceExhausted (recodeForwardedReplicaErr)
+// and skipped by the ResourceExhausted branch. Either way a mid-acquire
+// replica no longer consumes the failure budget. See docs/SPEC.md
+// "v0.8 Phase 2d".
 func isTransientReplicaErr(err error) bool {
 	if err == nil {
 		return false
+	}
+	if isAcquiringErr(err) {
+		return true
 	}
 	if st, ok := status.FromError(err); ok {
 		return st.Code() == codes.ResourceExhausted
@@ -576,7 +589,12 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 		// static, so the unit is mounted; an unmounted unit returns the
 		// retryable acquiring-window error the originator's fan-out tolerates.
 		if c.multiReplicated() {
-			return c.applyEnvelopeIfNewerToUnit(key, bytesToWrite)
+			// FORWARDED replica leg (Phase 2d): re-code a local acquiring
+			// refusal to the transient codes.ResourceExhausted before it
+			// crosses gRPC back to the originator, since errAcquiringSentinel
+			// cannot survive the wire. The originator's isTransientReplicaErr
+			// then skips it instead of counting it as a down-peer failure.
+			return recodeForwardedReplicaErr(c.applyEnvelopeIfNewerToUnit(key, bytesToWrite))
 		}
 		// Multi-backend mode (R=1): apply against the key's mounted unit,
 		// resolved UNDER the reshard write-pause so a mid-flight cut-over

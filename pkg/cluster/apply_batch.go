@@ -62,8 +62,11 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 		// R>1 (replicated multi-backend, v0.8 Phase 2b): apply the CAS write-set
 		// APPLY-IF-NEWER against the batch's MOUNTED unit, in ONE transaction.
 		// The whole batch co-shards (the cross-shard guard guarantees it), so
-		// one unit covers it; resolve it from the first key.
-		return c.applyBatchToUnit(writes)
+		// one unit covers it; resolve it from the first key. FORWARDED replica
+		// leg (Phase 2d): re-code a local acquiring refusal to the transient
+		// codes.ResourceExhausted before it crosses gRPC, since the sentinel
+		// cannot survive the wire (same reason as LocalReplicaPut).
+		return recodeForwardedReplicaErr(c.applyBatchToUnit(writes))
 	}
 	if c.multi {
 		// ApplyBatch is the R>1 CAS write-set fan-out protocol. An R=1 multi-
@@ -160,6 +163,35 @@ func txApplyIfNewer(tx backend.Transaction, key []byte, incomingStamp Stamp) (bo
 // so a hung peer cancels at the deadline instead of leaking goroutines,
 // the same shape putReplicated uses.
 func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error {
+	// v0.8 Phase 2d: in MULTI-BACKEND replicated mode, wrap the post-commit
+	// fan-out in the SAME WriteTimeout-bounded retry-on-acquiring as
+	// putReplicatedUnit, so a CAS commit whose remote replicas are mid-handoff
+	// waits (bounded latency) instead of erroring. The owner's local commit
+	// already happened ONCE (durable, OCC order established) and is NOT re-run;
+	// only the remote fan-out retries. The write-set envelopes carry a single
+	// shared commit stamp and are reused verbatim across attempts, so a re-
+	// applied batch is an apply-if-newer no-op (idempotent). Replicas are
+	// re-resolved from the live ring each attempt.
+	//
+	// The LEGACY per-node R>1 CAS path is UNCHANGED: it runs the attempt once
+	// and returns its error verbatim (the client retries on the transient
+	// migration-guard window exactly as before Phase 2d).
+	if c.multiReplicated() {
+		return c.retryWriteThroughHandoff(func(attemptCtx context.Context) writeAttempt {
+			return c.replicateCASBatchAttempt(attemptCtx, pinKey, writes)
+		})
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
+	defer cancel()
+	return c.replicateCASBatchAttempt(ctx, pinKey, writes).err
+}
+
+// replicateCASBatchAttempt is ONE fan-out pass of the post-commit CAS write-set
+// replication. It re-resolves the replica set, dispatches the (pre-stamped)
+// batch to the R-1 non-owner replicas, and reports a structured writeAttempt
+// the retry wrapper classifies. The owner's local commit is pre-counted as one
+// ack (the wrapper never re-runs it).
+func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, writes []EnvelopeWrite) writeAttempt {
 	// Re-key the replica set per UNIT in multi-backend mode (v0.8 Phase 2b):
 	// the batch fans out to the pin key's UNIT's R replica nodes (every key in
 	// a CAS commit co-shards with the pin key, so one unit covers the batch),
@@ -171,7 +203,7 @@ func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error
 		allReplicas = c.ring.LocateKeyN(c.shardKey(pinKey), c.replicationFactor())
 	}
 	if len(allReplicas) == 0 {
-		return status.Error(codes.Unavailable, "shale: no replicas available for CAS write-set")
+		return writeAttempt{err: status.Error(codes.Unavailable, "shale: no replicas available for CAS write-set")}
 	}
 
 	// W is computed over the full replica set (the owner is one of them
@@ -189,12 +221,14 @@ func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error
 	}
 	if len(others) == 0 {
 		// Owner is the only replica (R clamped to 1 by a small live ring).
-		// The local commit is the entire durability; nothing to fan out.
+		// The local commit is the entire durability; nothing to fan out. A
+		// W>1 shortfall here is structural (no other replica exists), not a
+		// handoff blip, so it is NOT retryable.
 		if w > 1 {
-			return status.Errorf(codes.Unavailable,
-				"shale: CAS write needed %d acks, only the owner is a replica", w)
+			return writeAttempt{err: status.Errorf(codes.Unavailable,
+				"shale: CAS write needed %d acks, only the owner is a replica", w)}
 		}
-		return nil
+		return writeAttempt{}
 	}
 
 	// Owner's local commit is the first ack; the fan-out must collect
@@ -205,17 +239,15 @@ func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error
 	// behavior at W=1.
 	remoteNeeded := w - 1
 
-	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
-	acks, errs, resultsCh := fanout(fanoutCtx, others, remoteNeeded,
-		func(ctx context.Context, replica ring.Member) ([]byte, error) {
-			return nil, c.dispatchApplyBatch(ctx, replica, writes)
+	acks, errs, resultsCh := fanout(ctx, others, remoteNeeded,
+		func(opCtx context.Context, replica ring.Member) ([]byte, error) {
+			return nil, c.dispatchApplyBatch(opCtx, replica, writes)
 		})
 
 	// Drain surplus replicas in the background so the WaitGroup finalizes
-	// and no goroutine leaks; cancel the fan-out context once every
-	// replica has reported so any in-flight gRPC call gets torn down.
+	// and no goroutine leaks; the retry wrapper cancels the attempt context
+	// once this pass returns, tearing down any in-flight gRPC call.
 	go func() {
-		defer cancelFanout()
 		//nolint:revive // empty-block: idiomatic channel drain.
 		for range resultsCh {
 		}
@@ -224,17 +256,11 @@ func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error
 	if remoteNeeded <= 0 {
 		// W satisfied by the owner's local commit; remote acks are bonus
 		// durability collected in the background by the drainer above.
-		return nil
+		return writeAttempt{}
 	}
 
 	// Total acks = owner's local commit (1) + remote acks collected.
-	totalAcks := acks + 1
-	if totalAcks < w {
-		return status.Errorf(codes.Unavailable,
-			"shale: CAS write needed %d acks, got %d (%d failures: %v)",
-			w, totalAcks, len(errs), firstErr(errs))
-	}
-	return nil
+	return classifyWriteAttempt(acks+1, w, errs)
 }
 
 // dispatchApplyBatch routes one replica's batch apply to either the local

@@ -32,6 +32,7 @@
 package cluster
 
 import (
+	"errors"
 	"time"
 
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -342,6 +343,39 @@ func (c *Cluster) TestingClearMount(u storageunit.UnitID) {
 	c.mountMu.Unlock()
 }
 
+// errAcquiringSentinel is the package-private sentinel that tags every
+// errUnitAcquiring value (v0.8 Phase 2d). The fan-out's classifier
+// (isTransientReplicaErr) recognizes it via errors.Is so a mid-acquire
+// replica counts toward NEITHER the ack nor the failure budget, rather
+// than being miscounted as a down-peer failure (the Phase 2b gap that
+// dropped the membership-change ack rate to ~52-64%).
+//
+// The sentinel survives the in-process local-self fan-out dispatch path
+// verbatim (it is a plain Go error, not re-serialized). It does NOT cross
+// gRPC: only the status code travels the wire, so the cross-node forwarded
+// replica leg re-codes the acquiring refusal to codes.ResourceExhausted
+// (recodeForwardedReplicaErr) which isTransientReplicaErr already skips.
+var errAcquiringSentinel = errors.New("cluster: unit acquiring (handoff window)")
+
+// acquiringError is the HANDOFF-WINDOW refusal value: it carries
+// codes.Unavailable ON THE WIRE (via GRPCStatus, so the client / forwarding
+// retry shape treats it as a transient backoff-and-retry, the same family
+// as the v0.3 cutover / migration-guard retries) AND wraps
+// errAcquiringSentinel so the in-process fan-out classifier can distinguish
+// "this replica is mid-acquire, skip it and wait for the budget to refill"
+// from "this replica is down, count it."
+type acquiringError struct {
+	st *status.Status
+}
+
+func (e *acquiringError) Error() string              { return e.st.Message() }
+func (e *acquiringError) GRPCStatus() *status.Status { return e.st }
+
+// Unwrap exposes the sentinel to errors.Is without flattening the gRPC
+// status: status.FromError still reads codes.Unavailable off GRPCStatus,
+// and errors.Is(err, errAcquiringSentinel) returns true.
+func (e *acquiringError) Unwrap() error { return errAcquiringSentinel }
+
 // errUnitAcquiring is the HANDOFF-WINDOW refusal: this node IS the ring
 // owner of the key's unit but has NOT yet mounted it (the acquire is in
 // flight, or the prior reconcile failed to open it and the next will
@@ -353,8 +387,37 @@ func (c *Cluster) TestingClearMount(u storageunit.UnitID) {
 // treats as a transient backoff-and-retry (the same family as the v0.3
 // cutover / migration-guard retries). The originator retries and succeeds
 // once the new owner has acquired. We NEVER serve a wrong or stale result
-// and NEVER lose a write during this window.
+// and NEVER lose a write during this window. The returned value also wraps
+// errAcquiringSentinel (Phase 2d) so the fan-out's isTransientReplicaErr
+// treats a local-self acquiring replica as transient, not as a failure.
 func errUnitAcquiring(op string) error {
-	return status.Errorf(codes.Unavailable,
+	st := status.Newf(codes.Unavailable,
 		"cluster: %s: unit for key is handing off to this node; retry shortly", op)
+	return &acquiringError{st: st}
+}
+
+// isAcquiringErr reports whether err is (or wraps) the Phase 2d acquiring-
+// window sentinel - i.e. a replica that is mid-acquire (handoff window),
+// NOT a genuinely-down peer. Used by layer 2's retry classifier to decide
+// whether an under-W fan-out outcome is a retryable handoff blip.
+func isAcquiringErr(err error) bool {
+	return errors.Is(err, errAcquiringSentinel)
+}
+
+// recodeForwardedReplicaErr converts a local acquiring refusal into the
+// transient codes.ResourceExhausted that crosses gRPC as a fan-out
+// transient (the SAME code the v0.3 migration guard uses), for the
+// FORWARDED replica leg ONLY (LocalReplicaPut / ApplyBatchLocal). The
+// errAcquiringSentinel does not survive the wire (gRPC carries only the
+// status code), so without this re-code a cross-node mid-acquire replica
+// would arrive at the originator as a bare codes.Unavailable and be
+// miscounted as a down peer. The CLIENT-facing top-level refusal stays
+// codes.Unavailable; only this internal replica-to-replica leg re-codes.
+// A non-acquiring error passes through unchanged.
+func recodeForwardedReplicaErr(err error) error {
+	if err == nil || !isAcquiringErr(err) {
+		return err
+	}
+	return status.Error(codes.ResourceExhausted,
+		"cluster: forwarded replica write: unit mid-acquire (handoff window); retry shortly")
 }

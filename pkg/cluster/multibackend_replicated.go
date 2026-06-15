@@ -342,42 +342,53 @@ func (c *Cluster) applyBatchToUnit(writes []EnvelopeWrite) error {
 }
 
 // putReplicatedUnit stamps + envelopes + fans a write out to the R replica
-// nodes of key's UNIT, waiting for W acks per WriteConsistency. It mirrors
-// putReplicated verbatim except the replica set is the unit's
-// (replicasForKey) rather than ring.LocateKeyN over the raw shard key, and
-// the local-self apply lands in the mounted unit backend (via the multi
-// dispatcher). value == nil is the Delete / tombstone shape.
+// nodes of key's UNIT, waiting for W acks per WriteConsistency. value == nil
+// is the Delete / tombstone shape.
+//
+// v0.8 Phase 2d (write-availability through a membership change): the write
+// is wrapped in a WriteTimeout-bounded RETRY (retryWriteThroughHandoff). The
+// stamp is computed ONCE and the same envelope bytes are reused across every
+// attempt, so a retry is idempotent: apply-if-newer makes a re-applied
+// identical envelope a no-op (its stamp does not strictly beat the stored
+// equal stamp), and the LWW ordering of this write relative to concurrent
+// writes is stable regardless of how many attempts it takes. The replica set
+// is re-resolved from the LIVE ring on every attempt, so a write started mid-
+// reassignment lands on the post-reassignment replica set once it settles.
 func (c *Cluster) putReplicatedUnit(key, value []byte) error {
-	replicas := c.replicasForKey(key)
-	if len(replicas) == 0 {
-		return status.Error(codes.Unavailable, "shale: no replicas available for key")
-	}
 	stamp := Stamp{
 		TimestampNanos: uint64(time.Now().UnixNano()),
 		NodeID:         c.cfg.NodeID,
 	}
 	envBytes := Encode(Envelope{Stamp: stamp, Payload: value})
+	return c.retryWriteThroughHandoff(func(attemptCtx context.Context) writeAttempt {
+		return c.putReplicatedUnitAttempt(attemptCtx, key, envBytes)
+	})
+}
+
+// putReplicatedUnitAttempt is ONE fan-out pass of a replicated unit write. It
+// re-resolves the replica set from the live ring, fans the pre-stamped
+// envelope out to the unit's R replica nodes, and reports a structured
+// writeAttempt the retry wrapper classifies (acks-met vs acquiring-shortfall
+// vs hard-failure). It carries no retry policy of its own.
+func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []byte) writeAttempt {
+	replicas := c.replicasForKey(key)
+	if len(replicas) == 0 {
+		return writeAttempt{err: status.Error(codes.Unavailable, "shale: no replicas available for key")}
+	}
 	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))
 
-	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
-	acks, errs, resultsCh := fanout(fanoutCtx, replicas, w,
-		func(ctx context.Context, replica ring.Member) ([]byte, error) {
-			return nil, c.dispatchReplicaPutUnit(ctx, replica, key, envBytes)
+	acks, errs, resultsCh := fanout(ctx, replicas, w,
+		func(opCtx context.Context, replica ring.Member) ([]byte, error) {
+			return nil, c.dispatchReplicaPutUnit(opCtx, replica, key, envBytes)
 		})
 
 	go func() {
-		defer cancelFanout()
 		//nolint:revive // empty-block: idiomatic channel drain.
 		for range resultsCh {
 		}
 	}()
 
-	if acks < w {
-		return status.Errorf(codes.Unavailable,
-			"shale: write needed %d acks, got %d (%d failures: %v)",
-			w, acks, len(errs), firstErr(errs))
-	}
-	return nil
+	return classifyWriteAttempt(acks, w, errs)
 }
 
 // dispatchReplicaPutUnit is the multi-backend analogue of dispatchReplicaPut:
