@@ -785,6 +785,17 @@ func (h *Handle) ReadServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoc
 	return h.backing.readServingMarker(ru)
 }
 
+// DurableEpochReplica reads replica position ru's durable manifest writer-epoch
+// WITHOUT opening the database, satisfying the ReplicaBackendFactory seam
+// (v0.8 Phase 2e). The old (draining) owner uses it as the LIVENESS HINT that
+// arms drainCheck; it is NOT the release trigger (a bare fence-epoch advance
+// never releases - only a serving marker strictly above the open epoch does).
+// Delegates to the Backing, which reads the shared-storage manifest every
+// node's Handle reaches.
+func (h *Handle) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Epoch, error) {
+	return h.backing.durableEpochReplica(ru)
+}
+
 // CloseReplicaUnit releases replica position ru from THIS handle: flushes
 // (Db.Shutdown forces pending writes durable) then shuts down the position's
 // slatedb instance, WITHOUT affecting any other replica or unit and WITHOUT
