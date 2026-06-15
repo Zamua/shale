@@ -527,6 +527,150 @@ func TestFactory_PresentUnits(t *testing.T) {
 	}
 }
 
+// TestFactory_OpenReplicaUnit_IndependentPositions is the R>1 analogue of
+// TestFactory_IndependentGenerations, against the ReplicaBackendFactory
+// surface. It opens replica 0 and replica 1 of the SAME unit, writes a
+// DISTINCT value to each, and asserts:
+//
+//   - the two positions do NOT alias: replica 0's bytes are never visible via
+//     replica 1 (and vice versa) - each is a complete independent database at
+//     its own disjoint prefix (dbNameReplica), which is the replica-
+//     independence durability guarantee;
+//   - opening one position does NOT fence the other (both stay writable after
+//     both are open - per-position epoch fencing);
+//   - each position's acked write survives an independent CloseReplicaUnit +
+//     reopen (AwaitDurable=true, bytes durable at the position's own prefix).
+//
+// committed-but-RUN-on-the-cluster: needs `slatedb` (cgo) + `integration`
+// (real MinIO); the box constraint forbids the slatedb Rust compile here, so
+// this runs on the staging cluster / CI, not in the authoring workflow.
+func TestFactory_OpenReplicaUnit_IndependentPositions(t *testing.T) {
+	fx := startFactoryMinIO(t)
+	b := newBacking(t, fx)
+	h := b.Handle()
+
+	unit := gu(1, 5)
+	r0 := storageunit.NewReplicaUnit(unit, 0)
+	r1 := storageunit.NewReplicaUnit(unit, 1)
+
+	be0, err := h.OpenReplicaUnit(r0, storageunit.Epoch(1))
+	if err != nil {
+		t.Fatalf("open replica 0: %v", err)
+	}
+	be1, err := h.OpenReplicaUnit(r1, storageunit.Epoch(1))
+	if err != nil {
+		t.Fatalf("open replica 1: %v", err)
+	}
+
+	if err := be0.Put([]byte("key"), []byte("r0-value")); err != nil {
+		t.Fatalf("put r0: %v", err)
+	}
+	if err := be1.Put([]byte("key"), []byte("r1-value")); err != nil {
+		t.Fatalf("put r1: %v", err)
+	}
+
+	// Each position holds ONLY its own value: no aliasing.
+	got0, err := be0.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("get r0: %v", err)
+	}
+	if !bytes.Equal(got0, []byte("r0-value")) {
+		t.Fatalf("replica 0: got %q want r0-value (replica 1 leaked across the position boundary)", got0)
+	}
+	got1, err := be1.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("get r1: %v", err)
+	}
+	if !bytes.Equal(got1, []byte("r1-value")) {
+		t.Fatalf("replica 1: got %q want r1-value (replica 0 leaked across the position boundary)", got1)
+	}
+
+	// A key written ONLY to r0 is absent from r1 (and vice versa): the
+	// positions share no key-space at all.
+	if err := be0.Put([]byte("only-r0"), []byte("x")); err != nil {
+		t.Fatalf("put only-r0: %v", err)
+	}
+	if _, err := be1.Get([]byte("only-r0")); err == nil {
+		t.Fatalf("replica 1 saw key 'only-r0' written only to replica 0: positions are aliasing")
+	}
+
+	// Opening r1 did not fence r0: r0 stays writable.
+	if err := be0.Put([]byte("after"), []byte("still-live")); err != nil {
+		t.Fatalf("replica 0 fenced by opening replica 1: %v", err)
+	}
+
+	// Independent close + reopen: each position's writes are durable at its
+	// own prefix and survive a release/re-acquire that does not touch the
+	// other position.
+	if err := h.CloseReplicaUnit(r0); err != nil {
+		t.Fatalf("close r0: %v", err)
+	}
+	if err := h.CloseReplicaUnit(r1); err != nil {
+		t.Fatalf("close r1: %v", err)
+	}
+
+	re0, err := h.OpenReplicaUnit(r0, storageunit.Epoch(2))
+	if err != nil {
+		t.Fatalf("reopen r0: %v", err)
+	}
+	re1, err := h.OpenReplicaUnit(r1, storageunit.Epoch(2))
+	if err != nil {
+		t.Fatalf("reopen r1: %v", err)
+	}
+	rg0, err := re0.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("get r0 after reopen: %v", err)
+	}
+	if !bytes.Equal(rg0, []byte("r0-value")) {
+		t.Fatalf("replica 0 durability: got %q want r0-value", rg0)
+	}
+	rg1, err := re1.Get([]byte("key"))
+	if err != nil {
+		t.Fatalf("get r1 after reopen: %v", err)
+	}
+	if !bytes.Equal(rg1, []byte("r1-value")) {
+		t.Fatalf("replica 1 durability: got %q want r1-value", rg1)
+	}
+
+	_ = h.CloseReplicaUnit(r0)
+	_ = h.CloseReplicaUnit(r1)
+}
+
+// TestFactory_ReplicaDoubleOpenRejected pins the one-live-writer-per-position
+// guard: re-opening a replica position this handle ALREADY holds is rejected
+// at ANY epoch, mirroring TestFactory_DoubleOpenRejected for the R>1 path.
+// CloseReplicaUnit must clear the slot first.
+func TestFactory_ReplicaDoubleOpenRejected(t *testing.T) {
+	fx := startFactoryMinIO(t)
+	b := newBacking(t, fx)
+	h := b.Handle()
+	r0 := storageunit.NewReplicaUnit(gu(0, 4), 0)
+
+	if _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(5)); err != nil {
+		t.Fatalf("first open: %v", err)
+	}
+	if _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(5)); err == nil {
+		t.Fatalf("re-open at the same epoch should be rejected (double-open), got nil")
+	}
+	if _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(6)); err == nil {
+		t.Fatalf("re-open at a higher epoch (without CloseReplicaUnit) should be rejected, got nil")
+	}
+	// Opening a DIFFERENT position of the same unit is NOT a double-open: the
+	// positions are independent.
+	r1 := storageunit.NewReplicaUnit(gu(0, 4), 1)
+	if _, err := h.OpenReplicaUnit(r1, storageunit.Epoch(5)); err != nil {
+		t.Fatalf("opening a different position should succeed: %v", err)
+	}
+	// CloseReplicaUnit clears the slot; closing a position not held is a no-op.
+	if err := h.CloseReplicaUnit(r0); err != nil {
+		t.Fatalf("close r0: %v", err)
+	}
+	if err := h.CloseReplicaUnit(r0); err != nil {
+		t.Fatalf("idempotent close of an unheld position should be nil: %v", err)
+	}
+	_ = h.CloseReplicaUnit(r1)
+}
+
 // backingDbName mirrors the factory's GenUnit -> DbName mapping for the
 // direct-open fence test (which needs the raw db name to reopen a stale
 // writer against the same database the factory used). Kept in sync with

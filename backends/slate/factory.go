@@ -54,11 +54,6 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
-// unitPrefix namespaces the per-unit databases away from any unrelated
-// object in the same bucket and gives PresentUnits a single list-prefix
-// to scan. A GenUnit gu maps to the DbName "<KeyPrefix>u/g<gen>/u<id>".
-const unitPrefix = "u/"
-
 // BackingConfig captures the shared-bucket connection parameters. Every
 // node's factory in one cluster uses the SAME values (one shared
 // backing); the per-unit DbName is what isolates one unit's database from
@@ -114,33 +109,18 @@ func (c *BackingConfig) applyDefaults() {
 	}
 }
 
-// dbName maps a GenUnit to its deterministic slatedb DbName (the
-// key-prefix within the shared bucket). The generation segment is ahead
-// of the unit segment, matching the ring's genUnitBytes ordering; the
-// pair is collision-free, so two GenUnits never share a database.
+// dbName maps a GenUnit to its deterministic slatedb DbName (the key-prefix
+// within the shared bucket). Delegates to the PURE dbNameFor so the encoding
+// is shared with the tagless unit tests (dbname.go) and cannot drift.
 func (c BackingConfig) dbName(gu storageunit.GenUnit) string {
-	return c.KeyPrefix + unitPrefix + fmt.Sprintf("g%d/u%d", gu.Gen, gu.ID)
+	return dbNameFor(c.KeyPrefix, gu)
 }
 
 // dbNameReplica maps a ReplicaUnit to its deterministic slatedb DbName (R>1
-// multi-backend). It appends a replica segment to the unit's R=1 DbName,
-// reusing dbName(ru.Unit) verbatim so the unit prefix can never drift between
-// the R=1 and R>1 encodings:
-//
-//	dbNameReplica(ru) = dbName(ru.Unit) + "/r<replica>"
-//	                  = "<KeyPrefix>u/g<gen>/u<id>/r<replica>"
-//
-// The replica position is a CHILD prefix of the unit's prefix, so each
-// (gen, unit, replica) triple maps to a DISTINCT slatedb database at a
-// DISTINCT, non-overlapping prefix: replica 0 of g1/u5 lives at
-// "u/g1/u5/r0", replica 1 at "u/g1/u5/r1". This prefix-disjointness IS the
-// replica-independence durability guarantee - no object key under one
-// replica's prefix is ever read or written by another replica's database,
-// so losing the node serving one position cannot truncate, fence, or corrupt
-// another position's bytes. It is the object-store realization of
-// ReplicaUnit.String() ("g<gen>/u<id>/r<replica>").
+// multi-backend). Delegates to the PURE dbNameReplicaFor (dbname.go); see
+// that function for the prefix-disjointness durability guarantee.
 func (c BackingConfig) dbNameReplica(ru storageunit.ReplicaUnit) string {
-	return c.dbName(ru.Unit) + fmt.Sprintf("/r%d", ru.Replica)
+	return dbNameReplicaFor(c.KeyPrefix, ru)
 }
 
 // Backing owns the shared-bucket connection parameters that every per-node
