@@ -157,12 +157,34 @@ service ShaleNode {
 // A->B->A->B... ping-pong. Clients dialing this service from outside
 // the cluster (CLI, embedded library callers) leave the flag false.
 
+// ReplicaUnitRef is the POSITION-ADDRESSED forward target (v0.8 Phase 2e,
+// Option B overlap handoff). The plain forwarded ops carry ONLY the key, and
+// the receiver re-resolves the unit+position from the key against its OWN
+// live ring index. On the predecessor of a moving position that no longer
+// yields the draining position (the position moved away in the ring), so the
+// overlap forward instead carries the EXPLICIT ReplicaUnit (gen, unit,
+// replica). When this field is set on a forwarded op, the predecessor's
+// handler resolves mountMap[ru] DIRECTLY by that ru - explicitly willing to
+// serve a Draining-phase entry - rather than re-deriving the position from
+// its ring index. It is the ONLY proto change Phase 2e introduces. Absent
+// (unset) on every non-overlap forward, so the existing key-only forwarding
+// is unchanged.
+message ReplicaUnitRef {
+  uint64 gen = 1;
+  uint32 unit = 2;
+  uint32 replica = 3;
+}
+
 // -- Put -------------------------------------------------------------
 
 message PutRequest {
   bytes key = 1;
   bytes value = 2;
   bool forwarded = 3;
+  // ru, when set, position-addresses this forwarded write to a specific
+  // Draining replica on the predecessor (Phase 2e overlap forward). Unset
+  // on every ordinary forward.
+  ReplicaUnitRef ru = 4;
 }
 
 message PutResponse {}
@@ -172,6 +194,8 @@ message PutResponse {}
 message GetRequest {
   bytes key = 1;
   bool forwarded = 2;
+  // ru: see PutRequest.ru. Position-addressed overlap forward (Phase 2e).
+  ReplicaUnitRef ru = 3;
 }
 
 message GetResponse {
@@ -184,6 +208,8 @@ message GetResponse {
 message DeleteRequest {
   bytes key = 1;
   bool forwarded = 2;
+  // ru: see PutRequest.ru. Position-addressed overlap forward (Phase 2e).
+  ReplicaUnitRef ru = 3;
 }
 
 message DeleteResponse {}

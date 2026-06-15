@@ -117,18 +117,94 @@ func (ReshardPhase) EnumDescriptor() ([]byte, []int) {
 	return file_shale_proto_rawDescGZIP(), []int{0}
 }
 
-type PutRequest struct {
+// ReplicaUnitRef is the POSITION-ADDRESSED forward target (v0.8 Phase 2e,
+// Option B overlap handoff). The plain forwarded ops carry ONLY the key, and
+// the receiver re-resolves the unit+position from the key against its OWN
+// live ring index. On the predecessor of a moving position that no longer
+// yields the draining position (the position moved away in the ring), so the
+// overlap forward instead carries the EXPLICIT ReplicaUnit (gen, unit,
+// replica). When this field is set on a forwarded op, the predecessor's
+// handler resolves mountMap[ru] DIRECTLY by that ru - explicitly willing to
+// serve a Draining-phase entry - rather than re-deriving the position from
+// its ring index. It is the ONLY proto change Phase 2e introduces. Absent
+// (unset) on every non-overlap forward, so the existing key-only forwarding
+// is unchanged.
+type ReplicaUnitRef struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Value         []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
-	Forwarded     bool                   `protobuf:"varint,3,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	Gen           uint64                 `protobuf:"varint,1,opt,name=gen,proto3" json:"gen,omitempty"`
+	Unit          uint32                 `protobuf:"varint,2,opt,name=unit,proto3" json:"unit,omitempty"`
+	Replica       uint32                 `protobuf:"varint,3,opt,name=replica,proto3" json:"replica,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ReplicaUnitRef) Reset() {
+	*x = ReplicaUnitRef{}
+	mi := &file_shale_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ReplicaUnitRef) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ReplicaUnitRef) ProtoMessage() {}
+
+func (x *ReplicaUnitRef) ProtoReflect() protoreflect.Message {
+	mi := &file_shale_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ReplicaUnitRef.ProtoReflect.Descriptor instead.
+func (*ReplicaUnitRef) Descriptor() ([]byte, []int) {
+	return file_shale_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *ReplicaUnitRef) GetGen() uint64 {
+	if x != nil {
+		return x.Gen
+	}
+	return 0
+}
+
+func (x *ReplicaUnitRef) GetUnit() uint32 {
+	if x != nil {
+		return x.Unit
+	}
+	return 0
+}
+
+func (x *ReplicaUnitRef) GetReplica() uint32 {
+	if x != nil {
+		return x.Replica
+	}
+	return 0
+}
+
+type PutRequest struct {
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Key       []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Value     []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
+	Forwarded bool                   `protobuf:"varint,3,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	// ru, when set, position-addresses this forwarded write to a specific
+	// Draining replica on the predecessor (Phase 2e overlap forward). Unset
+	// on every ordinary forward.
+	Ru            *ReplicaUnitRef `protobuf:"bytes,4,opt,name=ru,proto3" json:"ru,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *PutRequest) Reset() {
 	*x = PutRequest{}
-	mi := &file_shale_proto_msgTypes[0]
+	mi := &file_shale_proto_msgTypes[1]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -140,7 +216,7 @@ func (x *PutRequest) String() string {
 func (*PutRequest) ProtoMessage() {}
 
 func (x *PutRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[0]
+	mi := &file_shale_proto_msgTypes[1]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -153,7 +229,7 @@ func (x *PutRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutRequest.ProtoReflect.Descriptor instead.
 func (*PutRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{0}
+	return file_shale_proto_rawDescGZIP(), []int{1}
 }
 
 func (x *PutRequest) GetKey() []byte {
@@ -177,6 +253,13 @@ func (x *PutRequest) GetForwarded() bool {
 	return false
 }
 
+func (x *PutRequest) GetRu() *ReplicaUnitRef {
+	if x != nil {
+		return x.Ru
+	}
+	return nil
+}
+
 type PutResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -185,7 +268,7 @@ type PutResponse struct {
 
 func (x *PutResponse) Reset() {
 	*x = PutResponse{}
-	mi := &file_shale_proto_msgTypes[1]
+	mi := &file_shale_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -197,7 +280,7 @@ func (x *PutResponse) String() string {
 func (*PutResponse) ProtoMessage() {}
 
 func (x *PutResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[1]
+	mi := &file_shale_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -210,20 +293,22 @@ func (x *PutResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PutResponse.ProtoReflect.Descriptor instead.
 func (*PutResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{1}
+	return file_shale_proto_rawDescGZIP(), []int{2}
 }
 
 type GetRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Forwarded     bool                   `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Key       []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Forwarded bool                   `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	// ru: see PutRequest.ru. Position-addressed overlap forward (Phase 2e).
+	Ru            *ReplicaUnitRef `protobuf:"bytes,3,opt,name=ru,proto3" json:"ru,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *GetRequest) Reset() {
 	*x = GetRequest{}
-	mi := &file_shale_proto_msgTypes[2]
+	mi := &file_shale_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -235,7 +320,7 @@ func (x *GetRequest) String() string {
 func (*GetRequest) ProtoMessage() {}
 
 func (x *GetRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[2]
+	mi := &file_shale_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -248,7 +333,7 @@ func (x *GetRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRequest.ProtoReflect.Descriptor instead.
 func (*GetRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{2}
+	return file_shale_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *GetRequest) GetKey() []byte {
@@ -265,6 +350,13 @@ func (x *GetRequest) GetForwarded() bool {
 	return false
 }
 
+func (x *GetRequest) GetRu() *ReplicaUnitRef {
+	if x != nil {
+		return x.Ru
+	}
+	return nil
+}
+
 type GetResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Value         []byte                 `protobuf:"bytes,1,opt,name=value,proto3" json:"value,omitempty"`
@@ -275,7 +367,7 @@ type GetResponse struct {
 
 func (x *GetResponse) Reset() {
 	*x = GetResponse{}
-	mi := &file_shale_proto_msgTypes[3]
+	mi := &file_shale_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -287,7 +379,7 @@ func (x *GetResponse) String() string {
 func (*GetResponse) ProtoMessage() {}
 
 func (x *GetResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[3]
+	mi := &file_shale_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -300,7 +392,7 @@ func (x *GetResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetResponse.ProtoReflect.Descriptor instead.
 func (*GetResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{3}
+	return file_shale_proto_rawDescGZIP(), []int{4}
 }
 
 func (x *GetResponse) GetValue() []byte {
@@ -318,16 +410,18 @@ func (x *GetResponse) GetNotFound() bool {
 }
 
 type DeleteRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Forwarded     bool                   `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Key       []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Forwarded bool                   `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	// ru: see PutRequest.ru. Position-addressed overlap forward (Phase 2e).
+	Ru            *ReplicaUnitRef `protobuf:"bytes,3,opt,name=ru,proto3" json:"ru,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
 
 func (x *DeleteRequest) Reset() {
 	*x = DeleteRequest{}
-	mi := &file_shale_proto_msgTypes[4]
+	mi := &file_shale_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -339,7 +433,7 @@ func (x *DeleteRequest) String() string {
 func (*DeleteRequest) ProtoMessage() {}
 
 func (x *DeleteRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[4]
+	mi := &file_shale_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -352,7 +446,7 @@ func (x *DeleteRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteRequest.ProtoReflect.Descriptor instead.
 func (*DeleteRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{4}
+	return file_shale_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *DeleteRequest) GetKey() []byte {
@@ -369,6 +463,13 @@ func (x *DeleteRequest) GetForwarded() bool {
 	return false
 }
 
+func (x *DeleteRequest) GetRu() *ReplicaUnitRef {
+	if x != nil {
+		return x.Ru
+	}
+	return nil
+}
+
 type DeleteResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -377,7 +478,7 @@ type DeleteResponse struct {
 
 func (x *DeleteResponse) Reset() {
 	*x = DeleteResponse{}
-	mi := &file_shale_proto_msgTypes[5]
+	mi := &file_shale_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -389,7 +490,7 @@ func (x *DeleteResponse) String() string {
 func (*DeleteResponse) ProtoMessage() {}
 
 func (x *DeleteResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[5]
+	mi := &file_shale_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -402,7 +503,7 @@ func (x *DeleteResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use DeleteResponse.ProtoReflect.Descriptor instead.
 func (*DeleteResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{5}
+	return file_shale_proto_rawDescGZIP(), []int{6}
 }
 
 type ScanPrefixRequest struct {
@@ -415,7 +516,7 @@ type ScanPrefixRequest struct {
 
 func (x *ScanPrefixRequest) Reset() {
 	*x = ScanPrefixRequest{}
-	mi := &file_shale_proto_msgTypes[6]
+	mi := &file_shale_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -427,7 +528,7 @@ func (x *ScanPrefixRequest) String() string {
 func (*ScanPrefixRequest) ProtoMessage() {}
 
 func (x *ScanPrefixRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[6]
+	mi := &file_shale_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -440,7 +541,7 @@ func (x *ScanPrefixRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanPrefixRequest.ProtoReflect.Descriptor instead.
 func (*ScanPrefixRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{6}
+	return file_shale_proto_rawDescGZIP(), []int{7}
 }
 
 func (x *ScanPrefixRequest) GetPrefix() []byte {
@@ -467,7 +568,7 @@ type ScanPrefixResponse struct {
 
 func (x *ScanPrefixResponse) Reset() {
 	*x = ScanPrefixResponse{}
-	mi := &file_shale_proto_msgTypes[7]
+	mi := &file_shale_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -479,7 +580,7 @@ func (x *ScanPrefixResponse) String() string {
 func (*ScanPrefixResponse) ProtoMessage() {}
 
 func (x *ScanPrefixResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[7]
+	mi := &file_shale_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -492,7 +593,7 @@ func (x *ScanPrefixResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScanPrefixResponse.ProtoReflect.Descriptor instead.
 func (*ScanPrefixResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{7}
+	return file_shale_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *ScanPrefixResponse) GetKey() []byte {
@@ -518,7 +619,7 @@ type LocalScanRequest struct {
 
 func (x *LocalScanRequest) Reset() {
 	*x = LocalScanRequest{}
-	mi := &file_shale_proto_msgTypes[8]
+	mi := &file_shale_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -530,7 +631,7 @@ func (x *LocalScanRequest) String() string {
 func (*LocalScanRequest) ProtoMessage() {}
 
 func (x *LocalScanRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[8]
+	mi := &file_shale_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -543,7 +644,7 @@ func (x *LocalScanRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalScanRequest.ProtoReflect.Descriptor instead.
 func (*LocalScanRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{8}
+	return file_shale_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *LocalScanRequest) GetPrefix() []byte {
@@ -563,7 +664,7 @@ type LocalScanResponse struct {
 
 func (x *LocalScanResponse) Reset() {
 	*x = LocalScanResponse{}
-	mi := &file_shale_proto_msgTypes[9]
+	mi := &file_shale_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -575,7 +676,7 @@ func (x *LocalScanResponse) String() string {
 func (*LocalScanResponse) ProtoMessage() {}
 
 func (x *LocalScanResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[9]
+	mi := &file_shale_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -588,7 +689,7 @@ func (x *LocalScanResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use LocalScanResponse.ProtoReflect.Descriptor instead.
 func (*LocalScanResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{9}
+	return file_shale_proto_rawDescGZIP(), []int{10}
 }
 
 func (x *LocalScanResponse) GetKey() []byte {
@@ -613,7 +714,7 @@ type TopologyRequest struct {
 
 func (x *TopologyRequest) Reset() {
 	*x = TopologyRequest{}
-	mi := &file_shale_proto_msgTypes[10]
+	mi := &file_shale_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -625,7 +726,7 @@ func (x *TopologyRequest) String() string {
 func (*TopologyRequest) ProtoMessage() {}
 
 func (x *TopologyRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[10]
+	mi := &file_shale_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -638,7 +739,7 @@ func (x *TopologyRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TopologyRequest.ProtoReflect.Descriptor instead.
 func (*TopologyRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{10}
+	return file_shale_proto_rawDescGZIP(), []int{11}
 }
 
 type TopologyResponse struct {
@@ -657,7 +758,7 @@ type TopologyResponse struct {
 
 func (x *TopologyResponse) Reset() {
 	*x = TopologyResponse{}
-	mi := &file_shale_proto_msgTypes[11]
+	mi := &file_shale_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -669,7 +770,7 @@ func (x *TopologyResponse) String() string {
 func (*TopologyResponse) ProtoMessage() {}
 
 func (x *TopologyResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[11]
+	mi := &file_shale_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -682,7 +783,7 @@ func (x *TopologyResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use TopologyResponse.ProtoReflect.Descriptor instead.
 func (*TopologyResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{11}
+	return file_shale_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *TopologyResponse) GetNodeId() string {
@@ -716,7 +817,7 @@ type NodeInfo struct {
 
 func (x *NodeInfo) Reset() {
 	*x = NodeInfo{}
-	mi := &file_shale_proto_msgTypes[12]
+	mi := &file_shale_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -728,7 +829,7 @@ func (x *NodeInfo) String() string {
 func (*NodeInfo) ProtoMessage() {}
 
 func (x *NodeInfo) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[12]
+	mi := &file_shale_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -741,7 +842,7 @@ func (x *NodeInfo) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeInfo.ProtoReflect.Descriptor instead.
 func (*NodeInfo) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{12}
+	return file_shale_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *NodeInfo) GetNodeId() string {
@@ -766,7 +867,7 @@ type StatsRequest struct {
 
 func (x *StatsRequest) Reset() {
 	*x = StatsRequest{}
-	mi := &file_shale_proto_msgTypes[13]
+	mi := &file_shale_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -778,7 +879,7 @@ func (x *StatsRequest) String() string {
 func (*StatsRequest) ProtoMessage() {}
 
 func (x *StatsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[13]
+	mi := &file_shale_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -791,7 +892,7 @@ func (x *StatsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsRequest.ProtoReflect.Descriptor instead.
 func (*StatsRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{13}
+	return file_shale_proto_rawDescGZIP(), []int{14}
 }
 
 type StatsResponse struct {
@@ -816,7 +917,7 @@ type StatsResponse struct {
 
 func (x *StatsResponse) Reset() {
 	*x = StatsResponse{}
-	mi := &file_shale_proto_msgTypes[14]
+	mi := &file_shale_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -828,7 +929,7 @@ func (x *StatsResponse) String() string {
 func (*StatsResponse) ProtoMessage() {}
 
 func (x *StatsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[14]
+	mi := &file_shale_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -841,7 +942,7 @@ func (x *StatsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StatsResponse.ProtoReflect.Descriptor instead.
 func (*StatsResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{14}
+	return file_shale_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *StatsResponse) GetKeysHeld() uint64 {
@@ -901,7 +1002,7 @@ type PingRequest struct {
 
 func (x *PingRequest) Reset() {
 	*x = PingRequest{}
-	mi := &file_shale_proto_msgTypes[15]
+	mi := &file_shale_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -913,7 +1014,7 @@ func (x *PingRequest) String() string {
 func (*PingRequest) ProtoMessage() {}
 
 func (x *PingRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[15]
+	mi := &file_shale_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -926,7 +1027,7 @@ func (x *PingRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingRequest.ProtoReflect.Descriptor instead.
 func (*PingRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{15}
+	return file_shale_proto_rawDescGZIP(), []int{16}
 }
 
 type PingResponse struct {
@@ -937,7 +1038,7 @@ type PingResponse struct {
 
 func (x *PingResponse) Reset() {
 	*x = PingResponse{}
-	mi := &file_shale_proto_msgTypes[16]
+	mi := &file_shale_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -949,7 +1050,7 @@ func (x *PingResponse) String() string {
 func (*PingResponse) ProtoMessage() {}
 
 func (x *PingResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[16]
+	mi := &file_shale_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -962,7 +1063,7 @@ func (x *PingResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PingResponse.ProtoReflect.Descriptor instead.
 func (*PingResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{16}
+	return file_shale_proto_rawDescGZIP(), []int{17}
 }
 
 // RangeSpec identifies which partitions the destination claims it now
@@ -991,7 +1092,7 @@ type RangeSpec struct {
 
 func (x *RangeSpec) Reset() {
 	*x = RangeSpec{}
-	mi := &file_shale_proto_msgTypes[17]
+	mi := &file_shale_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1003,7 +1104,7 @@ func (x *RangeSpec) String() string {
 func (*RangeSpec) ProtoMessage() {}
 
 func (x *RangeSpec) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[17]
+	mi := &file_shale_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1016,7 +1117,7 @@ func (x *RangeSpec) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangeSpec.ProtoReflect.Descriptor instead.
 func (*RangeSpec) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{17}
+	return file_shale_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *RangeSpec) GetPartitionIds() []uint64 {
@@ -1050,7 +1151,7 @@ type MigrateChunk struct {
 
 func (x *MigrateChunk) Reset() {
 	*x = MigrateChunk{}
-	mi := &file_shale_proto_msgTypes[18]
+	mi := &file_shale_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1062,7 +1163,7 @@ func (x *MigrateChunk) String() string {
 func (*MigrateChunk) ProtoMessage() {}
 
 func (x *MigrateChunk) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[18]
+	mi := &file_shale_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1075,7 +1176,7 @@ func (x *MigrateChunk) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrateChunk.ProtoReflect.Descriptor instead.
 func (*MigrateChunk) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{18}
+	return file_shale_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *MigrateChunk) GetBody() isMigrateChunk_Body {
@@ -1132,7 +1233,7 @@ type KeyValue struct {
 
 func (x *KeyValue) Reset() {
 	*x = KeyValue{}
-	mi := &file_shale_proto_msgTypes[19]
+	mi := &file_shale_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1144,7 +1245,7 @@ func (x *KeyValue) String() string {
 func (*KeyValue) ProtoMessage() {}
 
 func (x *KeyValue) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[19]
+	mi := &file_shale_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1157,7 +1258,7 @@ func (x *KeyValue) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyValue.ProtoReflect.Descriptor instead.
 func (*KeyValue) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{19}
+	return file_shale_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *KeyValue) GetKey() []byte {
@@ -1189,7 +1290,7 @@ type MigrationDone struct {
 
 func (x *MigrationDone) Reset() {
 	*x = MigrationDone{}
-	mi := &file_shale_proto_msgTypes[20]
+	mi := &file_shale_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1201,7 +1302,7 @@ func (x *MigrationDone) String() string {
 func (*MigrationDone) ProtoMessage() {}
 
 func (x *MigrationDone) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[20]
+	mi := &file_shale_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1214,7 +1315,7 @@ func (x *MigrationDone) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MigrationDone.ProtoReflect.Descriptor instead.
 func (*MigrationDone) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{20}
+	return file_shale_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *MigrationDone) GetTotalKeys() uint64 {
@@ -1245,7 +1346,7 @@ type ProposeRebalanceRequest struct {
 
 func (x *ProposeRebalanceRequest) Reset() {
 	*x = ProposeRebalanceRequest{}
-	mi := &file_shale_proto_msgTypes[21]
+	mi := &file_shale_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1257,7 +1358,7 @@ func (x *ProposeRebalanceRequest) String() string {
 func (*ProposeRebalanceRequest) ProtoMessage() {}
 
 func (x *ProposeRebalanceRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[21]
+	mi := &file_shale_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1270,7 +1371,7 @@ func (x *ProposeRebalanceRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProposeRebalanceRequest.ProtoReflect.Descriptor instead.
 func (*ProposeRebalanceRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{21}
+	return file_shale_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *ProposeRebalanceRequest) GetDryRun() bool {
@@ -1305,7 +1406,7 @@ type ProposeRebalanceResponse struct {
 
 func (x *ProposeRebalanceResponse) Reset() {
 	*x = ProposeRebalanceResponse{}
-	mi := &file_shale_proto_msgTypes[22]
+	mi := &file_shale_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1317,7 +1418,7 @@ func (x *ProposeRebalanceResponse) String() string {
 func (*ProposeRebalanceResponse) ProtoMessage() {}
 
 func (x *ProposeRebalanceResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[22]
+	mi := &file_shale_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1330,7 +1431,7 @@ func (x *ProposeRebalanceResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ProposeRebalanceResponse.ProtoReflect.Descriptor instead.
 func (*ProposeRebalanceResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{22}
+	return file_shale_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *ProposeRebalanceResponse) GetRanges() []*RangePlanItem {
@@ -1355,7 +1456,7 @@ type RangePlanItem struct {
 
 func (x *RangePlanItem) Reset() {
 	*x = RangePlanItem{}
-	mi := &file_shale_proto_msgTypes[23]
+	mi := &file_shale_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1367,7 +1468,7 @@ func (x *RangePlanItem) String() string {
 func (*RangePlanItem) ProtoMessage() {}
 
 func (x *RangePlanItem) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[23]
+	mi := &file_shale_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1380,7 +1481,7 @@ func (x *RangePlanItem) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RangePlanItem.ProtoReflect.Descriptor instead.
 func (*RangePlanItem) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{23}
+	return file_shale_proto_rawDescGZIP(), []int{24}
 }
 
 func (x *RangePlanItem) GetPartitionId() uint64 {
@@ -1432,7 +1533,7 @@ type CommitCASRequest struct {
 
 func (x *CommitCASRequest) Reset() {
 	*x = CommitCASRequest{}
-	mi := &file_shale_proto_msgTypes[24]
+	mi := &file_shale_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1444,7 +1545,7 @@ func (x *CommitCASRequest) String() string {
 func (*CommitCASRequest) ProtoMessage() {}
 
 func (x *CommitCASRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[24]
+	mi := &file_shale_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1457,7 +1558,7 @@ func (x *CommitCASRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommitCASRequest.ProtoReflect.Descriptor instead.
 func (*CommitCASRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{24}
+	return file_shale_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *CommitCASRequest) GetPinKey() []byte {
@@ -1504,7 +1605,7 @@ type ReadCheck struct {
 
 func (x *ReadCheck) Reset() {
 	*x = ReadCheck{}
-	mi := &file_shale_proto_msgTypes[25]
+	mi := &file_shale_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1516,7 +1617,7 @@ func (x *ReadCheck) String() string {
 func (*ReadCheck) ProtoMessage() {}
 
 func (x *ReadCheck) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[25]
+	mi := &file_shale_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1529,7 +1630,7 @@ func (x *ReadCheck) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReadCheck.ProtoReflect.Descriptor instead.
 func (*ReadCheck) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{25}
+	return file_shale_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *ReadCheck) GetKey() []byte {
@@ -1566,7 +1667,7 @@ type WriteOp struct {
 
 func (x *WriteOp) Reset() {
 	*x = WriteOp{}
-	mi := &file_shale_proto_msgTypes[26]
+	mi := &file_shale_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1578,7 +1679,7 @@ func (x *WriteOp) String() string {
 func (*WriteOp) ProtoMessage() {}
 
 func (x *WriteOp) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[26]
+	mi := &file_shale_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1591,7 +1692,7 @@ func (x *WriteOp) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use WriteOp.ProtoReflect.Descriptor instead.
 func (*WriteOp) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{26}
+	return file_shale_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *WriteOp) GetKey() []byte {
@@ -1630,7 +1731,7 @@ type CommitCASResponse struct {
 
 func (x *CommitCASResponse) Reset() {
 	*x = CommitCASResponse{}
-	mi := &file_shale_proto_msgTypes[27]
+	mi := &file_shale_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1642,7 +1743,7 @@ func (x *CommitCASResponse) String() string {
 func (*CommitCASResponse) ProtoMessage() {}
 
 func (x *CommitCASResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[27]
+	mi := &file_shale_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1655,7 +1756,7 @@ func (x *CommitCASResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use CommitCASResponse.ProtoReflect.Descriptor instead.
 func (*CommitCASResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{27}
+	return file_shale_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *CommitCASResponse) GetCommitted() bool {
@@ -1692,7 +1793,7 @@ type ApplyBatchRequest struct {
 
 func (x *ApplyBatchRequest) Reset() {
 	*x = ApplyBatchRequest{}
-	mi := &file_shale_proto_msgTypes[28]
+	mi := &file_shale_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1704,7 +1805,7 @@ func (x *ApplyBatchRequest) String() string {
 func (*ApplyBatchRequest) ProtoMessage() {}
 
 func (x *ApplyBatchRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[28]
+	mi := &file_shale_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1717,7 +1818,7 @@ func (x *ApplyBatchRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyBatchRequest.ProtoReflect.Descriptor instead.
 func (*ApplyBatchRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{28}
+	return file_shale_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *ApplyBatchRequest) GetWrites() []*EnvelopeWrite {
@@ -1741,7 +1842,7 @@ type EnvelopeWrite struct {
 
 func (x *EnvelopeWrite) Reset() {
 	*x = EnvelopeWrite{}
-	mi := &file_shale_proto_msgTypes[29]
+	mi := &file_shale_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1753,7 +1854,7 @@ func (x *EnvelopeWrite) String() string {
 func (*EnvelopeWrite) ProtoMessage() {}
 
 func (x *EnvelopeWrite) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[29]
+	mi := &file_shale_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1766,7 +1867,7 @@ func (x *EnvelopeWrite) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EnvelopeWrite.ProtoReflect.Descriptor instead.
 func (*EnvelopeWrite) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{29}
+	return file_shale_proto_rawDescGZIP(), []int{30}
 }
 
 func (x *EnvelopeWrite) GetKey() []byte {
@@ -1796,7 +1897,7 @@ type ApplyBatchResponse struct {
 
 func (x *ApplyBatchResponse) Reset() {
 	*x = ApplyBatchResponse{}
-	mi := &file_shale_proto_msgTypes[30]
+	mi := &file_shale_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1808,7 +1909,7 @@ func (x *ApplyBatchResponse) String() string {
 func (*ApplyBatchResponse) ProtoMessage() {}
 
 func (x *ApplyBatchResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[30]
+	mi := &file_shale_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1821,7 +1922,7 @@ func (x *ApplyBatchResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ApplyBatchResponse.ProtoReflect.Descriptor instead.
 func (*ApplyBatchResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{30}
+	return file_shale_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *ApplyBatchResponse) GetError() string {
@@ -1845,7 +1946,7 @@ type ReshardControlRequest struct {
 
 func (x *ReshardControlRequest) Reset() {
 	*x = ReshardControlRequest{}
-	mi := &file_shale_proto_msgTypes[31]
+	mi := &file_shale_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1857,7 +1958,7 @@ func (x *ReshardControlRequest) String() string {
 func (*ReshardControlRequest) ProtoMessage() {}
 
 func (x *ReshardControlRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[31]
+	mi := &file_shale_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1870,7 +1971,7 @@ func (x *ReshardControlRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReshardControlRequest.ProtoReflect.Descriptor instead.
 func (*ReshardControlRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{31}
+	return file_shale_proto_rawDescGZIP(), []int{32}
 }
 
 func (x *ReshardControlRequest) GetPhase() ReshardPhase {
@@ -1900,7 +2001,7 @@ type ReshardControlResponse struct {
 
 func (x *ReshardControlResponse) Reset() {
 	*x = ReshardControlResponse{}
-	mi := &file_shale_proto_msgTypes[32]
+	mi := &file_shale_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1912,7 +2013,7 @@ func (x *ReshardControlResponse) String() string {
 func (*ReshardControlResponse) ProtoMessage() {}
 
 func (x *ReshardControlResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[32]
+	mi := &file_shale_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1925,7 +2026,7 @@ func (x *ReshardControlResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ReshardControlResponse.ProtoReflect.Descriptor instead.
 func (*ReshardControlResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{32}
+	return file_shale_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *ReshardControlResponse) GetError() string {
@@ -1945,7 +2046,7 @@ type GenStateRequest struct {
 
 func (x *GenStateRequest) Reset() {
 	*x = GenStateRequest{}
-	mi := &file_shale_proto_msgTypes[33]
+	mi := &file_shale_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1957,7 +2058,7 @@ func (x *GenStateRequest) String() string {
 func (*GenStateRequest) ProtoMessage() {}
 
 func (x *GenStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[33]
+	mi := &file_shale_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1970,7 +2071,7 @@ func (x *GenStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenStateRequest.ProtoReflect.Descriptor instead.
 func (*GenStateRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{33}
+	return file_shale_proto_rawDescGZIP(), []int{34}
 }
 
 // GenStateResponse carries the responder's live {generation, unit-count}.
@@ -1989,7 +2090,7 @@ type GenStateResponse struct {
 
 func (x *GenStateResponse) Reset() {
 	*x = GenStateResponse{}
-	mi := &file_shale_proto_msgTypes[34]
+	mi := &file_shale_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2001,7 +2102,7 @@ func (x *GenStateResponse) String() string {
 func (*GenStateResponse) ProtoMessage() {}
 
 func (x *GenStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[34]
+	mi := &file_shale_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2014,7 +2115,7 @@ func (x *GenStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenStateResponse.ProtoReflect.Descriptor instead.
 func (*GenStateResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{34}
+	return file_shale_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *GenStateResponse) GetGeneration() uint64 {
@@ -2035,23 +2136,30 @@ var File_shale_proto protoreflect.FileDescriptor
 
 const file_shale_proto_rawDesc = "" +
 	"\n" +
-	"\vshale.proto\x12\bshale.v1\"R\n" +
+	"\vshale.proto\x12\bshale.v1\"P\n" +
+	"\x0eReplicaUnitRef\x12\x10\n" +
+	"\x03gen\x18\x01 \x01(\x04R\x03gen\x12\x12\n" +
+	"\x04unit\x18\x02 \x01(\rR\x04unit\x12\x18\n" +
+	"\areplica\x18\x03 \x01(\rR\areplica\"|\n" +
 	"\n" +
 	"PutRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x1c\n" +
-	"\tforwarded\x18\x03 \x01(\bR\tforwarded\"\r\n" +
-	"\vPutResponse\"<\n" +
+	"\tforwarded\x18\x03 \x01(\bR\tforwarded\x12(\n" +
+	"\x02ru\x18\x04 \x01(\v2\x18.shale.v1.ReplicaUnitRefR\x02ru\"\r\n" +
+	"\vPutResponse\"f\n" +
 	"\n" +
 	"GetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1c\n" +
-	"\tforwarded\x18\x02 \x01(\bR\tforwarded\"@\n" +
+	"\tforwarded\x18\x02 \x01(\bR\tforwarded\x12(\n" +
+	"\x02ru\x18\x03 \x01(\v2\x18.shale.v1.ReplicaUnitRefR\x02ru\"@\n" +
 	"\vGetResponse\x12\x14\n" +
 	"\x05value\x18\x01 \x01(\fR\x05value\x12\x1b\n" +
-	"\tnot_found\x18\x02 \x01(\bR\bnotFound\"?\n" +
+	"\tnot_found\x18\x02 \x01(\bR\bnotFound\"i\n" +
 	"\rDeleteRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1c\n" +
-	"\tforwarded\x18\x02 \x01(\bR\tforwarded\"\x10\n" +
+	"\tforwarded\x18\x02 \x01(\bR\tforwarded\x12(\n" +
+	"\x02ru\x18\x03 \x01(\v2\x18.shale.v1.ReplicaUnitRefR\x02ru\"\x10\n" +
 	"\x0eDeleteResponse\"I\n" +
 	"\x11ScanPrefixRequest\x12\x16\n" +
 	"\x06prefix\x18\x01 \x01(\fR\x06prefix\x12\x1c\n" +
@@ -2184,87 +2292,91 @@ func file_shale_proto_rawDescGZIP() []byte {
 }
 
 var file_shale_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 36)
 var file_shale_proto_goTypes = []any{
 	(ReshardPhase)(0),                // 0: shale.v1.ReshardPhase
-	(*PutRequest)(nil),               // 1: shale.v1.PutRequest
-	(*PutResponse)(nil),              // 2: shale.v1.PutResponse
-	(*GetRequest)(nil),               // 3: shale.v1.GetRequest
-	(*GetResponse)(nil),              // 4: shale.v1.GetResponse
-	(*DeleteRequest)(nil),            // 5: shale.v1.DeleteRequest
-	(*DeleteResponse)(nil),           // 6: shale.v1.DeleteResponse
-	(*ScanPrefixRequest)(nil),        // 7: shale.v1.ScanPrefixRequest
-	(*ScanPrefixResponse)(nil),       // 8: shale.v1.ScanPrefixResponse
-	(*LocalScanRequest)(nil),         // 9: shale.v1.LocalScanRequest
-	(*LocalScanResponse)(nil),        // 10: shale.v1.LocalScanResponse
-	(*TopologyRequest)(nil),          // 11: shale.v1.TopologyRequest
-	(*TopologyResponse)(nil),         // 12: shale.v1.TopologyResponse
-	(*NodeInfo)(nil),                 // 13: shale.v1.NodeInfo
-	(*StatsRequest)(nil),             // 14: shale.v1.StatsRequest
-	(*StatsResponse)(nil),            // 15: shale.v1.StatsResponse
-	(*PingRequest)(nil),              // 16: shale.v1.PingRequest
-	(*PingResponse)(nil),             // 17: shale.v1.PingResponse
-	(*RangeSpec)(nil),                // 18: shale.v1.RangeSpec
-	(*MigrateChunk)(nil),             // 19: shale.v1.MigrateChunk
-	(*KeyValue)(nil),                 // 20: shale.v1.KeyValue
-	(*MigrationDone)(nil),            // 21: shale.v1.MigrationDone
-	(*ProposeRebalanceRequest)(nil),  // 22: shale.v1.ProposeRebalanceRequest
-	(*ProposeRebalanceResponse)(nil), // 23: shale.v1.ProposeRebalanceResponse
-	(*RangePlanItem)(nil),            // 24: shale.v1.RangePlanItem
-	(*CommitCASRequest)(nil),         // 25: shale.v1.CommitCASRequest
-	(*ReadCheck)(nil),                // 26: shale.v1.ReadCheck
-	(*WriteOp)(nil),                  // 27: shale.v1.WriteOp
-	(*CommitCASResponse)(nil),        // 28: shale.v1.CommitCASResponse
-	(*ApplyBatchRequest)(nil),        // 29: shale.v1.ApplyBatchRequest
-	(*EnvelopeWrite)(nil),            // 30: shale.v1.EnvelopeWrite
-	(*ApplyBatchResponse)(nil),       // 31: shale.v1.ApplyBatchResponse
-	(*ReshardControlRequest)(nil),    // 32: shale.v1.ReshardControlRequest
-	(*ReshardControlResponse)(nil),   // 33: shale.v1.ReshardControlResponse
-	(*GenStateRequest)(nil),          // 34: shale.v1.GenStateRequest
-	(*GenStateResponse)(nil),         // 35: shale.v1.GenStateResponse
+	(*ReplicaUnitRef)(nil),           // 1: shale.v1.ReplicaUnitRef
+	(*PutRequest)(nil),               // 2: shale.v1.PutRequest
+	(*PutResponse)(nil),              // 3: shale.v1.PutResponse
+	(*GetRequest)(nil),               // 4: shale.v1.GetRequest
+	(*GetResponse)(nil),              // 5: shale.v1.GetResponse
+	(*DeleteRequest)(nil),            // 6: shale.v1.DeleteRequest
+	(*DeleteResponse)(nil),           // 7: shale.v1.DeleteResponse
+	(*ScanPrefixRequest)(nil),        // 8: shale.v1.ScanPrefixRequest
+	(*ScanPrefixResponse)(nil),       // 9: shale.v1.ScanPrefixResponse
+	(*LocalScanRequest)(nil),         // 10: shale.v1.LocalScanRequest
+	(*LocalScanResponse)(nil),        // 11: shale.v1.LocalScanResponse
+	(*TopologyRequest)(nil),          // 12: shale.v1.TopologyRequest
+	(*TopologyResponse)(nil),         // 13: shale.v1.TopologyResponse
+	(*NodeInfo)(nil),                 // 14: shale.v1.NodeInfo
+	(*StatsRequest)(nil),             // 15: shale.v1.StatsRequest
+	(*StatsResponse)(nil),            // 16: shale.v1.StatsResponse
+	(*PingRequest)(nil),              // 17: shale.v1.PingRequest
+	(*PingResponse)(nil),             // 18: shale.v1.PingResponse
+	(*RangeSpec)(nil),                // 19: shale.v1.RangeSpec
+	(*MigrateChunk)(nil),             // 20: shale.v1.MigrateChunk
+	(*KeyValue)(nil),                 // 21: shale.v1.KeyValue
+	(*MigrationDone)(nil),            // 22: shale.v1.MigrationDone
+	(*ProposeRebalanceRequest)(nil),  // 23: shale.v1.ProposeRebalanceRequest
+	(*ProposeRebalanceResponse)(nil), // 24: shale.v1.ProposeRebalanceResponse
+	(*RangePlanItem)(nil),            // 25: shale.v1.RangePlanItem
+	(*CommitCASRequest)(nil),         // 26: shale.v1.CommitCASRequest
+	(*ReadCheck)(nil),                // 27: shale.v1.ReadCheck
+	(*WriteOp)(nil),                  // 28: shale.v1.WriteOp
+	(*CommitCASResponse)(nil),        // 29: shale.v1.CommitCASResponse
+	(*ApplyBatchRequest)(nil),        // 30: shale.v1.ApplyBatchRequest
+	(*EnvelopeWrite)(nil),            // 31: shale.v1.EnvelopeWrite
+	(*ApplyBatchResponse)(nil),       // 32: shale.v1.ApplyBatchResponse
+	(*ReshardControlRequest)(nil),    // 33: shale.v1.ReshardControlRequest
+	(*ReshardControlResponse)(nil),   // 34: shale.v1.ReshardControlResponse
+	(*GenStateRequest)(nil),          // 35: shale.v1.GenStateRequest
+	(*GenStateResponse)(nil),         // 36: shale.v1.GenStateResponse
 }
 var file_shale_proto_depIdxs = []int32{
-	13, // 0: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
-	20, // 1: shale.v1.MigrateChunk.kv:type_name -> shale.v1.KeyValue
-	21, // 2: shale.v1.MigrateChunk.done:type_name -> shale.v1.MigrationDone
-	24, // 3: shale.v1.ProposeRebalanceResponse.ranges:type_name -> shale.v1.RangePlanItem
-	26, // 4: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
-	27, // 5: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
-	30, // 6: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
-	0,  // 7: shale.v1.ReshardControlRequest.phase:type_name -> shale.v1.ReshardPhase
-	1,  // 8: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
-	3,  // 9: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
-	5,  // 10: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
-	7,  // 11: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
-	9,  // 12: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
-	11, // 13: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
-	14, // 14: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
-	16, // 15: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
-	18, // 16: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
-	22, // 17: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
-	25, // 18: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
-	29, // 19: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
-	32, // 20: shale.v1.ShaleNode.ReshardControl:input_type -> shale.v1.ReshardControlRequest
-	34, // 21: shale.v1.ShaleNode.GenState:input_type -> shale.v1.GenStateRequest
-	2,  // 22: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
-	4,  // 23: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
-	6,  // 24: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
-	8,  // 25: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
-	10, // 26: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
-	12, // 27: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
-	15, // 28: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
-	17, // 29: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
-	19, // 30: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
-	23, // 31: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
-	28, // 32: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
-	31, // 33: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
-	33, // 34: shale.v1.ShaleNode.ReshardControl:output_type -> shale.v1.ReshardControlResponse
-	35, // 35: shale.v1.ShaleNode.GenState:output_type -> shale.v1.GenStateResponse
-	22, // [22:36] is the sub-list for method output_type
-	8,  // [8:22] is the sub-list for method input_type
-	8,  // [8:8] is the sub-list for extension type_name
-	8,  // [8:8] is the sub-list for extension extendee
-	0,  // [0:8] is the sub-list for field type_name
+	1,  // 0: shale.v1.PutRequest.ru:type_name -> shale.v1.ReplicaUnitRef
+	1,  // 1: shale.v1.GetRequest.ru:type_name -> shale.v1.ReplicaUnitRef
+	1,  // 2: shale.v1.DeleteRequest.ru:type_name -> shale.v1.ReplicaUnitRef
+	14, // 3: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
+	21, // 4: shale.v1.MigrateChunk.kv:type_name -> shale.v1.KeyValue
+	22, // 5: shale.v1.MigrateChunk.done:type_name -> shale.v1.MigrationDone
+	25, // 6: shale.v1.ProposeRebalanceResponse.ranges:type_name -> shale.v1.RangePlanItem
+	27, // 7: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
+	28, // 8: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
+	31, // 9: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
+	0,  // 10: shale.v1.ReshardControlRequest.phase:type_name -> shale.v1.ReshardPhase
+	2,  // 11: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
+	4,  // 12: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
+	6,  // 13: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
+	8,  // 14: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
+	10, // 15: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
+	12, // 16: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
+	15, // 17: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
+	17, // 18: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
+	19, // 19: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
+	23, // 20: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
+	26, // 21: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
+	30, // 22: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
+	33, // 23: shale.v1.ShaleNode.ReshardControl:input_type -> shale.v1.ReshardControlRequest
+	35, // 24: shale.v1.ShaleNode.GenState:input_type -> shale.v1.GenStateRequest
+	3,  // 25: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
+	5,  // 26: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
+	7,  // 27: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
+	9,  // 28: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
+	11, // 29: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
+	13, // 30: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
+	16, // 31: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
+	18, // 32: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
+	20, // 33: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
+	24, // 34: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
+	29, // 35: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
+	32, // 36: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
+	34, // 37: shale.v1.ShaleNode.ReshardControl:output_type -> shale.v1.ReshardControlResponse
+	36, // 38: shale.v1.ShaleNode.GenState:output_type -> shale.v1.GenStateResponse
+	25, // [25:39] is the sub-list for method output_type
+	11, // [11:25] is the sub-list for method input_type
+	11, // [11:11] is the sub-list for extension type_name
+	11, // [11:11] is the sub-list for extension extendee
+	0,  // [0:11] is the sub-list for field type_name
 }
 
 func init() { file_shale_proto_init() }
@@ -2272,7 +2384,7 @@ func file_shale_proto_init() {
 	if File_shale_proto != nil {
 		return
 	}
-	file_shale_proto_msgTypes[18].OneofWrappers = []any{
+	file_shale_proto_msgTypes[19].OneofWrappers = []any{
 		(*MigrateChunk_Kv)(nil),
 		(*MigrateChunk_Done)(nil),
 	}
@@ -2282,7 +2394,7 @@ func file_shale_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_shale_proto_rawDesc), len(file_shale_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   35,
+			NumMessages:   36,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
