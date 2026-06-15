@@ -219,7 +219,7 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 	// "write needed N acks, got M" flake. The retry here is scoped to
 	// setup only; once this returns the cluster is write-ready and any
 	// later Unavailable in a test body is a real failure.
-	waitForWriteReady(t, clusters[0], 45*time.Second)
+	waitForWriteReady(t, clusters, 45*time.Second)
 
 	out := make([]*replicatedNode, 3)
 	for i := range 3 {

@@ -220,23 +220,62 @@ func startCountingCluster(t *testing.T, count, r int, wc cluster.WriteConsistenc
 	return nodes
 }
 
-// probeWriteReady blocks until a write through nodes[0] succeeds under
-// the cluster's configured write consistency, then resets every
-// backend's operation counters. It converts a transient setup-time ack
-// shortfall (under load) from a confusing mid-test failure into either
-// a retried success or a clear setup-time error.
+// probeWriteReady blocks until a spread of writes succeeds THROUGH EVERY
+// node under the cluster's configured write consistency, then resets
+// every backend's operation counters. It converts a transient setup-time
+// ack shortfall (under load) from a confusing mid-test failure into
+// either a retried success or a clear setup-time error.
+//
+// Probing a single key through nodes[0] only warms ONE (origin-node,
+// replica-set) pair, ONCE. Two gaps remained: (1) the tests fire their
+// seed Put through different nodes and against different keys, so a node
+// whose bootstrap StateReceiving window was still open - or whose gRPC
+// server lagged - for a different key range was never proven ready, and
+// its local-self leg came back transient (counts as neither ack nor
+// failure -> the WriteAll R3 seed lands 2 acks, 0 failures); (2) a single
+// passing probe does not prove the ring stays stable - a late-arriving
+// SWIM gossip join can reopen a receiving window MID-TEST. This gate
+// closes both: it requires a full CLEAN SWEEP of a spread of keys through
+// EVERY node, restarting the whole pass on any transient. Completing one
+// uninterrupted clean pass proves no node has an open receiving window,
+// every server is accepting, and the ring held stable for the pass.
+// Counters are zeroed afterward so the probe stays invisible to the
+// per-backend Put/Get/Delete deltas the tests assert on.
 func probeWriteReady(t *testing.T, nodes []*countingTestNode, budget time.Duration) {
 	t.Helper()
+	// Enough distinct keys that, under consistent hashing, every member
+	// is the local-self leg for at least one across a small cluster.
+	const probeKeys = 24
 	deadline := time.Now().Add(budget)
 	var lastErr error
 	for {
-		if lastErr = nodes[0].Cluster.Put([]byte("__write_ready_probe__"), []byte("ready")); lastErr == nil {
+		sweepClean := true
+		for from, n := range nodes {
+			for k := range probeKeys {
+				probeKey := fmt.Appendf(nil, "__write_ready_probe__/%d/%d", from, k)
+				if lastErr = n.Cluster.Put(probeKey, []byte("ready")); lastErr == nil {
+					continue
+				}
+				// Any shortfall taints the sweep: the ring is not stably
+				// write-ready. Back off and restart so readiness means a
+				// full clean pass, not one lucky probe.
+				sweepClean = false
+				if time.Now().After(deadline) {
+					t.Fatalf("write-readiness sweep through node %d never completed cleanly within %s: %v", from, budget, lastErr)
+				}
+				time.Sleep(100 * time.Millisecond)
+				break
+			}
+			if !sweepClean {
+				break
+			}
+		}
+		if sweepClean {
 			break
 		}
 		if time.Now().After(deadline) {
-			t.Fatalf("write-readiness probe never succeeded within %s: %v", budget, lastErr)
+			t.Fatalf("write-readiness sweep never completed cleanly within %s: %v", budget, lastErr)
 		}
-		time.Sleep(100 * time.Millisecond)
 	}
 	for _, n := range nodes {
 		n.Backend.puts.Store(0)
