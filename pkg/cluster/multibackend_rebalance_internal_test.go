@@ -46,7 +46,7 @@ func newReconcileCluster(t *testing.T, self string, n int, backing *sharedfactor
 		factory:    h,
 		unitCount:  storageunit.MustUnitCount(n),
 		genOwner:   owners.OwnerOfGen,
-		mountMap:   make(map[storageunit.GenUnit]backend.Backend),
+		mountMap:   make(map[storageunit.ReplicaUnit]backend.Backend),
 		pauseUnits: make(map[storageunit.UnitID]*sync.RWMutex),
 		closeCh:    make(chan struct{}),
 	}
@@ -65,8 +65,8 @@ func mountedUnits(c *Cluster) []storageunit.UnitID {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
 	out := make([]storageunit.UnitID, 0, len(c.mountMap))
-	for gu := range c.mountMap {
-		out = append(out, gu.ID)
+	for ru := range c.mountMap {
+		out = append(out, ru.Unit.ID)
 	}
 	// insertion-sort for determinism
 	for i := 1; i < len(out); i++ {
@@ -80,7 +80,7 @@ func mountedUnits(c *Cluster) []storageunit.UnitID {
 func hasUnit(c *Cluster, u storageunit.UnitID) bool {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
-	_, ok := c.mountMap[gu0(u)]
+	_, ok := c.mountMap[replica0(gu0(u))]
 	return ok
 }
 
@@ -170,7 +170,7 @@ func TestReconcileSelfHealsLostMount(t *testing.T) {
 	// Simulate a lost mount: drop unit 1 from the map (and from the handle)
 	// without changing ownership.
 	c.mountMu.Lock()
-	delete(c.mountMap, gu0(1))
+	delete(c.mountMap, replica0(gu0(1)))
 	c.mountMu.Unlock()
 	_ = c.factory.CloseUnit(gu0(1))
 
@@ -195,7 +195,7 @@ func TestAcquireFencesPriorOwner(t *testing.T) {
 
 	// A mounts its units and writes an ACKED key directly to U's backend.
 	a.reconcileUnits()
-	abk := a.mountMap[gu0(u)]
+	abk := a.mountMap[replica0(gu0(u))]
 	if abk == nil {
 		t.Fatal("A did not mount unit 1")
 	}
@@ -206,7 +206,7 @@ func TestAcquireFencesPriorOwner(t *testing.T) {
 	// Ring hands U to B. B reconciles -> acquires U at a higher epoch.
 	ownersB[1] = "B"
 	b.reconcileUnits()
-	bbk := b.mountMap[gu0(u)]
+	bbk := b.mountMap[replica0(gu0(u))]
 	if bbk == nil {
 		t.Fatal("B did not acquire unit 1 on reconcile")
 	}

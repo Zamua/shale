@@ -201,7 +201,7 @@ func (c *Cluster) pauseLockFor(u storageunit.UnitID) *sync.RWMutex {
 // handoff window, or never owned): the caller returns the retryable
 // acquiring-window error. The pause is still released via unlock in that case.
 // Multi-backend mode only.
-func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, gu storageunit.GenUnit, unlock func(), ok bool) {
+func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, ru storageunit.ReplicaUnit, unlock func(), ok bool) {
 	h := storageunit.HashShardKey(c.shardKey(key))
 	// Key the pause by the OLD unit at the CURRENT count. resolveGenUnit (under
 	// genMu) decides old-vs-new; the pause must be on the same K the resharder
@@ -231,16 +231,21 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, gu st
 	// (its value is copied) OR it takes the RLock after and is refused here
 	// (ok=false -> the retryable acquiring-window error, never an ack).
 	if c.isFrozen() {
-		return nil, storageunit.GenUnit{}, pause.RUnlock, false
+		return nil, storageunit.ReplicaUnit{}, pause.RUnlock, false
 	}
-	gu = c.genSnapshot().resolveGenUnit(h)
+	gu := c.genSnapshot().resolveGenUnit(h)
+	pos, ok := c.localReplicaPos(gu)
+	if !ok {
+		return nil, storageunit.ReplicaUnit{}, pause.RUnlock, false
+	}
+	ru = storageunit.NewReplicaUnit(gu, pos)
 	c.mountMu.RLock()
-	be, ok = c.mountMap[gu]
+	be, ok = c.mountMap[ru]
 	c.mountMu.RUnlock()
-	return be, gu, pause.RUnlock, ok
+	return be, ru, pause.RUnlock, ok
 }
 
-// evictStaleMount drops gu from the mount map if the entry still points at the
+// evictStaleMount drops ru from the mount map if the entry still points at the
 // SAME backend that just failed a write. A local write that fails on an
 // owned+mounted unit means the mount is STALE: the unit's lease moved (it was
 // re-acquired at a higher epoch by a concurrent reconcile - the cross-node
@@ -254,11 +259,11 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, gu st
 // originator retries and lands on the freshly re-acquired (or re-routed) mount.
 // This is the Phase 3 self-heal philosophy applied to a fenced mount; it keeps
 // the NO-ACKED-WRITE-LOST invariant by never acking a write that did not land.
-func (c *Cluster) evictStaleMount(gu storageunit.GenUnit, failed backend.Backend) {
+func (c *Cluster) evictStaleMount(ru storageunit.ReplicaUnit, failed backend.Backend) {
 	c.mountMu.Lock()
 	evicted := false
-	if cur, ok := c.mountMap[gu]; ok && cur == failed {
-		delete(c.mountMap, gu)
+	if cur, ok := c.mountMap[ru]; ok && cur == failed {
+		delete(c.mountMap, ru)
 		evicted = true
 	}
 	c.mountMu.Unlock()
@@ -386,9 +391,9 @@ func (c *Cluster) mountedOldUnits(gen storageunit.Generation) []storageunit.Unit
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
 	out := make([]storageunit.UnitID, 0, len(c.mountMap))
-	for gu := range c.mountMap {
-		if gu.Gen == gen {
-			out = append(out, gu.ID)
+	for ru := range c.mountMap {
+		if ru.Unit.Gen == gen {
+			out = append(out, ru.Unit.ID)
 		}
 	}
 	// ascending for a deterministic march
@@ -426,13 +431,13 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
 	c.mountMu.Lock()
-	c.mountMap[lowGU] = lowBE
-	c.mountMap[highGU] = highBE
+	c.mountMap[replica0(lowGU)] = lowBE
+	c.mountMap[replica0(highGU)] = highBE
 	c.mountMu.Unlock()
 
 	// The source backend (old gen-g unit K), which keeps serving throughout.
 	c.mountMu.RLock()
-	src, ok := c.mountMap[oldGU]
+	src, ok := c.mountMap[replica0(oldGU)]
 	c.mountMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("old unit %s not mounted", oldGU)
@@ -485,7 +490,7 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 	// the gen-g database. CloseUnit at the OLD generation does not touch the
 	// gen-(g+1) children (distinct identities).
 	c.mountMu.Lock()
-	delete(c.mountMap, oldGU)
+	delete(c.mountMap, replica0(oldGU))
 	c.mountMu.Unlock()
 	_ = c.factory.CloseUnit(oldGU)
 	return nil

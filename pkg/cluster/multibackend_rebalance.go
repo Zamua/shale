@@ -210,8 +210,10 @@ func (c *Cluster) reconcileUnits() {
 	// a half-applied reconcile.
 	c.mountMu.RLock()
 	mounted := make(map[storageunit.GenUnit]struct{}, len(c.mountMap))
-	for gu := range c.mountMap {
-		mounted[gu] = struct{}{}
+	for ru := range c.mountMap {
+		// R=1 lease-handoff path: a node holds each unit at position 0, so the
+		// GenUnit view is ru.Unit.
+		mounted[ru.Unit] = struct{}{}
 	}
 	c.mountMu.RUnlock()
 
@@ -275,7 +277,7 @@ func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 		_ = c.factory.CloseUnit(gu)
 		return
 	}
-	c.mountMap[gu] = b
+	c.mountMap[replica0(gu)] = b
 	c.mountMu.Unlock()
 }
 
@@ -295,7 +297,7 @@ func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 // Caller MUST hold reconcileMu. mountMap mutation takes mountMu.
 func (c *Cluster) releaseUnit(gu storageunit.GenUnit) {
 	c.mountMu.Lock()
-	delete(c.mountMap, gu)
+	delete(c.mountMap, replica0(gu))
 	c.mountMu.Unlock()
 	// CloseUnit is idempotent + best-effort: a close error does not change
 	// ownership (the ring already moved gu off this node), and the new
@@ -339,7 +341,7 @@ func (c *Cluster) TestingClearMount(u storageunit.UnitID) {
 	}
 	gu := storageunit.NewGenUnit(c.genSnapshot().gen, u)
 	c.mountMu.Lock()
-	delete(c.mountMap, gu)
+	delete(c.mountMap, replica0(gu))
 	c.mountMu.Unlock()
 }
 

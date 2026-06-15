@@ -90,7 +90,6 @@ func (c *Cluster) initReplicatedFactory() {
 	}
 	if rf, ok := c.factory.(storageunit.ReplicaBackendFactory); ok {
 		c.replicaFactory = rf
-		c.replicaPos = make(map[storageunit.GenUnit]uint8)
 	}
 }
 
@@ -146,8 +145,7 @@ func (c *Cluster) mountReplicaUnits() error {
 			return err
 		}
 		c.mountMu.Lock()
-		c.mountMap[ru.Unit] = b
-		c.replicaPos[ru.Unit] = ru.Replica
+		c.mountMap[ru] = b
 		c.mountMu.Unlock()
 	}
 	return nil
@@ -171,7 +169,7 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 		return err
 	}
 
-	b, gu, unlock, ok := c.localWriteBackendForKey(key)
+	b, ru, unlock, ok := c.localWriteBackendForKey(key)
 	defer unlock()
 	if !ok {
 		return errUnitAcquiring("Put")
@@ -182,7 +180,7 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 
 	tx, err := b.Begin(backend.SnapshotIsolation)
 	if err != nil {
-		c.evictStaleMount(gu, b)
+		c.evictStaleMount(ru, b)
 		return errUnitAcquiring("Put")
 	}
 	committed := false
@@ -223,30 +221,37 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 // self-healing. Caller MUST hold reconcileMu; mount mutations take mountMu.
 func (c *Cluster) reconcileReplicaUnits() {
 	desired := c.desiredReplicaUnits()
-	desiredPos := make(map[storageunit.GenUnit]uint8, len(desired))
+	desiredSet := make(map[storageunit.ReplicaUnit]struct{}, len(desired))
 	for _, ru := range desired {
-		desiredPos[ru.Unit] = ru.Replica
+		desiredSet[ru] = struct{}{}
 	}
 
 	c.mountMu.RLock()
-	mountedPos := make(map[storageunit.GenUnit]uint8, len(c.mountMap))
-	for gu := range c.mountMap {
-		mountedPos[gu] = c.replicaPos[gu]
+	mounted := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
+	for ru := range c.mountMap {
+		mounted = append(mounted, ru)
 	}
 	c.mountMu.RUnlock()
 
-	// RELEASE: units no longer replicated here, OR replicated at a DIFFERENT
-	// position than currently mounted (re-acquired below at the new position).
-	for gu, pos := range mountedPos {
-		want, ok := desiredPos[gu]
-		if !ok || want != pos {
-			c.releaseReplicaUnit(gu, pos)
+	// RELEASE: ReplicaUnits no longer desired here. A position shuffle of the
+	// same unit appears as "old ReplicaUnit not desired" (released) plus "new
+	// ReplicaUnit not mounted" (acquired below). Behavior-preserving clean-cut:
+	// a node holds at most one position per unit, so the old position is the
+	// only mounted entry for the unit and is released before the new one is
+	// acquired.
+	for _, ru := range mounted {
+		if _, ok := desiredSet[ru]; !ok {
+			c.releaseReplicaUnit(ru)
 		}
 	}
 
-	// ACQUIRE: desired units not currently mounted at the desired position.
+	// ACQUIRE: desired ReplicaUnits not currently mounted.
+	mountedSet := make(map[storageunit.ReplicaUnit]struct{}, len(mounted))
+	for _, ru := range mounted {
+		mountedSet[ru] = struct{}{}
+	}
 	for _, ru := range desired {
-		if cur, ok := mountedPos[ru.Unit]; ok && cur == ru.Replica {
+		if _, ok := mountedSet[ru]; ok {
 			continue
 		}
 		c.acquireReplicaUnit(ru)
@@ -270,21 +275,18 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 		_ = c.replicaFactory.CloseReplicaUnit(ru)
 		return
 	}
-	c.mountMap[ru.Unit] = b
-	c.replicaPos[ru.Unit] = ru.Replica
+	c.mountMap[ru] = b
 	c.mountMu.Unlock()
 }
 
-// releaseReplicaUnit unmounts replica position pos of unit gu via the per-
-// replica factory. The mount-map entry is removed BEFORE the close so a routed
-// op stops resolving the local backend immediately. Caller MUST hold
-// reconcileMu.
-func (c *Cluster) releaseReplicaUnit(gu storageunit.GenUnit, pos uint8) {
+// releaseReplicaUnit unmounts the ReplicaUnit ru via the per-replica factory.
+// The mount-map entry is removed BEFORE the close so a routed op stops resolving
+// the local backend immediately. Caller MUST hold reconcileMu.
+func (c *Cluster) releaseReplicaUnit(ru storageunit.ReplicaUnit) {
 	c.mountMu.Lock()
-	delete(c.mountMap, gu)
-	delete(c.replicaPos, gu)
+	delete(c.mountMap, ru)
 	c.mountMu.Unlock()
-	_ = c.replicaFactory.CloseReplicaUnit(storageunit.NewReplicaUnit(gu, pos))
+	_ = c.replicaFactory.CloseReplicaUnit(ru)
 }
 
 // applyBatchToUnit is the multi-backend analogue of ApplyBatchLocal's apply
@@ -298,7 +300,7 @@ func (c *Cluster) applyBatchToUnit(writes []EnvelopeWrite) error {
 	if len(writes) == 0 {
 		return nil
 	}
-	b, gu, unlock, ok := c.localWriteBackendForKey(writes[0].Key)
+	b, ru, unlock, ok := c.localWriteBackendForKey(writes[0].Key)
 	defer unlock()
 	if !ok {
 		return errUnitAcquiring("ApplyBatch")
@@ -309,7 +311,7 @@ func (c *Cluster) applyBatchToUnit(writes []EnvelopeWrite) error {
 
 	tx, err := b.Begin(backend.SnapshotIsolation)
 	if err != nil {
-		c.evictStaleMount(gu, b)
+		c.evictStaleMount(ru, b)
 		return errUnitAcquiring("ApplyBatch")
 	}
 	committed := false

@@ -32,7 +32,7 @@ func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfa
 		multi:      true,
 		factory:    h,
 		unitCount:  storageunit.MustUnitCount(n),
-		mountMap:   make(map[storageunit.GenUnit]backend.Backend),
+		mountMap:   make(map[storageunit.ReplicaUnit]backend.Backend),
 		pauseUnits: make(map[storageunit.UnitID]*sync.RWMutex),
 		ring:       rg,
 		closeCh:    make(chan struct{}),

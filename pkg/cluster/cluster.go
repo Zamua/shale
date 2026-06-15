@@ -314,22 +314,30 @@ type Cluster struct {
 	// / release no-longer-owned) and by the Phase 4 resharder (bisect creates
 	// the gen-(g+1) children, cut-over retires the gen-g unit). mountMu guards
 	// mountMap. See multibackend.go and multibackend_rebalance.go.
+	//
+	// v0.8 Phase 2e: mountMap is keyed by ReplicaUnit = (GenUnit, replica
+	// position), NOT bare GenUnit, so a node can hold the OLD position
+	// (draining) AND the NEW position (acquiring) of the SAME unit at once
+	// during an overlap handoff. At R=1 (and in the legacy / reshard paths) a
+	// node holds at most one position per unit and uses position 0, so a
+	// ReplicaUnit-keyed map is equivalent to the old per-GenUnit map: the
+	// non-replicated paths key via replica0(gu). The separate replicaPos map is
+	// folded into the key (the position is ru.Replica).
 	multi     bool
 	factory   storageunit.BackendFactory
 	unitCount storageunit.UnitCount
 	genOwner  func(storageunit.GenUnit) (storageunit.NodeID, bool)
 	mountMu   sync.RWMutex
-	mountMap  map[storageunit.GenUnit]backend.Backend
+	mountMap  map[storageunit.ReplicaUnit]backend.Backend
 
 	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
 	// capability view of factory: non-nil iff the factory implements
 	// ReplicaBackendFactory AND R>1. The replicated paths open each owned unit
 	// at its replica POSITION (an independent durable database) through this.
-	// replicaPos records, per mounted unit, the position this node holds it at
-	// so Close releases the right replica copy. Both nil/empty at R=1 and in
-	// legacy mode. mountMu guards replicaPos.
+	// Nil at R=1 and in legacy mode. The per-unit replica POSITION is the
+	// mountMap key's Replica field (Phase 2e re-keying); there is no separate
+	// replicaPos map.
 	replicaFactory storageunit.ReplicaBackendFactory
-	replicaPos     map[storageunit.GenUnit]uint8
 
 	// genState is the generation-aware routing state (v0.8 Phase 4): the
 	// CURRENT generation, the unit count at that generation, the doubled
@@ -878,7 +886,7 @@ func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (ba
 		if c.isFrozen() {
 			return nil, errWriteFrozen("CommitCASApply")
 		}
-		b, gu, unlock, ok := c.localWriteBackendForKey(key)
+		b, ru, unlock, ok := c.localWriteBackendForKey(key)
 		if !ok {
 			unlock()
 			return nil, errUnitAcquiring("CommitCASApply")
@@ -887,7 +895,7 @@ func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (ba
 		if err != nil {
 			// Stale mount (lease moved): evict + retryable so the CAS commit
 			// retries and lands on the freshly re-acquired mount.
-			c.evictStaleMount(gu, b)
+			c.evictStaleMount(ru, b)
 			unlock()
 			return nil, errUnitAcquiring("CommitCASApply")
 		}
@@ -1207,7 +1215,7 @@ func (c *Cluster) Put(key, value []byte) error {
 			// if a cut-over for this key's old unit is in flight, this blocks
 			// until it completes and then resolves to the new gen-(g+1) child,
 			// so the write never lands in a retired unit (NO ACKED WRITE LOST).
-			b, gu, unlock, ok := c.localWriteBackendForKey(key)
+			b, ru, unlock, ok := c.localWriteBackendForKey(key)
 			defer unlock()
 			if !ok {
 				// This node IS the ring owner but has not mounted the
@@ -1224,7 +1232,7 @@ func (c *Cluster) Put(key, value []byte) error {
 				// re-acquires fresh, and return the RETRYABLE acquiring-window
 				// error so the originator retries (never ack a write that did
 				// not land).
-				c.evictStaleMount(gu, b)
+				c.evictStaleMount(ru, b)
 				return errUnitAcquiring("Put")
 			}
 			return nil
@@ -1379,7 +1387,7 @@ func (c *Cluster) Delete(key []byte) error {
 			// Delete is a write: resolve under the reshard write-pause so a
 			// mid-flight cut-over routes it to the new child, not a retired
 			// unit (NO ACKED WRITE LOST; see Put).
-			b, gu, unlock, ok := c.localWriteBackendForKey(key)
+			b, ru, unlock, ok := c.localWriteBackendForKey(key)
 			defer unlock()
 			if !ok {
 				// Owner-but-unmounted: handoff landing on us. Retryable
@@ -1388,7 +1396,7 @@ func (c *Cluster) Delete(key []byte) error {
 			}
 			if err := b.Delete(key); err != nil {
 				// Stale mount (lease moved): evict + retryable, same as Put.
-				c.evictStaleMount(gu, b)
+				c.evictStaleMount(ru, b)
 				return errUnitAcquiring("Delete")
 			}
 			return nil

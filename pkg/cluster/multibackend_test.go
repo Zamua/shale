@@ -193,7 +193,7 @@ func TestMultiBackendRoundTripAndPlacement(t *testing.T) {
 		// And confirm physical placement: the value lives in the backend
 		// for THIS key's generation-qualified unit, and nowhere else.
 		gu := c.genUnitForKey(k)
-		b := c.mountMap[gu]
+		b := c.mountMap[replica0(gu)]
 		if v, err := b.Get(k); err != nil || !bytes.Equal(v, []byte("v-"+string(k))) {
 			t.Fatalf("key %s not in unit %s's backend: v=%q err=%v", k, gu, v, err)
 		}

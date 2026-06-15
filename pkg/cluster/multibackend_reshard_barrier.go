@@ -331,7 +331,7 @@ func (c *Cluster) reshardFlip(targetGen storageunit.Generation) error {
 	for _, k := range oldUnits {
 		oldGU := storageunit.NewGenUnit(start.gen, k)
 		c.mountMu.Lock()
-		delete(c.mountMap, oldGU)
+		delete(c.mountMap, replica0(oldGU))
 		c.mountMu.Unlock()
 		_ = c.factory.CloseUnit(oldGU)
 	}
@@ -550,13 +550,13 @@ func (c *Cluster) discardGenUnits(gen, keepGen storageunit.Generation) {
 	}
 	c.mountMu.Lock()
 	toDrop := make([]storageunit.GenUnit, 0)
-	for gu := range c.mountMap {
-		if gu.Gen == gen {
-			toDrop = append(toDrop, gu)
+	for ru := range c.mountMap {
+		if ru.Unit.Gen == gen {
+			toDrop = append(toDrop, ru.Unit)
 		}
 	}
 	for _, gu := range toDrop {
-		delete(c.mountMap, gu)
+		delete(c.mountMap, replica0(gu))
 	}
 	c.mountMu.Unlock()
 	for _, gu := range toDrop {
@@ -618,13 +618,13 @@ func (c *Cluster) bisectUnitStatic(gen storageunit.Generation, k storageunit.Uni
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
 	c.mountMu.Lock()
-	c.mountMap[lowGU] = lowBE
-	c.mountMap[highGU] = highBE
+	c.mountMap[replica0(lowGU)] = lowBE
+	c.mountMap[replica0(highGU)] = highBE
 	c.mountMu.Unlock()
 
 	// The source backend (old gen-g unit K), which keeps serving reads.
 	c.mountMu.RLock()
-	src, ok := c.mountMap[oldGU]
+	src, ok := c.mountMap[replica0(oldGU)]
 	c.mountMu.RUnlock()
 	if !ok {
 		return fmt.Errorf("old unit %s not mounted", oldGU)

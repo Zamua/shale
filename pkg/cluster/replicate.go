@@ -622,7 +622,7 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 		// the retryable acquiring-window error so the forwarder retries once
 		// the reconcile has acquired, rather than re-forwarding or losing the
 		// write.
-		b, gu, unlock, ok := c.localWriteBackendForKey(key)
+		b, ru, unlock, ok := c.localWriteBackendForKey(key)
 		defer unlock()
 		if !ok {
 			return errUnitAcquiring("Put")
@@ -631,7 +631,7 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 			// Stale mount (lease moved during the reshard redistribution):
 			// evict + retryable so the forwarder retries and lands on the
 			// freshly re-acquired mount (never ack a write that did not land).
-			c.evictStaleMount(gu, b)
+			c.evictStaleMount(ru, b)
 			return errUnitAcquiring("Put")
 		}
 		return nil
@@ -664,14 +664,14 @@ func (c *Cluster) LocalReplicaDelete(key []byte) error {
 		// Resolve under the reshard write-pause (Phase 4). Owner-but-unmounted:
 		// handoff landing on us. Retryable acquiring-window error (never lose
 		// the forwarded delete).
-		b, gu, unlock, ok := c.localWriteBackendForKey(key)
+		b, ru, unlock, ok := c.localWriteBackendForKey(key)
 		defer unlock()
 		if !ok {
 			return errUnitAcquiring("Delete")
 		}
 		if err := b.Delete(key); err != nil {
 			// Stale mount (lease moved): evict + retryable, same as Put.
-			c.evictStaleMount(gu, b)
+			c.evictStaleMount(ru, b)
 			return errUnitAcquiring("Delete")
 		}
 		return nil

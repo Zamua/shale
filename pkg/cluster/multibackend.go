@@ -162,6 +162,25 @@ func genUnitLess(a, b storageunit.GenUnit) bool {
 	return a.ID < b.ID
 }
 
+// replicaUnitLess orders by (Generation, UnitID, replica position), extending
+// genUnitLess so the admin scan reports mounted positions in a deterministic
+// (gen, unit, position) order. Phase 2e re-keying.
+func replicaUnitLess(a, b storageunit.ReplicaUnit) bool {
+	if a.Unit != b.Unit {
+		return genUnitLess(a.Unit, b.Unit)
+	}
+	return a.Replica < b.Replica
+}
+
+// sortReplicaUnits orders a slice of ReplicaUnits in place by replicaUnitLess.
+func sortReplicaUnits(r []storageunit.ReplicaUnit) {
+	for i := 1; i < len(r); i++ {
+		for j := i; j > 0 && replicaUnitLess(r[j], r[j-1]); j-- {
+			r[j-1], r[j] = r[j], r[j-1]
+		}
+	}
+}
+
 // initMultiBackend wires up multi-backend mode at Open: seed the
 // generation-aware routing state (generation 0, count N), derive the
 // generation-qualified units this node owns, and mount each via the factory
@@ -189,7 +208,7 @@ func (c *Cluster) initMultiBackend() error {
 		}
 	}
 
-	c.mountMap = make(map[storageunit.GenUnit]backend.Backend)
+	c.mountMap = make(map[storageunit.ReplicaUnit]backend.Backend)
 
 	// R>1 (replicated multi-backend, v0.8 Phase 2b): mount each owned unit at
 	// its replica POSITION (an independent durable database) via the per-replica
@@ -215,9 +234,37 @@ func (c *Cluster) initMultiBackend() error {
 			_ = c.closeMountedUnits()
 			return fmt.Errorf("cluster: open unit %s: %w", gu, err)
 		}
-		c.mountMap[gu] = b
+		c.mountMap[replica0(gu)] = b
 	}
 	return nil
+}
+
+// replica0 is the ReplicaUnit at position 0 for a GenUnit. The R=1 single-mount
+// paths (legacy multi-backend Phase 2/3, reshard Phase 4) hold each unit at one
+// position (0), so they key the ReplicaUnit-keyed mountMap via replica0(gu). The
+// R>1 replicated paths key by the unit's ACTUAL replica position instead. Phase
+// 2e re-keying helper.
+func replica0(gu storageunit.GenUnit) storageunit.ReplicaUnit {
+	return storageunit.NewReplicaUnit(gu, 0)
+}
+
+// localReplicaPos returns the replica POSITION this node holds key's unit gu at,
+// for resolving the ReplicaUnit-keyed mountMap on a normal ring-routed local op.
+// At R>1 it is this node's index in the unit's live replica set (unitReplicas);
+// the node appears at most once, so the position is unique. At R=1 (and in the
+// legacy / reshard paths) there is one position (0). ok is false at R>1 when this
+// node is not in the unit's replica set (it should not be serving the key
+// locally), in which case the caller treats the unit as unmounted.
+func (c *Cluster) localReplicaPos(gu storageunit.GenUnit) (pos uint8, ok bool) {
+	if !c.multiReplicated() {
+		return 0, true
+	}
+	for i, m := range c.unitReplicas(gu) {
+		if m.ID == c.cfg.NodeID {
+			return uint8(i), true
+		}
+	}
+	return 0, false
 }
 
 // closeMountedUnits releases every unit this node has mounted, via the
@@ -229,20 +276,19 @@ func (c *Cluster) closeMountedUnits() error {
 	c.mountMu.Lock()
 	defer c.mountMu.Unlock()
 	var firstErr error
-	for gu := range c.mountMap {
+	for ru := range c.mountMap {
 		// At R>1 each unit is an independent durable database mounted at a
 		// replica POSITION, so release the right replica copy via the per-
-		// replica factory; at R=1 (and legacy) release the GenUnit-keyed unit.
+		// replica factory; at R=1 (and legacy) release the GenUnit-keyed unit
+		// (ru.Replica is 0 there).
 		if c.replicaFactory != nil {
-			ru := storageunit.NewReplicaUnit(gu, c.replicaPos[gu])
 			if err := c.replicaFactory.CloseReplicaUnit(ru); err != nil && firstErr == nil {
 				firstErr = err
 			}
-			delete(c.replicaPos, gu)
-		} else if err := c.factory.CloseUnit(gu); err != nil && firstErr == nil {
+		} else if err := c.factory.CloseUnit(ru.Unit); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		delete(c.mountMap, gu)
+		delete(c.mountMap, ru)
 	}
 	return firstErr
 }
@@ -271,9 +317,13 @@ func (c *Cluster) unitOwnerOf(key []byte) (owner ring.Member, isLocal bool) {
 // NOT re-forward. Multi-backend mode only.
 func (c *Cluster) localBackendForKey(key []byte) (backend.Backend, bool) {
 	gu := c.genUnitForKey(key)
+	pos, ok := c.localReplicaPos(gu)
+	if !ok {
+		return nil, false
+	}
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
-	b, ok := c.mountMap[gu]
+	b, ok := c.mountMap[storageunit.NewReplicaUnit(gu, pos)]
 	return b, ok
 }
 
@@ -288,14 +338,14 @@ func (c *Cluster) localBackendForKey(key []byte) (backend.Backend, bool) {
 func (c *Cluster) mountedBackends() []backend.Backend {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
-	ids := make([]storageunit.GenUnit, 0, len(c.mountMap))
-	for gu := range c.mountMap {
-		ids = append(ids, gu)
+	ids := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
+	for ru := range c.mountMap {
+		ids = append(ids, ru)
 	}
-	sortGenUnits(ids)
+	sortReplicaUnits(ids)
 	out := make([]backend.Backend, 0, len(ids))
-	for _, gu := range ids {
-		out = append(out, c.mountMap[gu])
+	for _, ru := range ids {
+		out = append(out, c.mountMap[ru])
 	}
 	return out
 }
