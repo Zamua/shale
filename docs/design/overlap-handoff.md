@@ -28,11 +28,12 @@ an ACQUIRE-then-RELEASE driven by a single per-`ReplicaUnit`
 ownership-transition state machine, where: (1) the NEW owner, while it is
 still mounting, FORWARDS routed ops to the predecessor (the OLD owner) so
 the ring rotation does not strand the position; and (2) the OLD owner
-releases exactly when the NEW owner becomes READY (proven by the
-`ReplicaHandoffReady` RPC, re-verified before any release the durable
-epoch alone triggers). Availability stops depending on mount time because
-the old owner keeps serving (via the new owner's forward) until the new
-owner is provably serving locally.
+releases exactly when the NEW owner becomes READY (proven by a DURABLE,
+POLL-OBSERVABLE serving marker the new owner writes once after its mount
+flip; release is POLL-ONLY, never push, and a bare durable FENCE-epoch
+advance alone NEVER triggers it). Availability stops depending on mount
+time because the old owner keeps serving (via the new owner's forward)
+until the new owner is provably serving locally.
 
 ## Two flips, named once
 
@@ -90,17 +91,24 @@ transition is still a single guarded edge.
   multi analogue of the legacy `lastEvalRing`; see "Predecessor
   identification" below). The snapshot is consulted ONLY to identify the
   predecessor, NEVER for routing.
-- Two cross-node signals, with DISTINCT roles (the review's P1-1 fix):
-  - The `ReplicaHandoffReady(ru, E)` RPC is the AUTHORITATIVE readiness
-    signal. It is sent only AFTER the new owner's mount flip (so it proves
-    a live owner is serving the position). The old owner releases on it.
+- Two durable signals over shared storage, with DISTINCT roles (the
+  review's P1-1 fix). Release is POLL-ONLY; there is NO push RPC:
+  - The SERVING MARKER (`WriteServingMarker(ru, E)` /
+    `ReadServingMarker(ru)`) is the durable, poll-observable release signal.
+    The new owner writes it EXACTLY ONCE, AFTER its mount flip (so it proves
+    a live owner is actually SERVING the position), keyed by the
+    `ReplicaUnit` and carrying its open epoch E. The old owner's
+    `drainCheck` POLLS it on the periodic settle / self-heal cadence and
+    releases only on observing a marker at an epoch `>=` its own open epoch.
   - The DURABLE slatedb manifest writer-epoch (`DurableEpochReplica(ru)`)
-    is a LIVENESS HINT only. Seeing it cross proves SOMEONE fenced, NOT
-    that a live writer is serving (a new owner that fences and then crashes
-    mid-mount advances the epoch without ever serving). On seeing the epoch
-    cross, the old owner RE-VERIFIES a live owner is serving (a readiness
-    probe to the new replica) before releasing; it NEVER releases on a bare
-    epoch advance.
+    is a LIVENESS HINT only, and it is STRICTLY WEAKER than the serving
+    marker (it bumps at open-START, before the mount completes). Seeing it
+    cross proves SOMEONE fenced, NOT that a live writer is serving (a new
+    owner that fences and then crashes mid-mount advances the epoch without
+    ever serving and without ever writing the marker). A BARE fence-epoch
+    advance therefore NEVER releases the old owner; only the serving marker
+    does. The fence epoch is kept here purely as a contrast: it is what the
+    serving marker improves upon, not a release trigger.
 
 ## Keying by ReplicaUnit (the model fix, review P0-2 / P2-2)
 
@@ -283,8 +291,9 @@ NEW owner (the node GAINING the position):
   Ready  --- mountMap[ru]=b inserted under mountMu ---------------------- '
     |    THE MOUNT FLIP. The instant this entry is visible, this node
     |    serves routed ops LOCALLY and STOPS forwarding.
-    |    send ReplicaHandoffReady(ru, E) to the predecessor (authoritative
-    |    release signal; sent only here, after the flip).
+    |    WriteServingMarker(ru, E) to shared storage EXACTLY ONCE (the
+    |    durable, poll-observable release signal; written only here, after
+    |    the flip). No RPC is sent.
     v
   Owned   (steady state; phase entry dropped)
 ```
@@ -296,12 +305,14 @@ OLD owner (the node LOSING the position):
     | reconcile computes rP no longer desired here, but DO NOT release yet
     v
   Draining  --- keep serving (directly AND for the new owner's forwards) --.
-    |   release-check fires when the NEW owner is READY, proven by EITHER  |
-    |     (authoritative) a ReplicaHandoffReady(ru, E) arrives, OR         |
-    |     (hint -> verify) DurableEpochReplica(ru) > myOpenEpoch AND a     |
-    |        readiness probe to the new replica confirms it is serving.    |
-    |   A BARE epoch advance NEVER releases. Until release, OLD keeps      |
-    |   answering routed ops (its own + forwarded).                        |
+    |   release-check (drainCheck) POLLS the serving marker on the         |
+    |     periodic settle / self-heal cadence (no RPC wake). It fires when |
+    |     ReadServingMarker(ru) returns a marker at epoch >= myOpenEpoch   |
+    |     (positive proof a live owner is SERVING).                        |
+    |   A BARE DurableEpochReplica(ru) (fence) advance NEVER releases (it  |
+    |     bumps at open-START, before the mount; only the marker proves    |
+    |     serving). Until release, OLD keeps answering routed ops (its own |
+    |     + forwarded).                                                    |
     v                                                                      |
   Releasing  --- compare-and-delete mountMap[ru], CloseReplicaUnit(ru) --- '
     |    (flush is a no-op for acked writes: durable-before-ack;
@@ -370,14 +381,15 @@ new owner does not serve locally until after E.
 ## The dovetail: release-on-Ready == stop-forwarding
 
 The old owner releases exactly when the new owner becomes `Ready`, which is
-ALSO exactly when the new owner stops forwarding. One event
-(`ReplicaHandoffReady` after the mount flip) drives both: the new owner
-flips to local serving (stops forwarding to the predecessor) AND signals
-the old owner to release. There is no window where the old owner has
-released but the new owner is still forwarding to it (the new owner only
-forwards while `Acquiring`, and it sends the release signal only after
-leaving `Acquiring`). This is the clean single-instant handoff the
-state machine buys.
+ALSO exactly when the new owner stops forwarding. One event (the mount flip)
+drives both: the new owner flips to local serving (stops forwarding to the
+predecessor) AND writes the serving marker the old owner polls to release on.
+There is no window where the old owner has released but the new owner is
+still forwarding to it (the new owner only forwards while `Acquiring`, it
+writes the marker only after leaving `Acquiring`, and the old owner releases
+only after observing that marker). The release is POLL-driven: the old owner
+sees the marker on its next `drainCheck` tick rather than on a push, so the
+single-instant handoff is observed at poll latency, not RPC latency.
 
 ## Sequence of one handoff (happy path)
 
@@ -391,8 +403,8 @@ ring change: position rP of unit K  OLD --> NEW
         Acquiring op fall through to Option-A (errUnitAcquiring + retry).
         NEW: OpenReplicaUnit(ru, intended) starts the slow mount.
   t1  OLD reconcile: rP no longer desired -> phase Draining (NOT released).
-        OLD: keeps serving rP; arms release-check (RPC-wake primary, poll +
-        re-verify as the liveness fallback).
+        OLD: keeps serving rP; arms release-check (drainCheck POLLS the
+        serving marker on the settle / self-heal cadence; no RPC wake).
   t1..t2  OVERLAP: the ring has rotated, so writes route to NEW. NEW is
         Acquiring (no local mount) and FORWARDS each op to OLD ADDRESSED BY
         THE EXPLICIT ru (position-addressed forward). OLD's handler resolves
@@ -402,11 +414,11 @@ ring change: position rP of unit K  OLD --> NEW
   t2  NEW: OpenReplicaUnit returns at openedEpoch E (E > durable, fences
         any lower writer). NEW inserts mountMap[ru] -> phase Ready. NEW now
         serves rP LOCALLY and STOPS forwarding. THE MOUNT FLIP.
-        NEW: ReplicaHandoffReady(ru, E) -> OLD (authoritative release).
-  t3  OLD release-check: ReplicaHandoffReady arrived (or the epoch crossed
-        AND a readiness probe confirmed NEW serving). OLD: compare-and-delete
-        its mountMap[ru] entry, CloseReplicaUnit(ru) once -> Releasing ->
-        Absent.
+        NEW: WriteServingMarker(ru, E) to shared storage, exactly once.
+  t3  OLD release-check (next drainCheck poll tick): ReadServingMarker(ru)
+        returns a marker at epoch E >= OLD's open epoch. OLD:
+        compare-and-delete its mountMap[ru] entry, CloseReplicaUnit(ru) once
+        -> Releasing -> Absent.
   done. No instant between t1 and t3 had the position unserved.
 ```
 
@@ -417,19 +429,20 @@ one is ever the authoritative (unfenced) writer.
 ## Crash handling (the four cases)
 
 1. NEW crashes mid-acquire (between t1 and t2): the new owner stops
-   forwarding (it is gone), but it never sent `ReplicaHandoffReady` and
-   never advanced past fence-then-serve, so OLD's release-check never fires
-   (a bare epoch advance from NEW's pre-crash fence does NOT release: the
-   readiness re-verify probe to NEW fails). OLD stays in `Draining` and
+   forwarding (it is gone), but it never wrote the serving marker and never
+   advanced past fence-then-serve, so OLD's release-check never fires (a
+   bare fence-epoch advance from NEW's pre-crash fence does NOT release: no
+   serving marker `>=` OLD's epoch exists). OLD stays in `Draining` and
    KEEPS SERVING. No data loss, no unavailability of the position from the
    OLD owner's side; the only effect is that ops in-flight TO the crashed
    new owner fail and retry. The next reconcile re-derives the ring; if NEW
    is gone the position reassigns (possibly back to OLD, which drops the
    `Draining` phase and returns to Owned, or to a third node that starts
    its own `Acquiring` with OLD as predecessor). This is the crash case the
-   release-on-Ready fix protects: under the OLD design's bare-epoch
+   serving-marker release protects: under the OLD design's bare-epoch
    release, NEW's pre-crash fence would have triggered OLD to release,
-   stranding the position. It no longer does.
+   stranding the position. It no longer does, because the fence is not the
+   release signal - the serving marker is, and it was never written.
 
 2. OLD crashes while Draining (before NEW is Ready): the predecessor the
    new owner forwards to is gone, so the new owner's forward RPC fails and
@@ -443,42 +456,42 @@ one is ever the authoritative (unfenced) writer.
    ack), so NEW sees them all once it mounts; no acked write is lost.
 
 3. NEW crashes AFTER Ready but before OLD released (between t2 and t3): the
-   `ReplicaHandoffReady` may or may not have reached OLD. If it did, OLD has
-   already released; the position is owned-by-NEW per the ring but NEW is
-   gone, so the next reconcile reassigns it (to OLD or a third node) and
-   re-acquires from the durable state. If the RPC did not reach OLD, OLD is
-   still mounted but fenced (its writes fail); the epoch-cross hint fires,
-   the readiness re-verify probe to NEW now FAILS (NEW is gone), so OLD does
-   NOT release on the bare epoch and stays `Draining`-serving until the next
-   reconcile reassigns the position. Either way no acked write is lost (all
+   serving marker was written at the flip (it is durable in shared storage),
+   so OLD reads it on its next `drainCheck` poll and releases; the position
+   is owned-by-NEW per the ring but NEW is gone, so the next reconcile
+   reassigns it (to OLD or a third node) and re-acquires from the durable
+   state. If OLD has not yet polled when NEW crashes, OLD stays
+   `Draining`-serving and either reads the (still-durable) marker on a later
+   poll and releases, or the next reconcile reassigns the position first;
+   either way the position is never stranded. No acked write is lost (all
    durable), and any stale OLD mount is torn down by `evictStaleMount` on
    its next fenced write.
 
-   **Residual (NEW-P1-3, honesty fix - the re-verify is point-in-time).**
-   The readiness re-verify is a point-in-time liveness HINT, NOT a lease or
-   latch. On the epoch-hint path there is a window: OLD probes NEW, NEW
-   answers "serving" (it is, at probe time), OLD proceeds into the release
-   critical section, and NEW crashes CONCURRENTLY with that release (in the
-   probe-to-release gap). OLD already has its positive confirmation and does
-   not re-probe inside the lock (it could not without holding I/O under the
-   lock, which the lock discipline forbids). So OLD releases AND NEW is gone:
-   the position is UNSERVED until the NEXT RECONCILE reassigns it. This is
-   benign - there is NO acked-write loss (durable-before-ack holds; every
-   acked write is durable below E and recovered by whoever next acquires) -
-   and the recovery is the same next-reconcile path as the rest of case 3.
-   The same residual exists on the authoritative RPC path (the RPC arriving
-   means NEW reached Ready; NEW crashing right after is identical). So the
-   re-verify makes OLD safe against a NEW that crashed BEFORE becoming Ready
-   (crash case 1), NOT against a NEW that crashes in the release gap. Do not
-   read "re-verify" as making case 3 fully crash-safe; it closes the
-   bare-epoch hole, not the point-in-time-liveness gap, and the gap's
-   recovery is the benign next reconcile.
+   **Residual (NEW-P1-3, honesty fix - the marker read is point-in-time).**
+   The serving-marker read is a point-in-time liveness OBSERVATION, NOT a
+   lease or latch. There is a window: OLD reads the marker (NEW is serving,
+   at read time), OLD proceeds into the release critical section, and NEW
+   crashes CONCURRENTLY with that release (in the read-to-release gap). OLD
+   already has its positive observation and does not re-read inside the lock
+   (it could not without holding I/O under the lock, which the lock
+   discipline forbids). So OLD releases AND NEW is gone: the position is
+   UNSERVED until the NEXT RECONCILE reassigns it. This is benign - there is
+   NO acked-write loss (durable-before-ack holds; every acked write is
+   durable below E and recovered by whoever next acquires) - and the
+   recovery is the same next-reconcile path as the rest of case 3. So the
+   serving marker makes OLD safe against a NEW that crashed BEFORE becoming
+   Ready (crash case 1, where no marker was ever written), NOT against a NEW
+   that crashes in the release gap. Do not read the marker as making case 3
+   fully crash-safe; it closes the bare-fence-epoch hole, not the
+   point-in-time-liveness gap, and the gap's recovery is the benign next
+   reconcile.
 
-4. Both nodes survive but the `ReplicaHandoffReady` RPC is lost: the old
-   owner's release-check falls back to the durable-epoch hint, sees the
-   epoch cross, probes the new replica's readiness, gets a positive
-   confirmation (NEW is serving), and releases. Slightly higher latency
-   than the RPC fast-path; correctness unaffected.
+4. Both nodes survive but OLD is slow to observe the marker: because release
+   is POLL-ONLY, OLD always converges to release on its next `drainCheck`
+   tick once the durable marker is visible. There is no "lost signal" case
+   to recover from (the marker is durable in shared storage, not a
+   best-effort push); the only variable is poll latency, bounded by the
+   settle / self-heal cadence. Correctness unaffected.
 
 ## The slate manifest seal (consistent mount under overlap)
 
@@ -610,16 +623,24 @@ Domain (pure, no I/O) in `pkg/storageunit`:
     the loser side, and CAN be in both for DIFFERENT positions of one unit,
     which is why the key is `ReplicaUnit`). A `Releasable(state, ready bool)`
     predicate encodes the release rule: release requires a positive
-    readiness, NEVER a bare epoch compare (the epoch is only a hint that
-    triggers the re-verify, handled in the controller). These are
-    table-driven and trivially unit-testable with no ring or factory.
+    readiness (a serving marker at an epoch `>=` the old owner's open epoch,
+    computed in the controller from `ReadServingMarker`), NEVER a bare
+    fence-epoch compare. These are table-driven and trivially unit-testable
+    with no ring or factory.
 
 - `factory.go` (edit): extend `ReplicaBackendFactory` with
   `DurableEpochReplica(ru ReplicaUnit) (Epoch, error)` so the cluster can
-  read the cross-node durable LIVENESS HINT through the domain seam (the
-  slate `Backing` already implements it; this lifts it onto the interface).
-  The test `sharedfactory` gains the same method over its shared epoch
-  registry, plus the SLOW-mount injection the acceptance gate needs.
+  read the cross-node durable LIVENESS HINT (the bare fence epoch, kept as
+  a contrast) through the domain seam (the slate `Backing` already
+  implements it; this lifts it onto the interface), PLUS the SERVING-MARKER
+  seam: `WriteServingMarker(ru ReplicaUnit, epoch Epoch) error` and
+  `ReadServingMarker(ru ReplicaUnit) (Epoch, bool, error)` (the durable,
+  poll-observable release signal). The test `sharedfactory` implements all
+  three over an in-memory registry (the serving marker is a per-`ru`
+  epoch entry in a shared map), plus the SLOW-mount injection the
+  acceptance gate needs. The slate factory implements the serving marker as
+  a small durable object keyed by `ru` (real I/O); it is exercised only in
+  staging, not in the local acceptance gate.
   Implementation-must-verify (NEW-P1-4): the slate `OpenReplicaUnit`
   (`backends/slate/factory.go`) today orders `fenceEpochReplica` (writes the
   bumped manifest epoch) BEFORE `openSlateReplica` (opens the db, where the
@@ -651,8 +672,8 @@ Controller (the wiring) in `pkg/cluster`:
     node's new replica set): set `Draining` instead of releasing. For a
     position MOVING IN (this node is the new owner): derive the predecessor
     as `priorDesiredReplicas`-holder \ live-holder of the moving position;
-    if a SINGLE unambiguous predecessor results, set `Acquiring` (record it)
-    + start `acquireReplicaUnitOverlap`. If the predecessor is AMBIGUOUS or
+    if a SINGLE unambiguous predecessor results, set `Acquiring` (record
+    it) + start `acquireReplicaUnitOverlap`. If the predecessor is AMBIGUOUS or
     STALE (multi-hop coalesced move; prior holder gone/already released),
     record NO predecessor so the `Acquiring` op falls through to Option A -
     single-hop scope, NEW-P1-2. At the END of the reconcile, capture the new
@@ -665,7 +686,8 @@ Controller (the wiring) in `pkg/cluster`:
     "Overlap-move vs plain-release" below.
   - `acquireReplicaUnitOverlap(ru)`: OpenReplicaUnit; on success insert the
     `mountMap[ru]` entry (THE MOUNT FLIP) under mountMu, set `Ready -> Owned`,
-    STOP forwarding, fire `ReplicaHandoffReady(ru, E)` to the predecessor.
+    STOP forwarding, then `WriteServingMarker(ru, E)` to shared storage
+    EXACTLY ONCE (the durable, poll-observable release signal). No RPC.
   - the `Acquiring`-state forward: when `localBackendForKey` / the routed-op
     path finds a `ReplicaUnit` in `PhaseAcquiring` on this node WITH a
     recorded predecessor, it forwards the op to that predecessor via
@@ -680,29 +702,25 @@ Controller (the wiring) in `pkg/cluster`:
     resolver. Through the SAME `handoffPhase` / `mountMap[ru]` structures -
     no parallel draining map.
   - `drainCheck(ru)`: the old-owner release-check. The
-    `DurableEpochReplica(ru)` read AND the readiness probe (both MinIO /
-    network I/O) run BEFORE entering the critical section. The phase
-    compare-and-advance (`Draining -> Releasing`) and the `mountMap[ru]`
-    compare-and-delete are ONE critical section under `mountMu` (exactly-
-    once via the CAS-on-delete, reusing the `evictStaleMount` CAS shape),
-    then `CloseReplicaUnit(ru)` once. Release fires ONLY on a positive
-    readiness (the RPC, or the epoch-hint-plus-probe), never on a bare
-    epoch. Armed as a bounded periodic re-check on the existing settle /
-    self-heal cadence and woken early by the RPC. Lock discipline below.
+    `ReadServingMarker(ru)` poll (MinIO / shared-storage I/O) runs BEFORE
+    entering the critical section. The phase compare-and-advance
+    (`Draining -> Releasing`) and the `mountMap[ru]` compare-and-delete are
+    ONE critical section under `mountMu` (exactly-once via the
+    CAS-on-delete, reusing the `evictStaleMount` CAS shape), then
+    `CloseReplicaUnit(ru)` once. Release fires ONLY on a positive readiness
+    (a serving marker at an epoch `>=` this node's open epoch), never on a
+    bare fence-epoch advance. Armed as a bounded periodic re-check on the
+    existing settle / self-heal cadence; POLL-ONLY (no RPC wake). Lock
+    discipline below.
 
-- `multibackend_overlap_rpc.go` (new): the readiness signal + the forward.
-  - `ReplicaHandoffReady(ru, epoch)` one-shot best-effort RPC (client +
-    handler), reusing the existing `clientFor` / rpc server plumbing. The
-    handler wakes `drainCheck` for that `ru` and is the AUTHORITATIVE
-    release trigger (sent only after the mount flip).
-  - a readiness probe RPC (or reuse of an existing health/ping op aimed at
-    the new replica) used by the epoch-hint fallback to confirm a live owner
-    is serving the position before releasing.
+- `multibackend_overlap_forward.go` (new): the position-addressed forward.
   - the predecessor-forward is POSITION-ADDRESSED: it reuses the existing
     forwarded-op operations (Put/Get/Delete-as-tombstone/CAS-apply) but adds
     a `ReplicaUnit` field to the wire so the predecessor serves the draining
     position by explicit ru. This is a real WIRE change (NEW-P0); it is NOT
-    a "no new proto" reuse of the existing key-only forwarded messages.
+    a "no new proto" reuse of the existing key-only forwarded messages. (No
+    `ReplicaHandoffReady` RPC and no readiness-probe RPC exist: release is
+    poll-only via the durable serving marker on the factory seam.)
 
 - `multibackend_handoff_retry.go` (kept): Option A's retry stays as the belt
   for the residual cases (predecessor unreachable OR ambiguous/multi-hop,
@@ -710,32 +728,32 @@ Controller (the wiring) in `pkg/cluster`:
   the common-case window to near-zero; the retry is the safety net, not the
   primary mechanism.
 
-RPC proto (`proto/shale.proto`): add the `ReplicaHandoffReady` message + rpc
-and the readiness-probe rpc (or reuse an existing health rpc). ALSO add a
-`ReplicaUnit` (gen, unit, replica) field to the forwarded-op path - either a
-new position-addressed forwarded variant or an added field on the existing
+RPC proto (`proto/shale.proto`): the ONLY proto change is a `ReplicaUnit`
+(gen, unit, replica) field added to the forwarded-op path - either a new
+position-addressed forwarded variant or an added field on the existing
 `PutRequest` / `GetRequest` / `DeleteRequest` / CAS-apply-forward messages
 (today they carry only the key + a `forwarded` bool, which re-resolves to
 the wrong/absent position on the predecessor). The forward path therefore
-DOES add proto, contrary to the earlier draft's claim. No correctness
-depends on the readiness RPC's delivery (the durable-epoch hint plus the
-probe is the crash-proof fallback); the readiness PROBE, by contrast, is on
-the safe path (it is what makes a bare epoch advance non-releasing).
+DOES add proto, contrary to the earlier draft's claim. There is NO
+`ReplicaHandoffReady` message + rpc and NO readiness-probe rpc: release is
+POLL-ONLY via the durable serving marker on the factory seam, so no
+correctness or release behavior depends on any push RPC. The position-
+addressed forward is the only cross-node wire change Phase 2e introduces.
 
 ## Lock discipline (review P1-3)
 
-- The `drainCheck` I/O (`DurableEpochReplica` read, the readiness probe) runs
-  OUTSIDE any cluster lock. A slow MinIO read or a slow probe must NOT block
-  routed ops' `mountMap` reads.
+- The `drainCheck` I/O (the `ReadServingMarker` poll) runs OUTSIDE any
+  cluster lock. A slow MinIO read must NOT block routed ops' `mountMap`
+  reads.
 - The phase compare-and-advance (`Draining -> Releasing`) and the
   `mountMap[ru]` compare-and-delete are ONE critical section under `mountMu`.
-  Two wakeups (the poll tick and the RPC) racing into the same edge are made
-  exactly-once by the CAS-on-`mountMap`-delete (delete only if the entry
-  still points at the same backend) performed under the same `mountMu` hold
-  as the phase advance. The phase machine ALSO rejects a second `Releasing`
-  edge, but the `mountMap` CAS is the real exactly-once guard.
-- Lock order: `drainCheck` (whether woken by the poll cadence or by the RPC
-  handler goroutine) touches ONLY `mountMu` + the `handoffPhase` map. It does
+  Overlapping poll ticks racing into the same edge are made exactly-once by
+  the CAS-on-`mountMap`-delete (delete only if the entry still points at the
+  same backend) performed under the same `mountMu` hold as the phase
+  advance. The phase machine ALSO rejects a second `Releasing` edge, but the
+  `mountMap` CAS is the real exactly-once guard.
+- Lock order: `drainCheck` (run on the poll cadence) touches ONLY
+  `mountMu` + the `handoffPhase` map. It does
   NOT take `reconcileMu` or `reshardMu`, so it cannot invert the
   `reshardMu -> reconcileMu` order the self-heal / settle path uses. The
   `CloseReplicaUnit` call happens AFTER the `mountMu` critical section (the
@@ -789,9 +807,9 @@ crash. Do NOT state crash safety as "always fully available."
 - The legacy per-node path and the R=1 multi-backend lease handoff
   (Phase 3): untouched. Option B lives behind `multiReplicated()`.
 - Epoch fencing semantics: unchanged. Option B reuses the exact same
-  per-replica durable-manifest fence; it reads the durable epoch as a
-  LIVENESS HINT (re-verified before release), and the open-time fence is
-  the same acquire fence as before.
+  per-replica durable-manifest fence; the durable fence epoch is a LIVENESS
+  HINT only (strictly weaker than the serving marker and NEVER a release
+  trigger), and the open-time fence is the same acquire fence as before.
 
 ## What DOES change (explicit, since the original "nothing routing-side
 changes" claim is now false)
@@ -809,13 +827,18 @@ changes" claim is now false)
   `lastEvalRing`), captured at the END of each reconcile and consulted ONLY
   to identify the predecessor. Overlap is SINGLE-HOP: an ambiguous/multi-hop
   predecessor records no predecessor and degrades to Option A.
-- The OLD owner's release trigger is "new owner Ready" (the RPC, or the
-  epoch-hint-plus-readiness-probe), NOT a bare durable-epoch advance. The
-  re-verify is a point-in-time liveness HINT (NEW-P1-3): a NEW crash in the
-  probe-to-release gap leaves the position unserved until the next reconcile,
-  with no acked-write loss.
+- The OLD owner's release trigger is "new owner Ready," detected POLL-ONLY
+  by reading the durable SERVING MARKER (a marker at an epoch `>=` the old
+  owner's open epoch), NOT a bare durable FENCE-epoch advance and NOT a push
+  RPC. The marker read is a point-in-time liveness OBSERVATION (NEW-P1-3): a
+  NEW crash in the read-to-release gap leaves the position unserved until the
+  next reconcile, with no acked-write loss.
+- A new `WriteServingMarker` / `ReadServingMarker` pair on the
+  `ReplicaBackendFactory` seam (in-memory on `sharedfactory`, a small
+  durable per-`ru` object on the slate factory). This is the ONLY new
+  cross-node signal; there is NO `ReplicaHandoffReady` RPC and NO
+  readiness-probe RPC.
 - The intra-`OpenReplicaUnit` ordering is pinned (NEW-P1-4): the fence must
   be effective no later than the WAL-recovery cutoff, and the pin test is
   widened to a write-through-the-forward-CONCURRENT-with-the-flip case.
-- A new `handoffPhase` map + the `ReplicaHandoffReady` and readiness-probe
-  RPCs.
+- A new `handoffPhase` map.
