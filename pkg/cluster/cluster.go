@@ -225,6 +225,20 @@ type Config struct {
 	// ack the destination cannot deliver). Test-only; no production
 	// code path reads this.
 	TestingBlockPeerDials bool
+
+	// TestingForceCleanCut, when true, BREAKS the Option B overlap handoff
+	// back to the pre-2e clean-cut RELEASE-then-ACQUIRE on the R>1 reconcile
+	// AND disables the Option-A WriteTimeout-bounded retry. It exists solely
+	// to keep the overlap-handoff acceptance gate honest: the break-demo
+	// (docs/SPEC.md "v0.8 Phase 2e", THE OVERLAP-HANDOFF AVAILABILITY GATE)
+	// runs the SAME slow-mount membership change with this set and asserts the
+	// ack rate COLLAPSES, proving the overlap forward is what holds
+	// availability rather than rubber-stamping it. Disabling BOTH (not just
+	// overlap) is required: leaving Option-A retry on would let it partially
+	// absorb the slow mount and muddy the signal. Test-only; no production
+	// code path sets this. See multibackend_overlap.go (the clean-cut branch)
+	// and multibackend_handoff_retry.go (the single-attempt branch).
+	TestingForceCleanCut bool
 }
 
 // validateBackendMode enforces the legacy-vs-multi-backend XOR and

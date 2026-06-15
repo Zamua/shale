@@ -142,6 +142,51 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	c.mountMu.Unlock()
 }
 
+// reconcileReplicaUnitsCleanCut is the pre-2e clean-cut RELEASE-then-ACQUIRE
+// reconcile for the R>1 path, used ONLY by the break-demo (Config.
+// TestingForceCleanCut). It diffs desired-vs-mounted and, with NO overlap
+// sequencing and NO predecessor forwarding, eagerly RELEASES every position no
+// longer desired here and ACQUIRES every newly-desired one. A position moving
+// away thus has a window where neither the old owner (released) nor the new
+// owner (still mounting) serves it; a routed op to the still-Acquiring new owner
+// gets errUnitAcquiring. Paired with TestingForceCleanCut also disabling the
+// Option-A retry, this is the regime the gate proves collapses. Caller holds
+// reconcileMu; mount mutations take mountMu.
+func (c *Cluster) reconcileReplicaUnitsCleanCut() {
+	desired := c.desiredReplicaUnits()
+	desiredSet := make(map[storageunit.ReplicaUnit]struct{}, len(desired))
+	for _, ru := range desired {
+		desiredSet[ru] = struct{}{}
+	}
+
+	c.mountMu.RLock()
+	mounted := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
+	for ru := range c.mountMap {
+		mounted = append(mounted, ru)
+	}
+	c.mountMu.RUnlock()
+
+	mountedSet := make(map[storageunit.ReplicaUnit]struct{}, len(mounted))
+	for _, ru := range mounted {
+		mountedSet[ru] = struct{}{}
+	}
+
+	// RELEASE half: every mounted position no longer desired, eagerly.
+	for _, ru := range mounted {
+		if _, ok := desiredSet[ru]; ok {
+			continue
+		}
+		c.releaseReplicaUnit(ru)
+	}
+	// ACQUIRE half: every desired position not currently mounted.
+	for _, ru := range desired {
+		if _, ok := mountedSet[ru]; ok {
+			continue
+		}
+		c.acquireReplicaUnit(ru)
+	}
+}
+
 // liveDesiredReplicaSets returns the replica sets the LIVE ring assigns, as a
 // map from GenUnit (at the live generation) to the ordered NodeIDs holding each
 // replica position. It is the basis for predecessor identification (diffed

@@ -99,6 +99,16 @@ const handoffRetryBackoffCap = 500 * time.Millisecond
 // last retryable error (a timeout-bounded Unavailable the client retries),
 // exactly as a single-shot write would on a slow cluster.
 func (c *Cluster) retryWriteThroughHandoff(attempt func(ctx context.Context) writeAttempt) error {
+	if c.cfg.TestingForceCleanCut {
+		// Break-demo only (docs/SPEC.md "v0.8 Phase 2e" gate): disable the
+		// Option-A retry so it cannot mask the clean-cut gap. ONE attempt; a
+		// retryable acquiring shortfall surfaces immediately as an error, so the
+		// ack rate reflects the clean-cut availability with nothing absorbing the
+		// slow mount.
+		ctx, cancel := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
+		defer cancel()
+		return attempt(ctx).err
+	}
 	deadline := time.Now().Add(c.cfg.WriteTimeout)
 	base := time.Duration(c.retryAfterMs()) * time.Millisecond
 	backoff := base

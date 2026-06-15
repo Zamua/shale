@@ -202,6 +202,15 @@ func (c *Cluster) reconcileUnits() {
 		// this same cadence (drainCheck reads the durable serving marker). The
 		// initial-convergence pure-new-mount and plain drop-out cases stay the
 		// clean-cut acquire/release. See multibackend_overlap.go.
+		if c.cfg.TestingForceCleanCut {
+			// Break-demo only (docs/SPEC.md "v0.8 Phase 2e" gate): the pre-2e
+			// clean-cut RELEASE-then-ACQUIRE, no overlap, no forwarding. A
+			// position moving away is released eagerly and the new owner refuses
+			// routed ops (errUnitAcquiring) for the whole mount. Used to prove the
+			// overlap forward is what holds availability.
+			c.reconcileReplicaUnitsCleanCut()
+			return
+		}
 		c.reconcileReplicaUnitsOverlap()
 		c.runDrainChecks()
 		return
