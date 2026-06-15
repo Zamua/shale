@@ -146,4 +146,48 @@ type ReplicaBackendFactory interface {
 	// reading the durable manifest (an unopened replica is NOT an error: it is
 	// epoch 0).
 	DurableEpochReplica(ru ReplicaUnit) (Epoch, error)
+
+	// WriteServingMarker writes the durable, poll-observable SERVING MARKER for
+	// replica position ru carrying the new owner's open epoch (v0.8 Phase 2e,
+	// Option B overlap handoff). The new (gaining) owner calls it EXACTLY ONCE,
+	// at the Acquiring -> Ready transition, immediately AFTER its mount flip
+	// (after OpenReplicaUnit returned, after mountMap[ru] was inserted, after it
+	// started serving locally). The marker means "a live owner is actually
+	// SERVING this position at epoch >= the carried epoch," which is STRICTLY
+	// STRONGER than the durable manifest FENCE epoch (the fence bumps at
+	// open-START, before the mount completes, so a new owner that fences then
+	// crashes mid-mount advances the fence WITHOUT ever serving and WITHOUT ever
+	// writing a marker). It is the POLL-ONLY release signal of the overlap
+	// handoff: there is NO push RPC. The old (draining) owner observes it via
+	// ReadServingMarker on its periodic drainCheck cadence.
+	//
+	// It is keyed by the ReplicaUnit (node-independent, the same durable prefix
+	// dbNameReplica(ru) the position lives at), so whichever node currently
+	// holds the position writes the marker the predecessor polls. It is a small
+	// durable record, NOT a lease/latch. A re-write at the same-or-higher epoch
+	// is idempotent (the marker monotonically reflects the latest live owner); a
+	// write must never LOWER the recorded epoch (a stale write from a fenced
+	// prior owner must not roll the marker back). err is non-nil only on an I/O
+	// failure writing the durable record.
+	WriteServingMarker(ru ReplicaUnit, epoch Epoch) error
+
+	// ReadServingMarker reads the durable serving marker for replica position
+	// ru WITHOUT opening (mounting) it (v0.8 Phase 2e). It is the CROSS-NODE
+	// release signal the overlap handoff's old (draining) owner polls on its
+	// drainCheck cadence: it releases ONLY when it observes ok == true AND
+	// epoch >= its own open epoch (a positive confirmation that a live owner is
+	// actually serving the position, which the bare durable fence epoch cannot
+	// give). ok == false means no marker has been written yet (no live owner has
+	// reached Ready for this position), in which case the old owner stays
+	// Draining and KEEPS SERVING.
+	//
+	// The read is a POINT-IN-TIME liveness OBSERVATION, not a lease acquisition:
+	// it carries no expiry and grants no exclusivity. A NEW owner that crashes
+	// in the gap between the old owner reading the marker and completing its
+	// release leaves the position unserved until the next reconcile, with NO
+	// acked-write loss (durable-before-ack); the old owner does not re-read
+	// inside the release lock (I/O under the lock is forbidden). err is non-nil
+	// only on an I/O failure reading the durable record; a never-written marker
+	// is NOT an error (it is ok == false, epoch 0).
+	ReadServingMarker(ru ReplicaUnit) (epoch Epoch, ok bool, err error)
 }

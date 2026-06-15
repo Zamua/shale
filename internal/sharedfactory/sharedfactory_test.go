@@ -194,3 +194,81 @@ func TestHandlesIndependentOpenSets(t *testing.T) {
 		t.Fatalf("B.CurrentEpoch(0) ok=true, want false (B never opened unit 0)")
 	}
 }
+
+// ru0 builds a generation-0 ReplicaUnit for the serving-marker tests.
+func ru0(id storageunit.UnitID, replica uint8) storageunit.ReplicaUnit {
+	return storageunit.NewReplicaUnit(gu0(id), replica)
+}
+
+// TestServingMarkerCrossNodeReadWrite pins the v0.8 Phase 2e POLL-ONLY release
+// signal: the new owner's WriteServingMarker on its handle is observable via
+// ReadServingMarker on the OLD owner's DISTINCT handle (the marker lives in the
+// shared Backing, exactly like the durable object the slate factory writes).
+// Before any write the marker is absent (ok == false); after the new owner
+// writes it at its open epoch the old owner reads that exact epoch.
+func TestServingMarkerCrossNodeReadWrite(t *testing.T) {
+	backing := NewBacking()
+	oldOwner := backing.Handle()
+	newOwner := backing.Handle()
+	ru := ru0(7, 1)
+
+	// No live owner has reached Ready yet: the old owner sees no marker and must
+	// keep serving (Draining).
+	if e, ok, err := oldOwner.ReadServingMarker(ru); err != nil || ok || e != 0 {
+		t.Fatalf("ReadServingMarker before write = (%d,%v,%v), want (0,false,nil)", e, ok, err)
+	}
+
+	// New owner mounts, flips, and writes the marker at its open epoch (5).
+	if err := newOwner.WriteServingMarker(ru, 5); err != nil {
+		t.Fatalf("WriteServingMarker: %v", err)
+	}
+
+	// The OLD owner's handle now observes the marker at epoch 5 (cross-node).
+	if e, ok, err := oldOwner.ReadServingMarker(ru); err != nil || !ok || e != 5 {
+		t.Fatalf("ReadServingMarker after write = (%d,%v,%v), want (5,true,nil)", e, ok, err)
+	}
+}
+
+// TestServingMarkerMonotonic pins that the marker NEVER rolls back: a stale
+// write from a fenced prior owner (at a lower epoch) must not lower a live
+// higher-epoch owner's recorded value. A same-or-higher re-write is idempotent.
+func TestServingMarkerMonotonic(t *testing.T) {
+	backing := NewBacking()
+	h := backing.Handle()
+	ru := ru0(3, 0)
+
+	if err := h.WriteServingMarker(ru, 9); err != nil {
+		t.Fatalf("WriteServingMarker 9: %v", err)
+	}
+	// A stale lower-epoch write must be ignored (no rollback).
+	if err := h.WriteServingMarker(ru, 4); err != nil {
+		t.Fatalf("WriteServingMarker 4: %v", err)
+	}
+	if e, ok, err := h.ReadServingMarker(ru); err != nil || !ok || e != 9 {
+		t.Fatalf("after stale write = (%d,%v,%v), want (9,true,nil)", e, ok, err)
+	}
+	// A higher-epoch write advances it.
+	if err := h.WriteServingMarker(ru, 12); err != nil {
+		t.Fatalf("WriteServingMarker 12: %v", err)
+	}
+	if e, _, _ := h.ReadServingMarker(ru); e != 12 {
+		t.Fatalf("after higher write = %d, want 12", e)
+	}
+}
+
+// TestServingMarkerIndependentPositions pins that the marker is per-ReplicaUnit:
+// writing replica 0's marker never affects replica 1's (independent positions).
+func TestServingMarkerIndependentPositions(t *testing.T) {
+	backing := NewBacking()
+	h := backing.Handle()
+
+	if err := h.WriteServingMarker(ru0(1, 0), 2); err != nil {
+		t.Fatalf("WriteServingMarker r0: %v", err)
+	}
+	if _, ok, _ := h.ReadServingMarker(ru0(1, 1)); ok {
+		t.Fatalf("replica 1 marker ok=true, want false (only replica 0 written)")
+	}
+	if e, ok, _ := h.ReadServingMarker(ru0(1, 0)); !ok || e != 2 {
+		t.Fatalf("replica 0 marker = (%d,%v), want (2,true)", e, ok)
+	}
+}

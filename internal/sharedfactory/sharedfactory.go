@@ -80,15 +80,29 @@ type Backing struct {
 	// is what makes a single-replica node loss recoverable from the other copy.
 	replicaStores map[storageunit.ReplicaUnit]*memory.Memory
 	replicaEpochs map[storageunit.ReplicaUnit]storageunit.Epoch
+
+	// servingMarkers is the durable, poll-observable SERVING MARKER registry
+	// (v0.8 Phase 2e, Option B overlap handoff): per-replica-position, the open
+	// epoch of the latest live owner that reached Ready. It is the in-memory
+	// analogue of the small durable object the slate factory writes to shared
+	// storage keyed by dbNameReplica(ru). It is STRICTLY STRONGER than
+	// replicaEpochs (the fence epoch): a marker exists ONLY after a new owner
+	// completed its mount flip and started serving, whereas the fence epoch
+	// bumps at open-START. The old (draining) owner polls it to release. Stored
+	// in the same shared Backing every per-node Handle references, so the new
+	// owner's WriteServingMarker is visible to the old owner's ReadServingMarker
+	// across nodes. Absence (no entry) is "no live owner yet": ok == false.
+	servingMarkers map[storageunit.ReplicaUnit]storageunit.Epoch
 }
 
 // NewBacking returns an empty shared backing (no units written yet).
 func NewBacking() *Backing {
 	return &Backing{
-		stores:        make(map[storageunit.GenUnit]*memory.Memory),
-		epochs:        make(map[storageunit.GenUnit]storageunit.Epoch),
-		replicaStores: make(map[storageunit.ReplicaUnit]*memory.Memory),
-		replicaEpochs: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		stores:         make(map[storageunit.GenUnit]*memory.Memory),
+		epochs:         make(map[storageunit.GenUnit]storageunit.Epoch),
+		replicaStores:  make(map[storageunit.ReplicaUnit]*memory.Memory),
+		replicaEpochs:  make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		servingMarkers: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 	}
 }
 
@@ -254,6 +268,37 @@ func (b *Backing) replicaDurableEpoch(ru storageunit.ReplicaUnit) storageunit.Ep
 	return b.replicaEpochs[ru]
 }
 
+// writeServingMarker records the serving marker for replica ru at epoch (the
+// shared-storage write the new owner does at its mount flip). It is MONOTONIC:
+// it never lowers an already-recorded epoch, so a stale write from a fenced
+// prior owner cannot roll the marker back below a live higher-epoch owner's
+// value. Idempotent at the same-or-higher epoch.
+func (b *Backing) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if cur, ok := b.servingMarkers[ru]; ok && cur >= epoch {
+		return
+	}
+	b.servingMarkers[ru] = epoch
+}
+
+// readServingMarker reports replica ru's serving-marker epoch and whether a
+// marker has been written at all (ok). The point-in-time read the old owner's
+// drainCheck polls. ok == false (no entry) means no live owner has reached
+// Ready for this position yet.
+func (b *Backing) readServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	e, ok := b.servingMarkers[ru]
+	return e, ok
+}
+
+// ServingMarker is the exported read of the serving marker for tests that
+// assert the new owner wrote it at the expected epoch after the mount flip.
+func (b *Backing) ServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool) {
+	return b.readServingMarker(ru)
+}
+
 // Handle is a per-node factory handle over a shared Backing. It implements
 // storageunit.BackendFactory and storageunit.ReplicaBackendFactory. Several
 // handles (one per node) share one Backing, which is what makes a handoff
@@ -332,6 +377,29 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 // (the in-memory backing always answers), so err is always nil.
 func (h *Handle) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Epoch, error) {
 	return h.backing.replicaDurableEpoch(ru), nil
+}
+
+// WriteServingMarker writes the durable serving marker for replica ru at epoch
+// to the shared Backing (v0.8 Phase 2e). The new owner calls it EXACTLY ONCE at
+// its Acquiring -> Ready mount flip; because the marker lives in the shared
+// Backing every per-node Handle references, the old owner's Handle observes it
+// via ReadServingMarker across nodes. The write is monotonic (never lowers a
+// recorded epoch) so a stale write cannot roll the marker back. It cannot fail
+// here (the in-memory backing always answers), so err is always nil.
+func (h *Handle) WriteServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) error {
+	h.backing.writeServingMarker(ru, epoch)
+	return nil
+}
+
+// ReadServingMarker reads the durable serving marker for replica ru from the
+// shared Backing WITHOUT opening it (v0.8 Phase 2e). It is the point-in-time
+// liveness observation the old owner's drainCheck polls: it releases ONLY on
+// ok == true AND epoch >= its own open epoch. ok == false means no live owner
+// has reached Ready yet, so the old owner stays Draining + keeps serving. It
+// cannot fail here, so err is always nil.
+func (h *Handle) ReadServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool, error) {
+	e, ok := h.backing.readServingMarker(ru)
+	return e, ok, nil
 }
 
 // CloseReplicaUnit releases replica ru from THIS handle. Idempotent; the
