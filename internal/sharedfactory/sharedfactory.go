@@ -43,6 +43,8 @@ import (
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
@@ -260,6 +262,14 @@ func (b *Backing) replicaDurableEpoch(ru storageunit.ReplicaUnit) storageunit.Ep
 type Handle struct {
 	backing *Backing
 
+	// acquireDelayNanos, when > 0, makes OpenReplicaUnit (the R>1 acquire path)
+	// SLEEP that long before mounting, simulating the latency of opening a
+	// per-(unit, replica) slatedb manifest from real object storage. It widens
+	// the handoff acquiring-window deterministically so the v0.8 Phase 2d
+	// write-availability gate can reproduce the pre-fix ack-rate drop (and prove
+	// the fix rides it out). Zero = instant (every existing test). Test-only.
+	acquireDelayNanos atomic.Int64
+
 	mu          sync.Mutex
 	open        map[storageunit.GenUnit]storageunit.Epoch     // units THIS handle has open + at what epoch (R=1)
 	openReplica map[storageunit.ReplicaUnit]storageunit.Epoch // replicas THIS handle has open + at what epoch (R>1)
@@ -273,6 +283,13 @@ func (b *Backing) Handle() *Handle {
 		open:        make(map[storageunit.GenUnit]storageunit.Epoch),
 		openReplica: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 	}
+}
+
+// SetAcquireDelay sets the artificial OpenReplicaUnit acquire latency for this
+// handle (see acquireDelayNanos). Safe to call concurrently with mounts. A test
+// arms it before triggering a membership change to widen the acquiring window.
+func (h *Handle) SetAcquireDelay(d time.Duration) {
+	h.acquireDelayNanos.Store(int64(d))
 }
 
 // OpenReplicaUnit opens replica position ru.Replica of unit ru.Unit against
@@ -289,6 +306,14 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 		return nil, fmt.Errorf("sharedfactory: replica %s already open on this handle at epoch %d, refusing open at %d", ru, cur, epoch)
 	}
 	h.mu.Unlock()
+
+	// Simulate object-store open latency to widen the acquiring window (test
+	// support for the Phase 2d write-availability gate). The sleep is BEFORE the
+	// epoch bump, so the unit is genuinely unmounted (a routed op gets the
+	// retryable acquiring-window error) for the whole delay.
+	if d := h.acquireDelayNanos.Load(); d > 0 {
+		time.Sleep(time.Duration(d))
+	}
 
 	store, opened := h.backing.acquireReplica(ru, epoch)
 	h.mu.Lock()
