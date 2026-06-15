@@ -136,3 +136,43 @@ func TestDbNameReplicaFor_SharesUnitPrefix(t *testing.T) {
 		}
 	}
 }
+
+// TestServingMarkerKeyFor_Encoding pins the v0.8 Phase 2e serving-marker object
+// key: it is the position's replica DbName plus a fixed "/serving" suffix, a
+// SIBLING of the position's slatedb database so it can be GET/PUT directly
+// without opening the database. Tagless (no slatedb build) because it is pure
+// string logic, like the rest of the DbName encoding.
+func TestServingMarkerKeyFor_Encoding(t *testing.T) {
+	cases := []struct {
+		keyPrefix string
+		ru        storageunit.ReplicaUnit
+		want      string
+	}{
+		{"", ru(0, 0, 0), "u/g0/u0/r0/serving"},
+		{"", ru(1, 5, 2), "u/g1/u5/r2/serving"},
+		{"p/", ru(3, 9, 1), "p/u/g3/u9/r1/serving"},
+	}
+	for _, c := range cases {
+		if got := servingMarkerKeyFor(c.keyPrefix, c.ru); got != c.want {
+			t.Errorf("servingMarkerKeyFor(%q, %s) = %q, want %q", c.keyPrefix, c.ru, got, c.want)
+		}
+	}
+}
+
+// TestServingMarkerKeyFor_ExtendsReplicaPrefix pins that the marker key is a
+// strict child of the position's replica DbName (so it lives alongside, never
+// collides with, the database's own objects, and the marker of one replica
+// position never collides with another's).
+func TestServingMarkerKeyFor_ExtendsReplicaPrefix(t *testing.T) {
+	r := ru(1, 5, 1)
+	dbName := dbNameReplicaFor("p/", r)
+	marker := servingMarkerKeyFor("p/", r)
+	if !strings.HasPrefix(marker, dbName+"/") {
+		t.Fatalf("serving marker key %q does not extend replica DbName %q", marker, dbName)
+	}
+	// A different position's marker must not collide.
+	other := servingMarkerKeyFor("p/", ru(1, 5, 0))
+	if marker == other {
+		t.Fatalf("serving marker keys for distinct replica positions collide: %q", marker)
+	}
+}

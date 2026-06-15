@@ -54,3 +54,25 @@ func dbNameFor(keyPrefix string, gu storageunit.GenUnit) string {
 func dbNameReplicaFor(keyPrefix string, ru storageunit.ReplicaUnit) string {
 	return dbNameFor(keyPrefix, ru.Unit) + fmt.Sprintf("/r%d", ru.Replica)
 }
+
+// servingMarkerKeyFor maps a ReplicaUnit to the object key of its durable
+// SERVING MARKER (v0.8 Phase 2e, Option B overlap handoff). It is a small
+// object that lives ALONGSIDE the position's slatedb database, NOT inside it:
+// it carries the new owner's open epoch and is written EXACTLY ONCE at the
+// Acquiring -> Ready mount flip, then polled by the old (draining) owner as the
+// POLL-ONLY release signal. Keeping it a sibling object (the database prefix +
+// a fixed "/serving" suffix) rather than a key INSIDE the slatedb database is
+// deliberate: ReadServingMarker must read it WITHOUT opening (mounting) the
+// database (the old owner must not mount the position it is releasing), so the
+// marker is a plain object the S3 client GETs/PUTs directly.
+//
+//	servingMarkerKeyFor(p, ru) = dbNameReplicaFor(p, ru) + "/serving"
+//	                           = "<keyPrefix>u/g<gen>/u<id>/r<replica>/serving"
+//
+// The "/serving" suffix is OUTSIDE every slatedb-internal key segment (slatedb
+// owns "wal/", "manifest/", "compacted/" under the db prefix), so the marker
+// object never collides with the database's own objects, and parseUnitKey
+// ignores it (a "serving" tail is not a slatedb object root either way).
+func servingMarkerKeyFor(keyPrefix string, ru storageunit.ReplicaUnit) string {
+	return dbNameReplicaFor(keyPrefix, ru) + "/serving"
+}

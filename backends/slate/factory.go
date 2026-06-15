@@ -38,9 +38,11 @@
 package slate
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"sort"
 	"strconv"
 	"strings"
@@ -255,6 +257,105 @@ func (b *Backing) durableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.E
 		return 0, nil
 	}
 	return storageunit.Epoch(manifest.WriterEpoch), nil
+}
+
+// minioClient builds a fresh minio S3 client against the configured endpoint +
+// credentials. Shared by PresentUnits and the serving-marker read/write (the
+// marker is a plain object the S3 client GETs/PUTs directly, NOT a slatedb key,
+// so it does not go through the slatedb ObjectStore). The caller does not need
+// to close it (minio clients hold no persistent connection).
+func (b *Backing) minioClient() (*minio.Client, error) {
+	mc, err := minio.New(b.minioEndpointHost(), &minio.Options{
+		Creds:  credentials.NewStaticV4(b.cfg.AccessKey, b.cfg.SecretKey, ""),
+		Secure: b.cfg.UseSSL,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("slate: minio client: %w", err)
+	}
+	return mc, nil
+}
+
+// writeServingMarker writes replica ru's durable SERVING MARKER object (v0.8
+// Phase 2e): a tiny object at servingMarkerKeyFor(ru) carrying the new owner's
+// open epoch as a decimal string. The new (gaining) owner calls it EXACTLY ONCE
+// at its Acquiring -> Ready mount flip; the old (draining) owner polls it via
+// readServingMarker as the POLL-ONLY release signal.
+//
+// It is a sibling OBJECT of the position's slatedb database, written WITHOUT
+// opening the database, so it does not perturb the position's WAL/manifest and
+// the old owner can read it without mounting. It is MONOTONIC: it reads any
+// existing marker first and refuses to LOWER the recorded epoch (a stale write
+// from a fenced prior owner must not roll the marker back below a live
+// higher-epoch owner's value). Idempotent at the same-or-higher epoch.
+//
+// NB this read-then-write is NOT atomic against a concurrent marker write, but
+// the marker has a SINGLE legitimate writer at a time (the one live owner that
+// just reached Ready), so the non-atomicity only matters against a stale fenced
+// writer racing the live one - and the monotonic floor is exactly what blocks
+// that stale write from winning. A CAS (If-None-Match / version) would tighten
+// it; the floor is sufficient for the single-live-writer invariant.
+func (b *Backing) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) error {
+	cur, ok, err := b.readServingMarker(ru)
+	if err != nil {
+		return err
+	}
+	if ok && cur >= epoch {
+		return nil // monotonic: never lower a recorded marker.
+	}
+	mc, err := b.minioClient()
+	if err != nil {
+		return err
+	}
+	key := servingMarkerKeyFor(b.cfg.KeyPrefix, ru)
+	payload := []byte(strconv.FormatUint(uint64(epoch), 10))
+	_, err = mc.PutObject(context.Background(), b.cfg.Bucket, key,
+		bytes.NewReader(payload), int64(len(payload)),
+		minio.PutObjectOptions{ContentType: "text/plain"})
+	if err != nil {
+		return fmt.Errorf("slate: write serving marker %s: %w", ru, err)
+	}
+	return nil
+}
+
+// readServingMarker reads replica ru's durable SERVING MARKER object WITHOUT
+// opening the database (v0.8 Phase 2e). It returns (epoch, true, nil) when the
+// marker exists, (0, false, nil) when it has never been written (no live owner
+// has reached Ready for this position), and a non-nil err only on a real I/O
+// failure. It is the point-in-time liveness observation the old owner's
+// drainCheck polls: it releases ONLY on ok == true AND epoch >= its own open
+// epoch.
+func (b *Backing) readServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool, error) {
+	mc, err := b.minioClient()
+	if err != nil {
+		return 0, false, err
+	}
+	key := servingMarkerKeyFor(b.cfg.KeyPrefix, ru)
+	obj, err := mc.GetObject(context.Background(), b.cfg.Bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		return 0, false, fmt.Errorf("slate: read serving marker %s: %w", ru, err)
+	}
+	defer obj.Close()
+	raw, err := io.ReadAll(obj)
+	if err != nil {
+		// A missing object surfaces here (or on Stat) as a NoSuchKey error,
+		// which is NOT a failure: it means no marker has been written yet.
+		if isNotFound(err) {
+			return 0, false, nil
+		}
+		return 0, false, fmt.Errorf("slate: read serving marker %s: %w", ru, err)
+	}
+	parsed, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	if err != nil {
+		return 0, false, fmt.Errorf("slate: parse serving marker %s (%q): %w", ru, raw, err)
+	}
+	return storageunit.Epoch(parsed), true, nil
+}
+
+// isNotFound reports whether err is the S3 "object does not exist" error, which
+// the serving-marker read treats as ok == false rather than a failure.
+func isNotFound(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	return resp.Code == "NoSuchKey" || resp.StatusCode == 404
 }
 
 // PresentUnits enumerates the GenUnits whose databases EXIST in the bucket
@@ -610,6 +711,44 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 		return nil, fmt.Errorf("slate: replica %s already open on this handle at epoch %d; CloseReplicaUnit first to re-open", ru, cur.epoch)
 	}
 
+	// FENCE <= RECOVERY ORDERING INVARIANT (v0.8 Phase 2e, NEW-P1-4). The new
+	// owner's recovery snapshot (the durable WAL/manifest tail it mounts) MUST
+	// be taken AT-OR-AFTER the manifest-epoch fence is durably effective, so no
+	// write the OLD owner can still ack escapes the recovered tail. Because
+	// forwarding continues until the mount flip (strictly AFTER this open
+	// completes), a forwarded write can be acked on the old owner AFTER this
+	// recovery snapshot but still BELOW the fence epoch E; to keep every such
+	// write inside the recovered tail the fence must be effective no later than
+	// the recovery cutoff. The spec's required order is therefore: make the
+	// fence effective FIRST, THEN take the recovery snapshot.
+	//
+	// WHAT THE GO LAYER CAN GUARANTEE, AND WHAT IT CANNOT (the precise
+	// assumption). At the Go level we order fenceEpochReplica BEFORE
+	// openSlateReplica, which is the correct fence-then-recover sequence as far
+	// as Go can express it. BUT fenceEpochReplica is ARITHMETIC ONLY: it reads
+	// ru's durable manifest writer-epoch and computes opened = max(intended,
+	// durable+1); it does NOT itself durably WRITE the bumped epoch. The actual
+	// fence AND the WAL recovery both happen INSIDE slatedb's DbBuilder.Build()
+	// (openSlateReplica -> buildDb), which is a single opaque uniffi FFI call
+	// over the Rust core. The slatedb-go v0.13.1 binding exposes NO WithEpoch
+	// setter on DbBuilder and NO hook between the fence and the recovery
+	// snapshot, so from Go we can neither inject the computed epoch into the
+	// open NOR observe whether the Rust core fences-then-recovers or
+	// recovers-then-fences internally. We therefore CANNOT PROVE the
+	// fence<=recovery ordering from the module; it is an EXPLICIT ASSUMPTION
+	// about slatedb's open path (consistent with its independent WalReader
+	// surface and writer-epoch protocol, but not verified in Go source).
+	//
+	// THE RELEASE GATE. This assumption is PINNED by the two real-slate tests in
+	// factory_servingmarker_slatedb_test.go (build tag slatedb), run in the
+	// staging acceptance run, NOT here: (1) a write acked on the old owner JUST
+	// BEFORE the fence is readable on the new owner AFTER the handoff; (2) a
+	// write driven THROUGH THE FORWARD PATH concurrently with the flip (acked
+	// below E while the new owner's open/recovery races) is readable after. If
+	// either fails, the Rust core recovers-then-fences (or does not replay the
+	// full durable WAL tail) and this open must be adjusted to RE-SCAN the WAL
+	// tail after the fence (via the WalReader surface) before serving; until the
+	// pins pass on real slate, Phase 2e is BLOCKED per the spec's P0 gate.
 	opened, err := h.backing.fenceEpochReplica(ru, epoch)
 	if err != nil {
 		return nil, err
@@ -624,6 +763,26 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	h.openReplica[ru] = &mountedUnit{slate: s, epoch: opened}
 	h.mu.Unlock()
 	return s, nil
+}
+
+// WriteServingMarker writes replica ru's durable serving marker carrying epoch
+// (v0.8 Phase 2e, Option B overlap handoff). The new (gaining) owner calls it
+// EXACTLY ONCE at its Acquiring -> Ready mount flip, AFTER OpenReplicaUnit
+// returned and mountMap[ru] was inserted. It is the POLL-ONLY release signal
+// the old (draining) owner polls via ReadServingMarker; there is NO push RPC.
+// Delegates to the Backing (the marker is a shared-storage object every node's
+// Handle reaches, exactly like the position's bytes).
+func (h *Handle) WriteServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) error {
+	return h.backing.writeServingMarker(ru, epoch)
+}
+
+// ReadServingMarker reads replica ru's durable serving marker WITHOUT opening
+// the database (v0.8 Phase 2e). It is the cross-node, point-in-time liveness
+// observation the old owner's drainCheck polls: it releases ONLY on ok == true
+// AND epoch >= its own open epoch. ok == false means no live owner has reached
+// Ready for this position yet (the old owner stays Draining + keeps serving).
+func (h *Handle) ReadServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool, error) {
+	return h.backing.readServingMarker(ru)
 }
 
 // CloseReplicaUnit releases replica position ru from THIS handle: flushes
