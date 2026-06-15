@@ -792,6 +792,100 @@ set with the remaining replicas still covering W (plain release). No stray
 "isDraining" flag for the plain case: it takes the existing eager-delete
 path unchanged.
 
+## Graceful leave (scale-down) - drain on shutdown
+
+The overlap machine above is symmetric between scale-UP and scale-DOWN: a
+JOIN makes a survivor `Acquiring` while the existing owner `Draining`-serves;
+a deliberate REMOVAL makes the survivors `Acquiring` the leaving node's
+positions while the LEAVING node `Draining`-serves them. So a graceful leave
+is just an overlap drain seen from the LOSING side, for ALL of a node's
+positions at once. The one missing piece is on the SHUTDOWN path, not the
+reconcile path: the leaving node's `Close()` does not WAIT for that drain.
+
+THE GAP. On SIGTERM the run loop (`pkg/shaled/runtime.go`) calls
+`Cluster.Close()` (`pkg/cluster/cluster.go`). `Close()` broadcasts the
+memberlist leave (`membership.Close()` -> `memberlist.Leave(0)` then
+`Shutdown()`), so peers re-own the units and begin forwarding to the leaving
+node - but it IMMEDIATELY tears down the reconcile loops + peer clients +
+`closeMountedUnits()`, WITHOUT waiting for the survivors' slow `Acquiring` to
+complete. Every position the leaving node was serving is UNSERVED from the
+instant `Close()` closes its mounts until the survivors flip - the same
+mount-time gap Phase 2e removed for scale-up, reopened for scale-down. The
+serving + `drainCheck` + forward path that would have held availability are
+torn down before they could run.
+
+THE FIX (reuse the overlap machinery; add a drain-wait on shutdown). Three
+pieces:
+
+1. **Split membership `Leave()` from `Close()`.** memberlist has `Leave()`
+   (broadcast the graceful departure) DISTINCT from `Shutdown()` (tear down
+   the transport). The wrapper's `Close()` does both today. Add a membership
+   `Leave()` that broadcasts WITHOUT shutting the transport down, so the node
+   keeps serving gRPC and keeps being FORWARDED-TO during the drain;
+   `Shutdown()`/`Close()` of the transport stays in the existing teardown.
+
+2. **`Cluster.DrainForLeave(ctx)` (a.k.a. `GracefulLeave(timeout)`).**
+   Broadcast the graceful leave via the new membership `Leave()` (peers
+   re-own this node's units + start forwarding to it), then BLOCK until the
+   `handoffPhase` map holds no `Draining` entry owned by this node (every
+   position `drainCheck` released; `mountMap` carries no position this node
+   still owns) OR `ctx` cancels / the timeout fires. The reconcile loop,
+   serving, `drainCheck`, and the forward path STAY ALIVE during this wait.
+   Each `Draining` position releases on the SAME rule as any overlap drain (a
+   successor's serving marker at an epoch strictly above this node's open
+   epoch). Then return.
+
+3. **Wire it at the TOP of `Close()`, gated.** A config field
+   `GracefulLeaveDrainTimeout time.Duration`: `0` = disabled = today's
+   behavior (the gap remains; also the break-demo state). When `> 0` AND
+   `multiReplicated()`, `Close()` calls `DrainForLeave(timeout)` FIRST -
+   before ANY teardown, while the loops are still running - then proceeds
+   with the existing teardown unchanged. Putting the drain at the top of
+   `Close()` keeps it self-contained: the SIGTERM handler in `runtime.go`
+   just calls `Close()` as today, no run-loop change.
+
+DRAINING vs THE RESIDUAL. A position the leaving node owns is taken over by a
+SURVIVING node - a single-hop move (the leaving node held rP of unit K; a
+survivor now holds rP of K) - which the overlap machine resolves to
+`Draining` on the leaving side. So in the common case EVERY served position
+goes `Draining` and is covered by the drain wait. Two residuals are NOT
+covered (and do not need to be):
+
+- A position hitting the PLAIN clean-cut RELEASE path (overlap-move vs
+  plain-release, below) - the leaving node simply drops out of a unit's
+  replica set and some OTHER already-mounted replica covers W with no
+  successor taking its exact position. Nothing to drain; the eager release is
+  correct and the surviving replicas keep the position available. This is NOT
+  a gap, just outside the drain machinery.
+- A position whose successor is STUCK (its `Acquiring` mount never completes
+  within the grace budget): the drain wait times out, `Close()` proceeds, and
+  that one position is unserved from teardown until the survivor finally
+  mounts - exactly today's gap, for that position only, bounded by the grace
+  budget. No worse than the disabled (timeout 0) behavior.
+
+THE INVARIANT. For a position with a REACHABLE single-hop successor, a
+graceful leave has NO unserved window: the leaving node keeps serving
+(directly + via the survivor's forward) until the successor is `Ready` and
+`drainCheck` releases, and only then closes. No-acked-write-lost and
+single-writer-fence are unchanged (the drain reuses the exact overlap release
+rule; the leaving node never releases a position before its successor is
+provably serving).
+
+OPERATOR CONCERN. The orchestrator's termination grace period MUST exceed
+`GracefulLeaveDrainTimeout`, or the orchestrator SIGKILLs the process
+mid-drain and reopens the gap. On a k8s StatefulSet that is
+`terminationGracePeriodSeconds`, set STRICTLY GREATER than the drain timeout
+(with headroom for the leave broadcast to gossip and the post-drain teardown
+to finish). The code enforces only its own timeout, not the orchestrator's.
+
+ACCEPTANCE (break-demo). A continuous writer through a graceful one-node
+leave asserts ~100% ack + zero unserved window; the paired break demo sets
+`GracefulLeaveDrainTimeout = 0` (drain disabled) and the same leave shows the
+gap (ack rate drops while the just-closed positions are unserved until the
+survivors mount), proving the drain wait holds availability. Reuses the
+slow-`OpenReplicaUnit` injection from the overlap availability gate so the
+hand-off takes a measurable, mount-dominated interval.
+
 ## R/W availability matrix during a crash (review P1-4)
 
 The happy path is mount-time-independent for all R/W configs (the old owner
