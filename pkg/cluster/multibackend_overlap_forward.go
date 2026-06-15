@@ -88,7 +88,11 @@ func (c *Cluster) addrForNodeID(id storageunit.NodeID) (string, bool) {
 // failure it returns handled=true with the transient errUnitAcquiring so the
 // fan-out tolerates it and the Option-A retry rides it out (NOT a hard failure
 // that papers over the handoff).
-func (c *Cluster) forwardPutToPredecessor(key, envBytes []byte) (handled bool, err error) {
+//
+// The fanout ATTEMPT ctx (derived from WriteTimeout) is threaded to
+// PutAtReplica so a HUNG predecessor is cancelled at the write deadline rather
+// than leaking a goroutine + gRPC stream until the OS TCP timeout.
+func (c *Cluster) forwardPutToPredecessor(ctx context.Context, key, envBytes []byte) (handled bool, err error) {
 	ru, addr, ok := c.acquiringForwardTarget(key)
 	if !ok {
 		return false, nil
@@ -98,7 +102,7 @@ func (c *Cluster) forwardPutToPredecessor(key, envBytes []byte) (handled bool, e
 		// Predecessor unreachable: single-hop fallback to Option A.
 		return true, errUnitAcquiring("Put")
 	}
-	if perr := cli.PutAtReplica(context.Background(), ru, key, envBytes); perr != nil {
+	if perr := cli.PutAtReplica(ctx, ru, key, envBytes); perr != nil {
 		return true, errUnitAcquiring("Put")
 	}
 	return true, nil
@@ -109,7 +113,11 @@ func (c *Cluster) forwardPutToPredecessor(key, envBytes []byte) (handled bool, e
 // as forwardPutToPredecessor: handled=false means no overlap forward (caller
 // reads locally); a forward failure returns handled=true + errUnitAcquiring so
 // the read fan-out skips this leg and the Option-A path covers it.
-func (c *Cluster) forwardGetToPredecessor(key []byte) (handled bool, value []byte, err error) {
+//
+// The fanout ATTEMPT ctx (derived from ReadTimeout) is threaded to
+// GetAtReplica so a HUNG predecessor is cancelled at the read deadline rather
+// than leaking a goroutine + gRPC stream until the OS TCP timeout.
+func (c *Cluster) forwardGetToPredecessor(ctx context.Context, key []byte) (handled bool, value []byte, err error) {
 	ru, addr, ok := c.acquiringForwardTarget(key)
 	if !ok {
 		return false, nil, nil
@@ -118,7 +126,7 @@ func (c *Cluster) forwardGetToPredecessor(key []byte) (handled bool, value []byt
 	if derr != nil {
 		return true, nil, errUnitAcquiring("Get")
 	}
-	v, found, gerr := cli.GetAtReplica(context.Background(), ru, key)
+	v, found, gerr := cli.GetAtReplica(ctx, ru, key)
 	if gerr != nil {
 		return true, nil, errUnitAcquiring("Get")
 	}

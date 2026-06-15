@@ -398,8 +398,11 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 // drainCheck is the OLD owner's POLL-ONLY release-check for a Draining position,
 // armed on the periodic settle / self-heal cadence (runReconcile). It releases
 // the position ONLY on a POSITIVE readiness: a durable serving marker at an
-// epoch >= this node's own open epoch (proof a live new owner is actually
-// SERVING). A bare durable fence-epoch advance NEVER releases (it bumps at
+// epoch STRICTLY ABOVE (>) this node's own open epoch (proof a live new owner
+// is actually SERVING). The gate is strict to reject this node's OWN stale
+// gain-marker (written at exactly its open epoch); a genuine successor opens
+// at durable+1 and writes a marker strictly higher. A bare durable
+// fence-epoch advance NEVER releases (it bumps at
 // open-START, before the mount; only the marker proves serving).
 //
 // Lock discipline (review P1-3): the ReadServingMarker I/O runs OUTSIDE any
@@ -422,8 +425,18 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	if err != nil {
 		return
 	}
-	// Positive readiness: a live owner is serving at an epoch >= my open epoch.
-	ready := ok && markerEpoch >= state.OpenEpoch
+	// Positive readiness: a live SUCCESSOR is serving at an epoch STRICTLY
+	// ABOVE my open epoch. The gate is STRICT (>, not >=) to reject this
+	// node's OWN stale gain-marker: a node that GAINED ru at open epoch E
+	// wrote WriteServingMarker(ru, E); if the ring later moves ru OFF this
+	// node, beginDrain sets OpenEpoch = DurableEpochReplica(ru) = E (unchanged
+	// until the NEW gainer opens), so a >= gate would read this node's OWN
+	// marker E (E >= E true) and RELEASE while the real successor is still
+	// mid-mount, degrading a TWICE-churning position to clean-cut. A genuine
+	// successor always opens at durable+1 >= E+1 and writes a marker strictly
+	// above E, so > still releases on a real successor. This matches
+	// CanRelease's already-strict durable > open boundary.
+	ready := ok && markerEpoch > state.OpenEpoch
 	if !storageunit.Releasable(state, ready) {
 		// No marker yet (or below my epoch): stay Draining + keep serving.
 		return

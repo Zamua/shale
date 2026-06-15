@@ -264,6 +264,70 @@ func TestOverlap_drainCheck_ReleasesOnServingMarker(t *testing.T) {
 	}
 }
 
+// TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease pins the STRICT-gate fix
+// (review P1): the serving marker is keyed by ReplicaUnit (node-independent) and
+// monotonic, so a node that GAINED ru at open epoch E wrote
+// WriteServingMarker(ru, E). If the ring later moves ru OFF that node, beginDrain
+// sets OpenEpoch = DurableEpochReplica(ru) = E (unchanged until the NEW gainer
+// opens). Under a >= gate the node would read its OWN stale marker E (E >= E true)
+// and release while the real successor is still mid-mount, degrading any
+// twice-churning position to clean-cut. The strict > gate rejects the stale
+// self-marker (exactly E) and releases ONLY when a genuine successor writes a
+// marker STRICTLY above E (E+1). Deterministic, no gossip timing.
+func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+
+	const E = storageunit.Epoch(3)
+	target := ru(0, 0, 0)
+	h := backing.Handle()
+
+	// 1) self GAINED ru at open epoch E and wrote its own serving marker at E.
+	b, err := h.OpenReplicaUnit(target, E)
+	if err != nil {
+		t.Fatalf("seed gain mount: %v", err)
+	}
+	if err := h.WriteServingMarker(target, E); err != nil {
+		t.Fatalf("write self gain-marker: %v", err)
+	}
+
+	// 2) the ring now moves ru OFF self: beginDrain sets OpenEpoch = E (the
+	//    durable fence epoch, unchanged until the NEW gainer opens). Model that
+	//    Draining state directly (keep serving, mount retained).
+	c.mountMap[target] = b
+	c.handoffPhase[target] = storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: E}
+
+	// Only the STALE SELF-MARKER at exactly E exists: a >= gate would release
+	// here (the bug). The strict > gate must NOT.
+	if got, _ := h.DurableEpochReplica(target); got != E {
+		t.Fatalf("durable fence epoch should still be E=%d (no successor opened), got %d", E, got)
+	}
+	c.drainCheck(target)
+	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
+		t.Fatalf("stale self-marker at exactly the open epoch must NOT release (premature release bug)")
+	}
+	if st := c.handoffPhaseOf(target); st.Phase != storageunit.PhaseDraining {
+		t.Fatalf("with only the stale self-marker the phase must stay Draining, got %v", st.Phase)
+	}
+
+	// 3) a genuine SUCCESSOR opens at durable+1 (>= E+1) and writes a marker
+	//    STRICTLY above E. Now drainCheck must release.
+	h2 := backing.Handle()
+	if _, err := h2.OpenReplicaUnit(target, E+1); err != nil {
+		t.Fatalf("successor open: %v", err)
+	}
+	if err := h2.WriteServingMarker(target, E+1); err != nil {
+		t.Fatalf("write successor marker: %v", err)
+	}
+	c.drainCheck(target)
+	if _, mounted := c.localBackendForReplicaUnit(target); mounted {
+		t.Fatalf("a successor marker strictly above the open epoch must release the old owner")
+	}
+	if st := c.handoffPhaseOf(target); st.Phase != 0 {
+		t.Fatalf("after release the phase entry must be dropped (Absent), got %v", st.Phase)
+	}
+}
+
 // TestOverlap_drainCheck_NeverReleasesOnBareFenceEpoch: the durable fence epoch
 // advancing (DurableEpochReplica) WITHOUT a serving marker must NOT release the
 // old owner (crash-case-1 protection: a new owner that fenced then crashed

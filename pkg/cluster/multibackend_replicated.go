@@ -356,7 +356,7 @@ func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Membe
 		// against an absent mount. handled=false means no overlap forward (apply
 		// locally as before, which yields errUnitAcquiring if mid-mount with no
 		// predecessor - the Option-A belt).
-		if handled, ferr := c.forwardPutToPredecessor(key, envBytes); handled {
+		if handled, ferr := c.forwardPutToPredecessor(ctx, key, envBytes); handled {
 			return ferr
 		}
 		return c.applyEnvelopeIfNewerToUnit(key, envBytes)
@@ -463,7 +463,7 @@ func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Membe
 		// v0.8 Phase 2e (overlap forward): GAINING this position -> forward the
 		// read to the predecessor (Draining, still serving) addressed by the
 		// explicit ru. handled=false means no overlap forward (read locally).
-		if handled, v, ferr := c.forwardGetToPredecessor(key); handled {
+		if handled, v, ferr := c.forwardGetToPredecessor(ctx, key); handled {
 			return v, ferr
 		}
 		b, ok := c.localBackendForKey(key)

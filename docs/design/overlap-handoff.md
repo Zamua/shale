@@ -99,7 +99,18 @@ transition is still a single guarded edge.
     a live owner is actually SERVING the position), keyed by the
     `ReplicaUnit` and carrying its open epoch E. The old owner's
     `drainCheck` POLLS it on the periodic settle / self-heal cadence and
-    releases only on observing a marker at an epoch `>=` its own open epoch.
+    releases only on observing a marker at an epoch STRICTLY ABOVE (`>`) its
+    own open epoch. The boundary is STRICT, not `>=`, to reject a node's OWN
+    stale gain-marker: a node that GAINED `ru` at epoch E wrote
+    `WriteServingMarker(ru, E)`; if the ring later moves `ru` OFF that node,
+    `beginDrain` sets `OpenEpoch = DurableEpochReplica(ru) = E` (unchanged
+    until the NEW gainer opens). Under a `>=` gate the node would read its OWN
+    stale marker E (`E >= E` true) and release while the real successor is
+    still mid-mount, degrading any TWICE-churning position to clean-cut. A
+    genuine successor always opens at `durable+1 >= E+1` and writes a marker
+    STRICTLY above E, so `>` still releases on a real successor while
+    rejecting the node's own gain-marker (exactly E). This matches
+    `CanRelease`'s already-strict `durable > open` boundary.
   - The DURABLE slatedb manifest writer-epoch (`DurableEpochReplica(ru)`)
     is a LIVENESS HINT only, and it is STRICTLY WEAKER than the serving
     marker (it bumps at open-START, before the mount completes). Seeing it
@@ -307,8 +318,9 @@ OLD owner (the node LOSING the position):
   Draining  --- keep serving (directly AND for the new owner's forwards) --.
     |   release-check (drainCheck) POLLS the serving marker on the         |
     |     periodic settle / self-heal cadence (no RPC wake). It fires when |
-    |     ReadServingMarker(ru) returns a marker at epoch >= myOpenEpoch   |
-    |     (positive proof a live owner is SERVING).                        |
+    |     ReadServingMarker(ru) returns a marker at epoch > myOpenEpoch    |
+    |     (STRICT >: positive proof a live SUCCESSOR is SERVING; rejects   |
+    |      my own stale gain-marker at exactly myOpenEpoch).               |
     |   A BARE DurableEpochReplica(ru) (fence) advance NEVER releases (it  |
     |     bumps at open-START, before the mount; only the marker proves    |
     |     serving). Until release, OLD keeps answering routed ops (its own |
@@ -416,7 +428,10 @@ ring change: position rP of unit K  OLD --> NEW
         serves rP LOCALLY and STOPS forwarding. THE MOUNT FLIP.
         NEW: WriteServingMarker(ru, E) to shared storage, exactly once.
   t3  OLD release-check (next drainCheck poll tick): ReadServingMarker(ru)
-        returns a marker at epoch E >= OLD's open epoch. OLD:
+        returns a marker at epoch E STRICTLY ABOVE (>) OLD's open epoch
+        (NEW opened at E > durable >= OLD's open epoch, so E > OLD's open
+        epoch strictly; the strict gate also rejects OLD's own stale
+        gain-marker if OLD had earlier gained rP at its own open epoch). OLD:
         compare-and-delete its mountMap[ru] entry, CloseReplicaUnit(ru) once
         -> Releasing -> Absent.
   done. No instant between t1 and t3 had the position unserved.
@@ -432,7 +447,7 @@ one is ever the authoritative (unfenced) writer.
    forwarding (it is gone), but it never wrote the serving marker and never
    advanced past fence-then-serve, so OLD's release-check never fires (a
    bare fence-epoch advance from NEW's pre-crash fence does NOT release: no
-   serving marker `>=` OLD's epoch exists). OLD stays in `Draining` and
+   serving marker strictly above OLD's epoch exists). OLD stays in `Draining` and
    KEEPS SERVING. No data loss, no unavailability of the position from the
    OLD owner's side; the only effect is that ops in-flight TO the crashed
    new owner fail and retry. The next reconcile re-derives the ring; if NEW
@@ -623,9 +638,11 @@ Domain (pure, no I/O) in `pkg/storageunit`:
     the loser side, and CAN be in both for DIFFERENT positions of one unit,
     which is why the key is `ReplicaUnit`). A `Releasable(state, ready bool)`
     predicate encodes the release rule: release requires a positive
-    readiness (a serving marker at an epoch `>=` the old owner's open epoch,
-    computed in the controller from `ReadServingMarker`), NEVER a bare
-    fence-epoch compare. These are table-driven and trivially unit-testable
+    readiness (a serving marker at an epoch STRICTLY ABOVE (`>`) the old
+    owner's open epoch, computed in the controller from `ReadServingMarker`),
+    NEVER a bare fence-epoch compare. The strict `>` (not `>=`) rejects the
+    old owner's OWN stale gain-marker at exactly its open epoch (a real
+    successor opens at `durable+1` and writes a marker strictly higher). These are table-driven and trivially unit-testable
     with no ring or factory.
 
 - `factory.go` (edit): extend `ReplicaBackendFactory` with
@@ -708,8 +725,9 @@ Controller (the wiring) in `pkg/cluster`:
     ONE critical section under `mountMu` (exactly-once via the
     CAS-on-delete, reusing the `evictStaleMount` CAS shape), then
     `CloseReplicaUnit(ru)` once. Release fires ONLY on a positive readiness
-    (a serving marker at an epoch `>=` this node's open epoch), never on a
-    bare fence-epoch advance. Armed as a bounded periodic re-check on the
+    (a serving marker at an epoch STRICTLY ABOVE (`>`) this node's open
+    epoch), never on a bare fence-epoch advance. The strict `>` (not `>=`)
+    rejects the node's own stale gain-marker at exactly its open epoch. Armed as a bounded periodic re-check on the
     existing settle / self-heal cadence; POLL-ONLY (no RPC wake). Lock
     discipline below.
 
@@ -828,8 +846,10 @@ changes" claim is now false)
   to identify the predecessor. Overlap is SINGLE-HOP: an ambiguous/multi-hop
   predecessor records no predecessor and degrades to Option A.
 - The OLD owner's release trigger is "new owner Ready," detected POLL-ONLY
-  by reading the durable SERVING MARKER (a marker at an epoch `>=` the old
-  owner's open epoch), NOT a bare durable FENCE-epoch advance and NOT a push
+  by reading the durable SERVING MARKER (a marker at an epoch STRICTLY ABOVE
+  (`>`) the old owner's open epoch; strict `>` rejects the old owner's own
+  stale gain-marker at exactly its open epoch), NOT a bare durable
+  FENCE-epoch advance and NOT a push
   RPC. The marker read is a point-in-time liveness OBSERVATION (NEW-P1-3): a
   NEW crash in the read-to-release gap leaves the position unserved until the
   next reconcile, with no acked-write loss.
