@@ -405,6 +405,31 @@ func (m *Membership) Events() <-chan Event {
 	return m.events.out
 }
 
+// Leave broadcasts the graceful departure to peers WITHOUT shutting the
+// local transport down. memberlist exposes Leave (gossip the clean leave
+// so peers record a graceful departure and re-own this node's units)
+// DISTINCT from Shutdown (tear down the transport). Splitting them lets a
+// graceful-leave drain broadcast the departure (so survivors begin
+// re-owning + forwarding to this node) while THIS node keeps serving gRPC
+// and keeps being forwarded-to throughout the drain; the transport is torn
+// down later by Close.
+//
+// Idempotent + safe to call before Close: Close's own Leave is a no-op
+// once memberlist has already left. Leave is best-effort (bounded by
+// leaveTimeout); peers still observe the departure via failure detection
+// even if the graceful broadcast did not land. It does NOT mark the
+// Membership closed (the transport stays up), so Members / Snapshot keep
+// returning the live view.
+func (m *Membership) Leave() error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+	return m.ml.Leave(leaveTimeout)
+}
+
 // Close performs a graceful Leave (best-effort broadcast to peers)
 // followed by Shutdown of the local memberlist. Idempotent.
 //
@@ -412,6 +437,11 @@ func (m *Membership) Events() <-chan Event {
 // callbacks (memberlist re-fires NotifyLeave for the local node on
 // graceful exit), so we must drive the channel shutdown LAST,
 // after all callback-firing memberlist activity has wound down.
+//
+// Leave here is idempotent with a prior Leave() call (the graceful-leave
+// drain may have already broadcast the departure): memberlist's second
+// Leave is a no-op, so Close still runs Shutdown to tear the transport
+// down.
 func (m *Membership) Close() error {
 	m.mu.Lock()
 	if m.closed {

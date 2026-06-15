@@ -170,6 +170,75 @@ func TestLeaveEmitsEvent(t *testing.T) {
 	}
 }
 
+// TestLeaveBroadcastsWithoutShutdown pins the v0.8 Phase 2e split: Leave()
+// broadcasts the graceful departure (the peer observes EventLeave) WITHOUT
+// shutting the local transport down, so the leaver keeps serving - Members()
+// still returns the live view (non-nil, not the closed sentinel) - and a
+// subsequent Close() still tears the transport down cleanly + idempotently.
+func TestLeaveBroadcastsWithoutShutdown(t *testing.T) {
+	n1Port := ephemeralPort(t)
+	n2Port := ephemeralPort(t)
+
+	m1 := openTestMembership(t, Config{
+		NodeID:   "alpha",
+		BindAddr: bindAddr(n1Port),
+		GRPCAddr: "127.0.0.1:19301",
+	})
+	m2 := openTestMembership(t, Config{
+		NodeID:   "beta",
+		BindAddr: bindAddr(n2Port),
+		GRPCAddr: "127.0.0.1:19302",
+		Seeds:    []string{bindAddr(n1Port)},
+	})
+
+	want := map[string]string{
+		"alpha": "127.0.0.1:19301",
+		"beta":  "127.0.0.1:19302",
+	}
+	if err := waitForMembers(m1, want, 5*time.Second); err != nil {
+		t.Fatalf("alpha convergence: %v", err)
+	}
+
+	drainEvents(m1.Events())
+
+	// beta leaves WITHOUT shutting its transport down.
+	if err := m2.Leave(); err != nil {
+		t.Fatalf("beta Leave: %v", err)
+	}
+
+	// alpha observes the graceful departure.
+	deadline := time.After(10 * time.Second)
+	for done := false; !done; {
+		select {
+		case ev, ok := <-m1.Events():
+			if !ok {
+				t.Fatalf("alpha event channel closed before leave seen")
+			}
+			if ev.Type == EventLeave && ev.Member.ID == "beta" {
+				done = true
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for EventLeave for beta after Leave()")
+		}
+	}
+
+	// The leaver's transport is STILL UP: Members() returns the live view, not
+	// the closed-sentinel nil. (beta still knows about itself + alpha.)
+	if got := m2.Members(); got == nil {
+		t.Fatalf("after Leave() (no Shutdown) Members() must return the live view, got nil")
+	}
+
+	// Close() after Leave() still works (idempotent second leave + transport
+	// teardown).
+	if err := m2.Close(); err != nil {
+		t.Fatalf("Close after Leave: %v", err)
+	}
+	// Now the transport is down: Members() returns the closed sentinel.
+	if got := m2.Members(); got != nil {
+		t.Fatalf("after Close() Members() must be nil (closed sentinel), got %v", got)
+	}
+}
+
 // TestCloseReturnsWithPeerAlive pins the bounded graceful-leave fix:
 // Close on a node whose peer is still alive must return promptly
 // rather than blocking forever on the leave broadcast. Before the fix,
