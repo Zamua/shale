@@ -122,6 +122,27 @@ func (c BackingConfig) dbName(gu storageunit.GenUnit) string {
 	return c.KeyPrefix + unitPrefix + fmt.Sprintf("g%d/u%d", gu.Gen, gu.ID)
 }
 
+// dbNameReplica maps a ReplicaUnit to its deterministic slatedb DbName (R>1
+// multi-backend). It appends a replica segment to the unit's R=1 DbName,
+// reusing dbName(ru.Unit) verbatim so the unit prefix can never drift between
+// the R=1 and R>1 encodings:
+//
+//	dbNameReplica(ru) = dbName(ru.Unit) + "/r<replica>"
+//	                  = "<KeyPrefix>u/g<gen>/u<id>/r<replica>"
+//
+// The replica position is a CHILD prefix of the unit's prefix, so each
+// (gen, unit, replica) triple maps to a DISTINCT slatedb database at a
+// DISTINCT, non-overlapping prefix: replica 0 of g1/u5 lives at
+// "u/g1/u5/r0", replica 1 at "u/g1/u5/r1". This prefix-disjointness IS the
+// replica-independence durability guarantee - no object key under one
+// replica's prefix is ever read or written by another replica's database,
+// so losing the node serving one position cannot truncate, fence, or corrupt
+// another position's bytes. It is the object-store realization of
+// ReplicaUnit.String() ("g<gen>/u<id>/r<replica>").
+func (c BackingConfig) dbNameReplica(ru storageunit.ReplicaUnit) string {
+	return c.dbName(ru.Unit) + fmt.Sprintf("/r%d", ru.Replica)
+}
+
 // Backing owns the shared-bucket connection parameters that every per-node
 // Handle references. One Backing per CLUSTER; one Handle per NODE off it.
 // It is the production analogue of sharedfactory.Backing: the shared
@@ -209,6 +230,48 @@ func (b *Backing) durableEpoch(gu storageunit.GenUnit) (storageunit.Epoch, error
 	}
 	if manifest == nil {
 		// Db not yet created: no prior writer, durable epoch 0.
+		return 0, nil
+	}
+	return storageunit.Epoch(manifest.WriterEpoch), nil
+}
+
+// DurableEpochReplica is the R>1 analogue of DurableEpoch: it reads the
+// durable manifest writer-epoch for replica position ru WITHOUT opening the
+// database. Exposed so a test can pin the per-replica epoch arithmetic
+// directly (read the position's durable epoch, drive an acquire with a
+// deliberately-stale intended floor, assert the open landed strictly above).
+// Returns (0, nil) when the position's database does not yet exist.
+func (b *Backing) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Epoch, error) {
+	return b.durableEpochReplica(ru)
+}
+
+// durableEpochReplica reads replica position ru's durable manifest
+// writer-epoch WITHOUT opening the database (hence without fencing). It is
+// the per-replica cross-node source of truth a handoff of THAT position
+// fences against. Because each replica position is its own slatedb database
+// at dbNameReplica(ru), reading r1's manifest never observes or touches r0's
+// epoch: replica positions fence INDEPENDENTLY. A nil manifest means the
+// position has never been created (durable epoch 0). Mirrors durableEpoch.
+func (b *Backing) durableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Epoch, error) {
+	store, err := b.resolveStore()
+	if err != nil {
+		return 0, err
+	}
+	defer store.Destroy()
+
+	adminBuilder := slatedb.NewAdminBuilder(b.cfg.dbNameReplica(ru), store)
+	defer adminBuilder.Destroy()
+	admin, err := adminBuilder.Build()
+	if err != nil {
+		return 0, fmt.Errorf("slate: build admin for %s: %w", ru, err)
+	}
+	defer admin.Destroy()
+
+	manifest, err := admin.ReadManifest(nil)
+	if err != nil {
+		return 0, fmt.Errorf("slate: read manifest for %s: %w", ru, err)
+	}
+	if manifest == nil {
 		return 0, nil
 	}
 	return storageunit.Epoch(manifest.WriterEpoch), nil
@@ -321,6 +384,14 @@ type Handle struct {
 	// both open. Keyed per unit so opens of DIFFERENT units still proceed
 	// concurrently (the slatedb open is the slow part and is unit-local).
 	openLatch map[storageunit.GenUnit]*sync.Mutex
+
+	// openReplica + openLatchReplica are the R>1 siblings of open + openLatch,
+	// keyed by ReplicaUnit so each (gen, unit, replica) position is tracked +
+	// serialized INDEPENDENTLY. A Handle never mixes the R=1 and R>1 maps (a
+	// cluster runs R=1 OR R>1, fixed at Open); keeping them separate keeps the
+	// R=1 path byte-for-byte unchanged.
+	openReplica      map[storageunit.ReplicaUnit]*mountedUnit
+	openLatchReplica map[storageunit.ReplicaUnit]*sync.Mutex
 }
 
 // mountedUnit bundles a unit's live slatedb instance with the epoch this
@@ -334,9 +405,11 @@ type mountedUnit struct {
 // cluster gets its own Handle; they all share b.
 func (b *Backing) Handle() *Handle {
 	return &Handle{
-		backing:   b,
-		open:      make(map[storageunit.GenUnit]*mountedUnit),
-		openLatch: make(map[storageunit.GenUnit]*sync.Mutex),
+		backing:          b,
+		open:             make(map[storageunit.GenUnit]*mountedUnit),
+		openLatch:        make(map[storageunit.GenUnit]*sync.Mutex),
+		openReplica:      make(map[storageunit.ReplicaUnit]*mountedUnit),
+		openLatchReplica: make(map[storageunit.ReplicaUnit]*sync.Mutex),
 	}
 }
 
@@ -351,6 +424,22 @@ func (h *Handle) latchFor(gu storageunit.GenUnit) *sync.Mutex {
 	if !ok {
 		l = &sync.Mutex{}
 		h.openLatch[gu] = l
+	}
+	return l
+}
+
+// latchForReplica is the R>1 sibling of latchFor: it returns the
+// per-ReplicaUnit open latch, creating it on first use. Two goroutines
+// opening the SAME replica position get the SAME *sync.Mutex and serialize;
+// opens of different positions (or different units) get distinct latches and
+// do not contend.
+func (h *Handle) latchForReplica(ru storageunit.ReplicaUnit) *sync.Mutex {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	l, ok := h.openLatchReplica[ru]
+	if !ok {
+		l = &sync.Mutex{}
+		h.openLatchReplica[ru] = l
 	}
 	return l
 }
@@ -427,6 +516,25 @@ func (b *Backing) fenceEpoch(gu storageunit.GenUnit, intended storageunit.Epoch)
 	return opened, nil
 }
 
+// fenceEpochReplica is the R>1 analogue of fenceEpoch: it computes the epoch
+// the open of replica position ru will land at - strictly above ru's
+// PER-REPLICA durable manifest writer-epoch, and at least the cluster's
+// intended floor. Identical arithmetic to fenceEpoch (max(intended,
+// durable+1)), but reading the per-replica manifest at dbNameReplica(ru), so
+// opening replica 1 reads r1's manifest only: a fence of r0 never bumps r1,
+// and re-acquiring r0 at a higher epoch leaves r1 untouched.
+func (b *Backing) fenceEpochReplica(ru storageunit.ReplicaUnit, intended storageunit.Epoch) (storageunit.Epoch, error) {
+	durable, err := b.durableEpochReplica(ru)
+	if err != nil {
+		return 0, err
+	}
+	opened := intended
+	if floor := durable + 1; floor > opened {
+		opened = floor
+	}
+	return opened, nil
+}
+
 // openSlate opens the per-unit slatedb instance with AwaitDurable=true
 // (the multi-backend durability invariant) and the backing's Settings.
 func (b *Backing) openSlate(gu storageunit.GenUnit) (*Slate, error) {
@@ -442,6 +550,25 @@ func (b *Backing) openSlate(gu storageunit.GenUnit) (*Slate, error) {
 	if err != nil {
 		store.Destroy()
 		return nil, fmt.Errorf("slate: open unit %s: %w", gu, err)
+	}
+	return &Slate{db: db, store: store, writeOpts: wopts}, nil
+}
+
+// openSlateReplica is the R>1 analogue of openSlate: it opens the per-replica
+// slatedb instance at dbNameReplica(ru) with AwaitDurable=true and the
+// backing's Settings/Cache. Because the DbName encodes the replica position,
+// the instance's WAL/LSM/manifest live at a prefix disjoint from every other
+// replica's, which is the structural replica-independence guarantee.
+func (b *Backing) openSlateReplica(ru storageunit.ReplicaUnit) (*Slate, error) {
+	store, err := b.resolveStore()
+	if err != nil {
+		return nil, err
+	}
+	wopts := &slatedb.WriteOptions{AwaitDurable: true}
+	db, err := buildDb(b.cfg.dbNameReplica(ru), store, b.cfg.Settings, b.cfg.Cache)
+	if err != nil {
+		store.Destroy()
+		return nil, fmt.Errorf("slate: open replica %s: %w", ru, err)
 	}
 	return &Slate{db: db, store: store, writeOpts: wopts}, nil
 }
@@ -464,6 +591,79 @@ func (h *Handle) CloseUnit(gu storageunit.GenUnit) error {
 	}
 	if err := mu.slate.Close(); err != nil {
 		return fmt.Errorf("slate: close unit %s: %w", gu, err)
+	}
+	return nil
+}
+
+// OpenReplicaUnit opens (mounts) the slatedb instance for replica position
+// ru.Replica of unit ru.Unit at dbNameReplica(ru) and returns it ready to
+// serve. It is the R>1 analogue of OpenUnit, structurally identical but keyed
+// by ReplicaUnit. Opening the database IS the fence: slatedb's writer-epoch
+// protocol bumps the manifest at ru's OWN prefix, so any prior writer of the
+// SAME replica position still holding it at a lower epoch is locked out; a
+// writer of a DIFFERENT position (or a different unit) is never touched -
+// distinct positions are independent databases at disjoint prefixes.
+//
+//   - This handle ALREADY holds ru open: a double-open error at ANY epoch (one
+//     live writer per position per handle). The caller must CloseReplicaUnit(ru)
+//     first. We do NOT support a strictly-higher same-node re-open in-process
+//     for the same reason OpenUnit doesn't (it trips a slatedb async-task
+//     assertion); the reconcile RELEASEs before any same-node re-acquire.
+//   - This handle does NOT hold ru (the cold-acquire / handoff case): the
+//     intended epoch is a best-effort floor; the factory fences AUTHORITATIVELY
+//     against ru's durable manifest at max(intended, durableEpochReplica+1).
+//     This NEVER rejects for being too low - a new owner must always be able to
+//     take the position's lease.
+//
+// The whole open runs under a per-ru latch so a same-position concurrent open
+// SERIALIZES rather than both passing a stale held-check around the slow
+// slatedb open. Opens of different positions proceed concurrently.
+func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, error) {
+	latch := h.latchForReplica(ru)
+	latch.Lock()
+	defer latch.Unlock()
+
+	h.mu.Lock()
+	cur, held := h.openReplica[ru]
+	h.mu.Unlock()
+	if held {
+		return nil, fmt.Errorf("slate: replica %s already open on this handle at epoch %d; CloseReplicaUnit first to re-open", ru, cur.epoch)
+	}
+
+	opened, err := h.backing.fenceEpochReplica(ru, epoch)
+	if err != nil {
+		return nil, err
+	}
+
+	s, err := h.backing.openSlateReplica(ru)
+	if err != nil {
+		return nil, err
+	}
+
+	h.mu.Lock()
+	h.openReplica[ru] = &mountedUnit{slate: s, epoch: opened}
+	h.mu.Unlock()
+	return s, nil
+}
+
+// CloseReplicaUnit releases replica position ru from THIS handle: flushes
+// (Db.Shutdown forces pending writes durable) then shuts down the position's
+// slatedb instance, WITHOUT affecting any other replica or unit and WITHOUT
+// deleting the bucket bytes. The data stays durable at dbNameReplica(ru) for
+// the next owner. Idempotent: closing a position this handle does not hold is
+// a no-op returning nil. It is the R>1 analogue of CloseUnit.
+func (h *Handle) CloseReplicaUnit(ru storageunit.ReplicaUnit) error {
+	h.mu.Lock()
+	mu, held := h.openReplica[ru]
+	if held {
+		delete(h.openReplica, ru)
+	}
+	h.mu.Unlock()
+	if !held {
+		return nil
+	}
+	if err := mu.slate.Close(); err != nil {
+		return fmt.Errorf("slate: close replica %s: %w", ru, err)
 	}
 	return nil
 }
@@ -501,10 +701,14 @@ func (h *Handle) OpenUnits() []storageunit.GenUnit {
 // flush + shutdown). Used on node shutdown; idempotent.
 func (h *Handle) Close() error {
 	h.mu.Lock()
-	mounted := make([]*mountedUnit, 0, len(h.open))
+	mounted := make([]*mountedUnit, 0, len(h.open)+len(h.openReplica))
 	for gu, mu := range h.open {
 		mounted = append(mounted, mu)
 		delete(h.open, gu)
+	}
+	for ru, mu := range h.openReplica {
+		mounted = append(mounted, mu)
+		delete(h.openReplica, ru)
 	}
 	h.mu.Unlock()
 	var firstErr error
@@ -516,5 +720,8 @@ func (h *Handle) Close() error {
 	return firstErr
 }
 
-// compile-time assertion that Handle satisfies the domain interface.
+// compile-time assertions that Handle satisfies the domain interfaces. The
+// ReplicaBackendFactory assertion is what lets cluster.Open accept
+// multi-backend mode at ReplicationFactor > 1 with a slate Handle.
 var _ storageunit.BackendFactory = (*Handle)(nil)
+var _ storageunit.ReplicaBackendFactory = (*Handle)(nil)
