@@ -52,12 +52,14 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rpc"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 )
 
@@ -69,11 +71,34 @@ type StdConfig struct {
 	BindAddr string
 	Seeds    []string
 
+	// ReplicationFactor is the number of nodes that hold a copy of each
+	// key. Threaded into cluster.Config.ReplicationFactor in BOTH single-
+	// backend and multi-backend modes. Default 1 (single owner per key, no
+	// replicas); cluster.normalizeConfig normalizes a 0 to 1, so a default
+	// and an explicit 1 are identical. Populated from --replication-factor /
+	// SHALE_REPLICATION_FACTOR by Validate.
+	ReplicationFactor int
+
+	// UnitCount is the validated power-of-two number of storage units N for
+	// MULTI-BACKEND mode. Consumed ONLY when the binary's main supplies a
+	// BackendFactory (RunConfig.BackendFactory); in single-backend mode it is
+	// ignored. Validate parses --unit-count / SHALE_UNIT_COUNT through
+	// storageunit.NewUnitCount (rejecting non-power-of-two values before any
+	// backend opens) and stores the resulting value here so Run never
+	// re-parses it. Default 1.
+	UnitCount storageunit.UnitCount
+
 	// seedsRaw holds the comma-separated form pre-split; tests that
 	// poke at the flag set directly can inspect it. Populated by
 	// BindStdFlags after Parse; Seeds is derived from it inside
 	// Validate.
 	seedsRaw string
+
+	// replicationFactorRaw + unitCountRaw hold the parsed int flag values
+	// pre-validation. Populated by BindStdFlags; ReplicationFactor +
+	// UnitCount are derived from them inside Validate.
+	replicationFactorRaw int
+	unitCountRaw         int
 }
 
 // BindStdFlags registers the standard cluster/node flags into fs and
@@ -83,13 +108,16 @@ type StdConfig struct {
 //
 // Flags + env-var fallbacks registered:
 //
-//	--node-id       SHALE_NODE_ID    (required)
-//	--grpc-addr     SHALE_GRPC_ADDR  (default ":7947")
-//	--bind-addr     SHALE_BIND_ADDR  (default ":7946")
-//	--seeds         SHALE_SEEDS      (comma-separated; optional)
+//	--node-id            SHALE_NODE_ID             (required)
+//	--grpc-addr          SHALE_GRPC_ADDR           (default ":7947")
+//	--bind-addr          SHALE_BIND_ADDR           (default ":7946")
+//	--seeds              SHALE_SEEDS               (comma-separated; optional)
+//	--replication-factor SHALE_REPLICATION_FACTOR  (int; default 1)
+//	--unit-count         SHALE_UNIT_COUNT          (power-of-two int; default 1)
 //
-// Validation (required-ness, parsing of --seeds into a slice) happens
-// in StdConfig.Validate, which the caller runs after fs.Parse.
+// Validation (required-ness, parsing of --seeds into a slice, the
+// --unit-count power-of-two check) happens in StdConfig.Validate, which
+// the caller runs after fs.Parse.
 func BindStdFlags(fs *flag.FlagSet) *StdConfig {
 	std := &StdConfig{}
 	fs.StringVar(&std.NodeID, "node-id", envOr("SHALE_NODE_ID", ""),
@@ -100,16 +128,29 @@ func BindStdFlags(fs *flag.FlagSet) *StdConfig {
 		"memberlist bind address")
 	fs.StringVar(&std.seedsRaw, "seeds", envOr("SHALE_SEEDS", ""),
 		"comma-separated peer addresses for cluster join")
+	fs.IntVar(&std.replicationFactorRaw, "replication-factor",
+		envOrInt("SHALE_REPLICATION_FACTOR", 1),
+		"number of nodes that hold a copy of each key (default 1)")
+	fs.IntVar(&std.unitCountRaw, "unit-count",
+		envOrInt("SHALE_UNIT_COUNT", 1),
+		"power-of-two number of storage units N (multi-backend mode only; default 1)")
 	return std
 }
 
 // Validate enforces required fields and finalizes derived values
-// (notably parsing --seeds into a slice). Call after fs.Parse.
+// (parsing --seeds into a slice, validating --unit-count as a power of
+// two, recording --replication-factor). Call after fs.Parse.
 func (s *StdConfig) Validate() error {
 	if strings.TrimSpace(s.NodeID) == "" {
 		return errors.New("--node-id is required (or set SHALE_NODE_ID)")
 	}
 	s.Seeds = SplitSeeds(s.seedsRaw)
+	s.ReplicationFactor = s.replicationFactorRaw
+	uc, err := storageunit.NewUnitCount(s.unitCountRaw)
+	if err != nil {
+		return fmt.Errorf("--unit-count: %w (must be a power of two)", err)
+	}
+	s.UnitCount = uc
 	return nil
 }
 
@@ -124,15 +165,35 @@ type RunConfig struct {
 	// (e.g. "memory", "pebble", "slate"). Cosmetic.
 	BackendLabel string
 
-	// Backend is the opened backend.Backend. Run takes ownership for
-	// the lifetime of the process; the Cluster's Close releases it.
+	// Backend is the opened backend.Backend for SINGLE-BACKEND (legacy
+	// per-node) mode. Run takes ownership for the lifetime of the process;
+	// the Cluster's Close releases it. Mutually exclusive with
+	// BackendFactory: exactly one of Backend / BackendFactory must be set
+	// (Run validates the XOR before binding the listener).
 	Backend backend.Backend
 
 	// CloseBackend, if non-nil, is invoked after the Cluster has
 	// been closed and is the place to release any backend-owned
 	// resources that don't fit inside Backend.Close (file locks,
-	// background goroutines the constructor owns, etc.).
+	// background goroutines the constructor owns, etc.). Single-backend
+	// mode only.
 	CloseBackend func() error
+
+	// BackendFactory selects MULTI-BACKEND mode (v0.8): the per-node
+	// factory that opens / closes one backend per owned storage unit. The
+	// cluster mounts owned units and routes each key to its unit's owner
+	// (key -> shardKey -> unit -> owner) instead of a single Backend. The
+	// unit count is taken from Std.UnitCount. Mutually exclusive with
+	// Backend; Run validates the XOR.
+	BackendFactory storageunit.BackendFactory
+
+	// CloseFactory, if non-nil, is the multi-backend analogue of
+	// CloseBackend: invoked after Cluster.Close to release any backing-level
+	// resources the factory owns (the slate Backing's shared connection
+	// state, an operator-owned block cache, etc.). Cluster.Close already
+	// closes every MOUNTED unit via the factory; CloseFactory is for
+	// backing-level teardown the cluster does not own.
+	CloseFactory func() error
 
 	// Logger is where startup + shutdown lines are written. Required.
 	Logger *log.Logger
@@ -146,10 +207,27 @@ func Run(cfg RunConfig) error {
 	if cfg.Logger == nil {
 		return errors.New("shaled.Run: Logger required")
 	}
-	if cfg.Backend == nil {
-		return errors.New("shaled.Run: Backend required")
+	// Backend-vs-BackendFactory XOR, validated BEFORE binding the listener
+	// so a misconfigured node fails fast with a clear per-binary error and
+	// never reserves a port. The cluster re-validates downstream
+	// (validateBackendMode), but this is the friendlier first line.
+	hasBackend := cfg.Backend != nil
+	hasFactory := cfg.BackendFactory != nil
+	switch {
+	case hasBackend && hasFactory:
+		return errors.New("shaled.Run: set EITHER Backend OR BackendFactory, not both")
+	case !hasBackend && !hasFactory:
+		return errors.New("shaled.Run: Backend or BackendFactory required")
 	}
 	logger := cfg.Logger
+
+	// closeOwned releases whichever backing resource this run owns (the
+	// single backend's CloseBackend, or the factory's CloseFactory). Used on
+	// every early-return path below and after a clean shutdown.
+	closeOwned := cfg.CloseBackend
+	if hasFactory {
+		closeOwned = cfg.CloseFactory
+	}
 
 	// We must reserve the gRPC listener BEFORE opening the cluster so
 	// that the GRPCAddr we broadcast to peers is the resolved bound
@@ -157,20 +235,33 @@ func Run(cfg RunConfig) error {
 	// listener; tests do this).
 	lis, err := net.Listen("tcp", cfg.Std.GRPCAddr)
 	if err != nil {
-		_ = closeBackendQuiet(cfg.CloseBackend)
+		_ = closeBackendQuiet(closeOwned)
 		return fmt.Errorf("listen %s: %w", cfg.Std.GRPCAddr, err)
 	}
 
-	c, err := cluster.Open(cluster.Config{
-		NodeID:   cfg.Std.NodeID,
-		Backend:  cfg.Backend,
-		BindAddr: cfg.Std.BindAddr,
-		GRPCAddr: lis.Addr().String(),
-		Seeds:    cfg.Std.Seeds,
-	})
+	// Build ONE cluster.Config from Std plus whichever backend mode is set.
+	// ReplicationFactor is threaded in BOTH modes (the fix: single-backend
+	// Run previously omitted it, pinning the legacy path to the cluster
+	// default). UnitCount is carried only in multi-backend mode; legacy mode
+	// leaves it zero (validateBackendMode requires that).
+	clusterCfg := cluster.Config{
+		NodeID:            cfg.Std.NodeID,
+		BindAddr:          cfg.Std.BindAddr,
+		GRPCAddr:          lis.Addr().String(),
+		Seeds:             cfg.Std.Seeds,
+		ReplicationFactor: cfg.Std.ReplicationFactor,
+	}
+	if hasFactory {
+		clusterCfg.BackendFactory = cfg.BackendFactory
+		clusterCfg.UnitCount = cfg.Std.UnitCount
+	} else {
+		clusterCfg.Backend = cfg.Backend
+	}
+
+	c, err := cluster.Open(clusterCfg)
 	if err != nil {
 		_ = lis.Close()
-		_ = closeBackendQuiet(cfg.CloseBackend)
+		_ = closeBackendQuiet(closeOwned)
 		return fmt.Errorf("open cluster: %w", err)
 	}
 
@@ -202,7 +293,7 @@ func Run(cfg RunConfig) error {
 		// Serve returned before any signal: the listener died or grpc
 		// hit a fatal error. Treat it as a startup/runtime failure.
 		_ = c.Close()
-		_ = closeBackendQuiet(cfg.CloseBackend)
+		_ = closeBackendQuiet(closeOwned)
 		if err != nil {
 			return fmt.Errorf("grpc serve: %w", err)
 		}
@@ -219,8 +310,8 @@ func Run(cfg RunConfig) error {
 	if err := c.Close(); err != nil {
 		logger.Printf("shaled: cluster close: %v", err)
 	}
-	if cfg.CloseBackend != nil {
-		if err := cfg.CloseBackend(); err != nil {
+	if closeOwned != nil {
+		if err := closeOwned(); err != nil {
 			logger.Printf("shaled: backend close: %v", err)
 		}
 	}
@@ -256,6 +347,21 @@ func EnvOr(key, fallback string) string {
 func envOr(key, fallback string) string {
 	if v, ok := os.LookupEnv(key); ok && v != "" {
 		return v
+	}
+	return fallback
+}
+
+// envOrInt returns the env-var value parsed as an int if set + non-empty
+// + parseable, else fallback. A non-empty but unparseable value falls back
+// silently to fallback; the flag layer re-surfaces an explicit bad
+// --flag=value at parse time, and StdConfig.Validate re-validates the final
+// value (e.g. the --unit-count power-of-two check), so a bad env value is
+// caught downstream rather than panicking here.
+func envOrInt(key string, fallback int) int {
+	if v, ok := os.LookupEnv(key); ok && v != "" {
+		if n, err := strconv.Atoi(v); err == nil {
+			return n
+		}
 	}
 	return fallback
 }
