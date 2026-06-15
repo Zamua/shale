@@ -256,13 +256,19 @@ func (c *Cluster) replicationFactor() int {
 // replicas are transient + don't count toward the success or failure
 // budget per docs/SPEC.md "Fan-out + ack accounting".
 //
-// Each dispatch inherits a context.WithTimeout(WriteTimeout) deadline
-// so a hung peer (blackhole, half-open TCP, server stuck before
-// returning) cancels at deadline rather than blocking the call (and
-// the surplus drainer goroutine) forever. Without this, the
-// accounting goroutine never finalizes its sync.WaitGroup, the result
-// channel never closes, and every Put against a hung peer
-// permanently leaks two goroutines.
+// Retry-on-transient (symmetric with the multi-backend Phase 2d
+// handoff retry): when a single fan-out pass falls short of W ONLY
+// because replica legs came back transient (a still-open StateReceiving
+// migration-guard window, e.g. reopened by a late SWIM gossip join
+// mid-write) with ZERO real failures, the whole fan-out is RE-RUN after
+// a jittered backoff, bounded by WriteTimeout, rather than returning
+// Unavailable immediately. The stamp is computed ONCE and the same
+// envelope is reused across attempts, so a leg that already acked
+// re-applies an equal-stamped envelope that apply-if-newer no-ops; the
+// retry only buys wall-clock to collect W acks, it cannot double-apply
+// or lose data. A REAL failure (a down peer that exhausted the failure
+// budget) fast-fails unretried via classifyWriteAttempt. See
+// docs/SPEC.md "Fan-out + ack accounting -> Retry-on-transient".
 func (c *Cluster) putReplicated(key, value []byte) error {
 	replicas := c.ring.LocateKeyN(c.shardKey(key), c.replicationFactor())
 	if len(replicas) == 0 {
@@ -278,34 +284,45 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 	// after this point. So an inner defensive copy here would be pure
 	// waste (a second O(len) copy + alloc per Put). Pass value directly.
 	envBytes := Encode(Envelope{Stamp: stamp, Payload: value})
+	return c.retryWriteThroughHandoff(func(attemptCtx context.Context) writeAttempt {
+		return c.putReplicatedAttempt(attemptCtx, key, envBytes, replicas)
+	})
+}
+
+// putReplicatedAttempt is ONE fan-out pass of a single-backend
+// replicated write. It fans the pre-stamped envelope out to the R
+// replicas and reports a structured writeAttempt the retry wrapper
+// classifies (acks-met vs purely-transient shortfall vs hard failure).
+// It carries no retry policy of its own.
+//
+// The fan-out runs under the attemptCtx the wrapper supplies (deadline
+// = the WriteTimeout wall clock shared across the whole retry
+// sequence), so a hung peer cancels at the deadline rather than
+// blocking the call (and the surplus drainer goroutine) forever.
+// Without that, the accounting goroutine never finalizes its
+// sync.WaitGroup, the result channel never closes, and every Put
+// against a hung peer permanently leaks two goroutines. Each attempt
+// spawns its own background drainer so the surplus replicas drain (and
+// the fan-out goroutines exit) even on a passing attempt.
+func (c *Cluster) putReplicatedAttempt(ctx context.Context, key, envBytes []byte, replicas []ring.Member) writeAttempt {
 	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))
 
-	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
-	acks, errs, resultsCh := fanout(fanoutCtx, replicas, w,
-		func(ctx context.Context, replica ring.Member) ([]byte, error) {
-			return nil, c.dispatchReplicaPut(ctx, replica, key, envBytes)
+	acks, errs, resultsCh := fanout(ctx, replicas, w,
+		func(opCtx context.Context, replica ring.Member) ([]byte, error) {
+			return nil, c.dispatchReplicaPut(opCtx, replica, key, envBytes)
 		})
 
 	// Drain surplus replicas in the background so the WaitGroup
-	// finalizes + no goroutine leaks. The drainer also cancels the
-	// fanout context once every replica reports (success, error, or
-	// deadline) so any in-flight gRPC call that survived past the
-	// decision point gets torn down rather than leaking.
+	// finalizes + no goroutine leaks. The attemptCtx's deadline (owned
+	// by the retry wrapper) tears down any in-flight gRPC call that
+	// survived past the decision point.
 	go func() {
-		defer cancelFanout()
-		// Drain the channel so the fanout goroutines can exit
-		// cleanly; we have already collected the acks we need.
 		//nolint:revive // empty-block: idiomatic channel drain.
 		for range resultsCh {
 		}
 	}()
 
-	if acks < w {
-		return status.Errorf(codes.Unavailable,
-			"shale: write needed %d acks, got %d (%d failures: %v)",
-			w, acks, len(errs), firstErr(errs))
-	}
-	return nil
+	return classifyWriteAttempt(acks, w, errs)
 }
 
 // dispatchReplicaPut routes one replica's write to either the local
