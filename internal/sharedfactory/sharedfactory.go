@@ -68,15 +68,25 @@ var ErrFenced = errors.New("sharedfactory: writer fenced; unit lease moved to a 
 // children are populated.
 type Backing struct {
 	mu     sync.Mutex
-	stores map[storageunit.GenUnit]*memory.Memory // shared durable bytes per unit
+	stores map[storageunit.GenUnit]*memory.Memory // shared durable bytes per unit (R=1)
 	epochs map[storageunit.GenUnit]storageunit.Epoch
+
+	// R>1 (v0.8 Phase 2b): per-replica durable identity. A unit's R replicas
+	// are INDEPENDENT databases, so they cannot share the R=1 GenUnit-keyed
+	// store above. Keyed by ReplicaUnit{GenUnit, Replica}: replica 0 and
+	// replica 1 of one unit are separate stores that survive each other, which
+	// is what makes a single-replica node loss recoverable from the other copy.
+	replicaStores map[storageunit.ReplicaUnit]*memory.Memory
+	replicaEpochs map[storageunit.ReplicaUnit]storageunit.Epoch
 }
 
 // NewBacking returns an empty shared backing (no units written yet).
 func NewBacking() *Backing {
 	return &Backing{
-		stores: make(map[storageunit.GenUnit]*memory.Memory),
-		epochs: make(map[storageunit.GenUnit]storageunit.Epoch),
+		stores:        make(map[storageunit.GenUnit]*memory.Memory),
+		epochs:        make(map[storageunit.GenUnit]storageunit.Epoch),
+		replicaStores: make(map[storageunit.ReplicaUnit]*memory.Memory),
+		replicaEpochs: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 	}
 }
 
@@ -131,11 +141,17 @@ func (b *Backing) UnitStore(gu storageunit.GenUnit) (backend.Backend, bool) {
 // gone, which is precisely the failure the gate must detect.
 func (b *Backing) WipeUnit(gu storageunit.GenUnit) {
 	b.mu.Lock()
-	defer b.mu.Unlock()
 	s, ok := b.stores[gu]
+	b.mu.Unlock()
 	if !ok {
 		return
 	}
+	wipeStore(s)
+}
+
+// wipeStore deletes every key from s IN PLACE (so any handle holding a pointer
+// to s sees the data vanish). Shared by WipeUnit + WipeReplica.
+func wipeStore(s *memory.Memory) {
 	it, err := s.ScanPrefix(nil)
 	if err != nil {
 		return
@@ -181,23 +197,113 @@ func (b *Backing) acquire(gu storageunit.GenUnit, intended storageunit.Epoch) (*
 	return b.storeFor(gu), opened
 }
 
+// replicaStoreFor returns the shared *memory.Memory for replica ru, creating
+// it on first touch. Caller must hold b.mu. The R>1 analogue of storeFor.
+func (b *Backing) replicaStoreFor(ru storageunit.ReplicaUnit) *memory.Memory {
+	s, ok := b.replicaStores[ru]
+	if !ok {
+		s = memory.New()
+		b.replicaStores[ru] = s
+	}
+	return s
+}
+
+// ReplicaStore returns the shared backend for replica ru (ok=false if never
+// opened). Tests use it to assert a write landed on a SPECIFIC replica copy
+// and that the R copies are independent.
+func (b *Backing) ReplicaStore(ru storageunit.ReplicaUnit) (backend.Backend, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := b.replicaStores[ru]
+	return s, ok
+}
+
+// WipeReplica empties replica ru's shared bytes IN PLACE (same in-place
+// deletion semantics as WipeUnit) so a test can simulate the loss of one
+// replica copy and prove the gate catches it. Test-only; no production path.
+func (b *Backing) WipeReplica(ru storageunit.ReplicaUnit) {
+	b.mu.Lock()
+	s, ok := b.replicaStores[ru]
+	b.mu.Unlock()
+	if !ok {
+		return
+	}
+	wipeStore(s)
+}
+
+// acquireReplica is the R>1 analogue of acquire: it opens replica ru against
+// the per-replica durable store + epoch, fencing at max(intended, durable+1).
+func (b *Backing) acquireReplica(ru storageunit.ReplicaUnit, intended storageunit.Epoch) (*memory.Memory, storageunit.Epoch) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	opened := intended
+	if floor := b.replicaEpochs[ru] + 1; floor > opened {
+		opened = floor
+	}
+	b.replicaEpochs[ru] = opened
+	return b.replicaStoreFor(ru), opened
+}
+
+// replicaDurableEpoch reports replica ru's durable writer-epoch (0 if never
+// opened). The per-replica analogue of durableEpoch.
+func (b *Backing) replicaDurableEpoch(ru storageunit.ReplicaUnit) storageunit.Epoch {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.replicaEpochs[ru]
+}
+
 // Handle is a per-node factory handle over a shared Backing. It implements
-// storageunit.BackendFactory. Several handles (one per node) share one
-// Backing, which is what makes a handoff copy-free + fence-correct.
+// storageunit.BackendFactory and storageunit.ReplicaBackendFactory. Several
+// handles (one per node) share one Backing, which is what makes a handoff
+// copy-free + fence-correct, and (at R>1) what makes a unit's R independent
+// replicas reachable from the nodes that hold them.
 type Handle struct {
 	backing *Backing
 
-	mu   sync.Mutex
-	open map[storageunit.GenUnit]storageunit.Epoch // units THIS handle has open + at what epoch
+	mu          sync.Mutex
+	open        map[storageunit.GenUnit]storageunit.Epoch     // units THIS handle has open + at what epoch (R=1)
+	openReplica map[storageunit.ReplicaUnit]storageunit.Epoch // replicas THIS handle has open + at what epoch (R>1)
 }
 
 // Handle returns a fresh per-node handle over this backing. Each node in a
 // test gets its own handle; they all share b.
 func (b *Backing) Handle() *Handle {
 	return &Handle{
-		backing: b,
-		open:    make(map[storageunit.GenUnit]storageunit.Epoch),
+		backing:     b,
+		open:        make(map[storageunit.GenUnit]storageunit.Epoch),
+		openReplica: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 	}
+}
+
+// OpenReplicaUnit opens replica position ru.Replica of unit ru.Unit against
+// the per-replica shared backing, fencing any prior writer of the SAME
+// replica position. It returns a fencedReplicaBackend over the SHARED
+// per-replica bytes so a node re-acquiring this replica position sees its
+// prior writes, and so its writes start failing the instant a higher-epoch
+// owner of the same position acquires it. Distinct replica positions are
+// independent stores: opening replica 1 never touches replica 0.
+func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, error) {
+	h.mu.Lock()
+	if cur, held := h.openReplica[ru]; held && epoch <= cur {
+		h.mu.Unlock()
+		return nil, fmt.Errorf("sharedfactory: replica %s already open on this handle at epoch %d, refusing open at %d", ru, cur, epoch)
+	}
+	h.mu.Unlock()
+
+	store, opened := h.backing.acquireReplica(ru, epoch)
+	h.mu.Lock()
+	h.openReplica[ru] = opened
+	h.mu.Unlock()
+	return &fencedReplicaBackend{backing: h.backing, unit: ru, epoch: opened, store: store}, nil
+}
+
+// CloseReplicaUnit releases replica ru from THIS handle. Idempotent; the
+// shared per-replica bytes are retained in the Backing.
+func (h *Handle) CloseReplicaUnit(ru storageunit.ReplicaUnit) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	delete(h.openReplica, ru)
+	return nil
 }
 
 // OpenUnit acquires unit u against the shared backing, fencing any prior
@@ -343,3 +449,47 @@ func (f *fencedBackend) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 // handle's mount (the durable-bytes-survive-unmount property). CloseUnit on
 // the Handle is the real release.
 func (f *fencedBackend) Close() error { return nil }
+
+// fencedReplicaBackend is fencedBackend keyed by a per-replica durable epoch
+// (R>1, v0.8 Phase 2b). Reads pass through; writes fail once a higher-epoch
+// owner of the SAME replica position has acquired it. Independent of the R=1
+// GenUnit-keyed fence.
+type fencedReplicaBackend struct {
+	backing *Backing
+	unit    storageunit.ReplicaUnit
+	epoch   storageunit.Epoch
+	store   *memory.Memory
+}
+
+func (f *fencedReplicaBackend) fenced() bool {
+	return f.backing.replicaDurableEpoch(f.unit) > f.epoch
+}
+
+func (f *fencedReplicaBackend) Put(key, value []byte) error {
+	if f.fenced() {
+		return ErrFenced
+	}
+	return f.store.Put(key, value)
+}
+
+func (f *fencedReplicaBackend) Delete(key []byte) error {
+	if f.fenced() {
+		return ErrFenced
+	}
+	return f.store.Delete(key)
+}
+
+func (f *fencedReplicaBackend) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
+	if f.fenced() {
+		return nil, ErrFenced
+	}
+	return f.store.Begin(level)
+}
+
+func (f *fencedReplicaBackend) Get(key []byte) ([]byte, error) { return f.store.Get(key) }
+
+func (f *fencedReplicaBackend) ScanPrefix(prefix []byte) (backend.Iterator, error) {
+	return f.store.ScanPrefix(prefix)
+}
+
+func (f *fencedReplicaBackend) Close() error { return nil }

@@ -1,0 +1,518 @@
+// Replicated multi-backend node (v0.8 Phase 2b): R>1 per-UNIT replication
+// under a STATIC topology.
+//
+// Phase 2 (multibackend.go) is single-replica (R=1): each unit has ONE
+// durable database and ONE owner. Phase 2b extends it to R>1: each unit has R
+// INDEPENDENT durable databases (one per replica position), mounted on R
+// different nodes (the unit's replica set = LocateKeyN over the unit id). A
+// write fans out to the unit's R replica nodes and a read applies the
+// configured consistency across them, reusing the LEGACY R>1 envelope /
+// apply-if-newer / quorum machinery (cas.go, apply_if_newer.go,
+// apply_batch.go, replicate.go) re-keyed from per-NODE to per-UNIT.
+//
+// THE ONLY NEW CODE is the per-unit routing + the multi-backend dispatchers
+// that apply against the key's MOUNTED unit backend instead of the single
+// c.backend. The legacy per-node R>1 path (keyed to ring.LocateKeyN over the
+// raw shard key) is UNTOUCHED; the R=1 multi-backend paths (Phase 2/3/4) are
+// untouched outside their own branches.
+//
+// THE INVARIANT, PER UNIT (identical structure to the legacy R>1 proof):
+//
+//	NO ACKED WRITE MAY BE LOST.
+//
+//   - FAN-OUT ACK ACCOUNTING: a write is acked only after W of the unit's R
+//     replicas durably applied it (requiredWriteAcks); a replica mid-acquire
+//     returns the transient errUnitAcquiring, counting toward neither budget.
+//   - NEVER-CLOBBER APPLY: every replica applies APPLY-IF-NEWER (txApplyIfNewer),
+//     so a reordered older write or a stale read-repair self-resolves to a no-op.
+//   - INDEPENDENCE: the R replicas are independent durable databases, so the
+//     loss of one node leaves W-1+ complete copies; an acked write reached W
+//     replicas, so a quorum read still finds it.
+//
+// SCOPE: STATIC unit -> replica-set topology fixed at Open. Membership-change
+// lease handoff at R>1 and resharding at R>1 are OUT of scope (later phases),
+// exactly as Phase 2 bounded its static topology before Phase 3 added handoff.
+
+package cluster
+
+import (
+	"context"
+	"errors"
+	"time"
+
+	"github.com/Zamua/shale/pkg/backend"
+	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/storageunit"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+)
+
+// multiReplicated reports whether this cluster runs the R>1 (replicated)
+// multi-backend paths: multi-backend mode, R>1, and a populated ring. It is
+// the multi analogue of casReplicated(): when true, Put / Get / Delete /
+// CommitCASApply route to the per-unit replicated paths below; when false
+// (multi + R=1) the Phase 2/3/4 single-mount paths run unchanged. A nil /
+// empty ring (single-node) collapses to the single-mount R=1 path, which is
+// correct: with one node there is one replica.
+func (c *Cluster) multiReplicated() bool {
+	return c.multi && c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty()
+}
+
+// unitReplicas returns the ordered replica set (primary + R-1 ring
+// successors) for the generation-qualified unit gu: ring.LocateKeyN over
+// genUnitBytes(gu), the SAME successor-chain machinery the legacy per-node
+// R>1 path uses, but hashing the unit id instead of the raw key's shard key.
+// Co-location holds by construction: every key in a {tag} set hashes to one
+// unit, so the set's whole replica placement is identical. With a nil / empty
+// ring it returns the local node (single-node: this node is the one replica).
+func (c *Cluster) unitReplicas(gu storageunit.GenUnit) []ring.Member {
+	if c.ring == nil || c.ring.Empty() {
+		return []ring.Member{{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}}
+	}
+	return c.ring.LocateKeyN(genUnitBytes(gu), c.replicationFactor())
+}
+
+// replicasForKey resolves a key to its unit's replica set. The unit is
+// generation-aware (genUnitForKey), so every key in a co-located set shares
+// one unit and therefore one replica set.
+func (c *Cluster) replicasForKey(key []byte) []ring.Member {
+	return c.unitReplicas(c.genUnitForKey(key))
+}
+
+// initReplicatedFactory wires the R>1 capability view of the factory. Called
+// from initMultiBackend. At R=1 (or legacy mode) it is a no-op: replicaFactory
+// stays nil and the single-mount paths run. validateBackendMode already
+// guaranteed the factory implements ReplicaBackendFactory when R>1, so the
+// assertion here cannot fail in a validated cluster.
+func (c *Cluster) initReplicatedFactory() {
+	if !c.multi || c.replicationFactor() <= 1 {
+		return
+	}
+	if rf, ok := c.factory.(storageunit.ReplicaBackendFactory); ok {
+		c.replicaFactory = rf
+		c.replicaPos = make(map[storageunit.GenUnit]uint8)
+	}
+}
+
+// desiredReplicaUnits returns the units this node should have mounted at R>1,
+// each paired with the replica POSITION this node holds it at. A unit gu is
+// desired iff self appears anywhere in unitReplicas(gu); the position is
+// self's index in that set. Static-topology only (the cluster's generation is
+// fixed at Open in Phase 2b), so this is computed once at mount time. It is
+// the R>1 analogue of desiredGenUnits, generation-aware via genSnapshot.
+func (c *Cluster) desiredReplicaUnits() []storageunit.ReplicaUnit {
+	gs := c.genSnapshot()
+	self := c.cfg.NodeID
+	out := make([]storageunit.ReplicaUnit, 0)
+	for _, u := range gs.count.IDs() {
+		gu := storageunit.NewGenUnit(gs.gen, u)
+		for pos, m := range c.unitReplicas(gu) {
+			if m.ID == self {
+				out = append(out, storageunit.NewReplicaUnit(gu, uint8(pos)))
+				break
+			}
+		}
+	}
+	return out
+}
+
+// mountReplicaUnits opens every unit this node replicates at its replica
+// position into the mount map, via the per-replica factory (independent
+// durable databases). It is the R>1 analogue of initMultiBackend's mount
+// loop. On any open error it rolls back what it already mounted so Open fails
+// cleanly. Caller (initMultiBackend) has already wired replicaFactory.
+func (c *Cluster) mountReplicaUnits() error {
+	for _, ru := range c.desiredReplicaUnits() {
+		b, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
+		if err != nil {
+			_ = c.closeMountedUnits()
+			return err
+		}
+		c.mountMu.Lock()
+		c.mountMap[ru.Unit] = b
+		c.replicaPos[ru.Unit] = ru.Replica
+		c.mountMu.Unlock()
+	}
+	return nil
+}
+
+// applyEnvelopeIfNewerToUnit is the multi-backend analogue of
+// applyEnvelopeIfNewer: it applies an incoming LWW envelope APPLY-IF-NEWER
+// against the key's MOUNTED unit backend (resolved under the write-pause via
+// localWriteBackendForKey) instead of the single c.backend. The never-clobber
+// compare (txApplyIfNewer) runs in one transaction on that unit, under
+// c.applyMu, so two concurrent applies on the same key cannot race. ok=false
+// from the resolve (owner-but-unmounted, the static-topology window is only
+// the Open mount, so in practice always mounted here) yields the retryable
+// acquiring-window error the fan-out tolerates.
+func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error {
+	if c.notReady() {
+		return backend.ErrClosed
+	}
+	incoming, err := Decode(incomingEnvBytes)
+	if err != nil {
+		return err
+	}
+
+	b, gu, unlock, ok := c.localWriteBackendForKey(key)
+	defer unlock()
+	if !ok {
+		return errUnitAcquiring("Put")
+	}
+
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+
+	tx, err := b.Begin(backend.SnapshotIsolation)
+	if err != nil {
+		c.evictStaleMount(gu, b)
+		return errUnitAcquiring("Put")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+
+	apply, aerr := txApplyIfNewer(tx, key, incoming.Stamp)
+	if aerr != nil {
+		return aerr
+	}
+	if apply {
+		if err := tx.Put(key, incomingEnvBytes); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// reconcileReplicaUnits is the R>1 (v0.8 Phase 2b) anti-entropy mount: it
+// makes this node's mounted unit set match the units it REPLICATES under the
+// current ring, each opened at its replica POSITION (an independent durable
+// database). It runs on the INITIAL multi-node convergence (the ring fills
+// with peers after a join, changing which units this node replicates and at
+// what position). The topology is otherwise STATIC: there is no byte handoff
+// at R>1 (the replicas are independent), so a node simply mounts the replica
+// copies it should hold and releases ones it should not.
+//
+// A unit whose desired replica POSITION changed (e.g. this node went from
+// successor to primary as a peer left) is released and re-acquired at the new
+// position, so it mounts the correct per-replica database. Idempotent +
+// self-healing. Caller MUST hold reconcileMu; mount mutations take mountMu.
+func (c *Cluster) reconcileReplicaUnits() {
+	desired := c.desiredReplicaUnits()
+	desiredPos := make(map[storageunit.GenUnit]uint8, len(desired))
+	for _, ru := range desired {
+		desiredPos[ru.Unit] = ru.Replica
+	}
+
+	c.mountMu.RLock()
+	mountedPos := make(map[storageunit.GenUnit]uint8, len(c.mountMap))
+	for gu := range c.mountMap {
+		mountedPos[gu] = c.replicaPos[gu]
+	}
+	c.mountMu.RUnlock()
+
+	// RELEASE: units no longer replicated here, OR replicated at a DIFFERENT
+	// position than currently mounted (re-acquired below at the new position).
+	for gu, pos := range mountedPos {
+		want, ok := desiredPos[gu]
+		if !ok || want != pos {
+			c.releaseReplicaUnit(gu, pos)
+		}
+	}
+
+	// ACQUIRE: desired units not currently mounted at the desired position.
+	for _, ru := range desired {
+		if cur, ok := mountedPos[ru.Unit]; ok && cur == ru.Replica {
+			continue
+		}
+		c.acquireReplicaUnit(ru)
+	}
+}
+
+// acquireReplicaUnit mounts replica position ru.Replica of unit ru.Unit via
+// the per-replica factory, opening at a strictly higher epoch than this node's
+// current durable lease for that replica position (the fence). On error the
+// replica is left unmounted (a routed op gets the retryable acquiring-window
+// error and the next reconcile retries). Caller MUST hold reconcileMu.
+func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
+	epoch := acquireBaseEpoch
+	b, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
+	if err != nil {
+		return
+	}
+	c.mountMu.Lock()
+	if c.closed.Load() {
+		c.mountMu.Unlock()
+		_ = c.replicaFactory.CloseReplicaUnit(ru)
+		return
+	}
+	c.mountMap[ru.Unit] = b
+	c.replicaPos[ru.Unit] = ru.Replica
+	c.mountMu.Unlock()
+}
+
+// releaseReplicaUnit unmounts replica position pos of unit gu via the per-
+// replica factory. The mount-map entry is removed BEFORE the close so a routed
+// op stops resolving the local backend immediately. Caller MUST hold
+// reconcileMu.
+func (c *Cluster) releaseReplicaUnit(gu storageunit.GenUnit, pos uint8) {
+	c.mountMu.Lock()
+	delete(c.mountMap, gu)
+	delete(c.replicaPos, gu)
+	c.mountMu.Unlock()
+	_ = c.replicaFactory.CloseReplicaUnit(storageunit.NewReplicaUnit(gu, pos))
+}
+
+// applyBatchToUnit is the multi-backend analogue of ApplyBatchLocal's apply
+// loop: it applies a CAS write-set APPLY-IF-NEWER against the batch's MOUNTED
+// unit in ONE transaction, under c.applyMu. Every key in a CAS commit
+// co-shards with the pin key (the cross-shard guard guarantees it), so one
+// unit covers the whole batch; it is resolved from the first key. An empty
+// batch is a no-op. An unmounted unit (static-topology window) returns the
+// retryable acquiring-window error the owner's fan-out tolerates.
+func (c *Cluster) applyBatchToUnit(writes []EnvelopeWrite) error {
+	if len(writes) == 0 {
+		return nil
+	}
+	b, gu, unlock, ok := c.localWriteBackendForKey(writes[0].Key)
+	defer unlock()
+	if !ok {
+		return errUnitAcquiring("ApplyBatch")
+	}
+
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+
+	tx, err := b.Begin(backend.SnapshotIsolation)
+	if err != nil {
+		c.evictStaleMount(gu, b)
+		return errUnitAcquiring("ApplyBatch")
+	}
+	committed := false
+	defer func() {
+		if !committed {
+			_ = tx.Rollback()
+		}
+	}()
+	for _, w := range writes {
+		incoming, derr := Decode(w.Envelope)
+		if derr != nil {
+			return derr
+		}
+		apply, aerr := txApplyIfNewer(tx, w.Key, incoming.Stamp)
+		if aerr != nil {
+			return aerr
+		}
+		if !apply {
+			continue
+		}
+		if err := tx.Put(w.Key, w.Envelope); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	committed = true
+	return nil
+}
+
+// putReplicatedUnit stamps + envelopes + fans a write out to the R replica
+// nodes of key's UNIT, waiting for W acks per WriteConsistency. It mirrors
+// putReplicated verbatim except the replica set is the unit's
+// (replicasForKey) rather than ring.LocateKeyN over the raw shard key, and
+// the local-self apply lands in the mounted unit backend (via the multi
+// dispatcher). value == nil is the Delete / tombstone shape.
+func (c *Cluster) putReplicatedUnit(key, value []byte) error {
+	replicas := c.replicasForKey(key)
+	if len(replicas) == 0 {
+		return status.Error(codes.Unavailable, "shale: no replicas available for key")
+	}
+	stamp := Stamp{
+		TimestampNanos: uint64(time.Now().UnixNano()),
+		NodeID:         c.cfg.NodeID,
+	}
+	envBytes := Encode(Envelope{Stamp: stamp, Payload: value})
+	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))
+
+	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
+	acks, errs, resultsCh := fanout(fanoutCtx, replicas, w,
+		func(ctx context.Context, replica ring.Member) ([]byte, error) {
+			return nil, c.dispatchReplicaPutUnit(ctx, replica, key, envBytes)
+		})
+
+	go func() {
+		defer cancelFanout()
+		//nolint:revive // empty-block: idiomatic channel drain.
+		for range resultsCh {
+		}
+	}()
+
+	if acks < w {
+		return status.Errorf(codes.Unavailable,
+			"shale: write needed %d acks, got %d (%d failures: %v)",
+			w, acks, len(errs), firstErr(errs))
+	}
+	return nil
+}
+
+// dispatchReplicaPutUnit is the multi-backend analogue of dispatchReplicaPut:
+// the local-self branch applies the envelope APPLY-IF-NEWER into the key's
+// MOUNTED unit (applyEnvelopeIfNewerToUnit) instead of c.applyEnvelopeIfNewer;
+// the remote branch dispatches PutForwarded to the replica node, whose RPC
+// handler lands in LocalReplicaPut (multi R>1 branch). A frozen / acquiring
+// replica returns the transient code the fan-out tolerates.
+func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Member, key, envBytes []byte) error {
+	if replica.ID == c.cfg.NodeID {
+		return c.applyEnvelopeIfNewerToUnit(key, envBytes)
+	}
+	cli, err := c.clientFor(replica.Addr)
+	if err != nil {
+		return err
+	}
+	return cli.PutForwarded(ctx, key, envBytes)
+}
+
+// getReplicatedUnit fetches the LWW winner across N of the unit's R replica
+// nodes per ReadConsistency, read-repairing laggards. It mirrors getReplicated
+// verbatim except the replica set is the unit's (replicasForKey) and the
+// local-self read serves from the mounted unit backend (via the multi
+// dispatcher). Read-repair rides dispatchReplicaPutUnit, so a stale repair is
+// a never-clobber no-op against the mounted unit.
+func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
+	allReplicas := c.replicasForKey(key)
+	if len(allReplicas) == 0 {
+		return nil, status.Error(codes.Unavailable, "shale: no replicas available for key")
+	}
+	rc := c.cfg.ReadConsistency
+	n := min(requiredReadReplicas(rc, len(allReplicas)), len(allReplicas))
+	queried := allReplicas
+
+	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
+	_, _, resultsCh := fanout(fanoutCtx, queried, n,
+		func(ctx context.Context, replica ring.Member) ([]byte, error) {
+			return c.dispatchReplicaGetUnit(ctx, replica, key)
+		})
+
+	gathered := make([]collected, 0, len(queried))
+	var nonTransientErr error
+	usable := 0
+
+	for res := range resultsCh {
+		if res.Err != nil {
+			if isTransientReplicaErr(res.Err) {
+				continue
+			}
+			if errors.Is(res.Err, backend.ErrNotFound) {
+				if usable < n {
+					gathered = append(gathered, collected{member: res.Member, env: Envelope{}, hadValue: false})
+					usable++
+				}
+				continue
+			}
+			if nonTransientErr == nil {
+				nonTransientErr = res.Err
+			}
+			continue
+		}
+		env, err := Decode(res.Value)
+		if err != nil {
+			if nonTransientErr == nil {
+				nonTransientErr = err
+			}
+			continue
+		}
+		if usable < n {
+			gathered = append(gathered, collected{member: res.Member, env: env, hadValue: true})
+			usable++
+		} else if rc != ReadNearest {
+			gathered = append(gathered, collected{member: res.Member, env: env, hadValue: true})
+		}
+	}
+	cancelFanout()
+
+	if len(gathered) == 0 {
+		if nonTransientErr != nil {
+			return nil, nonTransientErr
+		}
+		return nil, backend.ErrNotFound
+	}
+
+	winner := gathered[0]
+	for _, g := range gathered[1:] {
+		if g.hadValue && (!winner.hadValue || g.env.Stamp.Greater(winner.env.Stamp)) {
+			winner = g
+		}
+	}
+
+	if rc != ReadNearest && winner.hadValue {
+		c.scheduleReadRepairUnit(key, winner.env, gathered)
+	}
+
+	if !winner.hadValue {
+		return nil, backend.ErrNotFound
+	}
+	if len(winner.env.Payload) == 0 {
+		return nil, backend.ErrNotFound
+	}
+	return winner.env.Payload, nil
+}
+
+// dispatchReplicaGetUnit is the multi-backend analogue of dispatchReplicaGet:
+// the local-self branch serves from the key's MOUNTED unit (localBackendForKey)
+// instead of c.backend; the remote branch forwards to the replica node, whose
+// LocalGet serves from its mounted unit. An owner-but-unmounted replica
+// returns the transient acquiring-window error the read fan-out skips.
+func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Member, key []byte) ([]byte, error) {
+	if replica.ID == c.cfg.NodeID {
+		b, ok := c.localBackendForKey(key)
+		if !ok {
+			return nil, errUnitAcquiring("Get")
+		}
+		return b.Get(key)
+	}
+	cli, err := c.clientFor(replica.Addr)
+	if err != nil {
+		return nil, err
+	}
+	v, found, err := cli.GetForwarded(ctx, key)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, backend.ErrNotFound
+	}
+	return v, nil
+}
+
+// scheduleReadRepairUnit is the multi-backend analogue of scheduleReadRepair:
+// it pushes the winning envelope to laggers via the unit dispatcher (so the
+// repair applies apply-if-newer into the mounted unit). Same lifecycle
+// (repairCtx / repairWG) so Close drains in-flight repairs.
+func (c *Cluster) scheduleReadRepairUnit(key []byte, winnerEnv Envelope, gathered []collected) {
+	if c.repairCtx == nil || c.repairCtx.Err() != nil {
+		return
+	}
+	winnerBytes := Encode(winnerEnv)
+	laggers := make([]ring.Member, 0, len(gathered))
+	for _, g := range gathered {
+		if !g.hadValue || winnerEnv.Stamp.Greater(g.env.Stamp) {
+			laggers = append(laggers, g.member)
+		}
+	}
+	if len(laggers) == 0 {
+		return
+	}
+	for _, m := range laggers {
+		c.repairWG.Go(func() {
+			_ = c.dispatchReplicaPutUnit(c.repairCtx, m, key, winnerBytes)
+		})
+	}
+}

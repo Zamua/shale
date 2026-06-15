@@ -58,11 +58,18 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 	if c.notReady() {
 		return backend.ErrClosed
 	}
+	if c.multiReplicated() {
+		// R>1 (replicated multi-backend, v0.8 Phase 2b): apply the CAS write-set
+		// APPLY-IF-NEWER against the batch's MOUNTED unit, in ONE transaction.
+		// The whole batch co-shards (the cross-shard guard guarantees it), so
+		// one unit covers it; resolve it from the first key.
+		return c.applyBatchToUnit(writes)
+	}
 	if c.multi {
-		// ApplyBatch is the R>1 CAS write-set fan-out protocol. Multi-backend
-		// mode is single-replica (R=1) in Phase 2, so no legitimate caller
-		// sends it; refuse cleanly rather than dereference the nil c.backend
-		// below. A registered RPC must fail closed, never panic.
+		// ApplyBatch is the R>1 CAS write-set fan-out protocol. An R=1 multi-
+		// backend cluster never sends it (no fan-out), so refuse cleanly rather
+		// than dereference the nil c.backend below. A registered RPC must fail
+		// closed, never panic.
 		return errors.New("cluster: ApplyBatch unsupported in multi-backend mode (single-replica)")
 	}
 	if rb := c.rebalance.Load(); rb != nil {
@@ -153,7 +160,16 @@ func txApplyIfNewer(tx backend.Transaction, key []byte, incomingStamp Stamp) (bo
 // so a hung peer cancels at the deadline instead of leaking goroutines,
 // the same shape putReplicated uses.
 func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error {
-	allReplicas := c.ring.LocateKeyN(c.shardKey(pinKey), c.replicationFactor())
+	// Re-key the replica set per UNIT in multi-backend mode (v0.8 Phase 2b):
+	// the batch fans out to the pin key's UNIT's R replica nodes (every key in
+	// a CAS commit co-shards with the pin key, so one unit covers the batch),
+	// not the per-node LocateKeyN over the raw shard key the legacy path uses.
+	var allReplicas []ring.Member
+	if c.multiReplicated() {
+		allReplicas = c.replicasForKey(pinKey)
+	} else {
+		allReplicas = c.ring.LocateKeyN(c.shardKey(pinKey), c.replicationFactor())
+	}
 	if len(allReplicas) == 0 {
 		return status.Error(codes.Unavailable, "shale: no replicas available for CAS write-set")
 	}

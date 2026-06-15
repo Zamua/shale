@@ -191,6 +191,17 @@ func (c *Cluster) initMultiBackend() error {
 
 	c.mountMap = make(map[storageunit.GenUnit]backend.Backend)
 
+	// R>1 (replicated multi-backend, v0.8 Phase 2b): mount each owned unit at
+	// its replica POSITION (an independent durable database) via the per-replica
+	// factory, then return. The R=1 single-mount loop below is bypassed; the
+	// replicated write/read paths key off the unit's replica set instead of a
+	// single owner. STATIC topology: the replica set is fixed at Open (no
+	// membership-change handoff at R>1 yet - a later phase).
+	c.initReplicatedFactory()
+	if c.replicaFactory != nil {
+		return c.mountReplicaUnits()
+	}
+
 	for _, gu := range c.desiredGenUnits() {
 		// Cold-start mount at the base epoch. The factory fences against
 		// the unit's durable manifest if one already exists. A later
@@ -219,7 +230,16 @@ func (c *Cluster) closeMountedUnits() error {
 	defer c.mountMu.Unlock()
 	var firstErr error
 	for gu := range c.mountMap {
-		if err := c.factory.CloseUnit(gu); err != nil && firstErr == nil {
+		// At R>1 each unit is an independent durable database mounted at a
+		// replica POSITION, so release the right replica copy via the per-
+		// replica factory; at R=1 (and legacy) release the GenUnit-keyed unit.
+		if c.replicaFactory != nil {
+			ru := storageunit.NewReplicaUnit(gu, c.replicaPos[gu])
+			if err := c.replicaFactory.CloseReplicaUnit(ru); err != nil && firstErr == nil {
+				firstErr = err
+			}
+			delete(c.replicaPos, gu)
+		} else if err := c.factory.CloseUnit(gu); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		delete(c.mountMap, gu)

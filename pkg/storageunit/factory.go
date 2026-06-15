@@ -95,3 +95,33 @@ type BackendFactory interface {
 	// effect; the returned slice is a copy the caller may retain.
 	OpenUnits() []GenUnit
 }
+
+// ReplicaBackendFactory is the R>1 (replicated) extension of BackendFactory:
+// it opens/closes a unit AT A REPLICA POSITION, so the R replicas of one unit
+// are INDEPENDENT durable databases (keyed by ReplicaUnit, not bare GenUnit).
+// A factory advertises R>1 support by implementing this in ADDITION to
+// BackendFactory; the cluster's R=1 multi-backend paths use only the base
+// interface (unchanged), and the R>1 paths type-assert for this capability.
+//
+// Why a capability interface (not a widened BackendFactory): the R=1 factory
+// contract (one durable store per GenUnit, copy-free handoff) is unchanged,
+// and the deployable single-replica factories must not be forced to grow a
+// replica argument they do not use. A factory that does not implement this is
+// simply not usable at R>1, which the cluster validates at Open.
+type ReplicaBackendFactory interface {
+	BackendFactory
+
+	// OpenReplicaUnit opens (mounts) the durable database for replica position
+	// ru.Replica of unit ru.Unit, at the given epoch, returning it ready to
+	// serve. Distinct replica positions of one unit are INDEPENDENT databases:
+	// opening replica 1 does NOT touch replica 0's bytes, so the loss of the
+	// node holding one position leaves the other a complete copy. Epoch
+	// semantics match OpenUnit (open higher to fence a prior writer of the SAME
+	// replica position).
+	OpenReplicaUnit(ru ReplicaUnit, epoch Epoch) (backend.Backend, error)
+
+	// CloseReplicaUnit releases the durable database for replica position
+	// ru.Replica of unit ru.Unit, WITHOUT affecting any other replica or unit.
+	// Idempotent: closing a replica not open is a no-op returning nil.
+	CloseReplicaUnit(ru ReplicaUnit) error
+}

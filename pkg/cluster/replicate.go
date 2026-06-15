@@ -569,6 +569,15 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 		if c.isFrozen() {
 			return errWriteFrozen("Put")
 		}
+		// Multi-backend mode at R>1 (replicated, v0.8 Phase 2b): the incoming
+		// bytes are an LWW envelope; apply them APPLY-IF-NEWER against the
+		// key's mounted unit so a reordered older fan-out or a stale read-
+		// repair self-resolves to a never-clobber no-op. The replica set is
+		// static, so the unit is mounted; an unmounted unit returns the
+		// retryable acquiring-window error the originator's fan-out tolerates.
+		if c.multiReplicated() {
+			return c.applyEnvelopeIfNewerToUnit(key, bytesToWrite)
+		}
 		// Multi-backend mode (R=1): apply against the key's mounted unit,
 		// resolved UNDER the reshard write-pause so a mid-flight cut-over
 		// routes the write to the new gen-(g+1) child, not a retired unit
@@ -654,6 +663,17 @@ func (c *Cluster) LocalReplicaDelete(key []byte) error {
 // acquiring-window error instead of the originator looping on a
 // refresh-ring refusal. See OwnsKey for the full rationale.
 func (c *Cluster) OwnsReplica(key []byte) bool {
+	if c.multiReplicated() {
+		// R>1 multi-backend (v0.8 Phase 2b): a forwarded replica write may land
+		// on ANY of the unit's R replica nodes, not just the primary. Accept if
+		// this node is anywhere in the unit's replica set.
+		for _, m := range c.replicasForKey(key) {
+			if m.ID == c.cfg.NodeID {
+				return true
+			}
+		}
+		return false
+	}
 	if c.multi {
 		_, isLocal := c.unitOwnerOf(key)
 		return isLocal

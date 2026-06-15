@@ -186,6 +186,17 @@ func (c *Cluster) runReconcile() {
 // running concurrently could release those mid-bisect. mountMap mutations
 // inside acquireUnit / releaseUnit take mountMu.
 func (c *Cluster) reconcileUnits() {
+	if c.replicaFactory != nil {
+		// R>1 (replicated multi-backend, v0.8 Phase 2b): the desired set is the
+		// replica-set membership, not single ownership. This runs on the INITIAL
+		// multi-node convergence (each node mounting the units it replicates as
+		// the ring fills with peers); the topology is otherwise STATIC (no
+		// lease handoff at R>1 yet - a later phase). It diffs desired-vs-mounted
+		// the same way, opening each newly-desired unit at its replica POSITION
+		// (an independent durable database) and releasing ones no longer desired.
+		c.reconcileReplicaUnits()
+		return
+	}
 	desired := c.desiredGenUnits()
 	desiredSet := make(map[storageunit.GenUnit]struct{}, len(desired))
 	for _, gu := range desired {

@@ -250,10 +250,15 @@ func validateBackendMode(cfg *Config) (multi bool, err error) {
 	case hasFactory != hasUnitCount:
 		return false, errors.New("cluster: multi-backend mode requires BOTH BackendFactory and UnitCount")
 	case hasFactory && hasUnitCount:
-		// Multi-backend mode. ReplicationFactor must be the single-replica
-		// default (per-unit replication is a later phase).
+		// Multi-backend mode. At R>1 (replicated multi-backend, v0.8 Phase 2b)
+		// the factory MUST be a ReplicaBackendFactory: a unit's R replicas are
+		// independent durable databases keyed by replica position, which the
+		// base BackendFactory cannot open. A single-replica factory at R>1 is a
+		// configuration error caught here, not a runtime nil-deref.
 		if cfg.ReplicationFactor > 1 {
-			return false, fmt.Errorf("cluster: multi-backend mode requires ReplicationFactor 1 (per-unit replication is a later phase), got %d", cfg.ReplicationFactor)
+			if _, ok := cfg.BackendFactory.(storageunit.ReplicaBackendFactory); !ok {
+				return false, fmt.Errorf("cluster: multi-backend mode at ReplicationFactor %d requires a ReplicaBackendFactory (the per-replica independent durable databases R>1 needs)", cfg.ReplicationFactor)
+			}
 		}
 		return true, nil
 	case hasBackend:
@@ -315,6 +320,16 @@ type Cluster struct {
 	genOwner  func(storageunit.GenUnit) (storageunit.NodeID, bool)
 	mountMu   sync.RWMutex
 	mountMap  map[storageunit.GenUnit]backend.Backend
+
+	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
+	// capability view of factory: non-nil iff the factory implements
+	// ReplicaBackendFactory AND R>1. The replicated paths open each owned unit
+	// at its replica POSITION (an independent durable database) through this.
+	// replicaPos records, per mounted unit, the position this node holds it at
+	// so Close releases the right replica copy. Both nil/empty at R=1 and in
+	// legacy mode. mountMu guards replicaPos.
+	replicaFactory storageunit.ReplicaBackendFactory
+	replicaPos     map[storageunit.GenUnit]uint8
 
 	// genState is the generation-aware routing state (v0.8 Phase 4): the
 	// CURRENT generation, the unit count at that generation, the doubled
@@ -1169,6 +1184,13 @@ func (c *Cluster) Put(key, value []byte) error {
 	if len(value) == 0 {
 		return ErrEmptyValue
 	}
+	if c.multiReplicated() {
+		// R>1 (replicated multi-backend, v0.8 Phase 2b): stamp + envelope +
+		// fan out to the unit's R replica nodes, waiting for W acks. The legacy
+		// envelope / fan-out machinery, re-keyed per unit. Static topology, so
+		// no freeze / reshard window applies here.
+		return c.putReplicatedUnit(key, value)
+	}
 	if c.multi {
 		// FREEZE gate (v0.8 multi-node reshard): while a cluster-wide reshard
 		// has this node write-frozen, refuse with the retryable error so the
@@ -1250,6 +1272,11 @@ func (c *Cluster) Put(key, value []byte) error {
 func (c *Cluster) Get(key []byte) ([]byte, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed
+	}
+	if c.multiReplicated() {
+		// R>1 (v0.8 Phase 2b): read N-of-R across the unit's replica nodes per
+		// ReadConsistency, pick the LWW winner, read-repair laggers.
+		return c.getReplicatedUnit(key)
 	}
 	if c.multi {
 		owner, local := c.ownerOf(key)
@@ -1334,6 +1361,11 @@ func (c *Cluster) deleteForwarded(cli *peerClient, key []byte) error {
 func (c *Cluster) Delete(key []byte) error {
 	if c.notReady() {
 		return backend.ErrClosed
+	}
+	if c.multiReplicated() {
+		// R>1 (v0.8 Phase 2b): Delete is a tombstone (empty-payload stamped
+		// envelope) fanned out to the unit's R replica nodes, same path as Put.
+		return c.putReplicatedUnit(key, nil)
 	}
 	if c.multi {
 		// FREEZE gate (v0.8 multi-node reshard): a frozen node refuses Delete
