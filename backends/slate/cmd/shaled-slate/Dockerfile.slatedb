@@ -1,0 +1,89 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.slatedb - containerizes shaled-slate with the SlateDB
+# (object-storage-backed) backend compiled in, so an operator can deploy
+# the multi-backend model (one slatedb per storage unit over a shared
+# bucket) or the single-backend slate node.
+#
+# Build context is the backends/slate MODULE root (this Dockerfile lives at
+# cmd/shaled-slate/ but references ./cmd/shaled-slate from the module root),
+# so the module's own go.mod resolves its deps:
+#
+#   docker build -f cmd/shaled-slate/Dockerfile.slatedb -t shaled-slate:slatedb .
+#
+# (run from backends/slate/). Three stages:
+#   1. uniffi-build:  Rust toolchain -> libslatedb_uniffi.so
+#   2. go-build:      Go toolchain + cgo -> shaled-slate (-tags slatedb)
+#   3. runtime:       distroless/cc:nonroot + the .so + the binary
+#
+# The Rust compile is heavy; this image is built by the operator (colima),
+# NOT as part of the wiring milestone.
+
+# SlateDB tag to clone + build. Keep aligned with the slatedb-go version
+# pinned in backends/slate/go.mod (slatedb.io/slatedb-go v0.13.1).
+ARG SLATEDB_VERSION=v0.13.1
+
+# ---- uniffi-build stage -----------------------------------------------------
+FROM rust:1.91-slim-bookworm AS uniffi-build
+ARG SLATEDB_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates pkg-config libssl-dev cmake \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git clone --depth 1 --branch ${SLATEDB_VERSION} \
+        https://github.com/slatedb/slatedb.git . \
+ && cargo build --release -p slatedb-uniffi \
+ && ls -la /src/target/release/libslatedb_uniffi.so
+
+# ---- go-build stage ---------------------------------------------------------
+FROM golang:1.26-bookworm AS go-build
+ARG SLATEDB_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+
+# The .so must be on the linker path at build time (cgo LDFLAGS:
+# -lslatedb_uniffi) AND on the loader path at runtime (final image).
+COPY --from=uniffi-build /src/target/release/libslatedb_uniffi.so /usr/local/lib/
+
+# Cache module downloads independently of source edits. GOWORK=off so the
+# module's own go.mod is the source of truth for its deps (the repo's
+# go.work is for in-tree development, not release builds).
+ENV GOWORK=off
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+ENV CGO_ENABLED=1 \
+    CGO_LDFLAGS="-L/usr/local/lib" \
+    LD_LIBRARY_PATH=/usr/local/lib
+
+# Build shaled-slate with -tags slatedb so the slatedb code path (single
+# AND multi-backend constructors) is compiled in.
+RUN GOOS=linux GOARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
+        go build -tags slatedb -buildvcs=false -ldflags="-s -w" \
+        -o /out/shaled-slate ./cmd/shaled-slate
+
+# ---- runtime stage ----------------------------------------------------------
+# distroless/cc has glibc + dynamic loader. distroless/static doesn't.
+FROM gcr.io/distroless/cc-debian12:nonroot
+
+COPY --from=uniffi-build /src/target/release/libslatedb_uniffi.so /usr/local/lib/
+COPY --from=go-build /out/shaled-slate /shaled-slate
+
+# memberlist (7946) + gRPC (7947).
+EXPOSE 7946 7947
+
+# LD_LIBRARY_PATH so the dynamic loader finds libslatedb_uniffi.so. The
+# operator supplies cluster + slate + multi-backend config via SHALE_* env:
+# SHALE_NODE_ID, SHALE_BIND_ADDR, SHALE_GRPC_ADDR, SHALE_SEEDS,
+# SHALE_REPLICATION_FACTOR, SHALE_UNIT_COUNT, SHALE_MULTI_BACKEND,
+# SHALE_SLATE_* (bucket, endpoint, region, access-key, secret-key, use-ssl,
+# key-prefix).
+ENV LD_LIBRARY_PATH=/usr/local/lib
+
+USER nonroot:nonroot
+
+ENTRYPOINT ["/shaled-slate"]
