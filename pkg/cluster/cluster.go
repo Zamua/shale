@@ -239,6 +239,31 @@ type Config struct {
 	// code path sets this. See multibackend_overlap.go (the clean-cut branch)
 	// and multibackend_handoff_retry.go (the single-attempt branch).
 	TestingForceCleanCut bool
+
+	// GracefulLeaveDrainTimeout bounds the graceful-leave drain on shutdown
+	// (v0.8 Phase 2e, scale-down). When > 0 AND the cluster runs the
+	// multi-backend overlap path (multiReplicated()), Close() FIRST broadcasts
+	// the memberlist leave and BLOCKS until every position this node owns has
+	// been handed off to its successor (the overlap drain seen from the losing
+	// side, for all positions at once) OR this timeout fires - all BEFORE any
+	// teardown, while the reconcile loop / serving / drainCheck / forward path
+	// are still running. Then Close proceeds with the normal teardown. This
+	// closes the scale-down availability gap: without it, Close tears down the
+	// mounts the instant the leave is broadcast, so the leaving node's
+	// positions are unserved from that instant until the survivors finish their
+	// (slow) Acquiring.
+	//
+	// 0 = DISABLED = exactly today's behavior (Close does not drain; the gap
+	// remains). This is also the break-demo state for the acceptance gate.
+	// The field is a no-op outside multi-backend overlap (the R=1 lease-handoff
+	// and legacy per-node paths are untouched, consistent with the rest of
+	// Phase 2e living behind multiReplicated()).
+	//
+	// OPERATOR CONCERN: the orchestrator's termination grace period (k8s
+	// terminationGracePeriodSeconds) MUST exceed this, or the orchestrator
+	// SIGKILLs the process mid-drain and reopens the gap. The code enforces
+	// only its own timeout, not the orchestrator's.
+	GracefulLeaveDrainTimeout time.Duration
 }
 
 // validateBackendMode enforces the legacy-vs-multi-backend XOR and
@@ -502,6 +527,12 @@ type Cluster struct {
 	closeOnce sync.Once
 	closed    atomic.Bool
 	loopWG    sync.WaitGroup
+
+	// drainOnce guards the graceful-leave drain (v0.8 Phase 2e, scale-down) so
+	// it runs exactly once at the top of Close even under concurrent Close
+	// calls. The winner runs DrainForLeave while closed is still false; the
+	// loser falls through to the closed CAS and waits on loopWG.
+	drainOnce sync.Once
 
 	// Rebalance state (multi-node only; rebalance is empty in
 	// single-node mode). rebalance is the per-range Coordinator, held
@@ -988,6 +1019,27 @@ func (t *pausedTx) release() {
 // pre-Close backend, but ops STARTING after closed=true return
 // backend.ErrClosed instead of panicking on a torn-down backend.
 func (c *Cluster) Close() error {
+	// Graceful-leave drain (v0.8 Phase 2e, scale-down) runs at the TOP of
+	// Close, BEFORE the closed CAS and BEFORE any teardown. It must run while
+	// closed is still false: the reconcile loop, drainCheck, the serving path,
+	// and the acquire/forward path all short-circuit on c.closed.Load(), so the
+	// hand-off can only converge while those paths are live. Gated on config +
+	// multiReplicated; the drainOnce guard makes it run exactly once even under
+	// concurrent Close calls (the loser of drainOnce falls straight through to
+	// the closed CAS below, where it waits on loopWG). DrainForLeave itself is a
+	// no-op outside multiReplicated, so the only observable effect when the
+	// feature is disabled (timeout 0) is skipping this block entirely.
+	if c.cfg.GracefulLeaveDrainTimeout > 0 {
+		c.drainOnce.Do(func() {
+			if !c.multiReplicated() {
+				return
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), c.cfg.GracefulLeaveDrainTimeout)
+			defer cancel()
+			_ = c.DrainForLeave(ctx)
+		})
+	}
+
 	if !c.closed.CompareAndSwap(false, true) {
 		// Another Close already ran (or is running). Wait for the
 		// background loops to wind down before returning so callers
