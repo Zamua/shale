@@ -1397,6 +1397,8 @@ The two sections above state WHAT the deploy gap closes; this section pins the E
 
 `ReadConsistency` / `WriteConsistency` / timeouts / rebalance settings stay at the `cluster` defaults (normalized by `cluster.normalizeConfig`); this milestone does not add operator flags for them. The teardown sequence in `Run` is unchanged except it calls `CloseFactory` (multi-backend) or `CloseBackend` (single-backend) after `Cluster.Close`, whichever is set.
 
+The `RunConfig` -> `cluster.Config` mapping is factored into two pure (no-I/O) helpers so the wiring is testable WITHOUT binding a listener or serving gRPC: `clusterConfig(cfg, grpcAddr)` does the field mapping above (R + UnitCount + single-vs-multi mode), and `buildCluster(cfg, grpcAddr)` validates the Backend-vs-BackendFactory XOR then calls `cluster.Open`. `Run` reserves the listener, then calls `cluster.Open(clusterConfig(cfg, resolvedAddr))`; a test calls `buildCluster` directly with an in-process `BackendFactory` + `ReplicationFactor` and exercises `Put`/`Get` on the returned cluster (single-node clusters never dial the broadcast `grpcAddr`, so the test passes any placeholder). This is a structural extraction only; the live `Run` path opens the SAME `cluster.Config`.
+
 **`shaled-slate`: building the slate `Backing` / `Handle` in multi-backend mode.** `backends/slate/cmd/shaled-slate` gains a `--multi-backend` flag (env `SHALE_MULTI_BACKEND`, default `false`):
 
   - `--multi-backend=false` (default): the EXISTING single-backend path, byte-for-byte. `openSlateBackend(cfg)` opens ONE `slate.New(Config{...DbName...})` and `Run` gets `Backend:` set. `--slate-db-name` is required (as today). `--unit-count` is ignored.

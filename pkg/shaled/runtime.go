@@ -211,13 +211,9 @@ func Run(cfg RunConfig) error {
 	// so a misconfigured node fails fast with a clear per-binary error and
 	// never reserves a port. The cluster re-validates downstream
 	// (validateBackendMode), but this is the friendlier first line.
-	hasBackend := cfg.Backend != nil
-	hasFactory := cfg.BackendFactory != nil
-	switch {
-	case hasBackend && hasFactory:
-		return errors.New("shaled.Run: set EITHER Backend OR BackendFactory, not both")
-	case !hasBackend && !hasFactory:
-		return errors.New("shaled.Run: Backend or BackendFactory required")
+	hasFactory, err := validateBackendXOR(cfg)
+	if err != nil {
+		return err
 	}
 	logger := cfg.Logger
 
@@ -239,26 +235,13 @@ func Run(cfg RunConfig) error {
 		return fmt.Errorf("listen %s: %w", cfg.Std.GRPCAddr, err)
 	}
 
-	// Build ONE cluster.Config from Std plus whichever backend mode is set.
-	// ReplicationFactor is threaded in BOTH modes (the fix: single-backend
-	// Run previously omitted it, pinning the legacy path to the cluster
-	// default). UnitCount is carried only in multi-backend mode; legacy mode
-	// leaves it zero (validateBackendMode requires that).
-	clusterCfg := cluster.Config{
-		NodeID:            cfg.Std.NodeID,
-		BindAddr:          cfg.Std.BindAddr,
-		GRPCAddr:          lis.Addr().String(),
-		Seeds:             cfg.Std.Seeds,
-		ReplicationFactor: cfg.Std.ReplicationFactor,
-	}
-	if hasFactory {
-		clusterCfg.BackendFactory = cfg.BackendFactory
-		clusterCfg.UnitCount = cfg.Std.UnitCount
-	} else {
-		clusterCfg.Backend = cfg.Backend
-	}
-
-	c, err := cluster.Open(clusterCfg)
+	// Build ONE cluster.Config from Std plus whichever backend mode is set,
+	// using the resolved (post-bind) listener address as the broadcast
+	// GRPCAddr. clusterConfig is the pure, testable seam: it does the whole
+	// Backend-vs-BackendFactory -> cluster.Config mapping with no I/O, so a
+	// test can assert the mapping (R + UnitCount + which mode) without binding
+	// a port or serving gRPC.
+	c, err := cluster.Open(clusterConfig(cfg, lis.Addr().String()))
 	if err != nil {
 		_ = lis.Close()
 		_ = closeBackendQuiet(closeOwned)
@@ -318,6 +301,74 @@ func Run(cfg RunConfig) error {
 
 	logger.Printf("shaled: shutdown complete")
 	return nil
+}
+
+// validateBackendXOR enforces the Backend-vs-BackendFactory contract:
+// exactly one of cfg.Backend / cfg.BackendFactory must be set. It is the
+// fail-fast guard Run runs BEFORE binding the listener (and buildCluster runs
+// before Open), mirroring cluster.validateBackendMode with a friendlier
+// per-binary message. Returns hasFactory so callers can pick the right teardown
+// hook without re-deriving it.
+func validateBackendXOR(cfg RunConfig) (hasFactory bool, err error) {
+	hasBackend := cfg.Backend != nil
+	hasFactory = cfg.BackendFactory != nil
+	switch {
+	case hasBackend && hasFactory:
+		return false, errors.New("shaled.Run: set EITHER Backend OR BackendFactory, not both")
+	case !hasBackend && !hasFactory:
+		return false, errors.New("shaled.Run: Backend or BackendFactory required")
+	}
+	return hasFactory, nil
+}
+
+// clusterConfig maps a RunConfig (plus the resolved gRPC broadcast address)
+// onto ONE cluster.Config. It is pure (no I/O) so it is the testable seam for
+// "Run threads ReplicationFactor + UnitCount + the right backend mode into the
+// cluster.Config it builds":
+//
+//   - common (both modes): NodeID, BindAddr, the resolved GRPCAddr, Seeds, and
+//     ReplicationFactor (the fix: single-backend Run previously omitted R,
+//     pinning the legacy path to the cluster default).
+//   - single-backend (Backend set): Backend only; UnitCount stays zero
+//     (cluster.validateBackendMode requires it zero in legacy mode).
+//   - multi-backend (BackendFactory set): BackendFactory + UnitCount; Backend
+//     stays nil.
+//
+// It does NOT validate the XOR (callers do that first via validateBackendXOR);
+// if BOTH are somehow set it prefers the factory, but that state never reaches
+// here on the Run / buildCluster paths.
+func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
+	clusterCfg := cluster.Config{
+		NodeID:            cfg.Std.NodeID,
+		BindAddr:          cfg.Std.BindAddr,
+		GRPCAddr:          grpcAddr,
+		Seeds:             cfg.Std.Seeds,
+		ReplicationFactor: cfg.Std.ReplicationFactor,
+	}
+	if cfg.BackendFactory != nil {
+		clusterCfg.BackendFactory = cfg.BackendFactory
+		clusterCfg.UnitCount = cfg.Std.UnitCount
+	} else {
+		clusterCfg.Backend = cfg.Backend
+	}
+	return clusterCfg
+}
+
+// buildCluster validates the Backend-vs-BackendFactory XOR and opens a Cluster
+// from the RunConfig, using grpcAddr as the broadcast gRPC address. It is the
+// cluster-construction core extracted out of Run so the wiring (R + UnitCount +
+// single-vs-multi mode -> a live cluster that accepts writes) is testable
+// WITHOUT binding a listener, serving gRPC, or sending a shutdown signal: a
+// test calls buildCluster with an in-process BackendFactory + ReplicationFactor
+// and exercises Put/Get on the returned cluster directly. Run uses it after it
+// has reserved the listener (so grpcAddr is the resolved bound address); a test
+// can pass any addr (single-node clusters never dial it). The caller owns the
+// returned cluster's Close.
+func buildCluster(cfg RunConfig, grpcAddr string) (*cluster.Cluster, error) {
+	if _, err := validateBackendXOR(cfg); err != nil {
+		return nil, err
+	}
+	return cluster.Open(clusterConfig(cfg, grpcAddr))
 }
 
 // SplitSeeds turns "a:7946,b:7946" into ["a:7946", "b:7946"], trimming

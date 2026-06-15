@@ -86,6 +86,50 @@ func TestRun_SingleBackendStillRequiresDbName(t *testing.T) {
 	}
 }
 
+// --multi-backend DEFAULTS to false: with no --multi-backend flag (and no
+// SHALE_MULTI_BACKEND env), the binary takes the single-backend path, which
+// requires --slate-db-name. The resulting --slate-db-name error (NOT the
+// multi-backend "tags slatedb" fast-fail) proves the default selected the
+// single-backend path.
+func TestRun_MultiBackendDefaultsFalse(t *testing.T) {
+	t.Setenv("SHALE_NODE_ID", "n1")
+	t.Setenv("SHALE_SLATE_BUCKET", "b")
+	t.Setenv("SHALE_SLATE_DB_NAME", "")
+	t.Setenv("SHALE_SLATE_ACCESS_KEY", "a")
+	t.Setenv("SHALE_SLATE_SECRET_KEY", "s")
+	t.Setenv("SHALE_MULTI_BACKEND", "")
+	err := run(nil, os.Stderr)
+	if err == nil || !strings.Contains(err.Error(), "--slate-db-name") {
+		t.Fatalf("default (no --multi-backend) must take single-backend path requiring --slate-db-name, got %v", err)
+	}
+	if strings.Contains(err.Error(), "tags slatedb") {
+		t.Fatalf("default must NOT take the multi-backend path, got %v", err)
+	}
+}
+
+// SHALE_MULTI_BACKEND=true (env, no flag) selects the multi-backend path:
+// db-name becomes optional and the !slatedb stub fast-fails at the factory.
+// Pins the env fallback for the --multi-backend flag.
+func TestRun_MultiBackendFromEnv(t *testing.T) {
+	t.Setenv("SHALE_NODE_ID", "n1")
+	t.Setenv("SHALE_SLATE_BUCKET", "b")
+	t.Setenv("SHALE_SLATE_DB_NAME", "")
+	t.Setenv("SHALE_SLATE_ACCESS_KEY", "a")
+	t.Setenv("SHALE_SLATE_SECRET_KEY", "s")
+	t.Setenv("SHALE_MULTI_BACKEND", "true")
+	t.Setenv("SHALE_UNIT_COUNT", "4")
+	err := run(nil, os.Stderr)
+	if err == nil {
+		t.Fatal("want an error from the !slatedb stub, got nil")
+	}
+	if strings.Contains(err.Error(), "--slate-db-name") {
+		t.Fatalf("multi-backend (from env) must NOT require --slate-db-name, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "tags slatedb") {
+		t.Fatalf("want rebuild-with-tags-slatedb fast-fail from the multi path, got %v", err)
+	}
+}
+
 // A non-power-of-two --unit-count is rejected at std validation, before any
 // slate config is touched (works in BOTH builds: the check is in
 // pkg/shaled, no slatedb needed).
