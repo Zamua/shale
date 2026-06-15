@@ -124,4 +124,26 @@ type ReplicaBackendFactory interface {
 	// ru.Replica of unit ru.Unit, WITHOUT affecting any other replica or unit.
 	// Idempotent: closing a replica not open is a no-op returning nil.
 	CloseReplicaUnit(ru ReplicaUnit) error
+
+	// DurableEpochReplica reports the DURABLE writer-epoch of replica position
+	// ru.Replica of unit ru.Unit, read WITHOUT opening (mounting) it. It is the
+	// cross-node source of truth a real factory reads from the per-replica
+	// slatedb manifest in object storage (the slate Backing already exposes
+	// this capability; v0.8 Phase 2e lifts it onto this interface).
+	//
+	// It is the CROSS-NODE LIVENESS HINT the overlap handoff's old owner uses
+	// to detect that a new owner has fenced the position: seeing the durable
+	// epoch advance past the old owner's own open epoch proves SOMEONE opened
+	// at a higher epoch. It is a HINT, not a release trigger: a bare epoch
+	// advance proves a fence happened, NOT that a live owner is serving (a new
+	// owner can fence then crash mid-mount). The old owner re-verifies a live
+	// owner is serving (a readiness probe) before releasing; it NEVER releases
+	// on this bare epoch alone. See CanRelease / Releasable in handoff.go and
+	// docs/SPEC.md "v0.8 Phase 2e".
+	//
+	// It reads durable state without side effect (no mount/unmount). A replica
+	// never opened has durable epoch 0. err is non-nil only on an I/O failure
+	// reading the durable manifest (an unopened replica is NOT an error: it is
+	// epoch 0).
+	DurableEpochReplica(ru ReplicaUnit) (Epoch, error)
 }

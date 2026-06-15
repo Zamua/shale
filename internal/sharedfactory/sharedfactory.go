@@ -322,6 +322,18 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	return &fencedReplicaBackend{backing: h.backing, unit: ru, epoch: opened, store: store}, nil
 }
 
+// DurableEpochReplica reports replica ru's DURABLE writer-epoch from the
+// shared Backing WITHOUT opening it (0 if never opened). It is the test analogue
+// of reading the per-replica slatedb manifest writer-epoch from object storage:
+// the CROSS-NODE source of truth every handle sees, regardless of which handle
+// currently holds the position open. The overlap handoff's old owner reads it
+// as a LIVENESS HINT (the durable epoch advancing past its own open epoch means
+// a new owner fenced); it never releases on a bare advance. It cannot fail here
+// (the in-memory backing always answers), so err is always nil.
+func (h *Handle) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Epoch, error) {
+	return h.backing.replicaDurableEpoch(ru), nil
+}
+
 // CloseReplicaUnit releases replica ru from THIS handle. Idempotent; the
 // shared per-replica bytes are retained in the Backing.
 func (h *Handle) CloseReplicaUnit(ru storageunit.ReplicaUnit) error {

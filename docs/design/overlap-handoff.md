@@ -594,9 +594,15 @@ Domain (pure, no I/O) in `pkg/storageunit`:
     Absent are represented by mountMap presence + phase absence, not enum
     values).
   - `HandoffState` value object: `{Phase HandoffPhase, OpenEpoch Epoch,
-    Predecessor NodeAddr}` (the predecessor is meaningful only in
+    Predecessor NodeID}` (the predecessor is meaningful only in
     `Acquiring`). The cluster keys the in-flight record by `ReplicaUnit`
-    (the position is the key, not a field).
+    (the position is the key, not a field). The predecessor field is a
+    `storageunit.NodeID` (the pure domain's node identity), NOT a dial
+    address: it is derived from the prior/live replica-set diff, which yields
+    `NodeID`s, and the pure domain stays I/O-free. Resolving a `NodeID` to a
+    transport address is a controller/membership concern done at forward time.
+    (Earlier drafts of this doc named the field `NodeAddr`; the foundation
+    implementation pinned it to `NodeID` to keep the type I/O-free.)
   - Pure transition functions / guards: `NextOnReady`, `NextOnDrain`,
     `NextOnRelease`, returning the next phase or an error for an illegal
     edge; the guards make explicit WHICH phases are legal on WHICH side (a
