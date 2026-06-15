@@ -400,53 +400,97 @@ func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc clust
 	// got M" flake. The probe write through nodes[0].Cluster drives the
 	// same routed + replicated path the tests use; its retry is scoped to
 	// THIS setup window only.
-	waitForWriteReady(t, nodes[0].Cluster, 45*time.Second)
+	waitForWriteReady(t, cs, 45*time.Second)
 	return nodes
 }
 
 // waitForWriteReady gates a freshly-stood-up multi-node cluster on the
-// one condition waitForClusterReady does NOT cover: that the routed
-// forwarding RPC path actually round-trips at the cluster's configured
-// WriteConsistency. Ring convergence proves every node is a MEMBER; it
-// does NOT prove every peer's gRPC HTTP/2 server goroutine is servicing
-// connections yet. Under CI starvation (-race + GOMAXPROCS contention +
-// full-workspace parallelism) the Serve goroutine can lag the listener
-// bind, so the seed Put fans out to a replica whose server isn't
-// accepting yet and the write can't reach quorum acks ("write needed N
-// acks, got M").
+// one condition waitForClusterReady does NOT cover: that the routed +
+// replicated write path actually round-trips at the cluster's configured
+// WriteConsistency, from EVERY node, for keys that land on EVERY owner.
+// Ring convergence proves every node is a MEMBER; it does NOT prove (a)
+// every peer's gRPC HTTP/2 server goroutine is servicing connections yet,
+// nor (b) that every node has closed the StateReceiving window its
+// bootstrap rebalance opened. Either gap makes a fan-out leg come back
+// transient (a peer's server not accepting yet, or a local-self leg
+// hitting the migration guard), and a transient leg counts as NEITHER ack
+// NOR failure - so a WriteAll R3 lands 2 acks, 0 failures and the test's
+// seed Put fails "write needed 3 acks, got 2 (0 failures: <nil>)".
 //
-// The gate issues a PROBE write through the public Cluster.Put path -
-// the exact same routed + replicated path the tests use - and retries
-// ONLY on transient warmup errors (Unavailable: refused dial / not
-// enough acks; ResourceExhausted: a partition still mid-migration) until
-// it succeeds or the bounded deadline expires. A non-transient error, or
-// exhausting the deadline, fails the test with a clear message.
+// The single-node, single-key probe the prior fix used only warmed ONE
+// (origin-node, replica-set) pair, ONCE. Two gaps remained that this gate
+// closes:
 //
-// CRUCIAL: this retry is scoped to SETUP. Once the probe succeeds the
-// cluster is proven write-ready, and any Unavailable a test then sees in
-// the body under assertion is a REAL failure - this helper never wraps
-// those. The probe key is namespaced + tombstoned afterward so it cannot
-// pollute a test that reads replica backends directly.
-func waitForWriteReady(t *testing.T, c *cluster.Cluster, deadline time.Duration) {
+//  1. SPREAD across nodes + keys. The tests fire their seed Put through
+//     DIFFERENT nodes and against many keys, so a node whose receiving
+//     window was still open - or whose server lagged - for a DIFFERENT
+//     key range was never proven ready. This gate probes a spread of keys
+//     (enough that every member is the local-self leg for at least one)
+//     THROUGH EVERY node.
+//  2. STABILITY across time. waitForClusterReady can return idle, then a
+//     LATE-arriving SWIM gossip join notification (push/pull sync still
+//     converging under load) fires a fresh debounced reconcile that
+//     reopens a StateReceiving window MID-TEST - so a write at key 83 of
+//     100 fails even though key 0 succeeded. A single passing probe does
+//     not prove the ring will stay stable. This gate therefore requires a
+//     full CLEAN SWEEP: every (node, key) probe must succeed within ONE
+//     uninterrupted pass. Any transient anywhere in a pass restarts the
+//     whole pass. Completing a clean sweep proves the ring held stable
+//     (no reopened receiving window, every server accepting) for the full
+//     duration of that pass, which is the deterministic stand-in for "the
+//     late gossip rounds have drained."
+//
+// It retries ONLY transient warmup errors (Unavailable: refused dial /
+// not enough acks yet; ResourceExhausted: a partition still mid-
+// migration) until a clean sweep completes or the bounded deadline. A
+// non-transient error, or exhausting the deadline, fails the test loudly.
+//
+// CRUCIAL: this retry is scoped to SETUP. Once it returns the cluster is
+// proven write-ready, and any Unavailable a test then sees in its body is
+// a REAL failure - this helper never wraps those. The probe keys are
+// namespaced + tombstoned afterward so they cannot pollute a test that
+// reads replica backends directly.
+func waitForWriteReady(t *testing.T, clusters []*cluster.Cluster, deadline time.Duration) {
 	t.Helper()
-	const probeKey = "__warmup_probe__"
+	// 24 distinct keys give consistent hashing ample spread to cover
+	// every owner as a local-self leg across a small cluster, without
+	// making the warmup expensive.
+	const probeKeys = 24
 	end := time.Now().Add(deadline)
 	var lastErr error
 	for time.Now().Before(end) {
-		err := c.Put([]byte(probeKey), []byte("ready"))
-		if err == nil {
-			// Best-effort cleanup so no stray probe key lands on the
-			// replica backends a test might read directly.
-			_ = c.Delete([]byte(probeKey))
+		sweepClean := true
+		for from, c := range clusters {
+			for k := range probeKeys {
+				probeKey := fmt.Appendf(nil, "__warmup_probe__/%d/%d", from, k)
+				err := c.Put(probeKey, []byte("ready"))
+				if err == nil {
+					// Best-effort cleanup so no stray probe key lands on
+					// the replica backends a test might read directly.
+					_ = c.Delete(probeKey)
+					continue
+				}
+				if !isTransientWarmupErr(err) {
+					t.Fatalf("waitForWriteReady: probe write through node %d returned a non-transient error (real failure, not a warmup race): %v", from, err)
+				}
+				// A transient anywhere taints this sweep: the ring is not
+				// stably write-ready yet. Back off and restart the sweep so
+				// readiness means "a full clean pass with no reopened
+				// receiving window," not "one lucky probe."
+				lastErr = err
+				sweepClean = false
+				time.Sleep(50 * time.Millisecond)
+				break
+			}
+			if !sweepClean {
+				break
+			}
+		}
+		if sweepClean {
 			return
 		}
-		if !isTransientWarmupErr(err) {
-			t.Fatalf("waitForWriteReady: probe write returned a non-transient error (real failure, not a warmup race): %v", err)
-		}
-		lastErr = err
-		time.Sleep(50 * time.Millisecond)
 	}
-	t.Fatalf("waitForWriteReady: cluster never became write-ready within %s; last probe error: %v", deadline, lastErr)
+	t.Fatalf("waitForWriteReady: cluster never completed a clean write-readiness sweep within %s; last probe error: %v", deadline, lastErr)
 }
 
 // isTransientWarmupErr reports whether err is one of the transient
