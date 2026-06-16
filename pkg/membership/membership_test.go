@@ -405,3 +405,168 @@ func TestDropCountObservable(t *testing.T) {
 		t.Fatalf("expected DropCount > 0 after saturating channel, got 0")
 	}
 }
+
+// findMember returns the cached Member for id and whether it was present.
+func findMember(m *Membership, id string) (Member, bool) {
+	for _, mem := range m.Members() {
+		if mem.ID == id {
+			return mem, true
+		}
+	}
+	return Member{}, false
+}
+
+// waitForDraining polls until the snapshot's member id has the wanted
+// draining value (with its address still intact), or the timeout fires.
+func waitForDraining(m *Membership, id string, want bool, wantAddr string, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	var last Member
+	for time.Now().Before(deadline) {
+		mem, ok := findMember(m, id)
+		last = mem
+		if ok && mem.Draining == want && mem.Addr == wantAddr {
+			return nil
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	return fmt.Errorf("did not observe %s draining=%v addr=%q in %s; last=%+v", id, want, wantAddr, timeout, last)
+}
+
+// TestEncodeDecodeMetaRoundTrip pins the backward-shaped Meta wire
+// format: the non-draining payload is byte-identical to the bare-address
+// legacy format, and the draining bit round-trips while the address
+// still decodes cleanly.
+func TestEncodeDecodeMetaRoundTrip(t *testing.T) {
+	const addr = "127.0.0.1:7001"
+
+	// Non-draining encodes to exactly the bare address (legacy-shaped).
+	meta := encodeMeta(addr, false)
+	if string(meta) != addr {
+		t.Fatalf("non-draining meta = %q, want bare addr %q", meta, addr)
+	}
+	gotAddr, draining := decodeMeta(meta)
+	if gotAddr != addr || draining {
+		t.Fatalf("decode(non-draining) = (%q, %v), want (%q, false)", gotAddr, draining, addr)
+	}
+
+	// Draining round-trips the bit while keeping the address.
+	meta = encodeMeta(addr, true)
+	gotAddr, draining = decodeMeta(meta)
+	if gotAddr != addr || !draining {
+		t.Fatalf("decode(draining) = (%q, %v), want (%q, true)", gotAddr, draining, addr)
+	}
+
+	// A legacy bare-address payload (no separator, written by an older
+	// node) decodes as not-draining with the address intact.
+	gotAddr, draining = decodeMeta([]byte(addr))
+	if gotAddr != addr || draining {
+		t.Fatalf("decode(legacy) = (%q, %v), want (%q, false)", gotAddr, draining, addr)
+	}
+}
+
+// TestSetDrainingGossipsToPeer pins the core Phase 2e membership
+// behavior: a node calls SetDraining(true), and BOTH its own snapshot
+// and a peer's snapshot observe Draining=true (with the address still
+// resolvable). The node stays a full alive member - it is NOT removed
+// from either snapshot. Clearing draining gossips back to false.
+func TestSetDrainingGossipsToPeer(t *testing.T) {
+	n1Port := ephemeralPort(t)
+	n2Port := ephemeralPort(t)
+
+	const n1Grpc = "127.0.0.1:19501"
+	const n2Grpc = "127.0.0.1:19502"
+
+	m1 := openTestMembership(t, Config{
+		NodeID:   "n1",
+		BindAddr: bindAddr(n1Port),
+		GRPCAddr: n1Grpc,
+	})
+	m2 := openTestMembership(t, Config{
+		NodeID:   "n2",
+		BindAddr: bindAddr(n2Port),
+		GRPCAddr: n2Grpc,
+		Seeds:    []string{bindAddr(n1Port)},
+	})
+
+	want := map[string]string{"n1": n1Grpc, "n2": n2Grpc}
+	if err := waitForMembers(m1, want, 5*time.Second); err != nil {
+		t.Fatalf("n1 convergence: %v", err)
+	}
+	if err := waitForMembers(m2, want, 5*time.Second); err != nil {
+		t.Fatalf("n2 convergence: %v", err)
+	}
+
+	// Baseline: nobody is draining.
+	if mem, _ := findMember(m1, "n1"); mem.Draining {
+		t.Fatalf("n1 unexpectedly draining at baseline: %+v", mem)
+	}
+
+	// n1 enters DRAINING.
+	if err := m1.SetDraining(true); err != nil {
+		t.Fatalf("SetDraining(true): %v", err)
+	}
+
+	// n1 sees itself draining, address intact.
+	if err := waitForDraining(m1, "n1", true, n1Grpc, 5*time.Second); err != nil {
+		t.Fatalf("n1 self-view: %v", err)
+	}
+	// The peer sees n1 draining via gossip, still in the snapshot.
+	if err := waitForDraining(m2, "n1", true, n1Grpc, 5*time.Second); err != nil {
+		t.Fatalf("n2 peer-view of n1 draining: %v", err)
+	}
+	// n1 stays a full member on the peer (not removed): both nodes present.
+	if len(m2.Members()) != 2 {
+		t.Fatalf("n1 vanished from n2 snapshot while draining: %v", m2.Members())
+	}
+	// n2 is not draining (the bit is per-member).
+	if mem, _ := findMember(m2, "n2"); mem.Draining {
+		t.Fatalf("n2 spuriously draining: %+v", mem)
+	}
+
+	// Clearing draining gossips back to false on the peer.
+	if err := m1.SetDraining(false); err != nil {
+		t.Fatalf("SetDraining(false): %v", err)
+	}
+	if err := waitForDraining(m2, "n1", false, n1Grpc, 5*time.Second); err != nil {
+		t.Fatalf("n2 peer-view of n1 cleared: %v", err)
+	}
+}
+
+// TestSetDrainingNoChangeIsNoop pins that setting the already-current
+// draining value does not error (and is treated as a no-op internally).
+func TestSetDrainingNoChangeIsNoop(t *testing.T) {
+	port := ephemeralPort(t)
+	m := openTestMembership(t, Config{
+		NodeID:   "solo",
+		BindAddr: bindAddr(port),
+		GRPCAddr: "127.0.0.1:19601",
+	})
+	// Already false: no-op.
+	if err := m.SetDraining(false); err != nil {
+		t.Fatalf("SetDraining(false) no-op: %v", err)
+	}
+	if err := m.SetDraining(true); err != nil {
+		t.Fatalf("SetDraining(true): %v", err)
+	}
+	// Already true: no-op.
+	if err := m.SetDraining(true); err != nil {
+		t.Fatalf("SetDraining(true) repeat no-op: %v", err)
+	}
+}
+
+// TestSetDrainingAfterCloseIsNoop pins that SetDraining on a closed
+// Membership returns nil without touching the torn-down transport.
+func TestSetDrainingAfterCloseIsNoop(t *testing.T) {
+	port := ephemeralPort(t)
+	m := openTestMembership(t, Config{
+		NodeID:   "solo",
+		BindAddr: bindAddr(port),
+		GRPCAddr: "127.0.0.1:19701",
+	})
+	if err := m.Close(); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	if err := m.SetDraining(true); err != nil {
+		t.Fatalf("SetDraining after close should be no-op, got %v", err)
+	}
+}

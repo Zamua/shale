@@ -7,7 +7,18 @@
 //
 // Each node advertises its gRPC listen address via memberlist's
 // per-node Meta bytes; peers decode that on receipt so they know
-// where to forward requests. The format is a plain UTF-8 string.
+// where to forward requests.
+//
+// Meta wire format (backward-shaped): a node that is NOT draining
+// publishes exactly its gRPC address as a plain UTF-8 string - byte
+// identical to the pre-draining format, so an old peer (or an old
+// decode path) reading it sees the address unchanged. A draining node
+// appends a single NUL separator + the marker byte 'D' (addr+"\x00D").
+// decodeMeta splits on the first NUL: the head is always the address;
+// a trailing "D" segment means Draining=true. Absence of any NUL means
+// not draining. So the common (non-draining) case is the legacy format,
+// and the draining bit rides alongside the address in the SAME Meta
+// payload that the graceful-leave path uses.
 package membership
 
 import (
@@ -71,6 +82,50 @@ type Member struct {
 	ID string
 	// Addr is the node's gRPC host:port, as broadcast via Config.GRPCAddr.
 	Addr string
+	// Draining is true when the node has entered the graceful-leave
+	// (scale-down) DRAINING state: it stays a full, alive, addressable
+	// member (Addr is still valid + serving) but yields OWNERSHIP - the
+	// ring-from-membership reconcile drops a draining member from the
+	// consistent-hash ownership ring so its positions redistribute to
+	// non-draining members. Decoded from the peer's Meta payload.
+	Draining bool
+}
+
+// metaSep separates the address head from the optional draining marker
+// in the Meta wire format. A NUL never appears in a host:port address,
+// so it is an unambiguous delimiter and keeps the non-draining payload
+// byte-identical to the bare-address legacy format.
+const metaSep = '\x00'
+
+// metaDrainingMarker is the trailing segment that flags a draining node.
+const metaDrainingMarker = "D"
+
+// encodeMeta builds the Meta payload for the local node. A non-draining
+// node encodes exactly its address (legacy-identical). A draining node
+// appends metaSep + the draining marker.
+func encodeMeta(addr string, draining bool) []byte {
+	if !draining {
+		return []byte(addr)
+	}
+	return []byte(addr + string(metaSep) + metaDrainingMarker)
+}
+
+// decodeMeta parses a Meta payload back into the address + draining bit.
+// The head (up to the first metaSep, or the whole payload if none) is
+// always the address; a trailing metaDrainingMarker segment sets
+// draining. Unknown trailing segments are ignored (forward-compatible).
+func decodeMeta(meta []byte) (addr string, draining bool) {
+	s := string(meta)
+	head, rest, found := strings.Cut(s, string(metaSep))
+	if !found {
+		return s, false
+	}
+	for _, seg := range strings.Split(rest, string(metaSep)) {
+		if seg == metaDrainingMarker {
+			draining = true
+		}
+	}
+	return head, draining
 }
 
 // Event is one membership change notification.
@@ -108,6 +163,7 @@ type Membership struct {
 
 	ml     *memberlist.Memberlist
 	events *eventDelegate
+	meta   *metaDelegate
 
 	mu     sync.Mutex
 	closed bool
@@ -126,17 +182,42 @@ type Membership struct {
 }
 
 // metaDelegate is the minimal memberlist.Delegate that publishes our
-// GRPCAddr as the node's Meta payload. The other Delegate methods are
-// no-ops; we do not use memberlist's user-message channel.
+// GRPCAddr (and draining bit) as the node's Meta payload. The other
+// Delegate methods are no-ops; we do not use memberlist's user-message
+// channel.
+//
+// addr is fixed for the node's lifetime; draining flips when
+// SetDraining is called. NodeMeta is invoked by memberlist from its own
+// goroutines (on gossip + on UpdateNode), so the fields are guarded by
+// mu. SetDraining mutates draining + then asks memberlist to re-read
+// NodeMeta via UpdateNode, gossiping the new payload out.
 type metaDelegate struct {
-	meta []byte
+	mu       sync.Mutex
+	addr     string
+	draining bool
 }
 
 func (d *metaDelegate) NodeMeta(limit int) []byte {
-	if len(d.meta) > limit {
-		return d.meta[:limit]
+	d.mu.Lock()
+	meta := encodeMeta(d.addr, d.draining)
+	d.mu.Unlock()
+	if len(meta) > limit {
+		return meta[:limit]
 	}
-	return d.meta
+	return meta
+}
+
+// setDraining updates the local draining flag. Returns true if the
+// value changed (so the caller knows whether a gossip refresh is worth
+// triggering).
+func (d *metaDelegate) setDraining(draining bool) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.draining == draining {
+		return false
+	}
+	d.draining = draining
+	return true
 }
 
 func (d *metaDelegate) NotifyMsg([]byte)                {}
@@ -184,9 +265,11 @@ type eventDelegate struct {
 func nodeToMember(n *memberlist.Node) Member {
 	name := strings.Clone(n.Name)
 	meta := append([]byte(nil), n.Meta...)
+	addr, draining := decodeMeta(meta)
 	return Member{
-		ID:   name,
-		Addr: string(meta),
+		ID:       name,
+		Addr:     addr,
+		Draining: draining,
 	}
 }
 
@@ -306,7 +389,9 @@ func Open(cfg Config) (*Membership, error) {
 	}
 	mlCfg.BindPort = bindPort
 	mlCfg.AdvertisePort = bindPort
-	mlCfg.Delegate = &metaDelegate{meta: []byte(cfg.GRPCAddr)}
+	meta := &metaDelegate{addr: cfg.GRPCAddr}
+	m.meta = meta
+	mlCfg.Delegate = meta
 	mlCfg.Events = events
 	if cfg.LogOutput != nil {
 		mlCfg.LogOutput = cfg.LogOutput
@@ -403,6 +488,37 @@ func (m *Membership) DropCount() uint64 {
 // Members() to reconcile if a consumer falls behind.
 func (m *Membership) Events() <-chan Event {
 	return m.events.out
+}
+
+// SetDraining flips the LOCAL node's draining bit and gossips the change
+// to peers. A draining node STAYS a full, alive, addressable member - it
+// keeps serving gRPC and keeps appearing in every node's Snapshot with
+// its Addr intact - but advertises that it is YIELDING OWNERSHIP, so the
+// ring-from-membership reconcile on every node drops it from the
+// consistent-hash ownership ring and redistributes its positions to
+// non-draining members. This is the foundation of the graceful-leave
+// (scale-down) DRAINING node-state; it is NOT Leave() (the transport
+// stays up and the node is not marked closed).
+//
+// The flag rides in the same Meta payload that already carries the gRPC
+// address. SetDraining updates the local metaDelegate then calls
+// memberlist.UpdateNode so memberlist re-reads NodeMeta + gossips the new
+// payload. If the value is unchanged, it is a no-op (no gossip churn).
+// No-op (returns nil) once the Membership is Closed.
+func (m *Membership) SetDraining(draining bool) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+	if !m.meta.setDraining(draining) {
+		return nil
+	}
+	// UpdateNode re-reads NodeMeta (now reflecting the flag) and gossips
+	// it. The 0 timeout means "do not block waiting for the broadcast to
+	// flush"; the change still propagates via the normal gossip loop.
+	return m.ml.UpdateNode(0)
 }
 
 // Leave broadcasts the graceful departure to peers WITHOUT shutting the
