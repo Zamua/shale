@@ -1,0 +1,74 @@
+# syntax=docker/dockerfile:1
+#
+# Dockerfile.slatedb.local - builds shaled-slate from the WORKING TREE so the
+# image carries LOCAL, UNPUBLISHED core-module (github.com/Zamua/shale) changes.
+#
+# Why this exists (do not delete it again): the sibling Dockerfile.slatedb builds
+# the backends/slate module with GOWORK=off against the PUBLISHED
+# github.com/Zamua/shale version pinned in backends/slate/go.mod. That is correct
+# for a release build, but it CANNOT carry unreleased core work - e.g. validating
+# a new pkg/cluster feature on a real cluster before the core commits are tagged.
+# This variant builds from the repo root with the in-tree go.work active, so the
+# build resolves the core module to the working tree.
+#
+# Build context is the REPO ROOT (not backends/slate):
+#
+#   docker build -f backends/slate/cmd/shaled-slate/Dockerfile.slatedb.local \
+#     --platform linux/amd64 -t <image>:<tag> .
+#
+# (run from the repo root). Three stages, identical to Dockerfile.slatedb EXCEPT
+# the go-build stage (go.work + repo-root context instead of GOWORK=off +
+# single-module context). Keep the uniffi + runtime stages IN SYNC with
+# Dockerfile.slatedb; the uniffi stage is byte-identical so the two share the
+# (heavy) Rust build-cache layer.
+
+ARG SLATEDB_VERSION=v0.13.1
+
+# ---- uniffi-build stage (identical to Dockerfile.slatedb; shares its cache) --
+FROM rust:1.91-slim-bookworm AS uniffi-build
+ARG SLATEDB_VERSION
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git ca-certificates pkg-config libssl-dev cmake \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN git clone --depth 1 --branch ${SLATEDB_VERSION} \
+        https://github.com/slatedb/slatedb.git . \
+ && cargo build --release -p slatedb-uniffi \
+ && ls -la /src/target/release/libslatedb_uniffi.so
+
+# ---- go-build stage (WORKING-TREE build via go.work) ------------------------
+FROM golang:1.26-bookworm AS go-build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        gcc libc6-dev \
+ && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+
+# The .so must be on the linker path at build time (cgo LDFLAGS) AND on the
+# loader path at runtime (final image).
+COPY --from=uniffi-build /src/target/release/libslatedb_uniffi.so /usr/local/lib/
+
+# The whole working tree (the repo is small). go.work wires the in-tree core
+# module + both backends, so the build compiles LOCAL core-module source rather
+# than a published version. GOWORK is left at its default (auto) so go.work is
+# honored - the opposite of Dockerfile.slatedb's GOWORK=off.
+COPY . .
+
+ENV CGO_ENABLED=1 \
+    CGO_LDFLAGS="-L/usr/local/lib" \
+    LD_LIBRARY_PATH=/usr/local/lib
+
+# Build shaled-slate (the slate module's cmd) with -tags slatedb so the slatedb
+# single + multi-backend code path is compiled in. The path is repo-root
+# relative because the context is the repo root.
+RUN GOOS=linux GOARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
+        go build -tags slatedb -buildvcs=false -ldflags="-s -w" \
+        -o /out/shaled-slate ./backends/slate/cmd/shaled-slate
+
+# ---- runtime stage (identical to Dockerfile.slatedb) ------------------------
+FROM gcr.io/distroless/cc-debian12:nonroot
+COPY --from=uniffi-build /src/target/release/libslatedb_uniffi.so /usr/local/lib/
+COPY --from=go-build /out/shaled-slate /shaled-slate
+EXPOSE 7946 7947
+ENV LD_LIBRARY_PATH=/usr/local/lib
+USER nonroot:nonroot
+ENTRYPOINT ["/shaled-slate"]
