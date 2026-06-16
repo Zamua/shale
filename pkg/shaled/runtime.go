@@ -55,6 +55,7 @@ import (
 	"strconv"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
@@ -94,11 +95,21 @@ type StdConfig struct {
 	// Validate.
 	seedsRaw string
 
+	// GracefulLeaveDrainTimeout, when > 0, makes a multi-backend overlap node
+	// drain its owned units to successors on shutdown (broadcast leave, keep
+	// serving until the successors are Ready) before closing, so a graceful
+	// scale-down is available. 0 (default) disables it = the prior immediate
+	// teardown. Threaded into cluster.Config.GracefulLeaveDrainTimeout.
+	// Populated from --graceful-leave-drain / SHALE_GRACEFUL_LEAVE_DRAIN_TIMEOUT
+	// by Validate (a Go duration string, e.g. "90s").
+	GracefulLeaveDrainTimeout time.Duration
+
 	// replicationFactorRaw + unitCountRaw hold the parsed int flag values
 	// pre-validation. Populated by BindStdFlags; ReplicationFactor +
 	// UnitCount are derived from them inside Validate.
-	replicationFactorRaw int
-	unitCountRaw         int
+	replicationFactorRaw  int
+	unitCountRaw          int
+	gracefulLeaveDrainRaw string
 }
 
 // BindStdFlags registers the standard cluster/node flags into fs and
@@ -134,6 +145,9 @@ func BindStdFlags(fs *flag.FlagSet) *StdConfig {
 	fs.IntVar(&std.unitCountRaw, "unit-count",
 		envOrInt("SHALE_UNIT_COUNT", 1),
 		"power-of-two number of storage units N (multi-backend mode only; default 1)")
+	fs.StringVar(&std.gracefulLeaveDrainRaw, "graceful-leave-drain",
+		envOr("SHALE_GRACEFUL_LEAVE_DRAIN_TIMEOUT", ""),
+		"on shutdown, drain owned units to successors for up to this Go duration before closing (e.g. 90s); empty/0 disables")
 	return std
 }
 
@@ -151,6 +165,16 @@ func (s *StdConfig) Validate() error {
 		return fmt.Errorf("--unit-count: %w (must be a power of two)", err)
 	}
 	s.UnitCount = uc
+	if raw := strings.TrimSpace(s.gracefulLeaveDrainRaw); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("--graceful-leave-drain: %w (want a Go duration like 90s)", err)
+		}
+		if d < 0 {
+			return errors.New("--graceful-leave-drain must not be negative")
+		}
+		s.GracefulLeaveDrainTimeout = d
+	}
 	return nil
 }
 
@@ -339,11 +363,12 @@ func validateBackendXOR(cfg RunConfig) (hasFactory bool, err error) {
 // here on the Run / buildCluster paths.
 func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 	clusterCfg := cluster.Config{
-		NodeID:            cfg.Std.NodeID,
-		BindAddr:          cfg.Std.BindAddr,
-		GRPCAddr:          grpcAddr,
-		Seeds:             cfg.Std.Seeds,
-		ReplicationFactor: cfg.Std.ReplicationFactor,
+		NodeID:                    cfg.Std.NodeID,
+		BindAddr:                  cfg.Std.BindAddr,
+		GRPCAddr:                  grpcAddr,
+		Seeds:                     cfg.Std.Seeds,
+		ReplicationFactor:         cfg.Std.ReplicationFactor,
+		GracefulLeaveDrainTimeout: cfg.Std.GracefulLeaveDrainTimeout,
 	}
 	if cfg.BackendFactory != nil {
 		clusterCfg.BackendFactory = cfg.BackendFactory
