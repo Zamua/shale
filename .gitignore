@@ -9,7 +9,15 @@
 /coverage.*
 /shale
 /shale-bench
-# per-backend + core shaled binaries, built anywhere in the tree
+# per-backend + core shaled binaries, built anywhere in the tree. The bare
+# names match the built executables; the negations keep the same-named SOURCE
+# directories tracked - otherwise a bare `shaled-slate` also ignores
+# cmd/shaled-slate/ and silently drops every NEW file added under it (a
+# Dockerfile, a source file), which has bitten commits more than once.
 shaled
 shaled-slate
 shaled-pebble
+!cmd/shaled/
+!pkg/shaled/
+!backends/slate/cmd/shaled-slate/
+!backends/pebble/cmd/shaled-pebble/
