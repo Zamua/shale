@@ -63,6 +63,7 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		mounted = append(mounted, ru)
 	}
 	prior := c.priorDesiredReplicas
+	priorAddrs := c.priorAddrs
 	c.mountMu.RUnlock()
 
 	mountedSet := make(map[storageunit.ReplicaUnit]struct{}, len(mounted))
@@ -128,18 +129,48 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 			c.acquireReplicaUnit(ru)
 			continue
 		}
-		// Single unambiguous predecessor: overlap. Record Acquiring (with the
-		// predecessor) BEFORE starting the mount, so a routed op arriving during
-		// the mount forwards to the predecessor instead of being refused.
-		c.beginAcquire(ru, pred)
+		// Single unambiguous predecessor: overlap. Resolve its DIAL ADDRESS from
+		// the PRIOR-ring snapshot (where the predecessor was still a member) so the
+		// forward survives the predecessor leaving the ring on a scale-down - a
+		// live-ring walk could not resolve a departed node. Record Acquiring (with
+		// the predecessor + its address) BEFORE starting the mount, so a routed op
+		// arriving during the mount forwards to the predecessor instead of being
+		// refused.
+		predAddr := priorAddrs[pred]
+		c.beginAcquire(ru, pred, predAddr)
 		c.acquireReplicaUnitOverlap(ru)
 	}
 
-	// Capture the live desired sets as the prior snapshot for the NEXT reconcile,
-	// at the END of the run (before the next run can read it).
+	// Capture the live desired sets AND the live member addresses as the prior
+	// snapshot for the NEXT reconcile, at the END of the run (before the next run
+	// can read it). Both are taken from the SAME live ring so that during the
+	// NEXT reconcile a soon-to-leave predecessor's address is still resolvable.
+	addrs := c.liveMemberAddrs()
 	c.mountMu.Lock()
 	c.priorDesiredReplicas = live
+	c.priorAddrs = addrs
 	c.mountMu.Unlock()
+}
+
+// liveMemberAddrs snapshots every live ring member's NodeID -> gRPC dial
+// address. Captured at the END of a reconcile alongside priorDesiredReplicas so
+// the NEXT reconcile can resolve a predecessor's address even after that
+// predecessor has LEFT the ring (a scale-down): the departed node was a member
+// of THIS prior ring, so its address is in this map. A live-ring walk at
+// forward time (addrForNodeID) cannot resolve a departed node; this snapshot
+// can. With a nil/empty ring it returns just the local node.
+func (c *Cluster) liveMemberAddrs() map[storageunit.NodeID]string {
+	if c.ring == nil || c.ring.Empty() {
+		return map[storageunit.NodeID]string{
+			storageunit.NodeID(c.cfg.NodeID): c.cfg.GRPCAddr,
+		}
+	}
+	members := c.ring.Members()
+	out := make(map[storageunit.NodeID]string, len(members))
+	for _, m := range members {
+		out[storageunit.NodeID(m.ID)] = m.Addr
+	}
+	return out
 }
 
 // reconcileReplicaUnitsCleanCut is the pre-2e clean-cut RELEASE-then-ACQUIRE
@@ -299,16 +330,20 @@ func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 }
 
 // beginAcquire records PhaseAcquiring for a position MOVING IN, carrying the
-// predecessor so a routed op arriving during the mount forwards to it (the
-// overlap window). It is set BEFORE the mount starts so there is no instant
-// where routing targets this node, the mount is incomplete, AND no predecessor
-// is recorded (which would force the Option-A refusal). Caller holds
+// predecessor (NodeID + its dial address) so a routed op arriving during the
+// mount forwards to it (the overlap window). The address is captured from the
+// PRIOR ring (where the predecessor was still a member) and stored here for the
+// entry's lifetime, so the forward reaches the predecessor even after it LEAVES
+// the ring on a scale-down. It is set BEFORE the mount starts so there is no
+// instant where routing targets this node, the mount is incomplete, AND no
+// predecessor is recorded (which would force the Option-A refusal). Caller holds
 // reconcileMu; the phase write takes mountMu.
-func (c *Cluster) beginAcquire(ru storageunit.ReplicaUnit, pred storageunit.NodeID) {
+func (c *Cluster) beginAcquire(ru storageunit.ReplicaUnit, pred storageunit.NodeID, predAddr string) {
 	c.mountMu.Lock()
 	c.handoffPhase[ru] = storageunit.HandoffState{
-		Phase:       storageunit.PhaseAcquiring,
-		Predecessor: pred,
+		Phase:           storageunit.PhaseAcquiring,
+		Predecessor:     pred,
+		PredecessorAddr: predAddr,
 	}
 	c.mountMu.Unlock()
 }

@@ -58,6 +58,28 @@ func TestHandoffState_HasPredecessor(t *testing.T) {
 	}
 }
 
+// TestHandoffState_PredecessorAddr pins that the Acquiring entry carries the
+// predecessor's dial address alongside its NodeID (the graceful-leave fix: the
+// address is stored so the forward survives the predecessor leaving the ring).
+func TestHandoffState_PredecessorAddr(t *testing.T) {
+	s := HandoffState{Phase: PhaseAcquiring, Predecessor: "old", PredecessorAddr: "10.0.0.9:7947"}
+	if !s.HasPredecessor() {
+		t.Fatalf("entry with a predecessor must report HasPredecessor()")
+	}
+	if s.PredecessorAddr != "10.0.0.9:7947" {
+		t.Fatalf("PredecessorAddr = %q, want the stored dial address", s.PredecessorAddr)
+	}
+	// Once Ready the node serves locally and no longer forwards, so the carried
+	// predecessor address is dropped along with the NodeID.
+	ready, err := NextOnReady(s, 7)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if ready.PredecessorAddr != "" {
+		t.Fatalf("Ready state must not retain a predecessor address, got %q", ready.PredecessorAddr)
+	}
+}
+
 // TestNextOnReady covers the single legal gainer edge Acquiring->Ready and
 // rejects every other predecessor phase.
 func TestNextOnReady(t *testing.T) {

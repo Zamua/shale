@@ -112,18 +112,29 @@ func (p HandoffPhase) IsLoser() bool {
 //     predecessor (ambiguous / multi-hop / pure-new-mount), in which case the
 //     Acquiring op falls through to the Option-A belt instead of forwarding.
 //     Meaningless on the loser side and in PhaseReady onward.
+//   - PredecessorAddr: the predecessor's gRPC DIAL ADDRESS, captured from the
+//     PRIOR ring at the same point the predecessor NodeID is derived and stored
+//     WITH this handoff entry for its whole lifetime. This is the graceful-leave
+//     fix: on a SCALE-DOWN the predecessor LEAVES the ring, so resolving its
+//     NodeID -> address at forward time (a live-ring walk) returns nothing and
+//     the forward gives up. Carrying the address here means the forward reaches
+//     the departed-but-still-serving predecessor regardless of the ring. An
+//     address string is just data (no I/O), so the domain stays pure. Empty
+//     when there is no predecessor or its address was not resolvable from the
+//     prior snapshot.
 //
-// NB the design doc names this field's type "NodeAddr". The pure domain
-// identifies nodes by NodeID (the predecessor is derived from the replica-set
-// diff, which yields NodeIDs); resolving a NodeID to a dial address is a
-// membership/transport concern that lives in the controller, not in this
-// I/O-free type. So the pure field is a NodeID and the controller maps it to
-// an address when it actually forwards. (Spec/design refinement noted in the
-// same change as the implementation.)
+// NB the design doc originally named the predecessor field's type "NodeAddr".
+// The pure domain identifies nodes by NodeID (the predecessor is derived from
+// the replica-set diff, which yields NodeIDs); the dial address is carried
+// alongside as plain data (PredecessorAddr) so the forward survives the
+// predecessor leaving the ring. Resolving NodeID -> address is still a
+// controller concern (it reads the prior-ring snapshot); the resolved string
+// is then stored here.
 type HandoffState struct {
-	Phase       HandoffPhase
-	OpenEpoch   Epoch
-	Predecessor NodeID
+	Phase           HandoffPhase
+	OpenEpoch       Epoch
+	Predecessor     NodeID
+	PredecessorAddr string
 }
 
 // HasPredecessor reports whether this state carries a single-hop predecessor to

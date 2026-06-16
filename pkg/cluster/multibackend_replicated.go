@@ -211,6 +211,21 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 // current durable lease for that replica position (the fence). On error the
 // replica is left unmounted (a routed op gets the retryable acquiring-window
 // error and the next reconcile retries). Caller MUST hold reconcileMu.
+//
+// It writes the durable SERVING MARKER after mounting, EXACTLY as the overlap
+// acquire does. This is REQUIRED for the graceful-leave (scale-down) drain to
+// complete: a position moving OFF a leaving node can land on its successor via
+// THIS clean-cut path (not only the overlap path) - e.g. a full-rebalance move
+// where the predecessor is no longer single-hop identifiable from the (tight-
+// loop-overwritten) prior snapshot, so predecessorOf yields no predecessor and
+// the reconcile falls through here. The leaving node is DRAINING that exact
+// position and releases ONLY on a serving marker strictly above its open epoch;
+// if this path mounted silently (no marker, the old behavior) the draining
+// predecessor would wait out the full grace timeout. The clean-cut gainer opens
+// at durable+1 (strictly above the predecessor's open epoch), so the marker it
+// writes here releases the draining predecessor. The marker is monotonic +
+// idempotent, so writing it on a pure new mount (no draining predecessor) is a
+// harmless no-op observer-wise.
 func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	epoch := acquireBaseEpoch
 	b, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
@@ -225,6 +240,14 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	}
 	c.mountMap[ru] = b
 	c.mountMu.Unlock()
+
+	// Write the durable serving marker AFTER the mount (outside the lock: shared
+	// storage I/O), at the epoch this node opened the position at. This is the
+	// poll-observable release signal a DRAINING predecessor of this position
+	// reads (drainCheck); without it a clean-cut-acquired successor of a leaving
+	// node never releases that node's drain.
+	openedEpoch := c.openEpochForReplica(ru)
+	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
 }
 
 // releaseReplicaUnit unmounts the ReplicaUnit ru via the per-replica factory.

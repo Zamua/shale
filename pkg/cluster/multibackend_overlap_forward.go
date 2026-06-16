@@ -54,10 +54,21 @@ func (c *Cluster) acquiringForwardTarget(key []byte) (ru storageunit.ReplicaUnit
 	if state.Phase != storageunit.PhaseAcquiring || !state.HasPredecessor() {
 		return storageunit.ReplicaUnit{}, "", false
 	}
+	// The STORED address is authoritative: it was captured from the prior ring
+	// where the predecessor was still a member, so it survives the predecessor
+	// LEAVING the ring on a scale-down (the graceful-leave fix). A live-ring walk
+	// (addrForNodeID) cannot resolve a departed node, which is exactly the
+	// scale-down case that previously broke the forward.
+	if state.PredecessorAddr != "" {
+		return ru, state.PredecessorAddr, true
+	}
+	// No stored address (older entry, or it was unresolvable from the prior
+	// snapshot): fall back to a live-ring resolve. This still works for the
+	// SCALE-UP case where the predecessor stays in the ring.
 	addr, resolved := c.addrForNodeID(state.Predecessor)
 	if !resolved {
-		// The recorded predecessor is no longer in the ring (it left). Treat as
-		// unreachable -> Option-A fallback.
+		// The recorded predecessor is no longer in the ring (it left) and we have
+		// no stored address. Treat as unreachable -> Option-A fallback.
 		return storageunit.ReplicaUnit{}, "", false
 	}
 	return ru, addr, true

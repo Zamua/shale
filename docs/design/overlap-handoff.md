@@ -216,8 +216,18 @@ Mechanics:
   reconcile keeps NO prior-ring snapshot today (only the legacy path has
   `lastEvalRing`), so Phase 2e ADDS a retained prior-desired-replica-set
   snapshot (see "Predecessor identification" below for where it lives and
-  when it is captured). The recorded predecessor address travels in the
-  `HandoffState` (an `Acquiring` entry carries `Predecessor NodeAddr`).
+  when it is captured). The recorded predecessor travels in the
+  `HandoffState`: an `Acquiring` entry carries the predecessor `NodeID`
+  (`Predecessor`) AND its dial address (`PredecessorAddr`). Carrying the
+  ADDRESS, not just the id, is the graceful-leave (scale-down) fix: on a leave
+  the predecessor is PURGED from the ring, so resolving its `NodeID` to an
+  address at forward time (a live-ring walk) returns nothing and the forward
+  gives up while the departed node is still serving. The address is captured
+  from the PRIOR ring (where the predecessor was still a member) and stored in
+  the entry, so the forward reaches the predecessor regardless of the ring.
+  The address is plain data, so the pure `HandoffState` stays I/O-free; a
+  sibling `priorAddrs` (`map[NodeID]string`) captured from the SAME ring as the
+  prior-desired-replica snapshot is the source the controller resolves it from.
 - **Position-addressed forward (NEW-P0). This is a real WIRE change.** The
   forward is NOT the plain key-only forwarded op the cluster uses for a
   ring-resolved non-local replica leg. The plain forwarded ops
@@ -354,11 +364,21 @@ Phase 2e ADDS a retained snapshot, the multi analogue of `lastEvalRing`:
 - **Where it lives.** A new `Cluster` field (e.g. `priorDesiredReplicas`)
   guarded by the same lock that guards `replicaPos` today (the mountMu /
   reconcile critical section), captured at the END of each
-  `reconcileReplicaUnits` run, BEFORE the next run can read it.
+  `reconcileReplicaUnits` run, BEFORE the next run can read it. A SIBLING
+  `priorAddrs` (`map[NodeID]string`) is captured at the SAME point from the
+  SAME ring, holding each prior member's dial address, so a predecessor that
+  LEAVES the ring before the next reconcile can still be reached (its address
+  was a member of THIS prior ring even though it is gone from the live one).
 - **How the predecessor is derived.** For a position rP of unit K that the
   live set assigns to THIS node but the prior snapshot did not, the
   predecessor is `prior-holder(K, rP) \ live-holder(K, rP)`: the node that
-  held position rP of K in the prior snapshot and does not hold it now.
+  held position rP of K in the prior snapshot and does not hold it now. The
+  predecessor's dial ADDRESS is resolved from `priorAddrs[predecessor]` (the
+  prior-ring snapshot) and stored in the `Acquiring` `HandoffState`
+  (`PredecessorAddr`), so the forward survives the predecessor leaving the
+  live ring. The forward (`acquiringForwardTarget`) uses the stored address
+  directly; a live-ring resolve is only a fallback for the scale-UP case where
+  the predecessor stays in the ring.
 - **Consulted ONLY to identify the predecessor, NEVER for routing.** Routing
   is always live-ring-derived; the snapshot only answers "who do I forward
   to while I acquire."
@@ -622,15 +642,21 @@ Domain (pure, no I/O) in `pkg/storageunit`:
     Absent are represented by mountMap presence + phase absence, not enum
     values).
   - `HandoffState` value object: `{Phase HandoffPhase, OpenEpoch Epoch,
-    Predecessor NodeID}` (the predecessor is meaningful only in
-    `Acquiring`). The cluster keys the in-flight record by `ReplicaUnit`
-    (the position is the key, not a field). The predecessor field is a
-    `storageunit.NodeID` (the pure domain's node identity), NOT a dial
-    address: it is derived from the prior/live replica-set diff, which yields
-    `NodeID`s, and the pure domain stays I/O-free. Resolving a `NodeID` to a
-    transport address is a controller/membership concern done at forward time.
-    (Earlier drafts of this doc named the field `NodeAddr`; the foundation
-    implementation pinned it to `NodeID` to keep the type I/O-free.)
+    Predecessor NodeID, PredecessorAddr string}` (the predecessor is
+    meaningful only in `Acquiring`). The cluster keys the in-flight record by
+    `ReplicaUnit` (the position is the key, not a field). `Predecessor` is a
+    `storageunit.NodeID` (the pure domain's node identity), derived from the
+    prior/live replica-set diff. `PredecessorAddr` carries that node's dial
+    address ALONGSIDE the id: an address string is plain data (no I/O), so the
+    type stays pure, and storing it is the graceful-leave (scale-down) fix - on
+    a leave the predecessor is purged from the ring, so a forward-time live-ring
+    resolve of the `NodeID` fails while the departed node is still serving. The
+    controller resolves the address from the prior-ring snapshot (`priorAddrs`,
+    where the predecessor was still a member) at the SAME point it derives the
+    `NodeID`, and stores it here so the forward survives the leave. (Earlier
+    drafts named the predecessor field `NodeAddr`; the foundation pinned the id
+    to `NodeID` and now carries the dial address as a separate plain-data field
+    rather than as I/O behind the type.)
   - Pure transition functions / guards: `NextOnReady`, `NextOnDrain`,
     `NextOnRelease`, returning the next phase or an error for an illegal
     edge; the guards make explicit WHICH phases are legal on WHICH side (a

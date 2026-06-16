@@ -404,6 +404,18 @@ type Cluster struct {
 	// fallback). See docs/design/overlap-handoff.md "Predecessor identification".
 	priorDesiredReplicas map[storageunit.GenUnit][]storageunit.NodeID
 
+	// priorAddrs is the dial-address sibling of priorDesiredReplicas: a map from
+	// NodeID to the gRPC dial address that node had in the PRIOR ring (the ring
+	// that produced the priorDesiredReplicas snapshot), captured at the SAME
+	// point at the END of each reconcileReplicaUnitsOverlap run. It exists so a
+	// predecessor that LEAVES the ring on a scale-down can still be reached: the
+	// predecessor address is resolved from THIS snapshot (where it was still a
+	// member) and stored in the Acquiring HandoffState, surviving the leave. A
+	// live-ring walk (addrForNodeID) cannot resolve a departed node; this prior
+	// snapshot can. Guarded by mountMu, same as priorDesiredReplicas. See
+	// docs/design/overlap-handoff.md "Predecessor identification".
+	priorAddrs map[storageunit.NodeID]string
+
 	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
 	// capability view of factory: non-nil iff the factory implements
 	// ReplicaBackendFactory AND R>1. The replicated paths open each owned unit

@@ -34,8 +34,12 @@ func seedOwnedPositions(t *testing.T, c *Cluster, backing *sharedfactory.Backing
 		c.mountMap[target] = b
 	}
 	// Capture the prior snapshot as the pre-leave live sets so that after self
-	// leaves, each of its positions is a single-hop move to its successor.
+	// leaves, each of its positions is a single-hop move to its successor. Also
+	// capture the member addresses from the SAME (pre-leave) ring so the
+	// departing node's dial address is stored in the survivors' Acquiring state
+	// and the forward survives the leave.
 	c.priorDesiredReplicas = c.liveDesiredReplicaSets()
+	c.priorAddrs = c.liveMemberAddrs()
 	return desired
 }
 

@@ -10,6 +10,7 @@ package cluster
 // acceptance gate.
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
@@ -222,6 +223,130 @@ func TestOverlap_Reconcile_PureNewMount_NoPredecessor_FallsThroughToCleanAcquire
 	}
 	if st := c.handoffPhaseOf(target); st.Phase != 0 {
 		t.Fatalf("pure new mount must not enter a handoff phase, got %v", st.Phase)
+	}
+	// The clean-cut acquire must ALSO write the serving marker so a DRAINING
+	// predecessor of this position (a leaving node whose position landed here via
+	// the non-overlap path) can release. This is the second half of the graceful-
+	// leave fix: reachability (the stored address) gets the forward to the leaving
+	// node; the clean-cut marker lets the leaving node's drain COMPLETE for the
+	// positions that did not resolve to a single-hop overlap.
+	if _, ok := backing.ServingMarker(target); !ok {
+		t.Fatalf("clean-cut acquire must write the serving marker so a draining predecessor releases")
+	}
+}
+
+// TestOverlap_CleanCutAcquire_WritesServingMarker pins directly that
+// acquireReplicaUnit (the clean-cut path) writes the serving marker after
+// mounting, at the epoch it opened. Without it a leaving node draining this
+// exact position never observes a marker and waits out the full grace timeout.
+func TestOverlap_CleanCutAcquire_WritesServingMarker(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+
+	target := ru(0, 0, 0)
+	c.acquireReplicaUnit(target)
+
+	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
+		t.Fatalf("clean-cut acquire must mount the position")
+	}
+	markerEpoch, ok := backing.ServingMarker(target)
+	if !ok {
+		t.Fatalf("clean-cut acquire must write the serving marker")
+	}
+	// The marker is at the epoch this node opened the position at (durable epoch
+	// after the fence), which is strictly above any prior draining holder's open
+	// epoch, so a draining predecessor's strict (>) gate releases.
+	durable, _ := backing.Handle().DurableEpochReplica(target)
+	if markerEpoch != durable {
+		t.Fatalf("serving marker epoch = %d, want the opened/durable epoch %d", markerEpoch, durable)
+	}
+}
+
+// firstKeyForUnit brute-forces a key whose live genUnit + this node's replica
+// position match target (so acquiringForwardTarget resolves to target via the
+// live-ring routing path). Fails the test if none is found in a bounded scan.
+func firstKeyForUnit(t *testing.T, c *Cluster, target storageunit.ReplicaUnit) []byte {
+	t.Helper()
+	for i := 0; i < 100000; i++ {
+		key := []byte(fmt.Sprintf("k%d", i))
+		gu := c.genUnitForKey(key)
+		if gu != target.Unit {
+			continue
+		}
+		pos, ok := c.localReplicaPos(gu)
+		if ok && pos == target.Replica {
+			return key
+		}
+	}
+	t.Fatalf("no key found routing to %v on self", target)
+	return nil
+}
+
+// -- predecessor address carry (graceful-leave P0 fix) -------------------
+
+// TestOverlap_ForwardTarget_UsesStoredAddrAfterPredecessorLeft pins the
+// graceful-leave fix: an Acquiring entry carries the predecessor's dial address
+// captured from the prior ring, and acquiringForwardTarget returns THAT stored
+// address even when the predecessor has LEFT the live ring (a scale-down).
+// Before the fix the forward resolved the address by walking the LIVE ring
+// (addrForNodeID), which returns nothing for a departed node, so the forward
+// gave up and the leaving node - though still serving - was unreachable.
+func TestOverlap_ForwardTarget_UsesStoredAddrAfterPredecessorLeft(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	// Live ring deliberately does NOT contain the predecessor "gone": self GAINS
+	// a position whose predecessor has already left the ring.
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+
+	// Find a position self DESIRES and is the live holder of, so
+	// acquiringForwardTarget resolves it from the live ring index.
+	desired := c.desiredReplicaUnits()
+	if len(desired) == 0 {
+		t.Fatalf("self desires no units; ring fixture broken")
+	}
+	target := desired[0]
+
+	const goneAddr = "gone:0"
+	// Seed an Acquiring entry whose predecessor "gone" is NOT in the live ring,
+	// but whose dial address was captured (from the prior ring) and stored.
+	c.handoffPhase[target] = storageunit.HandoffState{
+		Phase:           storageunit.PhaseAcquiring,
+		Predecessor:     "gone",
+		PredecessorAddr: goneAddr,
+	}
+
+	// A live-ring resolve of "gone" must FAIL (it left the ring) - this is the
+	// exact condition that broke the forward before the fix.
+	if _, ok := c.addrForNodeID("gone"); ok {
+		t.Fatalf("predecessor 'gone' must not be resolvable via the live ring")
+	}
+
+	// acquiringForwardTarget must still return the STORED address.
+	key := firstKeyForUnit(t, c, target)
+	gotRU, gotAddr, ok := c.acquiringForwardTarget(key)
+	if !ok {
+		t.Fatalf("acquiringForwardTarget must succeed using the stored predecessor address")
+	}
+	if gotRU != target {
+		t.Fatalf("forward target ru = %v, want %v", gotRU, target)
+	}
+	if gotAddr != goneAddr {
+		t.Fatalf("forward target addr = %q, want the stored %q", gotAddr, goneAddr)
+	}
+}
+
+// TestOverlap_liveMemberAddrs_SnapshotsEveryMember pins that the address
+// snapshot captures every live ring member's dial address, which is what the
+// NEXT reconcile reads to resolve a soon-to-leave predecessor.
+func TestOverlap_liveMemberAddrs_SnapshotsEveryMember(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+
+	addrs := c.liveMemberAddrs()
+	for _, id := range []storageunit.NodeID{"self", "n2", "n3"} {
+		want := string(id) + ":0" // newReplicatedCluster sets Addr = id + ":0"
+		if got := addrs[id]; got != want {
+			t.Fatalf("liveMemberAddrs[%q] = %q, want %q", id, got, want)
+		}
 	}
 }
 
