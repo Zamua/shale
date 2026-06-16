@@ -158,6 +158,17 @@ type Options struct {
 	HandoffTimeout time.Duration
 }
 
+// defaultGraceDuration is the GraceDuration DefaultOptions hands out. It is a
+// package var (not a literal) only so the in-process test suite can shorten it
+// binary-wide via SetDefaultGraceDuration - the 30s production grace makes every
+// fixture that relies on the default wait out a full grace window on bootstrap.
+// Production never calls the setter, so it stays 30s there.
+var defaultGraceDuration = 30 * time.Second
+
+// SetDefaultGraceDuration overrides the grace DefaultOptions returns. TEST-ONLY
+// (mirrors SetSweepInterval); call it from a test init, never from production.
+func SetDefaultGraceDuration(d time.Duration) { defaultGraceDuration = d }
+
 // DefaultOptions returns the spec-aligned tunables. Callers that
 // want to override a single field should still start here:
 //
@@ -167,7 +178,7 @@ type Options struct {
 func DefaultOptions() Options {
 	return Options{
 		SettleDelay:    5 * time.Second,
-		GraceDuration:  30 * time.Second,
+		GraceDuration:  defaultGraceDuration,
 		ChunkSize:      64,
 		RetryAfterMs:   50,
 		HandoffTimeout: 5 * time.Minute,

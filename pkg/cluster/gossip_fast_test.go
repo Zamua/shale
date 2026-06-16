@@ -18,7 +18,19 @@ import (
 //     default, every R>1 fixture's WaitForRebalanceIdle blocked ~10s for the
 //     next sweep even once the (test-shortened) grace had expired. 200ms keeps
 //     the sweep granularity well under the test grace windows without thrashing.
+//   - SetDefaultGraceDuration: a handed-off range lingers this long before the
+//     sweep retires it. The 30s production default made any fixture that did not
+//     set RebalanceGraceDuration (the inline two-node tests) wait a full 30s on
+//     bootstrap. The empty bootstrap handoff has nothing to protect, so 500ms is
+//     ample, and it keeps fixtures that DO override grace unaffected.
+//   - defaultSettleDelay: the post-membership-change reconcile debounce. The 5s
+//     default added a flat 5s to every fixture that did not set
+//     RebalanceSettleDelay; 300ms reconciles promptly after the (fast, loopback)
+//     gossip settles. Fixtures that set their own settle (incl. the time.Hour
+//     manual-reconcile ones) are unaffected.
 func init() {
 	membership.UseLocalGossipForTests()
 	rebalance.SetSweepInterval(200 * time.Millisecond)
+	rebalance.SetDefaultGraceDuration(500 * time.Millisecond)
+	defaultSettleDelay = 300 * time.Millisecond
 }
