@@ -24,6 +24,8 @@ package cluster
 
 import (
 	"context"
+	"fmt"
+	"os"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -108,13 +110,23 @@ func (c *Cluster) forwardPutToPredecessor(ctx context.Context, key, envBytes []b
 	if !ok {
 		return false, nil
 	}
+	diag := os.Getenv("SHALE_DRAIN_DIAG") != ""
 	cli, derr := c.clientFor(addr)
 	if derr != nil {
+		if diag {
+			fmt.Fprintf(os.Stderr, "[FWDDIAG node=%s DIALFAIL addr=%s ru=%v err=%v]\n", c.cfg.NodeID, addr, ru, derr)
+		}
 		// Predecessor unreachable: single-hop fallback to Option A.
 		return true, errUnitAcquiring("Put")
 	}
 	if perr := cli.PutAtReplica(ctx, ru, key, envBytes); perr != nil {
+		if diag {
+			fmt.Fprintf(os.Stderr, "[FWDDIAG node=%s RPCFAIL addr=%s ru=%v err=%v]\n", c.cfg.NodeID, addr, ru, perr)
+		}
 		return true, errUnitAcquiring("Put")
+	}
+	if diag {
+		fmt.Fprintf(os.Stderr, "[FWDDIAG node=%s OK addr=%s ru=%v]\n", c.cfg.NodeID, addr, ru)
 	}
 	return true, nil
 }

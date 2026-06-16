@@ -30,6 +30,9 @@
 package cluster
 
 import (
+	"fmt"
+	"os"
+
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -121,6 +124,10 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		}
 		pred, ok := predecessorOf(ru, prior, live)
 		if !ok {
+			if os.Getenv("SHALE_DRAIN_DIAG") != "" {
+				fmt.Fprintf(os.Stderr, "[ACQDIAG node=%s CLEANCUT ru=%v priorHolders=%v liveHolders=%v]\n",
+					c.cfg.NodeID, ru, prior[ru.Unit], live[ru.Unit])
+			}
 			// Pure new mount (initial convergence, no prior holder) OR an
 			// ambiguous / multi-hop predecessor (prior holder gone / already
 			// released). Overlap is single-hop best-effort: fall through to the
@@ -128,6 +135,9 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 			// gets errUnitAcquiring + the WriteTimeout-bounded retry.
 			c.acquireReplicaUnit(ru)
 			continue
+		}
+		if os.Getenv("SHALE_DRAIN_DIAG") != "" {
+			fmt.Fprintf(os.Stderr, "[ACQDIAG node=%s OVERLAP ru=%v pred=%s]\n", c.cfg.NodeID, ru, pred)
 		}
 		// Single unambiguous predecessor: overlap. Resolve its DIAL ADDRESS from
 		// the PRIOR-ring snapshot (where the predecessor was still a member) so the
