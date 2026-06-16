@@ -154,9 +154,14 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 			continue // already a current owner + mounted; nothing to acquire.
 		}
 		if _, isMounted := mountedSet[ru]; isMounted {
-			// Already mounted this pending position (a prior pass acquired it). If it
-			// is still PhaseAcquiring with the mount present (the flip races), let it
-			// resolve; otherwise it is Owned and serving.
+			// Already mounted this pending position. If it is still PhaseAcquiring
+			// with the mount present AND no acquire goroutine is in flight, the flip
+			// raced and exited WITHOUT dropping the phase / writing the serving marker
+			// - the position is stuck Acquiring forever, so the leaver's drainCheck
+			// never sees a marker and its drain runs to the timeout (the staging
+			// scale-down availability gap). Finish the flip here. Otherwise (Owned, or
+			// a flip still running) it is a no-op.
+			c.finishStuckFlipIfNeeded(ru)
 			continue
 		}
 		st := c.handoffPhaseOf(ru)
@@ -189,6 +194,9 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	// this exact slot, so there is nothing to drain from).
 	for _, ru := range current {
 		if _, isMounted := mountedSet[ru]; isMounted {
+			// A mounted current position stuck in a gainer phase with no acquire
+			// goroutine in flight is the same stuck-flip race: finish it.
+			c.finishStuckFlipIfNeeded(ru)
 			continue
 		}
 		st := c.handoffPhaseOf(ru)
@@ -202,6 +210,41 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		}
 		c.acquireReplicaUnit(ru)
 	}
+}
+
+// finishStuckFlipIfNeeded completes a handoff flip that the background acquire
+// goroutine left half-done: a position that is MOUNTED + in a GAINER phase
+// (PhaseAcquiring/PhaseReady) with NO acquire goroutine in flight. In that state
+// the mount is present + durable but the phase was never dropped to Owned and the
+// serving marker was never written, so the position never reads as "serving":
+// the leaver's drainCheck never sees a successor marker and its graceful drain
+// runs to the timeout (the staging scale-down availability gap). The mount being
+// present means the open already succeeded + the durable copy is recovered, so it
+// is safe to advance to Owned (drop the phase) and write the serving marker at
+// the position's durable open epoch (strictly above the leaver's, which releases
+// its drain). Caller holds reconcileMu. A no-op unless genuinely stuck.
+func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
+	c.mountMu.Lock()
+	if _, inFlight := c.acquireInFlight[ru]; inFlight {
+		c.mountMu.Unlock()
+		return // a flip goroutine is running; let it complete.
+	}
+	st, ok := c.handoffPhase[ru]
+	if !ok || !st.Phase.IsGainer() {
+		c.mountMu.Unlock()
+		return // Owned (no phase) or a loser phase: nothing to finish.
+	}
+	if _, mounted := c.mountMap[ru]; !mounted {
+		c.mountMu.Unlock()
+		return // not mounted; the acquire half re-drives the mount.
+	}
+	delete(c.handoffPhase, ru) // mounted + no phase = Owned (serving locally).
+	c.mountMu.Unlock()
+
+	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at the
+	// durable open epoch - exactly what the in-goroutine flip would have written.
+	openedEpoch := c.openEpochForReplica(ru)
+	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
 }
 
 // desiredPendingReplicaUnits returns the positions this node owns under the
