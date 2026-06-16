@@ -168,17 +168,27 @@ func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, st
 		return withUnit(current), stableR
 	}
 
-	// Union, current-first, each member paired with the ru it holds: current
-	// owners keep their current index; a pending-only member takes its pending
-	// index (the slot it acquired).
+	// Union over (member, POSITION) PAIRS - current-first, then every pending
+	// pair not already present. A leave shuffles replica indices: a survivor that
+	// moves from replica-1 (its CURRENT slot, which it keeps serving until drain)
+	// to replica-0 (its PENDING slot, which it acquires + fences the leaver off)
+	// appears in BOTH sets at DIFFERENT indices, so it is routed to BOTH (gu,1) and
+	// (gu,0). Deduping by member ID alone (keeping only the current index) was the
+	// during-leave write-availability gap: the survivor was never routed to the
+	// position it acquired, so within the fence cascade (the leaver released at
+	// (gu,0), the survivor's old (gu,1) fenced by its own successor) a write could
+	// reach only one live db and miss W. Pairing it at both positions keeps a
+	// second live copy reachable throughout. Dedup is by the (member, ru) pair so
+	// the steady state (pending == current) is unchanged.
 	curRR := withUnit(current)
-	out := make([]routedReplica, 0, len(curRR)+len(pending))
+	penRR := withUnit(pending)
+	out := make([]routedReplica, 0, len(curRR)+len(penRR))
 	out = append(out, curRR...)
-	for i, m := range pending {
-		if containsMember(current, m.ID) {
-			continue // already added at its current index.
+	for _, rr := range penRR {
+		if containsRoutedReplica(out, rr) {
+			continue // same (member, position) already routed.
 		}
-		out = append(out, routedReplica{member: m, ru: storageunit.NewReplicaUnit(gu, uint8(i))})
+		out = append(out, rr)
 	}
 	return out, stableR
 }
@@ -228,6 +238,20 @@ func sameMemberSet(a, b []ring.Member) bool {
 		}
 	}
 	return true
+}
+
+// containsRoutedReplica reports whether rs already holds the same (member,
+// position) pair as want. Used to dedup the routed union so a member that owns
+// the SAME position in both the current and pending sets is routed once, while a
+// member that owns DIFFERENT positions across the sets (an index-shuffling
+// survivor) is routed to each.
+func containsRoutedReplica(rs []routedReplica, want routedReplica) bool {
+	for _, r := range rs {
+		if r.member.ID == want.member.ID && r.ru == want.ru {
+			return true
+		}
+	}
+	return false
 }
 
 // containsMember reports whether ms holds a member with the given ID.

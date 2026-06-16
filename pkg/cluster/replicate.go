@@ -67,11 +67,16 @@ type replicaResult struct {
 // land before deciding. Migration-guard codes.ResourceExhausted from
 // a replica that is mid-handoff is the canonical transient (v0.4
 // distinguishes this from codes.Unavailable, which counts as failure).
+// op receives idx, the position of replica within the replicas slice, so a
+// caller that routes the SAME member to more than one target (the pending-ranges
+// union routes a survivor that shifted replica indices to BOTH the position it is
+// draining and the position it acquired) can recover which target this goroutine
+// is for - a member-keyed lookup would collapse the duplicates onto one position.
 func fanout(
 	ctx context.Context,
 	replicas []ring.Member,
 	requiredAcks int,
-	op func(ctx context.Context, replica ring.Member) ([]byte, error),
+	op func(ctx context.Context, idx int, replica ring.Member) ([]byte, error),
 ) (int, []error, <-chan replicaResult) {
 	n := len(replicas)
 	if n == 0 {
@@ -89,10 +94,10 @@ func fanout(
 	resultsCh := make(chan replicaResult, n)
 	var wg sync.WaitGroup
 	wg.Add(n)
-	for _, r := range replicas {
+	for i, r := range replicas {
 		go func() {
 			defer wg.Done()
-			v, err := op(ctx, r)
+			v, err := op(ctx, i, r)
 			resultsCh <- replicaResult{Member: r, Err: err, Value: v}
 		}()
 	}
@@ -308,7 +313,7 @@ func (c *Cluster) putReplicatedAttempt(ctx context.Context, key, envBytes []byte
 	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))
 
 	acks, errs, resultsCh := fanout(ctx, replicas, w,
-		func(opCtx context.Context, replica ring.Member) ([]byte, error) {
+		func(opCtx context.Context, _ int, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchReplicaPut(opCtx, replica, key, envBytes)
 		})
 
@@ -392,7 +397,7 @@ func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 
 	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
 	_, _, resultsCh := fanout(fanoutCtx, queried, n,
-		func(ctx context.Context, replica ring.Member) ([]byte, error) {
+		func(ctx context.Context, _ int, replica ring.Member) ([]byte, error) {
 			return c.dispatchReplicaGet(ctx, replica, key)
 		})
 

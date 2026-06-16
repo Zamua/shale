@@ -240,7 +240,7 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, w
 	remoteNeeded := w - 1
 
 	acks, errs, resultsCh := fanout(ctx, others, remoteNeeded,
-		func(opCtx context.Context, replica ring.Member) ([]byte, error) {
+		func(opCtx context.Context, _ int, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchApplyBatch(opCtx, replica, writes)
 		})
 

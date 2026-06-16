@@ -21,7 +21,7 @@ import (
 func TestFanout_AllSucceed(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	acks, errs, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			return []byte("ok"), nil
 		})
 	if acks < 2 {
@@ -39,7 +39,7 @@ func TestFanout_FailureBudgetExhausted(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var nonAck int32
 	acks, errs, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			if atomic.AddInt32(&nonAck, 1) <= 2 {
 				return nil, errors.New("boom")
 			}
@@ -69,7 +69,7 @@ func TestFanout_TransientDoesNotCount(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var seq int32
 	acks, errs, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			n := atomic.AddInt32(&seq, 1)
 			if n == 1 {
 				return nil, status.Error(codes.ResourceExhausted, "transient")
@@ -95,7 +95,7 @@ func TestFanout_UnavailableCountsAsFailure(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var seq int32
 	acks, errs, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			n := atomic.AddInt32(&seq, 1)
 			if n <= 2 {
 				return nil, status.Error(codes.Unavailable, "peer down")
@@ -118,7 +118,7 @@ func TestFanout_SuccessAcksClampToRequired(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	// Slow one replica so the other two ack first.
 	acks, _, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, m ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, m ring.Member) ([]byte, error) {
 			if m.ID == "c" {
 				time.Sleep(50 * time.Millisecond)
 			}
@@ -141,7 +141,7 @@ func TestFanout_SuccessAcksClampToRequired(t *testing.T) {
 // channel without panicking.
 func TestFanout_EmptyReplicas(t *testing.T) {
 	acks, errs, ch := fanout(context.Background(), nil, 1,
-		func(_ context.Context, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			return nil, nil
 		})
 	if acks != 0 || len(errs) != 0 {

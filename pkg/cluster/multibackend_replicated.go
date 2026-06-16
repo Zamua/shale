@@ -352,16 +352,21 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 		return writeAttempt{err: status.Error(codes.Unavailable, "shale: no replicas available for key")}
 	}
 	replicas := make([]ring.Member, len(routed))
-	ruByMember := make(map[string]storageunit.ReplicaUnit, len(routed))
 	for i, rr := range routed {
 		replicas[i] = rr.member
-		ruByMember[rr.member.ID] = rr.ru
 	}
 	w := c.writeAckBar(len(replicas), stableR)
 
+	// Position-address by the fan-out INDEX, not the member ID: under a leave that
+	// shuffles replica indices, a survivor is routed to TWO positions (the slot it
+	// is draining AND the slot it acquired), so the same member appears twice in
+	// routed at different ru. A member-keyed lookup would collapse those onto one
+	// position, leaving the acquired slot unwritten - the during-leave
+	// write-availability gap. idx maps each fan-out goroutine to its exact
+	// routedReplica.
 	acks, errs, resultsCh := fanout(ctx, replicas, w,
-		func(opCtx context.Context, replica ring.Member) ([]byte, error) {
-			return nil, c.dispatchReplicaPutUnit(opCtx, replica, ruByMember[replica.ID], key, envBytes)
+		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
+			return nil, c.dispatchReplicaPutUnit(opCtx, replica, routed[idx].ru, key, envBytes)
 		})
 
 	go func() {
@@ -439,7 +444,7 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 
 	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
 	_, _, resultsCh := fanout(fanoutCtx, queried, n,
-		func(ctx context.Context, replica ring.Member) ([]byte, error) {
+		func(ctx context.Context, _ int, replica ring.Member) ([]byte, error) {
 			return c.dispatchReplicaGetUnit(ctx, replica, key)
 		})
 
