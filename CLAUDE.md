@@ -95,6 +95,41 @@ go build ./...    # all packages compile
 
 Integration tests spin up 3-node clusters in-process via goroutines + ephemeral ports. No external services required.
 
+## Building the deployable shaled-slate image
+
+`backends/slate/cmd/shaled-slate/` carries TWO Dockerfiles. Both share a 3-stage
+shape (Rust `libslatedb_uniffi.so` -> Go+cgo `-tags slatedb` binary -> distroless
+runtime); only how they resolve the core `github.com/Zamua/shale` module differs:
+
+- **`Dockerfile.slatedb`** (release): build context is the `backends/slate` module
+  root, `GOWORK=off`, so the core module resolves to the PUBLISHED version pinned
+  in `backends/slate/go.mod`. Use this once the core changes you depend on are
+  tagged/published.
+- **`Dockerfile.slatedb.local`** (working tree): build context is the REPO ROOT,
+  `go.work` active, so the core module resolves to the IN-TREE source. Use this to
+  build an image that carries LOCAL, unpublished core-module changes (e.g.
+  validating a new `pkg/cluster` feature on a real cluster before the core commits
+  are tagged):
+
+  ```
+  docker build -f backends/slate/cmd/shaled-slate/Dockerfile.slatedb.local \
+    --platform linux/amd64 -t <image>:<tag> .   # from the repo root
+  ```
+
+  The heavy Rust stage is byte-identical between the two and shares its build
+  cache. Do NOT delete `Dockerfile.slatedb.local` "because it looks redundant": it
+  is the only way to ship unreleased core changes, and it has been lost before.
+
+### Debug / observability endpoint
+
+The shaled run-loop exposes an OPTIONAL debug HTTP server, OFF unless the
+`SHALE_DEBUG_ADDR` env var is set (so production is unaffected). When set (e.g.
+`:6060` on a node under investigation) it serves `net/http/pprof` plus
+`/debug/shale/state` - a per-node dump of every `ReplicaUnit`'s
+desired/pending/mounted/handoff-phase (flagging the desired-but-unmounted
+auto-recovery wedge) and the last swallowed acquire error. Reach it with a
+port-forward; no shell needed in the distroless image.
+
 ## Don'ts
 
 - Don't commit environment-specific paths, IPs, hostnames, account IDs, or operator credentials. The repo is meant to be a clean implementation that anyone can clone and run.
