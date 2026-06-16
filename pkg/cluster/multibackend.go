@@ -350,6 +350,28 @@ func (c *Cluster) localBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backen
 	return b, ok
 }
 
+// localMountedBackendForKey resolves the key's unit against this node's PHYSICAL
+// mountMap (ANY replica index), NOT the live-ring index. It backs LocalGet (the
+// "we physically hold this key even though the ring moved it off us" read
+// forwarder). The ring-index resolver (localBackendForKey) disclaims a position
+// this node is no longer the ring owner of - which is exactly a DRAINING node:
+// it is excluded from the ownership ring (graceful scale-down) yet still holds
+// the unit MOUNTED while it hands off. Scanning the mountMap by GenUnit lets the
+// draining node keep serving routed reads of the data it physically holds during
+// the drain window, instead of refusing them via the loop-guard. Returns the
+// first mounted backend whose ReplicaUnit is for the key's GenUnit.
+func (c *Cluster) localMountedBackendForKey(key []byte) (backend.Backend, bool) {
+	gu := c.genUnitForKey(key)
+	c.mountMu.RLock()
+	defer c.mountMu.RUnlock()
+	for ru, b := range c.mountMap {
+		if ru.Unit == gu {
+			return b, true
+		}
+	}
+	return nil, false
+}
+
 // mountedBackends returns a snapshot of every backend this node currently
 // has mounted, in ascending (generation, unit) order. Used by the LOCAL admin
 // scan (LocalScanPrefix with the unit-spanning behavior keysHeld + Aggregate

@@ -918,6 +918,18 @@ func (c *Cluster) OwnsKey(key []byte) bool {
 	return local
 }
 
+// DebugKeyState reports, for diagnostics, whether this node has the key's unit
+// physically MOUNTED (any replica index) and whether the ring places the key's
+// unit on this node (OwnsKey). Used by the graceful-leave gate to distinguish a
+// MIS-ROUTED key (mounted somewhere, but a survivor's ring routes elsewhere)
+// from an ORPHANED key (mounted nowhere). Multi-backend only.
+func (c *Cluster) DebugKeyState(key []byte) (mountedHere, ownsHere bool) {
+	if c.multi {
+		_, mountedHere = c.localMountedBackendForKey(key)
+	}
+	return mountedHere, c.OwnsKey(key)
+}
+
 // LocalScanPrefix returns an iterator over the LOCAL backend's keys
 // with the given prefix, bypassing ring routing entirely. Use this
 // for admin-style operations (peer snapshotting, per-node counters)
@@ -952,7 +964,13 @@ func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
 		return nil, backend.ErrClosed
 	}
 	if c.multi {
-		b, ok := c.localBackendForKey(key)
+		// PHYSICAL mount resolution (any replica index), not the ring index:
+		// LocalGet exists to serve a key this node physically holds even though
+		// the ring moved it off us (the v0.3 receive-window forwarder AND a v0.8
+		// DRAINING node, which is excluded from the ownership ring but still holds
+		// the unit mounted while it hands off). localBackendForKey would disclaim
+		// it via the ring index; scan the mountMap by unit instead.
+		b, ok := c.localMountedBackendForKey(key)
 		if !ok {
 			return nil, backend.ErrNotFound
 		}
