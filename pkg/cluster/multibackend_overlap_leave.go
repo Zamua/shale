@@ -83,10 +83,20 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 	t := time.NewTicker(drainPollInterval)
 	defer t.Stop()
 	for {
-		// Re-drive the reconcile so this node's own "I am draining, I no longer
-		// own these positions" converts them to Draining, then drainCheck
-		// releases the ones whose successors wrote a serving marker. runReconcile
-		// is idempotent + runs the overlap reconcile + runDrainChecks.
+		// FIRST pull this node out of its OWN ownership ring. reconcileRingFromMembership
+		// reads the snapshot (which now shows this node Draining) and drops every
+		// draining member - including self - from the consistent-hash ring. Without
+		// this drive the ring would only refresh on the slow background
+		// runReconcileLoop tick, so the tight drain poll below would keep computing
+		// desiredReplicaUnits() against a ring that still contains self and never
+		// convert any position to Draining. runReconcile (the unit/overlap reconcile)
+		// does NOT touch the membership-driven ring, so the ring reconcile must be
+		// driven explicitly here.
+		c.reconcileRingFromMembership()
+		// Re-drive the unit reconcile so this node's now-shrunken desired set
+		// converts its yielded positions to Draining, then drainCheck releases the
+		// ones whose successors wrote a serving marker. runReconcile is idempotent +
+		// runs the overlap reconcile + runDrainChecks.
 		c.runReconcile()
 		if c.ownedPositionCount() == 0 {
 			return nil

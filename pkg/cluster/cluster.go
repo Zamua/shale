@@ -391,6 +391,18 @@ type Cluster struct {
 	// Nil outside the R>1 (multiReplicated) paths.
 	handoffPhase map[storageunit.ReplicaUnit]storageunit.HandoffState
 
+	// acquireInFlight tracks ReplicaUnits whose overlap mount (the slow
+	// OpenReplicaUnit) is currently running in a background goroutine. The
+	// overlap acquire opens asynchronously so a node gaining MANY positions at
+	// once (a graceful scale-down hands a survivor all the leaving node's
+	// positions) mounts them CONCURRENTLY instead of serializing one slow open
+	// after another inside the reconcile - which would make the drain exceed its
+	// budget and the leaving node depart before the hand-off completes. The set
+	// is the idempotency guard: a reconcile that re-drives an already-in-flight
+	// acquire must NOT spawn a second open for the same position. Guarded by
+	// mountMu.
+	acquireInFlight map[storageunit.ReplicaUnit]struct{}
+
 	// priorDesiredReplicas is the DESIRED replica sets as of the ring the LAST
 	// reconcile acted on: a map from GenUnit to the ordered NodeIDs that held
 	// each replica position. It is the multi-backend analogue of the legacy
@@ -724,6 +736,18 @@ func (c *Cluster) runEventsLoop() {
 			}
 			switch ev.Type {
 			case membership.EventJoin:
+				// A DRAINING member is yielding ownership: it stays a reachable
+				// member (addressable for forwards) but must NOT be in the
+				// consistent-hash ownership ring, so its positions redistribute to
+				// non-draining members. EventJoin fires on every NotifyUpdate
+				// (including the draining-bit gossip), so without this guard the
+				// event loop would re-Add a draining node that reconcileRingFromMembership
+				// just removed, flip-flopping the ring and stranding positions
+				// mid-handoff. Skip the Add for a draining member; the periodic
+				// reconcileRingFromMembership owns removing it from the ring.
+				if ev.Member.Draining {
+					break
+				}
 				// If the addr changed (NotifyUpdate path - same ID,
 				// different Meta payload), evict the cached client
 				// for the OLD addr so the next dial picks up the
