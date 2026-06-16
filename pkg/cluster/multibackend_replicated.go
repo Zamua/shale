@@ -227,8 +227,10 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	epoch := acquireBaseEpoch
 	b, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
 	if err != nil {
+		c.lastAcquireErr.Store(ru, err.Error())
 		return
 	}
+	c.lastAcquireErr.Delete(ru)
 	c.mountMu.Lock()
 	if c.closed.Load() {
 		c.mountMu.Unlock()

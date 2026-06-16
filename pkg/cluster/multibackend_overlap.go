@@ -424,8 +424,10 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	if err != nil {
 		// Mount failed; stay Acquiring. The position is not stranded: the old owner
 		// is still a routed current owner serving via the union.
+		c.lastAcquireErr.Store(ru, err.Error())
 		return
 	}
+	c.lastAcquireErr.Delete(ru)
 
 	openedEpoch := c.openEpochForReplica(ru)
 

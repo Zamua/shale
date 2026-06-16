@@ -369,6 +369,13 @@ type Cluster struct {
 	mountMu   sync.RWMutex
 	mountMap  map[storageunit.ReplicaUnit]backend.Backend
 
+	// lastAcquireErr records, per ReplicaUnit, the most recent OpenReplicaUnit
+	// failure during an acquire (clean-cut or overlap). Diagnostic ONLY: the
+	// acquire paths otherwise swallow the error and retry next tick, so a
+	// position that fails to mount forever is invisible. Surfaced via DebugState.
+	// sync.Map so it needs no Open-time init and no extra lock ordering.
+	lastAcquireErr sync.Map // storageunit.ReplicaUnit -> string
+
 	// handoffPhase holds, per IN-FLIGHT ReplicaUnit, the pure
 	// ownership-transition state of an overlap handoff (v0.8 Phase 2e,
 	// Option B). Absence means steady state: Owned if mountMap[ru] is present,

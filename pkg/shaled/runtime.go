@@ -50,6 +50,8 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/http"
+	_ "net/http/pprof" // registers /debug/pprof on http.DefaultServeMux (debug server only)
 	"os"
 	"os/signal"
 	"strconv"
@@ -270,6 +272,25 @@ func Run(cfg RunConfig) error {
 		_ = lis.Close()
 		_ = closeBackendQuiet(closeOwned)
 		return fmt.Errorf("open cluster: %w", err)
+	}
+
+	// Optional debug/observability server (net/http/pprof). Off unless
+	// SHALE_DEBUG_ADDR is set, so production is unaffected; when set (e.g. on a
+	// staging node under investigation) it exposes /debug/pprof/goroutine so a
+	// wedged mount / acquire can be inspected live via `kubectl port-forward`
+	// without crashing the process. Bound to a SEPARATE listener from gRPC.
+	if dbgAddr := os.Getenv("SHALE_DEBUG_ADDR"); dbgAddr != "" {
+		// Per-node handoff-state dump alongside pprof (same DefaultServeMux).
+		http.HandleFunc("/debug/shale/state", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(c.DebugState()))
+		})
+		dbgSrv := &http.Server{Addr: dbgAddr}
+		go func() {
+			logger.Printf("shaled: debug/pprof listening on %s", dbgAddr)
+			if err := dbgSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Printf("shaled: debug server: %v", err)
+			}
+		}()
 	}
 
 	grpcServer := grpc.NewServer()
