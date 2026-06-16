@@ -693,9 +693,28 @@ Domain (pure, no I/O) in `pkg/storageunit`:
   ordering must be pinned/adjusted (re-scan the WAL tail after the fence).
   Flag for implementation; do not write code here.
 
+Membership (the draining node-state) in `pkg/membership`:
+
+- `membership.go` (edit): add `Draining bool` to the `Member` value object and
+  carry it in the node's `Meta` alongside the existing gRPC address (extend the
+  `metaDelegate.NodeMeta` encoding + the `nodeToMember` decode in
+  `NotifyJoin` / `NotifyUpdate`). Add `SetDraining(bool)` that updates the local
+  `Meta` var and calls `memberlist.UpdateNode` so the bit gossips out. A
+  `Draining` member stays in the snapshot (alive, address known); `SetDraining`
+  is distinct from `Leave()`. This is the foundation the graceful-leave drain is
+  built on - see "Graceful leave (scale-down)" above.
+
 Controller (the wiring) in `pkg/cluster`:
 
-- `cluster.go` (edit): re-key `mountMap` to `map[ReplicaUnit]backend.Backend`,
+- `cluster.go` (edit, ring exclusion + drain teardown): `reconcileRingFromMembership`
+  EXCLUDES any `Draining` member from the consistent-hash OWNERSHIP ring (so
+  `LocateKeyN` / `desiredReplicaUnits` redistribute its positions on every node)
+  while its address stays resolvable (it remains in MEMBERSHIP). REMOVE the
+  `leaving atomic.Bool` flag, its early-return guard in
+  `reconcileRingFromMembership`, and the remove-self-only step in
+  `DrainForLeave` (the ring-freeze stopgap): the draining node stays alive, so
+  its snapshot does not collapse and the reconcile works normally. Re-key
+  `mountMap` to `map[ReplicaUnit]backend.Backend`,
   remove the separate `replicaPos` map (subsumed by the key), add
   `handoffPhase map[ReplicaUnit]HandoffState` guarded by `mountMu`. ADD a
   `priorDesiredReplicas` snapshot (the prior desired replica sets, the multi
@@ -766,6 +785,15 @@ Controller (the wiring) in `pkg/cluster`:
     `ReplicaHandoffReady` RPC and no readiness-probe RPC exist: release is
     poll-only via the durable serving marker on the factory seam.)
 
+- `multibackend_overlap_leave.go` (edit): the graceful-leave drain.
+  `DrainForLeave(ctx)` SETS THIS NODE DRAINING (`membership.SetDraining(true)`
+  so the bit gossips and every node excludes it from ownership), then drives
+  the reconcile + `drainCheck` and BLOCKS until `ownedPositionCount() == 0` OR
+  `ctx` done. It does NOT call `memberlist.Leave()` and does NOT freeze the
+  ring; the real `Leave()` + `Shutdown()` run in `Close()`'s teardown AFTER the
+  drain returns. Drop the `c.leaving.Store(true)` + `c.ring.Remove(self)` +
+  `SHALE_DRAIN_DIAG` scaffolding (the stopgap + the investigation prints).
+
 - `multibackend_handoff_retry.go` (kept): Option A's retry stays as the belt
   for the residual cases (predecessor unreachable OR ambiguous/multi-hop,
   crash mid-handoff, a pure-new-mount initial convergence). Option B shrinks
@@ -818,57 +846,157 @@ set with the remaining replicas still covering W (plain release). No stray
 "isDraining" flag for the plain case: it takes the existing eager-delete
 path unchanged.
 
-## Graceful leave (scale-down) - drain on shutdown
+## Graceful leave (scale-down) - the DRAINING node-state
 
 The overlap machine above is symmetric between scale-UP and scale-DOWN: a
 JOIN makes a survivor `Acquiring` while the existing owner `Draining`-serves;
 a deliberate REMOVAL makes the survivors `Acquiring` the leaving node's
 positions while the LEAVING node `Draining`-serves them. So a graceful leave
 is just an overlap drain seen from the LOSING side, for ALL of a node's
-positions at once. The one missing piece is on the SHUTDOWN path, not the
-reconcile path: the leaving node's `Close()` does not WAIT for that drain.
+positions at once. Two pieces are missing: (1) a NODE-STATE that lets the
+survivors re-own a position WHILE the leaving node stays reachable to serve
+the forwards (the reconcile-path gap), and (2) the leaving node's `Close()`
+WAITING for that drain (the shutdown-path gap).
 
-THE GAP. On SIGTERM the run loop (`pkg/shaled/runtime.go`) calls
-`Cluster.Close()` (`pkg/cluster/cluster.go`). `Close()` broadcasts the
-memberlist leave (`membership.Close()` -> `memberlist.Leave(0)` then
-`Shutdown()`), so peers re-own the units and begin forwarding to the leaving
-node - but it IMMEDIATELY tears down the reconcile loops + peer clients +
-`closeMountedUnits()`, WITHOUT waiting for the survivors' slow `Acquiring` to
-complete. Every position the leaving node was serving is UNSERVED from the
-instant `Close()` closes its mounts until the survivors flip - the same
-mount-time gap Phase 2e removed for scale-up, reopened for scale-down. The
-serving + `drainCheck` + forward path that would have held availability are
-torn down before they could run.
+THE ROOT CAUSE (a design flaw, found by instrumentation). The graceful drain
+delivers almost no availability (~58% in-process, ~70% real staging) because
+the obvious shutdown fix is SELF-CONTRADICTORY. The leaving node is asked to
+be BOTH:
 
-THE FIX (reuse the overlap machinery; add a drain-wait on shutdown). Three
-pieces:
+- ALIVE - so it can keep serving routed ops + the survivors' forwards during
+  the drain, and
+- GONE - so the survivors take over its ownership positions (the whole point
+  of a scale-down),
 
-1. **Split membership `Leave()` from `Close()`.** memberlist has `Leave()`
-   (broadcast the graceful departure) DISTINCT from `Shutdown()` (tear down
-   the transport). The wrapper's `Close()` does both today. Add a membership
-   `Leave()` that broadcasts WITHOUT shutting the transport down, so the node
-   keeps serving gRPC and keeps being FORWARDED-TO during the drain;
-   `Shutdown()`/`Close()` of the transport stays in the existing teardown.
+and `memberlist.Leave()`-while-keeping-the-transport-up cannot represent
+that. `memberlist.Leave()` broadcasts a "leaving" intent, but the node then
+KEEPS GOSSIPING AS ALIVE. Survivors receive the leave, briefly drop the node,
+then keep hearing it alive and RE-ADD it to their membership snapshot.
+Because ownership is derived from the LIVE membership ring on EVERY node, a
+survivor that re-added the leaver computes it as STILL OWNING its positions,
+so it NEVER enters the overlap-`Acquiring` path for them: no predecessor, no
+handoff. The survivor CLEAN-CUT acquires only once failure detection
+eventually evicts the leaver, and meanwhile writes bottom out on the slow
+mount. The instrumented evidence: 54 survivor acquire decisions DURING the
+drain, every one with the leaver still in the live ring
+(`liveHolders=[gl-c gl-a]`), so survivors never saw a handoff and only ~15 of
+~136 expected forwards ever fired. The forward MECHANISM is sound (15/15 OK,
+zero dial/RPC failures) - the survivors simply never ENTER the overlap-acquire
+path, because they never see the leaver YIELD ownership. `memberlist.Leave()`
+says "I am gone" while the transport says "I am alive"; membership cannot hold
+both, so the handoff never starts.
 
-2. **`Cluster.DrainForLeave(ctx)` (a.k.a. `GracefulLeave(timeout)`).**
-   Broadcast the graceful leave via the new membership `Leave()` (peers
-   re-own this node's units + start forwarding to it), then BLOCK until the
-   `handoffPhase` map holds no `Draining` entry owned by this node (every
-   position `drainCheck` released; `mountMap` carries no position this node
-   still owns) OR `ctx` cancels / the timeout fires. The reconcile loop,
-   serving, `drainCheck`, and the forward path STAY ALIVE during this wait.
-   Each `Draining` position releases on the SAME rule as any overlap drain (a
-   successor's serving marker at an epoch strictly above this node's open
-   epoch). Then return.
+THE GAP ON SHUTDOWN (the second half). On SIGTERM the run loop
+(`pkg/shaled/runtime.go`) calls `Cluster.Close()` (`pkg/cluster/cluster.go`).
+Even if the survivors DID re-own the positions, `Close()` IMMEDIATELY tears
+down the reconcile loops + peer clients + `closeMountedUnits()`, WITHOUT
+waiting for the survivors' slow `Acquiring` to complete. Every position the
+leaving node was serving is UNSERVED from the instant `Close()` closes its
+mounts until the survivors flip - the same mount-time gap Phase 2e removed for
+scale-up, reopened for scale-down. The serving + `drainCheck` + forward path
+that would have held availability are torn down before they could run.
 
-3. **Wire it at the TOP of `Close()`, gated.** A config field
+THE FIX: a distinct DRAINING node-state - REACHABLE but YIELDING OWNERSHIP.
+The node needs the exact state `memberlist.Leave()`-while-alive could not
+express: it stays a full, alive, addressable member (so survivors keep
+forwarding to it AND it keeps serving), yet it is EXCLUDED FROM OWNERSHIP on
+every node (so its positions redistribute to survivors, who overlap-`Acquire`
+it as their predecessor). This is advertised by a gossiped per-member
+`Draining` bit, NOT by leaving the cluster. Four pieces:
+
+1. **Membership: a gossiped `Draining` bit (`pkg/membership`).** Add a
+   per-member `Draining bool` carried in the node's memberlist `Meta`, which
+   ALREADY encodes the gRPC dial address (`metaDelegate.NodeMeta` /
+   `nodeToMember`); the draining bit rides alongside the address in that same
+   `Meta` payload. Add `SetDraining(bool)` that updates the local `Meta` var
+   and calls `memberlist.UpdateNode` so the flag gossips out, and expose
+   `Draining` on the `Member` returned by `Members()` / `Snapshot()` (decode
+   peers' `Meta` in `NotifyJoin` / `NotifyUpdate`). A draining node STAYS in
+   the membership snapshot - alive, address known. It is NOT removed. This is
+   the heart of the fix: `SetDraining(true)` is NOT `Leave()`; the node keeps
+   gossiping as alive, so survivors keep its address (they forward to it) AND
+   see its `Draining` bit (they yield-acquire its positions).
+
+2. **Ownership: exclude `Draining` members from the ring (`pkg/cluster`).**
+   `reconcileRingFromMembership` (and wherever the ownership ring is built)
+   REMOVES a `Draining` member from the consistent-hash OWNERSHIP ring (so
+   `LocateKeyN` / `desiredReplicaUnits` no longer assign it positions, and its
+   keys redistribute to non-draining members) on EVERY node. Its ADDRESS
+   stays resolvable for forwards: the forward path already resolves the
+   predecessor via the STORED `HandoffState.PredecessorAddr` (the address-in-
+   the-handoff-state fix), so forwards reach it even though it owns nothing.
+   The moment the draining `Meta` gossips, every node (including the draining
+   node itself) drops it from the OWNERSHIP ring, its positions move to
+   survivors, the survivors enter overlap-`Acquire` with it as the identified
+   single-hop predecessor, and forward to it while it serves. It is excluded
+   from OWNERSHIP, not from MEMBERSHIP.
+
+3. **Drain flow: set draining, serve + wait, THEN real leave + shutdown
+   (`DrainForLeave`).** `Cluster.DrainForLeave(ctx)` (a.k.a.
+   `GracefulLeave(timeout)`) SETS THIS NODE DRAINING (the membership `Meta`
+   flag via `SetDraining(true)`) - it does NOT call `memberlist.Leave()` here.
+   It then BLOCKS until the `handoffPhase` map holds no `Draining` entry owned
+   by this node (every position `drainCheck` released; `mountMap` carries no
+   position this node still owns; `ownedPositionCount() == 0`) OR `ctx`
+   cancels / the timeout fires. The reconcile loop, serving, `drainCheck`, and
+   the forward path STAY ALIVE during this wait. Each `Draining` position
+   releases on the SAME rule as any overlap drain (a successor's serving
+   marker at an epoch strictly above this node's open epoch). ONLY AFTER the
+   drain completes (or times out) does the node do the REAL
+   `membership.Leave()` + the existing `Close` teardown (`Shutdown`). So the
+   order is: SET DRAINING -> SERVE + WAIT -> REAL LEAVE + SHUTDOWN.
+
+4. **Wire it at the TOP of `Close()`, gated.** A config field
    `GracefulLeaveDrainTimeout time.Duration`: `0` = disabled = today's
    behavior (the gap remains; also the break-demo state). When `> 0` AND
    `multiReplicated()`, `Close()` calls `DrainForLeave(timeout)` FIRST -
    before ANY teardown, while the loops are still running - then proceeds
-   with the existing teardown unchanged. Putting the drain at the top of
-   `Close()` keeps it self-contained: the SIGTERM handler in `runtime.go`
-   just calls `Close()` as today, no run-loop change.
+   with the existing teardown (now including the real membership `Leave()`)
+   unchanged. Putting the drain at the top of `Close()` keeps it
+   self-contained: the SIGTERM handler in `runtime.go` just calls `Close()`
+   as today, no run-loop change.
+
+### Two memberlist verbs, split - but `Leave()` is used at the END, not the start
+
+memberlist exposes `Leave()` (broadcast the graceful departure so peers
+record a clean leave and STOP re-adding the node) DISTINCT from `Shutdown()`
+(tear down the local transport). The wrapper's `Close()` does both today. They
+are still split, but the split serves a different purpose than an earlier
+draft assumed: the REAL `Leave()` is DEFERRED to AFTER the drain, NOT used to
+START it. Starting the drain with `Leave()` is exactly the self-contradiction
+above (leave-intent + still-alive => survivors re-add). The drain is started
+by the `Draining` `Meta` bit (the node stays fully alive). Only once the drain
+is done does the node call the real `Leave()` (now correct: the node really is
+going away, so survivors recording a clean leave is right) followed by the
+transport `Shutdown()` in the existing teardown.
+
+### This supersedes the ring-freeze stopgap
+
+An earlier attempt called `memberlist.Leave()` at the START of the drain (the
+self-contradiction above) and then papered over the resulting snapshot
+collapse with a `leaving atomic.Bool` flag plus a remove-self-only step. Once
+the node broadcast `Leave()` it stopped gossiping; its own failure detector
+marked every peer dead within seconds; its membership `Snapshot()` collapsed
+to empty - so `reconcileRingFromMembership` would have rebuilt the ring from
+nothing and WIPED the very survivors it needed to hand off to. The stopgap
+FROZE the ring (`c.leaving.Store(true)` made `reconcileRingFromMembership` a
+no-op via an early-return guard) and removed only self (`c.ring.Remove(self)`)
+so the captured survivors persisted. The DRAINING node-state removes the need
+for ALL of it: because the node stays ALIVE (a real member) throughout the
+drain, its snapshot does NOT collapse, `reconcileRingFromMembership` works
+normally (it just excludes `Draining` members from ownership), and there is no
+frozen ring to maintain. REMOVE the `leaving` flag, its early-return guard in
+`reconcileRingFromMembership`, and the remove-self-only step, replacing them
+with the draining-`Meta`-driven ownership exclusion. (Keep any of them only if
+proven still necessary after the draining-state lands.)
+
+### Remove the SHALE_DRAIN_DIAG scaffolding
+
+The `SHALE_DRAIN_DIAG`-gated `fmt.Fprintf` diagnostics in
+`multibackend_overlap.go`, `multibackend_overlap_forward.go`, and
+`multibackend_overlap_leave.go` were investigation-only (they are what
+captured the "54 acquire decisions, leaver still in the live ring" evidence
+above). Once the draining-state fix verifies, remove them.
 
 DRAINING vs THE RESIDUAL. A position the leaving node owns is taken over by a
 SURVIVING node - a single-hop move (the leaving node held rP of unit K; a
