@@ -546,17 +546,6 @@ type Cluster struct {
 	// loser falls through to the closed CAS and waits on loopWG.
 	drainOnce sync.Once
 
-	// leaving is set by DrainForLeave for the duration of a graceful-leave
-	// drain. Once a node broadcasts memberlist.Leave it stops gossiping and its
-	// failure detector marks every peer dead within seconds, collapsing its
-	// membership Snapshot to empty. reconcileRingFromMembership must therefore
-	// NOT rebuild this node's ring from that (now-unreliable) snapshot during the
-	// drain: it would wipe every survivor and leave the node unable to see where
-	// its positions moved. While leaving is set the ring is frozen at
-	// "survivors minus self" (DrainForLeave removes only self) so the drain can
-	// hand off to the survivors it captured before the leave.
-	leaving atomic.Bool
-
 	// Rebalance state (multi-node only; rebalance is empty in
 	// single-node mode). rebalance is the per-range Coordinator, held
 	// behind an atomic.Pointer so the events / reconcile loops can
@@ -801,17 +790,19 @@ func (c *Cluster) reconcileRingFromMembership() {
 	if c.membership == nil || c.ring == nil {
 		return
 	}
-	// During a graceful-leave drain this node's own Snapshot has collapsed to
-	// empty (it stopped gossiping on Leave, so its failure detector marked every
-	// peer dead). Rebuilding from it would wipe the survivors this node needs to
-	// hand its positions off to. DrainForLeave froze the ring at survivors-minus-
-	// self; leave it alone until the drain finishes.
-	if c.leaving.Load() {
-		return
-	}
 	snap := c.membership.Snapshot()
 	want := make(map[string]ring.Member, len(snap))
 	for _, m := range snap {
+		// A DRAINING member STAYS in the snapshot (alive, addressable) so the
+		// overlap forward path can still resolve + reach it, but it is YIELDING
+		// OWNERSHIP: exclude it from the consistent-hash ownership ring on every
+		// node so LocateKeyN / desiredReplicaUnits never assign it positions and
+		// its keys redistribute to non-draining members. The forward to a draining
+		// predecessor uses the STORED HandoffState.PredecessorAddr, not the ring,
+		// so dropping it from the ring does not break the hand-off.
+		if m.Draining {
+			continue
+		}
 		want[m.ID] = ring.Member{ID: m.ID, Addr: m.Addr}
 	}
 	changed := false
