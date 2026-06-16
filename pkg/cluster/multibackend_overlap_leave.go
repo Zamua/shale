@@ -83,20 +83,28 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 	t := time.NewTicker(drainPollInterval)
 	defer t.Stop()
 	for {
-		// FIRST pull this node out of its OWN ownership ring. reconcileRingFromMembership
-		// reads the snapshot (which now shows this node Draining) and drops every
-		// draining member - including self - from the consistent-hash ring. Without
-		// this drive the ring would only refresh on the slow background
-		// runReconcileLoop tick, so the tight drain poll below would keep computing
-		// desiredReplicaUnits() against a ring that still contains self and never
-		// convert any position to Draining. runReconcile (the unit/overlap reconcile)
-		// does NOT touch the membership-driven ring, so the ring reconcile must be
-		// driven explicitly here.
-		c.reconcileRingFromMembership()
 		// Re-drive the unit reconcile so this node's now-shrunken desired set
-		// converts its yielded positions to Draining, then drainCheck releases the
-		// ones whose successors wrote a serving marker. runReconcile is idempotent +
-		// runs the overlap reconcile + runDrainChecks.
+		// (it excluded itself from the ownership ring the moment it gossiped
+		// Draining) converts its yielded positions to Draining, then drainCheck
+		// releases the ones whose successors wrote a serving marker. runReconcile is
+		// idempotent + runs the overlap reconcile + runDrainChecks.
+		//
+		// NOTE: this drives the UNIT reconcile only, NOT reconcileRingFromMembership.
+		// The membership-driven ring refresh (which drops this Draining node from
+		// its own ownership ring) is left to the background runReconcileLoop tick.
+		// Driving the ring reconcile here on the tight poll cadence was tried and
+		// REVERTED: it amplifies transient membership-snapshot dips into eager
+		// plain-releases of this node's still-needed positions, collapsing the
+		// during-leave availability. See the KNOWN RESIDUAL note below.
+		//
+		// KNOWN RESIDUAL (handed to the next session): the survivors' ownership
+		// convergence under this scale-down is not yet reliable - a survivor's ring
+		// can transiently collapse, so the successor for some of this node's
+		// replica-0 (primary) positions never writes a serving marker, drainCheck
+		// never releases them, and the drain runs to the timeout. During-leave
+		// availability holds (this node keeps serving its mounts throughout), but
+		// the post-leave loss oracle can still see a primary position that no
+		// survivor mounted. The root cause is survivor-side ring convergence.
 		c.runReconcile()
 		if c.ownedPositionCount() == 0 {
 			return nil
