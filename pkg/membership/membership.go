@@ -515,6 +515,21 @@ func (m *Membership) SetDraining(draining bool) error {
 	if !m.meta.setDraining(draining) {
 		return nil
 	}
+	// Update THIS node's OWN cache entry directly so the local Snapshot
+	// reflects the new draining bit immediately. memberlist's UpdateNode
+	// broadcasts the new Meta to peers (who learn it via their NotifyUpdate),
+	// but it does NOT reliably fire a local NotifyUpdate for the node itself -
+	// so without this the local node's own cache (and therefore its ring
+	// reconcile) would never observe its own draining state and would keep
+	// owning the positions it is trying to yield.
+	m.cacheMu.Lock()
+	if m.cache != nil {
+		if cur, ok := m.cache[m.cfg.NodeID]; ok {
+			cur.Draining = draining
+			m.cache[m.cfg.NodeID] = cur
+		}
+	}
+	m.cacheMu.Unlock()
 	// UpdateNode re-reads NodeMeta (now reflecting the flag) and gossips
 	// it. The 0 timeout means "do not block waiting for the broadcast to
 	// flush"; the change still propagates via the normal gossip loop.
