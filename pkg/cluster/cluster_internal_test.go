@@ -58,6 +58,43 @@ func waitForLocalInRing(c *Cluster, timeout time.Duration) bool {
 	return false
 }
 
+// quiesceInitialSelfJoin drains the evaluation the local node's OWN
+// self-join schedules, so a test can establish a deterministic at-rest
+// baseline.
+//
+// memberlist.Create fires NotifyJoin for the local node, which queues an
+// EventJoin on membership's buffered events channel. runEventsLoop drains
+// it asynchronously and calls bumpRingGen -> scheduleEvaluate, which does
+// settlePending.Add(1) and re-Adds the local member to the ring. That
+// drain is NOT ordered against the test body: waitForLocalInRing returns
+// as soon as the ring is SEEDED (synchronously, in Open), which can happen
+// before the self-join event is processed. Under -race the events loop is
+// scheduled late enough that the re-Add / settlePending bump lands AFTER a
+// test's at-rest assertion, which is the sole cause of both
+// TestReconcileRingFromMembership_RestoresMissingLocal and
+// TestWaitForRebalanceIdle_BlocksWhileDebouncePending flaking under -race.
+//
+// This helper waits for that scheduled evaluation to appear
+// (settlePending == 1), then runs it to completion via runEvaluateNow so
+// settlePending returns to 0 and no background goroutine has an unrun
+// re-Add / re-arm left in flight. After it returns, the only writers that
+// can still touch the ring or settlePending are the reconcile loop (which
+// callers park far in the future) and the test's own explicit drives.
+func quiesceInitialSelfJoin(t *testing.T, c *Cluster) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for c.settlePending.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatalf("self-join evaluation never scheduled; settlePending stayed 0")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	c.runEvaluateNow()
+	if got := c.settlePending.Load(); got != 0 {
+		t.Fatalf("self-join evaluation did not drain; settlePending=%d", got)
+	}
+}
+
 // TestReconcileRingFromMembership_RestoresMissingLocal pins issue 3b:
 // the reconcileRingFromMembership method must re-add a member that
 // membership knows about but the ring has lost (the failure mode where
@@ -75,6 +112,13 @@ func waitForLocalInRing(c *Cluster, timeout time.Duration) bool {
 // check) leaves the ring missing the local ID forever after this test
 // induces the divergence. The assertion fires before the test cleans up.
 func TestReconcileRingFromMembership_RestoresMissingLocal(t *testing.T) {
+	// Park the reconcile loop far in the future so a background reconcile
+	// tick cannot re-Add "solo" between the manual Remove + the assertion
+	// (the test drives reconcileRingFromMembership explicitly).
+	saved := reconcileInterval
+	reconcileInterval = time.Hour
+	t.Cleanup(func() { reconcileInterval = saved })
+
 	port := freeTCPPort(t)
 	c, err := Open(Config{
 		NodeID:    "solo",
@@ -91,6 +135,17 @@ func TestReconcileRingFromMembership_RestoresMissingLocal(t *testing.T) {
 	if !waitForLocalInRing(c, 2*time.Second) {
 		t.Fatalf("local member never landed in ring; ring=%v", c.ring.Members())
 	}
+
+	// Drain the local node's own self-join event before inducing the
+	// divergence. The self-join EventJoin queued by memberlist.Create is
+	// processed asynchronously by runEventsLoop, which re-Adds "solo". If
+	// that drain lands AFTER the Remove below (as it can under -race's late
+	// scheduling), the events loop re-inserts "solo" and the
+	// post-Remove-empty assertion fails. Quiescing it here guarantees the
+	// only writer left that could re-Add "solo" is the explicit
+	// reconcileRingFromMembership call we make below (the reconcile loop is
+	// parked an hour out).
+	quiesceInitialSelfJoin(t, c)
 
 	// Simulate the divergence: events-channel drop lost a join, ring
 	// no longer contains the local member. Membership.Snapshot() still
@@ -459,6 +514,12 @@ func (s *blockingTestSource) OpenRange(_ []uint64, _ uint64) (<-chan rebalance.K
 // delay long enough that it cannot fire on its own, and asserts the
 // wait blocks until the evaluation is forced to run + drain.
 func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
+	// Park the reconcile loop far in the future so a background reconcile
+	// tick cannot bump settlePending behind the manual drive below.
+	saved := reconcileInterval
+	reconcileInterval = time.Hour
+	t.Cleanup(func() { reconcileInterval = saved })
+
 	port := freeTCPPort(t)
 	be := memory.New()
 	c, err := Open(Config{
@@ -479,6 +540,13 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 	if !waitForLocalInRing(c, 2*time.Second) {
 		t.Fatalf("local member never landed in ring")
 	}
+
+	// Drain the evaluation the local node's own self-join schedules so we
+	// have a deterministic at-rest baseline. Without this, the self-join's
+	// scheduleEvaluate races the assertion below: with a time.Hour settle
+	// the bump never decrements on its own, so an unhandled self-join makes
+	// settlePending read 1 here under -race's late goroutine scheduling.
+	quiesceInitialSelfJoin(t, c)
 
 	// Sanity: a quiescent node is idle immediately (no pending, no
 	// in-flight ranges).
