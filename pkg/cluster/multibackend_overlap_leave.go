@@ -16,7 +16,11 @@ package cluster
 
 import (
 	"context"
+	"fmt"
+	"os"
 	"time"
+
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 // drainPollInterval is how often DrainForLeave re-drives the reconcile +
@@ -61,6 +65,19 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 		return nil
 	}
 
+	// FREEZE the ring at "survivors minus self" BEFORE broadcasting the leave.
+	// Once Leave() goes out this node stops gossiping and its OWN membership
+	// Snapshot collapses to empty within seconds (its failure detector marks
+	// every peer dead), so reconcileRingFromMembership (the background loop AND
+	// the drain below) would rebuild the ring from an empty snapshot and wipe
+	// every survivor, leaving this node unable to see where its positions moved.
+	// Setting leaving makes reconcileRingFromMembership a no-op; removing only
+	// self rotates this node off its own positions while KEEPING the survivors
+	// it must hand off to. Order matters: set leaving + remove self while the
+	// ring still has the survivors, THEN broadcast the leave.
+	c.leaving.Store(true)
+	c.ring.Remove(c.cfg.NodeID)
+
 	// Broadcast the graceful departure WITHOUT shutting the transport down, so
 	// peers re-own this node's positions and begin forwarding to it while this
 	// node keeps serving gRPC throughout the drain. The transport Shutdown stays
@@ -75,22 +92,36 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 	t := time.NewTicker(drainPollInterval)
 	defer t.Stop()
 	for {
-		// Pull the leave into the ring FIRST: membership.Leave() fired
-		// NotifyLeave for the local node, dropping it from the membership
-		// snapshot, but the ring is only re-derived from membership by
-		// reconcileRingFromMembership (the background loop calls it; runReconcile
-		// does not). Without this the ring still lists this node, so it stays in
-		// its own desired set and never drains. Drive it here so the leave
-		// actually rotates this node off its positions.
-		c.reconcileRingFromMembership()
-		// Re-drive the reconcile so the ring change converts this node's
-		// positions to Draining, then poll every Draining position's serving
-		// marker (drainCheck) to release the ones whose successors are Ready.
-		// runReconcile is idempotent + already runs the overlap reconcile +
-		// runDrainChecks for the multiReplicated path.
+		if os.Getenv("SHALE_DRAIN_DIAG") != "" {
+			snap := c.membership.Snapshot()
+			fmt.Fprintf(os.Stderr, "[DRAINDIAG-SNAP node=%s snapshotLen=%d]\n", c.cfg.NodeID, len(snap))
+		}
+		// Re-drive the reconcile so the frozen ring's "this node no longer owns
+		// these positions" converts them to Draining, then drainCheck releases
+		// the ones whose successors wrote a serving marker. runReconcile is
+		// idempotent + runs the overlap reconcile + runDrainChecks.
 		c.runReconcile()
 		if c.ownedPositionCount() == 0 {
 			return nil
+		}
+		if os.Getenv("SHALE_DRAIN_DIAG") != "" {
+			c.mountMu.RLock()
+			stuck := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
+			phases := make(map[storageunit.ReplicaUnit]storageunit.HandoffState, len(c.mountMap))
+			for ru := range c.mountMap {
+				stuck = append(stuck, ru)
+				phases[ru] = c.handoffPhase[ru]
+			}
+			nMembers := len(c.ring.Members())
+			c.mountMu.RUnlock()
+			diag := fmt.Sprintf("[DRAINDIAG node=%s owned=%d ringMembers=%d]", c.cfg.NodeID, len(stuck), nMembers)
+			for _, ru := range stuck {
+				st := phases[ru]
+				me, ok, _ := c.replicaFactory.ReadServingMarker(ru)
+				diag += fmt.Sprintf("\n  ru=%v phase=%v openEpoch=%v marker=(%v,ok=%v) wouldRelease=%v",
+					ru, st.Phase, st.OpenEpoch, me, ok, ok && me > st.OpenEpoch)
+			}
+			fmt.Fprintln(os.Stderr, diag)
 		}
 		select {
 		case <-ctx.Done():
