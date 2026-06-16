@@ -215,6 +215,7 @@ func (c *Cluster) initMultiBackend() error {
 	// when a position moves. priorDesiredReplicas is filled at the END of the
 	// first overlap reconcile.
 	c.handoffPhase = make(map[storageunit.ReplicaUnit]storageunit.HandoffState)
+	c.acquireInFlight = make(map[storageunit.ReplicaUnit]struct{})
 
 	// R>1 (replicated multi-backend, v0.8 Phase 2b): mount each owned unit at
 	// its replica POSITION (an independent durable database) via the per-replica

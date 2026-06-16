@@ -41,14 +41,15 @@ func newReconcileCluster(t *testing.T, self string, n int, backing *sharedfactor
 	t.Helper()
 	h := backing.Handle()
 	c := &Cluster{
-		cfg:        Config{NodeID: self},
-		multi:      true,
-		factory:    h,
-		unitCount:  storageunit.MustUnitCount(n),
-		genOwner:   owners.OwnerOfGen,
-		mountMap:   make(map[storageunit.ReplicaUnit]backend.Backend),
-		pauseUnits: make(map[storageunit.UnitID]*sync.RWMutex),
-		closeCh:    make(chan struct{}),
+		cfg:             Config{NodeID: self},
+		multi:           true,
+		factory:         h,
+		unitCount:       storageunit.MustUnitCount(n),
+		genOwner:        owners.OwnerOfGen,
+		mountMap:        make(map[storageunit.ReplicaUnit]backend.Backend),
+		acquireInFlight: make(map[storageunit.ReplicaUnit]struct{}),
+		pauseUnits:      make(map[storageunit.UnitID]*sync.RWMutex),
+		closeCh:         make(chan struct{}),
 	}
 	c.initGenState()
 	return c

@@ -71,6 +71,24 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		mountedSet[ru] = struct{}{}
 	}
 
+	// RECLAIM half: a position this node is DRAINING (gave up on an earlier pass)
+	// but now DESIRES again, while it is STILL mounted. This happens when the ring
+	// flip-flops a position away from this node then back (e.g. during a draining
+	// node's gradual gossip convergence). The drain is waiting for a SUCCESSOR's
+	// serving marker, but there is no successor anymore - this node is the live
+	// holder again - so drainCheck would never release it and the position would be
+	// stranded in Draining forever. Abort the drain: clear the in-flight phase so
+	// the position returns to Owned (it is still mounted + serving the whole time,
+	// so no availability gap). Reads under mountMu; the phase clear takes the lock.
+	for _, ru := range mounted {
+		if _, ok := desiredSet[ru]; !ok {
+			continue
+		}
+		if c.handoffPhaseOf(ru).Phase.IsLoser() {
+			c.reclaimDrainingPosition(ru)
+		}
+	}
+
 	// RELEASE / DRAIN half: a mounted ReplicaUnit no longer desired here.
 	//
 	//   - if some OTHER node is the LIVE holder of this exact position (the
@@ -104,6 +122,17 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	// ACQUIRE half: a desired ReplicaUnit not currently mounted.
 	for _, ru := range desired {
 		if _, ok := mountedSet[ru]; ok {
+			continue
+		}
+		// A position in a LOSER phase (Draining/Releasing) that is now RE-DESIRED
+		// (the ring flip-flopped this position away then back, as can happen
+		// during a draining node's gradual gossip propagation) must NOT be
+		// re-acquired here: that would either illegally overwrite the Draining
+		// state via beginAcquire or mount via the clean-cut path while leaving a
+		// stale Draining phase entry, stranding the FSM. Let drainCheck finish the
+		// drain first (it deletes the phase entry on release); a later reconcile
+		// then sees Phase 0 + unmounted + desired and acquires cleanly.
+		if c.handoffPhaseOf(ru).Phase.IsLoser() {
 			continue
 		}
 		// A position already PhaseAcquiring but NOT mounted means a prior pass
@@ -348,6 +377,24 @@ func (c *Cluster) beginAcquire(ru storageunit.ReplicaUnit, pred storageunit.Node
 	c.mountMu.Unlock()
 }
 
+// reclaimDrainingPosition aborts an in-flight drain for a position this node
+// now owns again: it clears the loser-phase entry so the position converges back
+// to Owned (mounted + no phase). It is a no-op unless the position is still
+// mounted AND in a loser phase (a concurrent drainCheck may have already
+// released it, in which case the acquire half re-mounts it cleanly). The mount
+// is never touched here - the position has been served locally the entire time -
+// so the reclaim has no availability gap. Takes mountMu.
+func (c *Cluster) reclaimDrainingPosition(ru storageunit.ReplicaUnit) {
+	c.mountMu.Lock()
+	defer c.mountMu.Unlock()
+	if _, mounted := c.mountMap[ru]; !mounted {
+		return
+	}
+	if cur, ok := c.handoffPhase[ru]; ok && cur.Phase.IsLoser() {
+		delete(c.handoffPhase, ru)
+	}
+}
+
 // openEpochForReplica reports the epoch this node currently holds ru open at,
 // read as the DURABLE epoch of the position (the loser's own open advanced the
 // durable epoch to its open value). It is what drainCheck's serving-marker
@@ -374,7 +421,49 @@ func (c *Cluster) openEpochForReplica(ru storageunit.ReplicaUnit) storageunit.Ep
 // owner's drainCheck poll releases. On open failure it leaves the Acquiring
 // phase in place (a routed op keeps forwarding to the predecessor) and the next
 // reconcile / self-heal retries. Caller holds reconcileMu.
+// acquireReplicaUnitOverlap spawns the GAINER's slow mount in a BACKGROUND
+// goroutine so a node gaining many positions at once mounts them CONCURRENTLY
+// rather than serializing one multi-second OpenReplicaUnit after another inside
+// the reconcile (which holds reconcileMu). Serial opens would make a graceful
+// scale-down's drain exceed its budget - the leaving node would depart with
+// positions still un-handed-off, stranding the only durable copy of writes that
+// were forwarded to it. The position stays PhaseAcquiring (routed ops keep
+// forwarding to the predecessor) until the goroutine completes the mount flip.
+// The acquireInFlight set (under mountMu) is the idempotency guard: a reconcile
+// that re-drives an already-in-flight acquire does not spawn a second open. The
+// goroutine is tracked by loopWG so Close awaits it.
 func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
+	c.mountMu.Lock()
+	if c.closed.Load() {
+		c.mountMu.Unlock()
+		return
+	}
+	if _, inFlight := c.acquireInFlight[ru]; inFlight {
+		// An open for this position is already running; do not spawn a second.
+		c.mountMu.Unlock()
+		return
+	}
+	c.acquireInFlight[ru] = struct{}{}
+	c.mountMu.Unlock()
+
+	c.loopWG.Add(1)
+	go func() {
+		defer c.loopWG.Done()
+		defer func() {
+			c.mountMu.Lock()
+			delete(c.acquireInFlight, ru)
+			c.mountMu.Unlock()
+		}()
+		c.acquireReplicaUnitOverlapBlocking(ru)
+	}()
+}
+
+// acquireReplicaUnitOverlapBlocking performs the GAINER's slow mount + flip
+// synchronously. It is run from acquireReplicaUnitOverlap's background goroutine
+// (so concurrent positions overlap) and directly by tests that want the
+// deterministic blocking behavior. It must NOT be called while holding mountMu
+// (it takes mountMu for the flip).
+func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) {
 	b, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 	if err != nil {
 		// Mount failed; stay Acquiring (keep forwarding to the predecessor). The
@@ -454,6 +543,23 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	if state.Phase != storageunit.PhaseDraining {
 		return
 	}
+
+	// An ORPHANED Draining phase (the mount is already gone) converges straight
+	// to Absent regardless of marker readiness. Without this, a Draining phase
+	// whose mount was evicted but whose successor never wrote a marker would loop
+	// forever in the readiness poll below (which returns early on a not-ready
+	// marker), and the acquire half's loser-phase skip would never let the
+	// position re-mount - permanently stranding a re-desired position as
+	// unowned/unserved. The mount being gone means there is nothing to drain.
+	c.mountMu.Lock()
+	if cur, ok := c.handoffPhase[ru]; ok && cur.Phase == storageunit.PhaseDraining {
+		if _, mounted := c.mountMap[ru]; !mounted {
+			delete(c.handoffPhase, ru)
+			c.mountMu.Unlock()
+			return
+		}
+	}
+	c.mountMu.Unlock()
 
 	// I/O OUTSIDE the lock: poll the durable serving marker.
 	markerEpoch, ok, err := c.replicaFactory.ReadServingMarker(ru)

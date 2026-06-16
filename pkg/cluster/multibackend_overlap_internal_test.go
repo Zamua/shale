@@ -188,9 +188,12 @@ func TestOverlap_Reconcile_MoveIn_SinglePredecessor_AcquiresAndRecords(t *testin
 	}
 
 	c.reconcileReplicaUnitsOverlap()
+	// The overlap acquire opens in a background goroutine (so many positions
+	// mount concurrently). Wait for it to finish the flip before asserting.
+	c.loopWG.Wait()
 
-	// sharedfactory mounts instantly, so acquireReplicaUnitOverlap completes the
-	// flip synchronously: the position is now Owned (mounted, no phase entry).
+	// sharedfactory mounts instantly, so acquireReplicaUnitOverlapBlocking completes
+	// the flip: the position is now Owned (mounted, no phase entry).
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
 		t.Fatalf("acquired position must be mounted after the (instant) mount flip")
 	}
