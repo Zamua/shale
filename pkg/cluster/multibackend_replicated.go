@@ -227,8 +227,21 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	epoch := acquireBaseEpoch
 	b, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
 	if err != nil {
-		c.lastAcquireErr.Store(ru, err.Error())
-		return
+		// SELF-HEAL a factory/cluster desync (the mass-restart auto-recovery wedge,
+		// #408): this path only runs for a DESIRED-but-UNMOUNTED position, so the
+		// cluster has no live mount for ru. If the factory nonetheless refuses the
+		// open because it still holds ru open on this handle ("already open on this
+		// handle"), its openReplica state is STALE relative to mountMap and every
+		// retry fails identically forever. Close the stale handle to re-sync, then
+		// reopen ONCE. The close is safe: there is no mountMap entry pointing at it,
+		// so no routed op can be reading it. If the reopen still fails (a genuine
+		// open failure, e.g. a peer holds the durable db), record it + retry next tick.
+		_ = c.replicaFactory.CloseReplicaUnit(ru)
+		b, err = c.replicaFactory.OpenReplicaUnit(ru, epoch)
+		if err != nil {
+			c.lastAcquireErr.Store(ru, err.Error())
+			return
+		}
 	}
 	c.lastAcquireErr.Delete(ru)
 	c.mountMu.Lock()

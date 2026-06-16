@@ -422,10 +422,19 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) {
 	b, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 	if err != nil {
-		// Mount failed; stay Acquiring. The position is not stranded: the old owner
-		// is still a routed current owner serving via the union.
-		c.lastAcquireErr.Store(ru, err.Error())
-		return
+		// SELF-HEAL the same factory/cluster desync as the clean-cut path (#408):
+		// this position is mid-acquire with no mount installed yet, so if the
+		// factory refuses because it still holds ru open on this handle ("already
+		// open"), that handle state is stale - close it to re-sync, then reopen
+		// once. Safe: no mount entry points at the stale handle.
+		_ = c.replicaFactory.CloseReplicaUnit(ru)
+		b, err = c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
+		if err != nil {
+			// Mount still failing; stay Acquiring. The position is not stranded: the
+			// old owner is still a routed current owner serving via the union.
+			c.lastAcquireErr.Store(ru, err.Error())
+			return
+		}
 	}
 	c.lastAcquireErr.Delete(ru)
 
