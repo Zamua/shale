@@ -10,6 +10,12 @@ import (
 // Tune the in-process test fixtures for speed. Runs once before any test in the
 // pkg/cluster test binary; production is unaffected (it never calls either).
 //
+// These tunables are what keeps the pkg/cluster suite fast enough for the TIGHT
+// CI timeout (.github/workflows/test.yml). If a fixture starts taking tens of
+// seconds, the cause is almost always a convergence delay slipping back to a
+// production default (grace / settle / sweep) - shorten the fixture here, do NOT
+// raise the CI timeout.
+//
 //   - UseLocalGossipForTests: memberlist's tight loopback preset so 3-node
 //     fixtures converge in milliseconds instead of the seconds the LAN preset
 //     costs.

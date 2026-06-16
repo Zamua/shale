@@ -55,6 +55,11 @@ import (
 // content (testNode + friends are test-only anyway).
 func TestMain(m *testing.M) {
 	rebalance.SetSweepInterval(50 * time.Millisecond)
+	// Shorten the handed-off-range grace binary-wide so fixtures that do not set
+	// their own RebalanceGraceDuration do not eat the 30s production default on
+	// bootstrap (the same speedup pkg/cluster's init applies). Fixtures that DO
+	// set grace are unaffected; production never calls this setter.
+	rebalance.SetDefaultGraceDuration(500 * time.Millisecond)
 	// Share the ONE canonical ignore set with pkg/cluster's TestMain via
 	// internal/goleakignore so the two lists can never drift. The drift
 	// this closes was real: the integration list used to be a hand-copied

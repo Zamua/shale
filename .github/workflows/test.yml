@@ -56,12 +56,45 @@ jobs:
       # default parallelism with high variance; serial trades a
       # minute of wall clock for a predictable upper bound.
       - name: go test (race, workspace, all modules)
+        # Split timeouts by package speed. The fast packages get a TIGHT
+        # per-package timeout so a fixture perf regression - reverting to the 30s
+        # RebalanceGraceDuration default, or dropping the fast-sweep / short-settle
+        # test init - trips CI instead of hiding under a generous budget.
+        # pkg/cluster (the heaviest fast package) runs in ~113s under -race
+        # locally; 360s carries ample margin for a slower CI runner while still
+        # catching a multi-minute regression (the whole fast set was ~600s before
+        # the grace/settle/sweep fixes).
+        #
+        # The integration package keeps the larger budget: its graceful-leave and
+        # overlap gates are DELIBERATELY slow (multi-second artificial mounts that
+        # exercise the slow-handoff regime), so that runtime is the floor, not
+        # waste.
+        #
+        # RAISING EITHER TIMEOUT IS A LAST RESORT. First profile the suite
+        # (`go test ./<pkg> -v` then sort tests by duration) and optimize the slow
+        # fixtures: almost every multi-second UNIT test is a fixed convergence
+        # delay (rebalance grace / settle debounce / sweep tick), not real work.
+        # The test-wide tunables live in pkg/cluster/gossip_fast_test.go and
+        # tests/integration/helpers_test.go (SetSweepInterval /
+        # SetDefaultGraceDuration / defaultSettleDelay). Shorten a fixture before
+        # you touch these numbers.
         run: |
           set -euo pipefail
-          MODULES=(. backends/pebble backends/slate)
-          for m in "${MODULES[@]}"; do
+          FAST_TIMEOUT=360s
+          SLOW_TIMEOUT=600s
+          # Root module: fast packages on the tight budget, integration on the
+          # slow one (go list emits full import paths, so the suffix match is exact).
+          echo "::group::go test root fast packages"
+          go test $(go list ./... | grep -v '/tests/integration$') \
+            -race -timeout "$FAST_TIMEOUT" -p 1 -parallel 1
+          echo "::endgroup::"
+          echo "::group::go test ./tests/integration (slow gates)"
+          go test ./tests/integration -race -timeout "$SLOW_TIMEOUT" -p 1 -parallel 1
+          echo "::endgroup::"
+          # Backend modules (separate go.mod) keep the generous budget.
+          for m in backends/pebble backends/slate; do
             echo "::group::go test $m"
-            (cd "$m" && go test ./... -race -timeout 600s -p 1 -parallel 1)
+            (cd "$m" && go test ./... -race -timeout "$SLOW_TIMEOUT" -p 1 -parallel 1)
             echo "::endgroup::"
           done
 
