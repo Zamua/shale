@@ -736,18 +736,17 @@ func (c *Cluster) runEventsLoop() {
 			}
 			switch ev.Type {
 			case membership.EventJoin:
-				// A DRAINING member is yielding ownership: it stays a reachable
-				// member (addressable for forwards) but must NOT be in the
-				// consistent-hash ownership ring, so its positions redistribute to
-				// non-draining members. EventJoin fires on every NotifyUpdate
-				// (including the draining-bit gossip), so without this guard the
-				// event loop would re-Add a draining node that reconcileRingFromMembership
-				// just removed, flip-flopping the ring and stranding positions
-				// mid-handoff. Skip the Add for a draining member; the periodic
-				// reconcileRingFromMembership owns removing it from the ring.
-				if ev.Member.Draining {
-					break
-				}
+				// v0.8 Phase 2e (pending ranges): a DRAINING member STAYS a
+				// current owner in the consistent-hash ring - it is NOT excluded.
+				// The current/pending split (current = ring INCLUDING draining;
+				// pending = ring EXCLUDING draining) is computed PER-OP inside
+				// replicasForKey, not baked into the ring. So the event loop Adds a
+				// draining member normally (it keeps its positions + keeps serving
+				// the union); the drain ends only when its successors are provably
+				// serving (the serving-marker gate), and the real memberlist.Leave()
+				// then fires an EventLeave that removes it. (This REVERSES the
+				// superseded draining-exclusion stopgap.)
+				//
 				// If the addr changed (NotifyUpdate path - same ID,
 				// different Meta payload), evict the cached client
 				// for the OLD addr so the next dial picks up the
@@ -817,16 +816,15 @@ func (c *Cluster) reconcileRingFromMembership() {
 	snap := c.membership.Snapshot()
 	want := make(map[string]ring.Member, len(snap))
 	for _, m := range snap {
-		// A DRAINING member STAYS in the snapshot (alive, addressable) so the
-		// overlap forward path can still resolve + reach it, but it is YIELDING
-		// OWNERSHIP: exclude it from the consistent-hash ownership ring on every
-		// node so LocateKeyN / desiredReplicaUnits never assign it positions and
-		// its keys redistribute to non-draining members. The forward to a draining
-		// predecessor uses the STORED HandoffState.PredecessorAddr, not the ring,
-		// so dropping it from the ring does not break the hand-off.
-		if m.Draining {
-			continue
-		}
+		// v0.8 Phase 2e (pending ranges): a DRAINING member STAYS a CURRENT
+		// OWNER in the ring - do NOT exclude it. The current/pending split is
+		// computed per-op inside replicasForKey (current = ring INCLUDING
+		// draining members; pending = the same ring with draining members
+		// removed from the located chain), so the ring carries every alive
+		// member and the leaver keeps its positions + keeps serving the routed
+		// union until its successors are provably serving. (This REVERSES the
+		// superseded draining-exclusion: dropping a draining member here is what
+		// collapsed its snapshot and stranded the hand-off.)
 		want[m.ID] = ring.Member{ID: m.ID, Addr: m.Addr}
 	}
 	changed := false

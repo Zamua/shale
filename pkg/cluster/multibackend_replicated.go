@@ -344,11 +344,17 @@ func (c *Cluster) putReplicatedUnit(key, value []byte) error {
 // writeAttempt the retry wrapper classifies (acks-met vs acquiring-shortfall
 // vs hard-failure). It carries no retry policy of its own.
 func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []byte) writeAttempt {
-	replicas := c.replicasForKey(key)
+	// v0.8 Phase 2e (pending ranges): route to the UNION of current + pending
+	// owners during a membership transition (DUAL-WRITE), but hold the ack bar W
+	// at the STABLE R quorum (over stableR = len(current)), NOT raised to cover
+	// the transient extra union member. The pending replica is a bonus write
+	// target. In steady state routed == the stable set and stableR == len(routed),
+	// so this is the unchanged static path.
+	replicas, stableR := c.routedReplicasForKey(key)
 	if len(replicas) == 0 {
 		return writeAttempt{err: status.Error(codes.Unavailable, "shale: no replicas available for key")}
 	}
-	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))
+	w := c.writeAckBar(len(replicas), stableR)
 
 	acks, errs, resultsCh := fanout(ctx, replicas, w,
 		func(opCtx context.Context, replica ring.Member) ([]byte, error) {
