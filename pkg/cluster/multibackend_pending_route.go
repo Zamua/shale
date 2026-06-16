@@ -207,21 +207,22 @@ func (c *Cluster) pendingReplicasForKey(key []byte, draining map[string]struct{}
 	return c.pendingUnitReplicas(c.genUnitForKey(key), draining)
 }
 
-// writeAckBar computes the write ack target W for a fan-out over routedN
-// replicas whose STABLE replica count is stableR. Under the pending-ranges
-// model a transition makes routedN > stableR (the union carries an extra
-// pending owner mid-mount); the WriteOne / WriteQuorum bars stay PINNED to the
-// stable R so a transition never raises the durability bar - the pending owner
-// is a bonus write target, not a higher hurdle, which is what keeps writes
-// available while ownership moves. WriteAll is the deliberate exception: "all"
-// means every routed replica, so it widens with the union (a WriteAll caller
-// has opted into all-replica durability and a mid-mount pending owner simply
-// returns the acquiring-shortfall the retry wrapper waits out). In steady state
-// routedN == stableR and this is identical to requiredWriteAcks(wc, stableR).
-func (c *Cluster) writeAckBar(routedN, stableR int) int {
-	if c.cfg.WriteConsistency == WriteAll {
-		return requiredWriteAcks(WriteAll, routedN)
-	}
+// writeAckBar computes the write ack target W. It is ALWAYS the configured
+// consistency over the STABLE replica count (requiredWriteAcks(wc, stableR)): a
+// topology transition that widens the routed set to the union of current +
+// pending owners NEVER raises the bar. The pending owners are BONUS dual-write
+// targets - they inherit the data through the shared object-storage db the
+// moment they mount, so requiring their ack WHILE THEY ARE MID-MOUNT would make a
+// graceful leave unavailable for the whole mount window (a write would block on
+// the acquiring-shortfall until the slow mount finishes, then time out).
+//
+// This includes WriteAll: "all" means all STABLE replicas, NOT all transient
+// union members. That is a deliberate shale choice and it differs from Cassandra,
+// whose CL=ALL raises blockFor to include pending replicas and is correspondingly
+// unavailable during a topology change; shale keeps scale-down available because
+// the stable replicas (the leaver, still serving, plus its surviving co-replica)
+// can always satisfy the bar while the successors mount in the background.
+func (c *Cluster) writeAckBar(stableR int) int {
 	return requiredWriteAcks(c.cfg.WriteConsistency, stableR)
 }
 

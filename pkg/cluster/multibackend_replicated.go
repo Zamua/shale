@@ -355,7 +355,7 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 	for i, rr := range routed {
 		replicas[i] = rr.member
 	}
-	w := c.writeAckBar(len(replicas), stableR)
+	w := c.writeAckBar(stableR)
 
 	// Position-address by the fan-out INDEX, not the member ID: under a leave that
 	// shuffles replica indices, a survivor is routed to TWO positions (the slot it

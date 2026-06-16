@@ -128,9 +128,13 @@ the configured R; it is NOT raised to cover the transient extra union member.
   stable R because raising it to ALL-3 transiently would make any one slow
   union node halve write availability on an R=2 store, defeating the point
   (the survey's open question (a): the answer is NO, do not raise the bar).
-- `WriteConsistency=All` is the one setting that widens with the union (All
-  means every ROUTED replica). An operator who picks All accepts that a slow
-  union member blocks the write - that is the explicit meaning of All.
+- `WriteConsistency=All` is held at the stable R too: `W = R`, the number of
+  STABLE replicas, NOT the transient union size. Widening All to the union would
+  block every write on a mid-mount successor for the whole mount window and
+  collapse scale-down availability. This departs from Cassandra's CL=ALL (which
+  raises blockFor for pending endpoints); the pending owners inherit the data
+  through the shared object-storage db on mount, so All's durability holds
+  without requiring their in-flight ack. All means all STABLE replicas.
 
 Reads (union reads): a read fans out across the routed union per
 `ReadConsistency` (`Nearest` returns on the first answer; `Quorum`/`All` wait

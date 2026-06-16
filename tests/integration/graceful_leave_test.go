@@ -132,10 +132,11 @@ func runGracefulLeave(t *testing.T, drainTimeout, mountDelay time.Duration) grac
 	}
 
 	var (
-		mu        sync.Mutex
-		ackedKeys = make(map[string][]byte)
-		stop      atomic.Bool
-		wg        sync.WaitGroup
+		mu          sync.Mutex
+		ackedKeys   = make(map[string][]byte)
+		failReasons = make(map[string]int) // DIAG: during-window failure histogram
+		stop        atomic.Bool
+		wg          sync.WaitGroup
 
 		// during* tally only the writes attempted while leaveInFlight is true.
 		leaveInFlight   atomic.Bool
@@ -169,12 +170,23 @@ func runGracefulLeave(t *testing.T, drainTimeout, mountDelay time.Duration) grac
 				}
 				// Call Put DIRECTLY (no external retry) so the ack rate reflects the
 				// cluster's INTERNAL availability through the leave + survivor mount.
-				if err := entry.Cluster.Put([]byte(k), []byte(v)); err == nil {
+				err := entry.Cluster.Put([]byte(k), []byte(v))
+				if err == nil {
 					if inFlight {
 						duringAcked.Add(1)
 					}
 					mu.Lock()
 					ackedKeys[k] = v
+					mu.Unlock()
+				} else if inFlight {
+					// DIAG (test-only): tally WHY during-window writes failed, so a
+					// regression shows the failure mode (a systematic "needed N acks, got
+					// M" points straight at the ack-bar/routing; sparse transients are the
+					// expected sub-second fence-flip windows).
+					st, _ := status.FromError(err)
+					reason := fmt.Sprintf("%s | %s", st.Code(), firstLine(err.Error()))
+					mu.Lock()
+					failReasons[reason]++
 					mu.Unlock()
 				}
 				time.Sleep(2 * time.Millisecond)
@@ -228,6 +240,11 @@ func runGracefulLeave(t *testing.T, drainTimeout, mountDelay time.Duration) grac
 	<-leaveDone
 	t.Logf("graceful leave (drainTimeout=%v, mount=%v): Close() returned in %v",
 		drainTimeout, mountDelay, closeDur)
+	mu.Lock()
+	if len(failReasons) > 0 {
+		t.Logf("DIAG during-window failure histogram: %v", failReasons)
+	}
+	mu.Unlock()
 	stop.Store(true)
 	wg.Wait()
 
@@ -265,6 +282,15 @@ func runGracefulLeave(t *testing.T, drainTimeout, mountDelay time.Duration) grac
 		want:            want,
 		survivors:       survivors,
 	}
+}
+
+// firstLine returns s up to its first newline (DIAG helper: keep the failure
+// histogram keys to the gRPC status message, not the full wrapped chain).
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }
 
 // getOracleReadback reads key back for the loss oracle, retrying past the
@@ -338,13 +364,16 @@ func assertNoAckedLossSurvivors(t *testing.T, r gracefulLeaveResult) {
 }
 
 // glGateThreshold is the floor the drain path must clear (and the no-drain
-// break-demo must fall well below) for the DURING-LEAVE window. The drain run
-// keeps the leaving node serving via the survivors' forwards until they are
-// Ready, so the during-window ack rate stays high. The floor carries margin for
-// the -race build, whose instrumentation stretches the mount/forward timing and
-// widens the residual fallback window. 0.85 stays comfortably above the
-// break-demo's observed gap so the two regimes never overlap.
-const glGateThreshold = 0.85
+// break-demo must fall well below) for the DURING-LEAVE window. Under the
+// pending-ranges model the leaver stays a routed current owner and the ack bar is
+// pinned to the stable R, so the two stable replicas satisfy W instantly while
+// the successors mount in the background: the during-window ack rate sits at
+// ~99.8-99.9% (16k+ writes/run), the residual being sub-second windows around the
+// fence flip. 0.95 locks that in (catches any regression to the old
+// mount-blocked ~86%) while carrying margin for the -race build, whose
+// instrumentation stretches the mount timing. It stays far above the break-demo's
+// ~53-63% gap so the two regimes never overlap.
+const glGateThreshold = 0.95
 
 // glBreakDemoCeiling is the ceiling the no-drain run must stay UNDER for the
 // during-leave window. Comfortably below glGateThreshold so the two regimes are
