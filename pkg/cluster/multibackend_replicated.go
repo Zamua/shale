@@ -215,17 +215,14 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 // It writes the durable SERVING MARKER after mounting, EXACTLY as the overlap
 // acquire does. This is REQUIRED for the graceful-leave (scale-down) drain to
 // complete: a position moving OFF a leaving node can land on its successor via
-// THIS clean-cut path (not only the overlap path) - e.g. a full-rebalance move
-// where the predecessor is no longer single-hop identifiable from the (tight-
-// loop-overwritten) prior snapshot, so predecessorOf yields no predecessor and
-// the reconcile falls through here. The leaving node is DRAINING that exact
-// position and releases ONLY on a serving marker strictly above its open epoch;
-// if this path mounted silently (no marker, the old behavior) the draining
-// predecessor would wait out the full grace timeout. The clean-cut gainer opens
-// at durable+1 (strictly above the predecessor's open epoch), so the marker it
-// writes here releases the draining predecessor. The marker is monotonic +
-// idempotent, so writing it on a pure new mount (no draining predecessor) is a
-// harmless no-op observer-wise.
+// THIS clean-cut path (initial-convergence / pure-new-mount), not only the
+// pending-owner overlap path. The leaving node is DRAINING that exact position
+// and releases ONLY on a serving marker strictly above its open epoch; if this
+// path mounted silently (no marker, the old behavior) the draining leaver would
+// wait out the full grace timeout. The clean-cut gainer opens at durable+1
+// (strictly above the leaver's open epoch), so the marker it writes here releases
+// the draining leaver. The marker is monotonic + idempotent, so writing it on a
+// pure new mount (no draining leaver) is a harmless no-op observer-wise.
 func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	epoch := acquireBaseEpoch
 	b, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
@@ -350,15 +347,21 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 	// the transient extra union member. The pending replica is a bonus write
 	// target. In steady state routed == the stable set and stableR == len(routed),
 	// so this is the unchanged static path.
-	replicas, stableR := c.routedReplicasForKey(key)
-	if len(replicas) == 0 {
+	routed, stableR := c.routedReplicasWithUnit(key)
+	if len(routed) == 0 {
 		return writeAttempt{err: status.Error(codes.Unavailable, "shale: no replicas available for key")}
+	}
+	replicas := make([]ring.Member, len(routed))
+	ruByMember := make(map[string]storageunit.ReplicaUnit, len(routed))
+	for i, rr := range routed {
+		replicas[i] = rr.member
+		ruByMember[rr.member.ID] = rr.ru
 	}
 	w := c.writeAckBar(len(replicas), stableR)
 
 	acks, errs, resultsCh := fanout(ctx, replicas, w,
 		func(opCtx context.Context, replica ring.Member) ([]byte, error) {
-			return nil, c.dispatchReplicaPutUnit(opCtx, replica, key, envBytes)
+			return nil, c.dispatchReplicaPutUnit(opCtx, replica, ruByMember[replica.ID], key, envBytes)
 		})
 
 	go func() {
@@ -376,25 +379,38 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 // the remote branch dispatches PutForwarded to the replica node, whose RPC
 // handler lands in LocalReplicaPut (multi R>1 branch). A frozen / acquiring
 // replica returns the transient code the fan-out tolerates.
-func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Member, key, envBytes []byte) error {
+func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Member, ru storageunit.ReplicaUnit, key, envBytes []byte) error {
 	if replica.ID == c.cfg.NodeID {
-		// v0.8 Phase 2e (overlap forward): if this node is GAINING the key's
-		// position (PhaseAcquiring with a recorded predecessor), forward the
-		// write to the predecessor (the OLD owner still serving the Draining
-		// entry) addressed by the explicit ru, instead of applying locally
-		// against an absent mount. handled=false means no overlap forward (apply
-		// locally as before, which yields errUnitAcquiring if mid-mount with no
-		// predecessor - the Option-A belt).
-		if handled, ferr := c.forwardPutToPredecessor(ctx, key, envBytes); handled {
-			return ferr
+		// v0.8 Phase 2e (pending ranges): apply the union dual-write to the EXPLICIT
+		// position ru this member holds. For a current owner ru is its current
+		// index; for a pending owner ru is the slot it acquired (which its own
+		// current-set ring index would NOT resolve, since a pending owner is absent
+		// from the current set). applyEnvelopeIfNewerToBackend resolves mountMap[ru]
+		// directly. A pending owner still mid-mount has no mounted entry for ru and
+		// returns errUnitAcquiring; the union covers the key via the still-mounted
+		// current owner and the fan-out tolerates the transient. There is NO
+		// per-position forward (the union routes directly to both current and
+		// pending owners).
+		if c.isFrozen() {
+			// Reshard write-freeze (Phase 4 / multi-node reshard): refuse with the
+			// retryable error, same as the remote leg, so no write is acked during
+			// the static bisect.
+			return errWriteFrozen("Put")
 		}
-		return c.applyEnvelopeIfNewerToUnit(key, envBytes)
+		b, ok := c.localBackendForReplicaUnit(ru)
+		if !ok {
+			return errUnitAcquiring("Put")
+		}
+		return c.applyEnvelopeIfNewerToBackend(b, ru, key, envBytes)
 	}
 	cli, err := c.clientFor(replica.Addr)
 	if err != nil {
 		return err
 	}
-	return cli.PutForwarded(ctx, key, envBytes)
+	// Position-addressed forward: carry the explicit ru so the remote replica
+	// resolves mountMap[ru] directly (a pending owner is not at this position in
+	// its own current-set ring index).
+	return cli.PutAtReplica(ctx, ru, key, envBytes)
 }
 
 // getReplicatedUnit fetches the LWW winner across N of the unit's R replica
@@ -404,12 +420,21 @@ func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Membe
 // dispatcher). Read-repair rides dispatchReplicaPutUnit, so a stale repair is
 // a never-clobber no-op against the mounted unit.
 func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
-	allReplicas := c.replicasForKey(key)
+	// v0.8 Phase 2e (pending ranges): read across the ROUTED union (current +
+	// pending owners) during a transition so any union member that physically
+	// holds the position can answer (a mid-mount pending owner returns the
+	// transient acquiring error the fan-out skips). In steady state routed == the
+	// stable set, so this is the unchanged static path. The read N (quorum / all)
+	// is computed over the STABLE replica count, NOT widened by the union, matching
+	// the write ack bar.
+	allReplicas, stableR := c.routedReplicasForKey(key)
 	if len(allReplicas) == 0 {
 		return nil, status.Error(codes.Unavailable, "shale: no replicas available for key")
 	}
 	rc := c.cfg.ReadConsistency
-	n := min(requiredReadReplicas(rc, len(allReplicas)), len(allReplicas))
+	// N is the stable read quorum, NOT widened by a transient union member; clamp
+	// to the routed size so a single-replica routed set is still answerable.
+	n := min(requiredReadReplicas(rc, stableR), len(allReplicas))
 	queried := allReplicas
 
 	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
@@ -489,12 +514,12 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 // returns the transient acquiring-window error the read fan-out skips.
 func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Member, key []byte) ([]byte, error) {
 	if replica.ID == c.cfg.NodeID {
-		// v0.8 Phase 2e (overlap forward): GAINING this position -> forward the
-		// read to the predecessor (Draining, still serving) addressed by the
-		// explicit ru. handled=false means no overlap forward (read locally).
-		if handled, v, ferr := c.forwardGetToPredecessor(ctx, key); handled {
-			return v, ferr
-		}
+		// v0.8 Phase 2e (pending ranges): serve the union read locally. The
+		// resolver finds the CURRENT position (current owner / leaver) or the
+		// PENDING position (a mounted pending owner). A pending owner still
+		// mid-mount has no mounted position and returns the transient
+		// errUnitAcquiring, which the read fan-out skips while another union member
+		// (the still-mounted current owner) answers.
 		b, ok := c.localBackendForKey(key)
 		if !ok {
 			return nil, errUnitAcquiring("Get")
@@ -524,6 +549,13 @@ func (c *Cluster) scheduleReadRepairUnit(key []byte, winnerEnv Envelope, gathere
 		return
 	}
 	winnerBytes := Encode(winnerEnv)
+	// Map each routed union member to the ReplicaUnit it holds so a repair to a
+	// pending owner is position-addressed (same as the primary write path).
+	routed, _ := c.routedReplicasWithUnit(key)
+	ruByMember := make(map[string]storageunit.ReplicaUnit, len(routed))
+	for _, rr := range routed {
+		ruByMember[rr.member.ID] = rr.ru
+	}
 	laggers := make([]ring.Member, 0, len(gathered))
 	for _, g := range gathered {
 		if !g.hadValue || winnerEnv.Stamp.Greater(g.env.Stamp) {
@@ -534,8 +566,14 @@ func (c *Cluster) scheduleReadRepairUnit(key []byte, winnerEnv Envelope, gathere
 		return
 	}
 	for _, m := range laggers {
+		ru, ok := ruByMember[m.ID]
+		if !ok {
+			// A lagger no longer in the routed set (the union shifted between the
+			// read and the repair); skip - the next read re-resolves.
+			continue
+		}
 		c.repairWG.Go(func() {
-			_ = c.dispatchReplicaPutUnit(c.repairCtx, m, key, winnerBytes)
+			_ = c.dispatchReplicaPutUnit(c.repairCtx, m, ru, key, winnerBytes)
 		})
 	}
 }

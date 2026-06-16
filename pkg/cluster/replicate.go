@@ -701,8 +701,14 @@ func (c *Cluster) OwnsReplica(key []byte) bool {
 	if c.multiReplicated() {
 		// R>1 multi-backend (v0.8 Phase 2b): a forwarded replica write may land
 		// on ANY of the unit's R replica nodes, not just the primary. Accept if
-		// this node is anywhere in the unit's replica set.
-		for _, m := range c.replicasForKey(key) {
+		// this node is anywhere in the unit's ROUTED replica set. v0.8 Phase 2e
+		// (pending ranges): the routed set is the UNION of current + pending owners
+		// during a transition, so a PENDING owner receiving a union dual-write is
+		// accepted here (it is a legitimate routed replica) and the loop-guard does
+		// NOT refuse it. In steady state routed == the stable replica set, so this
+		// is unchanged.
+		routed, _ := c.routedReplicasForKey(key)
+		for _, m := range routed {
 			if m.ID == c.cfg.NodeID {
 				return true
 			}

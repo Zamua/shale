@@ -11,13 +11,14 @@ import "fmt"
 // There are FOUR in-flight phases, split across the two nodes of a move:
 //
 //   - on the GAINER (the node taking over a position): PhaseAcquiring ->
-//     PhaseReady. While Acquiring the new owner is still mounting and FORWARDS
-//     routed ops to the predecessor; at Ready its mount entry is inserted (the
-//     mount flip) and it serves locally.
+//     PhaseReady. While Acquiring the new (pending) owner is still mounting; the
+//     union covers the position via the still-mounted current owner. At Ready its
+//     mount entry is inserted (the mount flip) and it serves locally + writes its
+//     serving marker.
 //   - on the LOSER (the node giving up a position): PhaseDraining ->
-//     PhaseReleasing. While Draining the old owner keeps serving (directly and
-//     for the new owner's forwards); at Releasing it tears down its mount
-//     exactly once.
+//     PhaseReleasing. While Draining the old owner stays a routed current owner
+//     and keeps serving (dual-written via the union); at Releasing it tears down
+//     its mount exactly once, after the successor's marker gates the release.
 //
 // The two STEADY-STATE poles (Owned and Absent) are NOT enum values: they are
 // represented by mountMap presence (Owned = mounted, no phase entry) and
@@ -28,18 +29,17 @@ import "fmt"
 type HandoffPhase uint8
 
 const (
-	// PhaseAcquiring is the GAINER mid-mount: routing already targets this
-	// node (the ring rotated) but OpenReplicaUnit has not completed, so a
-	// routed op is forwarded to the recorded Predecessor (or, when no
-	// predecessor is identifiable, falls through to the Option-A belt). The
-	// zero value is deliberately NOT a valid phase (see phaseValid) so a
-	// zero-initialized HandoffState is never mistaken for a real Acquiring
-	// entry.
+	// PhaseAcquiring is the GAINER (pending owner) mid-mount: the union already
+	// routes this position to this node but OpenReplicaUnit has not completed, so
+	// a routed op returns the transient acquiring error and the union covers the
+	// position via the still-mounted current owner. The zero value is deliberately
+	// NOT a valid phase (see phaseValid) so a zero-initialized HandoffState is
+	// never mistaken for a real Acquiring entry.
 	PhaseAcquiring HandoffPhase = iota + 1
 
-	// PhaseReady is the GAINER after the mount flip: mountMap[ru] is inserted,
-	// the node serves locally and STOPS forwarding, and it has fired (or is
-	// about to fire) ReplicaHandoffReady to the predecessor.
+	// PhaseReady is the GAINER after the mount flip: mountMap[ru] is inserted and
+	// the node serves the position locally. It then writes its durable serving
+	// marker exactly once, which gates the leaver's release.
 	PhaseReady
 
 	// PhaseDraining is the LOSER still serving the position it no longer
@@ -102,46 +102,19 @@ func (p HandoffPhase) IsLoser() bool {
 //
 //   - Phase: which of the four in-flight phases this position is in.
 //   - OpenEpoch: the epoch the GAINER opened the position at (the fence epoch
-//     E). Meaningful from PhaseReady onward (it is what ReplicaHandoffReady
+//     E). Meaningful from PhaseReady onward (it is what the serving marker
 //     carries and what CanRelease compares the loser's own open epoch against).
 //     Zero while Acquiring (the open has not completed).
-//   - Predecessor: on the GAINER's Acquiring entry, the node that held this
-//     exact position before (derived by diffing the prior-desired-replica
-//     snapshot against the live set). Routed ops are forwarded here during the
-//     overlap. The empty NodeID ("") means NO identifiable single-hop
-//     predecessor (ambiguous / multi-hop / pure-new-mount), in which case the
-//     Acquiring op falls through to the Option-A belt instead of forwarding.
-//     Meaningless on the loser side and in PhaseReady onward.
-//   - PredecessorAddr: the predecessor's gRPC DIAL ADDRESS, captured from the
-//     PRIOR ring at the same point the predecessor NodeID is derived and stored
-//     WITH this handoff entry for its whole lifetime. This is the graceful-leave
-//     fix: on a SCALE-DOWN the predecessor LEAVES the ring, so resolving its
-//     NodeID -> address at forward time (a live-ring walk) returns nothing and
-//     the forward gives up. Carrying the address here means the forward reaches
-//     the departed-but-still-serving predecessor regardless of the ring. An
-//     address string is just data (no I/O), so the domain stays pure. Empty
-//     when there is no predecessor or its address was not resolvable from the
-//     prior snapshot.
 //
-// NB the design doc originally named the predecessor field's type "NodeAddr".
-// The pure domain identifies nodes by NodeID (the predecessor is derived from
-// the replica-set diff, which yields NodeIDs); the dial address is carried
-// alongside as plain data (PredecessorAddr) so the forward survives the
-// predecessor leaving the ring. Resolving NodeID -> address is still a
-// controller concern (it reads the prior-ring snapshot); the resolved string
-// is then stored here.
+// Under the pending-ranges model (v0.8 Phase 2e) there is NO predecessor field:
+// the routing layer's union dual-writes a position DIRECTLY to both its current
+// (draining-inclusive) and pending (draining-exclusive) owners, so a pending
+// owner mid-mount has no forwarding target to remember - a routed op arriving on
+// it simply returns the transient acquiring error and the union covers the
+// position via the still-mounted current owner.
 type HandoffState struct {
-	Phase           HandoffPhase
-	OpenEpoch       Epoch
-	Predecessor     NodeID
-	PredecessorAddr string
-}
-
-// HasPredecessor reports whether this state carries a single-hop predecessor to
-// forward to. False means "no identifiable predecessor" -> the Acquiring op
-// degrades to the Option-A clean-cut belt rather than forwarding.
-func (s HandoffState) HasPredecessor() bool {
-	return s.Predecessor != ""
+	Phase     HandoffPhase
+	OpenEpoch Epoch
 }
 
 // errIllegalEdge is the shape every illegal-transition error takes. Kept as a
@@ -162,8 +135,6 @@ func NextOnReady(from HandoffState, openEpoch Epoch) (HandoffState, error) {
 	return HandoffState{
 		Phase:     PhaseReady,
 		OpenEpoch: openEpoch,
-		// Predecessor is dropped: once Ready the node serves locally and no
-		// longer forwards, so the recorded predecessor is no longer meaningful.
 	}, nil
 }
 

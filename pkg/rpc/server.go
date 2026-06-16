@@ -67,14 +67,14 @@ func errForwardLoop(reason string) error {
 func (s *Server) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
 	s.puts.Add(1)
 	if req.GetForwarded() {
-		// v0.8 Phase 2e overlap forward: a POSITION-ADDRESSED forwarded write
-		// carries the explicit ReplicaUnit (req.Ru). The predecessor of a moving
-		// position no longer holds it at its own ring index (that is the whole
-		// point of the move), so the OwnsReplica ring-index check below would
-		// wrongly refuse it. Instead resolve mountMap[ru] DIRECTLY by the explicit
-		// ru, serving the Draining entry. An unmounted ru (already released)
-		// returns the retryable acquiring error so the forwarder degrades to
-		// Option A; no re-forward, no loop.
+		// v0.8 Phase 2e (pending ranges): a POSITION-ADDRESSED union write carries
+		// the explicit ReplicaUnit (req.Ru). A PENDING owner targeted by the union
+		// does not hold the position at its own current-set ring index, so the
+		// OwnsReplica ring-index check below would wrongly refuse it. Instead
+		// resolve mountMap[ru] DIRECTLY by the explicit ru. An unmounted ru (a
+		// pending owner still mid-mount, or a released drain) returns the retryable
+		// acquiring error so the originator's union fan-out tolerates it; no
+		// re-forward, no loop.
 		if ru := req.GetRu(); ru != nil {
 			if err := s.c.LocalReplicaPutAtWire(ru.GetGen(), ru.GetUnit(), ru.GetReplica(), req.GetKey(), req.GetValue()); err != nil {
 				return nil, err
@@ -108,11 +108,11 @@ func (s *Server) Put(_ context.Context, req *pb.PutRequest) (*pb.PutResponse, er
 func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
 	s.gets.Add(1)
 	if ru := req.GetRu(); req.GetForwarded() && ru != nil {
-		// v0.8 Phase 2e overlap forward (position-addressed read): resolve
-		// mountMap[ru] DIRECTLY by the explicit ru (the Draining entry on the
-		// predecessor), bypassing the ring-index OwnsKey check. An unmounted ru
-		// returns the retryable acquiring error / not-found so the forwarder
-		// degrades to Option A.
+		// v0.8 Phase 2e (pending ranges, position-addressed read): resolve
+		// mountMap[ru] DIRECTLY by the explicit ru, bypassing the ring-index
+		// OwnsKey check (a pending owner is not at this position in its current-set
+		// ring index). An unmounted ru returns the retryable acquiring error /
+		// not-found so the originator's read fan-out skips this leg.
 		v, err := s.c.LocalReplicaGetAtWire(ru.GetGen(), ru.GetUnit(), ru.GetReplica(), req.GetKey())
 		if errors.Is(err, backend.ErrNotFound) {
 			return &pb.GetResponse{NotFound: true}, nil
@@ -176,10 +176,10 @@ func (s *Server) Get(_ context.Context, req *pb.GetRequest) (*pb.GetResponse, er
 func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
 	s.deletes.Add(1)
 	if req.GetForwarded() {
-		// v0.8 Phase 2e overlap forward (position-addressed delete): resolve
+		// v0.8 Phase 2e (pending ranges, position-addressed delete): resolve
 		// mountMap[ru] DIRECTLY by the explicit ru. At R>1 a Delete is normally a
 		// tombstone envelope routed through Put, so this path is the rare direct
-		// forward; the value carries the tombstone envelope bytes.
+		// position-addressed delete; the value carries the tombstone envelope bytes.
 		if ru := req.GetRu(); ru != nil {
 			if err := s.c.LocalReplicaDeleteAtWire(ru.GetGen(), ru.GetUnit(), ru.GetReplica(), req.GetKey(), nil); err != nil {
 				return nil, err

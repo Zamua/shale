@@ -1,12 +1,13 @@
 package cluster
 
-// White-box tests for the graceful-leave drain (v0.8 Phase 2e, scale-down):
-// DrainForLeave + ownedPositionCount. They drive the drain against a per-replica
-// shared-backing factory + a real ring, with NO membership / gRPC (membership is
-// nil; the leave is modeled by removing self from the ring, exactly what
-// reconcileRingFromMembership would do once the leave gossips out). The wired
-// cross-node leave + the slow-mount loss-oracle acceptance gate are covered by
-// the integration tests.
+// White-box tests for the graceful-leave drain (v0.8 Phase 2e, pending ranges,
+// scale-down): DrainForLeave + the completion gate. They drive the drain against
+// a per-replica shared-backing factory + a real ring, with NO membership / gRPC
+// (membership is nil; the leave is modeled by injecting the Draining bit via the
+// test hook - under the pending-ranges model the leaver STAYS in the ring, so its
+// positions become current-but-not-pending and the reconcile sets them Draining).
+// The wired cross-node leave + the slow-mount loss-oracle acceptance gate are
+// covered by the integration tests.
 
 import (
 	"context"
@@ -33,23 +34,16 @@ func seedOwnedPositions(t *testing.T, c *Cluster, backing *sharedfactory.Backing
 		}
 		c.mountMap[target] = b
 	}
-	// Capture the prior snapshot as the pre-leave live sets so that after self
-	// leaves, each of its positions is a single-hop move to its successor. Also
-	// capture the member addresses from the SAME (pre-leave) ring so the
-	// departing node's dial address is stored in the survivors' Acquiring state
-	// and the forward survives the leave.
-	c.priorDesiredReplicas = c.liveDesiredReplicaSets()
-	c.priorAddrs = c.liveMemberAddrs()
 	return desired
 }
 
-// leaveRing removes self from the ring, modeling the post-leave ring the
-// background reconcileRingFromMembership would converge to once the memberlist
-// Leave gossips out. After this, self is no longer in any position's live
-// replica set, so its mounted positions are moves to survivors (Draining).
-func leaveRing(c *Cluster) {
-	c.ring.Remove(c.cfg.NodeID)
-	c.bumpRingGen()
+// markDraining models the leave under the pending-ranges model: self STAYS in
+// the ring (it is not removed) but advertises the Draining bit. Every node's
+// replicasForKey then computes self's positions as current-but-not-pending, so
+// the reconcile sets them Draining. With no membership layer in this white-box
+// test, the draining set is injected directly via the test hook.
+func markDraining(c *Cluster) {
+	c.draining = map[string]struct{}{c.cfg.NodeID: {}}
 }
 
 // TestLeave_DrainForLeave_ReleasesAllWhenSuccessorsReady: the happy path. Self
@@ -65,8 +59,9 @@ func TestLeave_DrainForLeave_ReleasesAllWhenSuccessorsReady(t *testing.T) {
 		t.Fatalf("seed: ownedPositionCount = %d, want %d", c.ownedPositionCount(), len(owned))
 	}
 
-	// Self leaves: drop it from the ring so its positions become moves.
-	leaveRing(c)
+	// Self leaves: advertise Draining (it stays in the ring) so its positions
+	// become current-but-not-pending and the reconcile drains them.
+	markDraining(c)
 
 	// Each successor is Ready: write a serving marker at epoch 2 (strictly above
 	// self's open epoch 1) for every owned position. This is what drainCheck
@@ -98,7 +93,7 @@ func TestLeave_DrainForLeave_TimesOutWhenSuccessorStuck(t *testing.T) {
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
 
 	owned := seedOwnedPositions(t, c, backing)
-	leaveRing(c)
+	markDraining(c)
 	// Deliberately write NO serving markers: every successor is "stuck".
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)

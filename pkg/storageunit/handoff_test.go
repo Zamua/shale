@@ -49,42 +49,11 @@ func TestHandoffPhase_sides(t *testing.T) {
 	}
 }
 
-func TestHandoffState_HasPredecessor(t *testing.T) {
-	if (HandoffState{Predecessor: "node-a"}).HasPredecessor() != true {
-		t.Errorf("non-empty Predecessor should report HasPredecessor() true")
-	}
-	if (HandoffState{Predecessor: ""}).HasPredecessor() != false {
-		t.Errorf("empty Predecessor should report HasPredecessor() false")
-	}
-}
-
-// TestHandoffState_PredecessorAddr pins that the Acquiring entry carries the
-// predecessor's dial address alongside its NodeID (the graceful-leave fix: the
-// address is stored so the forward survives the predecessor leaving the ring).
-func TestHandoffState_PredecessorAddr(t *testing.T) {
-	s := HandoffState{Phase: PhaseAcquiring, Predecessor: "old", PredecessorAddr: "10.0.0.9:7947"}
-	if !s.HasPredecessor() {
-		t.Fatalf("entry with a predecessor must report HasPredecessor()")
-	}
-	if s.PredecessorAddr != "10.0.0.9:7947" {
-		t.Fatalf("PredecessorAddr = %q, want the stored dial address", s.PredecessorAddr)
-	}
-	// Once Ready the node serves locally and no longer forwards, so the carried
-	// predecessor address is dropped along with the NodeID.
-	ready, err := NextOnReady(s, 7)
-	if err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	if ready.PredecessorAddr != "" {
-		t.Fatalf("Ready state must not retain a predecessor address, got %q", ready.PredecessorAddr)
-	}
-}
-
 // TestNextOnReady covers the single legal gainer edge Acquiring->Ready and
 // rejects every other predecessor phase.
 func TestNextOnReady(t *testing.T) {
 	t.Run("legal Acquiring->Ready", func(t *testing.T) {
-		from := HandoffState{Phase: PhaseAcquiring, Predecessor: "old"}
+		from := HandoffState{Phase: PhaseAcquiring}
 		got, err := NextOnReady(from, 7)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
@@ -94,10 +63,6 @@ func TestNextOnReady(t *testing.T) {
 		}
 		if got.OpenEpoch != 7 {
 			t.Errorf("OpenEpoch = %d, want 7", got.OpenEpoch)
-		}
-		// Predecessor dropped once Ready (no longer forwarding).
-		if got.HasPredecessor() {
-			t.Errorf("Ready state should not retain a predecessor, got %q", got.Predecessor)
 		}
 	})
 
@@ -228,8 +193,9 @@ func TestHandoffSequences(t *testing.T) {
 	})
 
 	t.Run("gainer Acquiring->Ready", func(t *testing.T) {
-		// Controller would set this entry on reconcile with the predecessor.
-		s := HandoffState{Phase: PhaseAcquiring, Predecessor: "old-owner"}
+		// Controller sets this entry on reconcile when a pending owner begins its
+		// mount.
+		s := HandoffState{Phase: PhaseAcquiring}
 		s, err := NextOnReady(s, 11)
 		if err != nil || s.Phase != PhaseReady {
 			t.Fatalf("ready: phase=%s err=%v", s.Phase, err)

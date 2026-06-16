@@ -1,16 +1,21 @@
 package cluster
 
-// White-box tests for the v0.8 Phase 2e (Option B) overlap-handoff controller.
-// They drive the unexported controller helpers (predecessorOf,
-// positionHasLiveSuccessor, reconcileReplicaUnitsOverlap, acquireReplicaUnitOverlap,
+// White-box tests for the v0.8 Phase 2e (pending ranges) handoff controller.
+// They drive the unexported controller helpers (desiredPendingReplicaUnits,
+// pendingUnitReplicas, reconcileReplicaUnitsOverlap, acquireReplicaUnitOverlap,
 // drainCheck) against a per-replica shared-backing factory + a real ring, with no
 // membership / gRPC, so they run fast and deterministically (no memberlist). The
 // pure HandoffState FSM is covered in pkg/storageunit/handoff_test.go; the wired
-// cross-node forward + the slow-mount loss oracle are covered by the integration
-// acceptance gate.
+// cross-node union dual-write + the slow-mount loss oracle are covered by the
+// integration acceptance gate.
+//
+// The leave (a draining member) is modeled by removing the leaver from the ring
+// directly: a draining node STAYS in the ring under the pending-ranges model, so
+// to exercise the PENDING owner's acquire trigger in a membership-free white-box
+// test we instead drive the per-unit current/pending split helpers and the
+// reconcile against a ring that mounts a pending position on self.
 
 import (
-	"fmt"
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
@@ -25,125 +30,146 @@ func ru(g uint64, u uint32, r uint8) storageunit.ReplicaUnit {
 	return storageunit.NewReplicaUnit(gu(g, u), r)
 }
 
-// -- predecessorOf --------------------------------------------------------
+// -- pendingUnitReplicas (the draining-excluded split) -------------------
 
-func TestOverlap_predecessorOf_SingleHopMove(t *testing.T) {
-	target := ru(0, 5, 0)
-	prior := map[storageunit.GenUnit][]storageunit.NodeID{
-		gu(0, 5): {"old", "x"},
-	}
-	live := map[storageunit.GenUnit][]storageunit.NodeID{
-		gu(0, 5): {"new", "x"}, // position 0 moved old -> new
-	}
-	got, ok := predecessorOf(target, prior, live)
-	if !ok || got != "old" {
-		t.Fatalf("predecessorOf = (%q, %v), want (old, true)", got, ok)
-	}
-}
+// TestOverlap_pendingUnitReplicas_DropsDrainingMember pins that excluding a
+// draining member from the replica-set resolution shifts the position to the next
+// clockwise survivor, while a non-draining set is unchanged.
+func TestOverlap_pendingUnitReplicas_DropsDrainingMember(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 8, 2, backing, "self", "n2", "n3", "n4")
 
-func TestOverlap_predecessorOf_NoPriorSnapshot(t *testing.T) {
-	if _, ok := predecessorOf(ru(0, 5, 0), nil, nil); ok {
-		t.Fatalf("nil prior snapshot must yield no predecessor (pure new mount)")
+	target := gu(0, 0)
+	current := c.unitReplicas(target)
+	if len(current) != 2 {
+		t.Fatalf("R=2 current set must have 2 members, got %d", len(current))
 	}
-}
-
-func TestOverlap_predecessorOf_PriorHolderStillLive_Ambiguous(t *testing.T) {
-	target := ru(0, 5, 0)
-	prior := map[storageunit.GenUnit][]storageunit.NodeID{gu(0, 5): {"old", "x"}}
-	// The prior holder STILL holds the position live: this is not a move away
-	// from it, so no single-hop predecessor (degrade to Option A).
-	live := map[storageunit.GenUnit][]storageunit.NodeID{gu(0, 5): {"old", "x"}}
-	if _, ok := predecessorOf(target, prior, live); ok {
-		t.Fatalf("prior holder still live must yield no predecessor")
+	// No draining members: pending == current.
+	if got := c.pendingUnitReplicas(target, nil); !sameMemberSet(got, current) {
+		t.Fatalf("with no draining members pending must equal current")
+	}
+	// Drain the primary (index 0): pending must drop it and pull in a survivor.
+	draining := map[string]struct{}{current[0].ID: {}}
+	pending := c.pendingUnitReplicas(target, draining)
+	if len(pending) != 2 {
+		t.Fatalf("pending must still have R=2 survivors, got %d", len(pending))
+	}
+	for _, m := range pending {
+		if m.ID == current[0].ID {
+			t.Fatalf("draining member %q must not appear in the pending set", current[0].ID)
+		}
 	}
 }
 
-func TestOverlap_predecessorOf_NoPriorHolderForPosition(t *testing.T) {
-	target := ru(0, 5, 1)
-	// prior snapshot has only position 0 (shorter than replica index 1).
-	prior := map[storageunit.GenUnit][]storageunit.NodeID{gu(0, 5): {"old"}}
-	live := map[storageunit.GenUnit][]storageunit.NodeID{gu(0, 5): {"old", "new"}}
-	if _, ok := predecessorOf(target, prior, live); ok {
-		t.Fatalf("position with no prior holder must yield no predecessor (new mount)")
-	}
-}
+// -- desiredPendingReplicaUnits (the pending-owner enumeration) -----------
 
-// -- positionHasLiveSuccessor --------------------------------------------
-
-func TestOverlap_positionHasLiveSuccessor(t *testing.T) {
+// TestOverlap_desiredPendingReplicaUnits_NoDrainingEqualsCurrent pins that with
+// no draining members the pending desired set is identical to the current desired
+// set (steady state: nothing to acquire, nothing to drain).
+func TestOverlap_desiredPendingReplicaUnits_NoDrainingEqualsCurrent(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 8, 2, backing, "self", "n2", "n3")
 
-	// A position whose live holder is some OTHER node = a move (drain).
-	moved := ru(0, 0, 0)
-	live := map[storageunit.GenUnit][]storageunit.NodeID{
-		gu(0, 0): {"n2", "n3"},
+	current := c.desiredReplicaUnits()
+	pending := c.desiredPendingReplicaUnits(nil)
+	if len(current) != len(pending) {
+		t.Fatalf("steady-state pending desired set size = %d, want current %d", len(pending), len(current))
 	}
-	if !c.positionHasLiveSuccessor(moved, live) {
-		t.Fatalf("position held live by another node must report a successor")
+	cur := make(map[storageunit.ReplicaUnit]struct{}, len(current))
+	for _, ru := range current {
+		cur[ru] = struct{}{}
 	}
-
-	// A position absent from the live set = plain drop-out (no successor).
-	gone := ru(0, 1, 0)
-	if c.positionHasLiveSuccessor(gone, map[storageunit.GenUnit][]storageunit.NodeID{}) {
-		t.Fatalf("position absent from live set must report no successor")
+	for _, ru := range pending {
+		if _, ok := cur[ru]; !ok {
+			t.Fatalf("pending position %v not in current set (should be equal in steady state)", ru)
+		}
 	}
 }
 
-// -- reconcileReplicaUnitsOverlap: DRAIN (position moving away) -----------
-
-// TestOverlap_Reconcile_MoveAway_SetsDrainingKeepsMount: a mounted position the
-// live ring now assigns to ANOTHER node (and the prior snapshot had this node
-// holding it) is set Draining and KEPT MOUNTED (not released).
-func TestOverlap_Reconcile_MoveAway_SetsDrainingKeepsMount(t *testing.T) {
+// TestOverlap_desiredPendingReplicaUnits_GainsLeaversPositions pins the
+// pending-owner acquire trigger's INPUT: when a peer drains, self's pending
+// desired set GROWS to include positions the leaver vacates (positions self does
+// NOT own in the current view). Those extra positions are exactly what the
+// reconcile's pending-acquire half mounts.
+func TestOverlap_desiredPendingReplicaUnits_GainsLeaversPositions(t *testing.T) {
 	backing := sharedfactory.NewBacking()
-	// Live ring does NOT contain self for the units it should drain: build a
-	// cluster where self is NOT in the live replica set, but mount + prior say
-	// it held position 0.
-	c := newReplicatedCluster(t, "self", 4, 2, backing, "n2", "n3", "n4")
+	c := newReplicatedCluster(t, "self", 16, 2, backing, "self", "n2", "n3")
 
-	// Pick a unit and mount position 0 on self as if it were the prior holder.
-	target := ru(0, 0, 0)
-	h := backing.Handle()
-	b, err := h.OpenReplicaUnit(target, 1)
-	if err != nil {
-		t.Fatalf("seed mount: %v", err)
+	current := c.desiredReplicaUnits()
+	curSet := make(map[storageunit.ReplicaUnit]struct{}, len(current))
+	for _, ru := range current {
+		curSet[ru] = struct{}{}
 	}
-	c.mountMap[target] = b
 
-	// Prior snapshot: self held position 0 of unit 0.
-	c.priorDesiredReplicas = map[storageunit.GenUnit][]storageunit.NodeID{
-		gu(0, 0): {"self", "n2"},
+	// Drain n2: self should pick up some of n2's positions in the pending view.
+	pending := c.desiredPendingReplicaUnits(map[string]struct{}{"n2": {}})
+	extra := 0
+	for _, ru := range pending {
+		if _, ok := curSet[ru]; !ok {
+			extra++
+		}
+	}
+	if extra == 0 {
+		t.Fatalf("draining a peer must give self at least one new pending position to acquire; got none")
+	}
+}
+
+// -- reconcileReplicaUnitsOverlap: DRAIN (a draining-split move away) -----
+
+// TestOverlap_Reconcile_DrainSplit_SetsDrainingKeepsMount: a position self holds
+// in CURRENT but no longer in PENDING (because self is draining, so the pending
+// split excludes it) is set Draining and KEPT MOUNTED (keep serving via the
+// union), not released.
+func TestOverlap_Reconcile_DrainSplit_SetsDrainingKeepsMount(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	// self is in the ring (a current owner) AND draining, so its positions are
+	// current-but-not-pending.
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
+	c.draining = map[string]struct{}{"self": {}}
+
+	// Mount every position self currently owns, as if it had been serving them.
+	current := c.desiredReplicaUnits()
+	if len(current) == 0 {
+		t.Fatalf("self owns no positions; ring fixture broken")
+	}
+	h := backing.Handle()
+	for _, target := range current {
+		b, err := h.OpenReplicaUnit(target, 1)
+		if err != nil {
+			t.Fatalf("seed mount %v: %v", target, err)
+		}
+		c.mountMap[target] = b
 	}
 
 	c.reconcileReplicaUnitsOverlap()
 
-	st := c.handoffPhaseOf(target)
-	if st.Phase != storageunit.PhaseDraining {
-		t.Fatalf("moved-away position phase = %v, want Draining", st.Phase)
-	}
-	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
-		t.Fatalf("Draining position must stay mounted (keep serving), but mount was removed")
+	for _, target := range current {
+		st := c.handoffPhaseOf(target)
+		if st.Phase != storageunit.PhaseDraining {
+			t.Fatalf("draining-split position %v phase = %v, want Draining", target, st.Phase)
+		}
+		if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
+			t.Fatalf("Draining position %v must stay mounted (keep serving)", target)
+		}
 	}
 }
 
-// TestOverlap_Reconcile_PlainDropOut_Releases: a mounted position NOT desired
-// and with NO live successor (vanished from the set) is plain clean-cut
-// released, NOT drained.
+// TestOverlap_Reconcile_PlainDropOut_Releases: a mounted position NOT in CURRENT
+// and NOT in PENDING (it vanished from this node's set entirely, with no draining
+// split keeping it) is plain clean-cut released, NOT drained.
 func TestOverlap_Reconcile_PlainDropOut_Releases(t *testing.T) {
 	backing := sharedfactory.NewBacking()
-	c := newReplicatedCluster(t, "self", 4, 2, backing, "n2", "n3", "n4")
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
 
-	// Mount a position whose unit does not exist in the live set at this index:
-	// use an out-of-range replica index so positionHasLiveSuccessor is false.
-	target := ru(0, 0, 5) // replica index 5 has no live holder (R=2)
+	// Mount a position at an out-of-range replica index so it is in neither the
+	// current nor the pending set (R=2, index 5 has no holder).
+	target := ru(0, 0, 5)
 	h := backing.Handle()
 	b, err := h.OpenReplicaUnit(target, 1)
 	if err != nil {
 		t.Fatalf("seed mount: %v", err)
 	}
 	c.mountMap[target] = b
-	// No prior snapshot entry for this position -> not a move.
 
 	c.reconcileReplicaUnitsOverlap()
 
@@ -155,71 +181,75 @@ func TestOverlap_Reconcile_PlainDropOut_Releases(t *testing.T) {
 	}
 }
 
-// -- reconcileReplicaUnitsOverlap: ACQUIRE (position moving in) -----------
+// -- reconcileReplicaUnitsOverlap: ACQUIRE (a pending position moving in) -
 
-// TestOverlap_Reconcile_MoveIn_SinglePredecessor_AcquiresAndRecords: a desired
-// position not yet mounted, whose prior holder (a single identifiable node)
-// moved away, enters Acquiring with the predecessor recorded, then completes the
-// mount flip to Owned (sharedfactory mounts instantly) and writes the serving
-// marker.
-func TestOverlap_Reconcile_MoveIn_SinglePredecessor_AcquiresAndRecords(t *testing.T) {
+// TestOverlap_Reconcile_PendingOwner_AcquiresAndMarks: a position self holds in
+// PENDING but not in CURRENT (a peer is draining, so the split makes self the
+// future owner) enters Acquiring, then completes the mount flip to Owned
+// (sharedfactory mounts instantly) and writes the serving marker that gates the
+// leaver's release.
+func TestOverlap_Reconcile_PendingOwner_AcquiresAndMarks(t *testing.T) {
 	backing := sharedfactory.NewBacking()
-	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+	c := newReplicatedCluster(t, "self", 16, 2, backing, "self", "n2", "n3")
 
-	// Find a unit/position self DESIRES (is in the live replica set for).
-	desired := c.desiredReplicaUnits()
-	if len(desired) == 0 {
-		t.Fatalf("self desires no units; ring fixture broken")
-	}
-	target := desired[0]
+	// Drain n2: self gains some of n2's positions as pending-only.
+	c.draining = map[string]struct{}{"n2": {}}
 
-	// Prior snapshot: a DIFFERENT node held target's exact position; self did
-	// not. Build the prior set as the live set but with target's position held
-	// by "pred" instead of self.
-	live := c.liveDesiredReplicaSets()
-	priorHolders := append([]storageunit.NodeID(nil), live[target.Unit]...)
-	priorHolders[target.Replica] = "n2" // a node still in the live ring elsewhere
-	// ensure prior holder differs from live holder (self)
-	if priorHolders[target.Replica] == live[target.Unit][target.Replica] {
-		t.Fatalf("prior holder must differ from live holder for a move")
+	current := c.desiredReplicaUnits()
+	curSet := make(map[storageunit.ReplicaUnit]struct{}, len(current))
+	for _, ru := range current {
+		curSet[ru] = struct{}{}
 	}
-	c.priorDesiredReplicas = map[storageunit.GenUnit][]storageunit.NodeID{
-		target.Unit: priorHolders,
+	// Mount the positions self currently owns (it is a current owner of them).
+	h := backing.Handle()
+	for _, target := range current {
+		b, err := h.OpenReplicaUnit(target, 1)
+		if err != nil {
+			t.Fatalf("seed current mount %v: %v", target, err)
+		}
+		c.mountMap[target] = b
+	}
+
+	pending := c.desiredPendingReplicaUnits(c.draining)
+	var pendingOnly []storageunit.ReplicaUnit
+	for _, ru := range pending {
+		if _, ok := curSet[ru]; !ok {
+			pendingOnly = append(pendingOnly, ru)
+		}
+	}
+	if len(pendingOnly) == 0 {
+		t.Fatalf("expected at least one pending-only position to acquire")
 	}
 
 	c.reconcileReplicaUnitsOverlap()
-	// The overlap acquire opens in a background goroutine (so many positions
-	// mount concurrently). Wait for it to finish the flip before asserting.
+	// The overlap acquire opens in a background goroutine; wait for the flip.
 	c.loopWG.Wait()
 
-	// sharedfactory mounts instantly, so acquireReplicaUnitOverlapBlocking completes
-	// the flip: the position is now Owned (mounted, no phase entry).
-	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
-		t.Fatalf("acquired position must be mounted after the (instant) mount flip")
-	}
-	if st := c.handoffPhaseOf(target); st.Phase != 0 {
-		t.Fatalf("after the mount flip the position is Owned (no phase entry), got %v", st.Phase)
-	}
-	// The serving marker was written at the flip.
-	if _, ok := backing.ServingMarker(target); !ok {
-		t.Fatalf("mount flip must write the serving marker exactly once")
+	for _, target := range pendingOnly {
+		if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
+			t.Fatalf("pending-acquired position %v must be mounted after the mount flip", target)
+		}
+		if st := c.handoffPhaseOf(target); st.Phase != 0 {
+			t.Fatalf("after the mount flip pending position %v is Owned (no phase), got %v", target, st.Phase)
+		}
+		if _, ok := backing.ServingMarker(target); !ok {
+			t.Fatalf("pending-acquire mount flip must write the serving marker for %v", target)
+		}
 	}
 }
 
-// TestOverlap_Reconcile_PureNewMount_NoPredecessor_FallsThroughToCleanAcquire:
-// a desired position not mounted with NO prior holder (initial convergence) is
-// acquired clean-cut (no Acquiring phase, no predecessor, no overlap forward).
-func TestOverlap_Reconcile_PureNewMount_NoPredecessor_FallsThroughToCleanAcquire(t *testing.T) {
+// TestOverlap_Reconcile_PureNewMount_FallsThroughToCleanAcquire: a desired
+// CURRENT position not mounted with no transition (initial convergence) is
+// acquired clean-cut (no Acquiring phase) and writes its serving marker.
+func TestOverlap_Reconcile_PureNewMount_FallsThroughToCleanAcquire(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
 
 	desired := c.desiredReplicaUnits()
 	target := desired[0]
 
-	// No prior snapshot at all -> pure new mount.
-	c.priorDesiredReplicas = nil
-
 	c.reconcileReplicaUnitsOverlap()
+	c.loopWG.Wait()
 
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
 		t.Fatalf("pure-new-mount position must be acquired (mounted)")
@@ -227,21 +257,18 @@ func TestOverlap_Reconcile_PureNewMount_NoPredecessor_FallsThroughToCleanAcquire
 	if st := c.handoffPhaseOf(target); st.Phase != 0 {
 		t.Fatalf("pure new mount must not enter a handoff phase, got %v", st.Phase)
 	}
-	// The clean-cut acquire must ALSO write the serving marker so a DRAINING
-	// predecessor of this position (a leaving node whose position landed here via
-	// the non-overlap path) can release. This is the second half of the graceful-
-	// leave fix: reachability (the stored address) gets the forward to the leaving
-	// node; the clean-cut marker lets the leaving node's drain COMPLETE for the
-	// positions that did not resolve to a single-hop overlap.
+	// The clean-cut acquire must ALSO write the serving marker so a draining
+	// leaver of this position (whose slot landed here via the non-overlap path)
+	// can release.
 	if _, ok := backing.ServingMarker(target); !ok {
-		t.Fatalf("clean-cut acquire must write the serving marker so a draining predecessor releases")
+		t.Fatalf("clean-cut acquire must write the serving marker so a draining leaver releases")
 	}
 }
 
 // TestOverlap_CleanCutAcquire_WritesServingMarker pins directly that
 // acquireReplicaUnit (the clean-cut path) writes the serving marker after
-// mounting, at the epoch it opened. Without it a leaving node draining this
-// exact position never observes a marker and waits out the full grace timeout.
+// mounting, at the epoch it opened. Without it a leaving node draining this exact
+// position never observes a marker and waits out the full grace timeout.
 func TestOverlap_CleanCutAcquire_WritesServingMarker(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
@@ -256,107 +283,16 @@ func TestOverlap_CleanCutAcquire_WritesServingMarker(t *testing.T) {
 	if !ok {
 		t.Fatalf("clean-cut acquire must write the serving marker")
 	}
-	// The marker is at the epoch this node opened the position at (durable epoch
-	// after the fence), which is strictly above any prior draining holder's open
-	// epoch, so a draining predecessor's strict (>) gate releases.
 	durable, _ := backing.Handle().DurableEpochReplica(target)
 	if markerEpoch != durable {
 		t.Fatalf("serving marker epoch = %d, want the opened/durable epoch %d", markerEpoch, durable)
 	}
 }
 
-// firstKeyForUnit brute-forces a key whose live genUnit + this node's replica
-// position match target (so acquiringForwardTarget resolves to target via the
-// live-ring routing path). Fails the test if none is found in a bounded scan.
-func firstKeyForUnit(t *testing.T, c *Cluster, target storageunit.ReplicaUnit) []byte {
-	t.Helper()
-	for i := 0; i < 100000; i++ {
-		key := []byte(fmt.Sprintf("k%d", i))
-		gu := c.genUnitForKey(key)
-		if gu != target.Unit {
-			continue
-		}
-		pos, ok := c.localReplicaPos(gu)
-		if ok && pos == target.Replica {
-			return key
-		}
-	}
-	t.Fatalf("no key found routing to %v on self", target)
-	return nil
-}
-
-// -- predecessor address carry (graceful-leave P0 fix) -------------------
-
-// TestOverlap_ForwardTarget_UsesStoredAddrAfterPredecessorLeft pins the
-// graceful-leave fix: an Acquiring entry carries the predecessor's dial address
-// captured from the prior ring, and acquiringForwardTarget returns THAT stored
-// address even when the predecessor has LEFT the live ring (a scale-down).
-// Before the fix the forward resolved the address by walking the LIVE ring
-// (addrForNodeID), which returns nothing for a departed node, so the forward
-// gave up and the leaving node - though still serving - was unreachable.
-func TestOverlap_ForwardTarget_UsesStoredAddrAfterPredecessorLeft(t *testing.T) {
-	backing := sharedfactory.NewBacking()
-	// Live ring deliberately does NOT contain the predecessor "gone": self GAINS
-	// a position whose predecessor has already left the ring.
-	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
-
-	// Find a position self DESIRES and is the live holder of, so
-	// acquiringForwardTarget resolves it from the live ring index.
-	desired := c.desiredReplicaUnits()
-	if len(desired) == 0 {
-		t.Fatalf("self desires no units; ring fixture broken")
-	}
-	target := desired[0]
-
-	const goneAddr = "gone:0"
-	// Seed an Acquiring entry whose predecessor "gone" is NOT in the live ring,
-	// but whose dial address was captured (from the prior ring) and stored.
-	c.handoffPhase[target] = storageunit.HandoffState{
-		Phase:           storageunit.PhaseAcquiring,
-		Predecessor:     "gone",
-		PredecessorAddr: goneAddr,
-	}
-
-	// A live-ring resolve of "gone" must FAIL (it left the ring) - this is the
-	// exact condition that broke the forward before the fix.
-	if _, ok := c.addrForNodeID("gone"); ok {
-		t.Fatalf("predecessor 'gone' must not be resolvable via the live ring")
-	}
-
-	// acquiringForwardTarget must still return the STORED address.
-	key := firstKeyForUnit(t, c, target)
-	gotRU, gotAddr, ok := c.acquiringForwardTarget(key)
-	if !ok {
-		t.Fatalf("acquiringForwardTarget must succeed using the stored predecessor address")
-	}
-	if gotRU != target {
-		t.Fatalf("forward target ru = %v, want %v", gotRU, target)
-	}
-	if gotAddr != goneAddr {
-		t.Fatalf("forward target addr = %q, want the stored %q", gotAddr, goneAddr)
-	}
-}
-
-// TestOverlap_liveMemberAddrs_SnapshotsEveryMember pins that the address
-// snapshot captures every live ring member's dial address, which is what the
-// NEXT reconcile reads to resolve a soon-to-leave predecessor.
-func TestOverlap_liveMemberAddrs_SnapshotsEveryMember(t *testing.T) {
-	backing := sharedfactory.NewBacking()
-	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
-
-	addrs := c.liveMemberAddrs()
-	for _, id := range []storageunit.NodeID{"self", "n2", "n3"} {
-		want := string(id) + ":0" // newReplicatedCluster sets Addr = id + ":0"
-		if got := addrs[id]; got != want {
-			t.Fatalf("liveMemberAddrs[%q] = %q, want %q", id, got, want)
-		}
-	}
-}
-
 // -- drainCheck -----------------------------------------------------------
 
 // TestOverlap_drainCheck_ReleasesOnServingMarker: a Draining position releases
-// exactly when the durable serving marker is present at epoch >= its open epoch.
+// exactly when the durable serving marker is present at epoch > its open epoch.
 func TestOverlap_drainCheck_ReleasesOnServingMarker(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
@@ -385,7 +321,7 @@ func TestOverlap_drainCheck_ReleasesOnServingMarker(t *testing.T) {
 	}
 	c.drainCheck(target)
 	if _, mounted := c.localBackendForReplicaUnit(target); mounted {
-		t.Fatalf("with a serving marker >= open epoch the Draining position must release")
+		t.Fatalf("with a serving marker above the open epoch the Draining position must release")
 	}
 	if st := c.handoffPhaseOf(target); st.Phase != 0 {
 		t.Fatalf("after release the phase entry must be dropped (Absent), got %v", st.Phase)
@@ -397,11 +333,10 @@ func TestOverlap_drainCheck_ReleasesOnServingMarker(t *testing.T) {
 // monotonic, so a node that GAINED ru at open epoch E wrote
 // WriteServingMarker(ru, E). If the ring later moves ru OFF that node, beginDrain
 // sets OpenEpoch = DurableEpochReplica(ru) = E (unchanged until the NEW gainer
-// opens). Under a >= gate the node would read its OWN stale marker E (E >= E true)
-// and release while the real successor is still mid-mount, degrading any
-// twice-churning position to clean-cut. The strict > gate rejects the stale
-// self-marker (exactly E) and releases ONLY when a genuine successor writes a
-// marker STRICTLY above E (E+1). Deterministic, no gossip timing.
+// opens). Under a >= gate the node would read its OWN stale marker E and release
+// while the real successor is still mid-mount. The strict > gate rejects the
+// stale self-marker (exactly E) and releases ONLY when a genuine successor writes
+// a marker STRICTLY above E. Deterministic, no gossip timing.
 func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
@@ -419,14 +354,10 @@ func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 		t.Fatalf("write self gain-marker: %v", err)
 	}
 
-	// 2) the ring now moves ru OFF self: beginDrain sets OpenEpoch = E (the
-	//    durable fence epoch, unchanged until the NEW gainer opens). Model that
-	//    Draining state directly (keep serving, mount retained).
+	// 2) the ring now moves ru OFF self: beginDrain sets OpenEpoch = E.
 	c.mountMap[target] = b
 	c.handoffPhase[target] = storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: E}
 
-	// Only the STALE SELF-MARKER at exactly E exists: a >= gate would release
-	// here (the bug). The strict > gate must NOT.
 	if got, _ := h.DurableEpochReplica(target); got != E {
 		t.Fatalf("durable fence epoch should still be E=%d (no successor opened), got %d", E, got)
 	}
@@ -438,8 +369,8 @@ func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 		t.Fatalf("with only the stale self-marker the phase must stay Draining, got %v", st.Phase)
 	}
 
-	// 3) a genuine SUCCESSOR opens at durable+1 (>= E+1) and writes a marker
-	//    STRICTLY above E. Now drainCheck must release.
+	// 3) a genuine SUCCESSOR opens at durable+1 and writes a marker STRICTLY above
+	//    E. Now drainCheck must release.
 	h2 := backing.Handle()
 	if _, err := h2.OpenReplicaUnit(target, E+1); err != nil {
 		t.Fatalf("successor open: %v", err)
@@ -474,8 +405,7 @@ func TestOverlap_drainCheck_NeverReleasesOnBareFenceEpoch(t *testing.T) {
 	c.handoffPhase[target] = storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: 1}
 
 	// Simulate a new owner FENCING (advancing the durable epoch) WITHOUT ever
-	// writing the serving marker (it crashed mid-mount). A second handle opens
-	// at a higher epoch, bumping the durable fence epoch, but writes no marker.
+	// writing the serving marker (it crashed mid-mount).
 	h2 := backing.Handle()
 	if _, err := h2.OpenReplicaUnit(target, 5); err != nil {
 		t.Fatalf("fence open: %v", err)

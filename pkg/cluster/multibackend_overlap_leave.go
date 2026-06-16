@@ -1,13 +1,19 @@
-// Graceful-leave drain (v0.8 Phase 2e, scale-down). The overlap handoff
-// machine in multibackend_overlap.go is symmetric between scale-UP and
-// scale-DOWN: a JOIN makes a survivor Acquiring while the existing owner
-// Draining-serves; a deliberate REMOVAL makes the survivors Acquiring the
-// leaving node's positions while the LEAVING node Draining-serves them. So a
-// graceful leave is just an overlap drain seen from the LOSING side, for ALL
-// of a node's positions at once. The one missing piece is on the SHUTDOWN
-// path, not the reconcile path: Close() does not WAIT for that drain. This
-// file adds the wait (DrainForLeave) and the helper that decides when it is
-// done; Close() calls it (gated) BEFORE any teardown.
+// Graceful-leave drain (v0.8 Phase 2e, pending ranges, scale-down). Under the
+// pending-ranges model a leaving node sets a gossiped Draining bit but STAYS a
+// full, alive member AND a current owner of every position it serves: it is NOT
+// removed from the consistent-hash ownership ring. Every node's replicasForKey
+// then computes the leaver's positions as CURRENT-but-not-PENDING (current = ring
+// including the leaver, pending = ring excluding it), forms the routed UNION, and
+// DUAL-WRITES the leaver + its pending successors. The leaver keeps serving
+// (dual-written via the union) until each successor mounts the position and
+// writes its serving marker; ordered removal then collapses the union onto the
+// pending set and drainCheck releases the leaver's mount.
+//
+// This file adds the SHUTDOWN-path wait (DrainForLeave) and the completion gate.
+// Close() calls DrainForLeave at the TOP (gated on GracefulLeaveDrainTimeout >
+// 0 + multiReplicated()), BEFORE any teardown, while the reconcile loop +
+// drainCheck still run. Only after the drain completes (or its bounded timeout
+// fires) does the real membership.Leave() + transport Shutdown run.
 //
 // See docs/SPEC.md "v0.8 Phase 2e: Graceful leave (scale-down)" and
 // docs/design/overlap-handoff.md "Graceful leave (scale-down)".
@@ -17,96 +23,87 @@ package cluster
 import (
 	"context"
 	"time"
+
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 // drainPollInterval is how often DrainForLeave re-drives the reconcile +
 // drainCheck and re-tests for completion. It is deliberately tighter than
-// reconcileInterval: the drain is a bounded, latency-sensitive shutdown wait,
-// so it actively drives the loop rather than waiting for the background
-// reconcile tick. The reconcile is idempotent, so an extra drive is cheap.
+// reconcileInterval: the drain is a bounded, latency-sensitive shutdown wait, so
+// it actively drives the loop rather than waiting for the background reconcile
+// tick. The reconcile is idempotent, so an extra drive is cheap.
 const drainPollInterval = 50 * time.Millisecond
 
-// DrainForLeave performs the graceful-leave drain for a scale-down: it SETS
-// THIS NODE DRAINING (gossiping the yield-ownership bit, so survivors re-own
-// this node's positions and start forwarding to it via the overlap machine
-// while it stays alive + addressable), then BLOCKS until this node owns no more
-// positions (every position handed off to its successor and released by
-// drainCheck, or plain-released) OR ctx is cancelled / its deadline fires.
-// The real membership.Leave() + transport Shutdown happen later, in Close.
+// DrainForLeave performs the graceful-leave drain for a scale-down: it SETS THIS
+// NODE DRAINING (gossiping the Draining bit, so every node recomputes the
+// pending split current-minus-this-node, forms the routed union, and dual-writes
+// the leaver + its successors while it stays alive + a current owner + serving),
+// then BLOCKS until every position this node owns has a PENDING SUCCESSOR that is
+// PROVABLY SERVING (its serving marker is present at an epoch strictly above this
+// node's open epoch) OR ctx is cancelled / its deadline fires. The real
+// membership.Leave() + transport Shutdown happen later, in Close.
 //
-// Throughout the wait the reconcile loop, the serving path, drainCheck, and the
-// forward path all stay alive (Close has not torn them down yet - DrainForLeave
-// runs at the TOP of Close). DrainForLeave additionally DRIVES the reconcile +
-// drainCheck itself on a tight cadence so the hand-off converges at poll
-// latency rather than waiting for the background reconcile tick. Each Draining
-// position releases on the SAME rule as any overlap drain (a successor's
-// serving marker at an epoch strictly above this node's open epoch); this
-// reuses drainCheck's release, it does not reimplement it.
+// THE COMPLETION GATE (allOwnedPositionsHandedOff): this node stays a CURRENT
+// OWNER in the ring throughout the drain, so it KEEPS its positions mounted and
+// keeps serving them - the old mountMap-empties completion is therefore NOT the
+// signal (a current owner's mount does not vanish on its own). Instead the drain
+// is done when EVERY position this node still has mounted as a Draining position
+// has a serving marker strictly above its open epoch. drainCheck runs on the
+// same cadence and releases (CloseReplicaUnit) each such position once its marker
+// appears; a released position is no longer mounted, so it trivially satisfies
+// the gate. The gate thus holds the instant every owned position has a provably
+// serving successor, whether or not drainCheck has finished closing the mount.
 //
-// It is a no-op (returns nil immediately) outside the multi-backend overlap
+// Throughout the wait the reconcile loop, the serving path, and drainCheck all
+// stay alive (Close has not torn them down yet - DrainForLeave runs at the TOP of
+// Close). DrainForLeave additionally DRIVES the reconcile + drainCheck itself on
+// a tight cadence so the hand-off converges at poll latency rather than waiting
+// for the background reconcile tick.
+//
+// It is a no-op (returns nil immediately) outside the multi-backend replicated
 // path: a graceful leave only has positions to drain when multiReplicated().
 //
 // RESIDUALS (not covered, by design):
-//   - a position taking the PLAIN clean-cut release path (the leaving node
-//     simply drops out of a unit's replica set, another already-mounted replica
-//     covers W, no successor takes its exact position) is released eagerly by
-//     the reconcile; there is nothing to drain and the surviving replicas keep
-//     it available. mountMap drops it, so it does not block completion.
+//   - a position taking the PLAIN clean-cut release path (this node simply drops
+//     out of a unit's replica set, another already-mounted replica covers W, no
+//     successor takes its exact slot) is released eagerly by the reconcile; there
+//     is nothing to drain and the surviving replicas keep it available. Its mount
+//     drops, so it does not block completion.
 //   - a position whose successor is STUCK (its Acquiring mount never completes
 //     within the grace budget): the wait times out and Close proceeds, leaving
-//     that one position unserved from teardown until the survivor finally
-//     mounts - exactly today's gap, for that position only, no worse than the
-//     disabled (timeout 0) behavior.
+//     that one position unserved from teardown until the successor finally mounts
+//   - exactly today's gap, for that position only, no worse than the disabled
+//     (timeout 0) behavior.
 func (c *Cluster) DrainForLeave(ctx context.Context) error {
 	if !c.multiReplicated() {
 		return nil
 	}
 
-	// SET THIS NODE DRAINING and gossip it. The node stays alive + a full,
-	// addressable member (its transport stays up, its Snapshot does not
-	// collapse), but it advertises that it is YIELDING OWNERSHIP. The moment
-	// the draining Meta gossips, reconcileRingFromMembership on EVERY node
-	// (including this one) drops this node from the consistent-hash ownership
-	// ring, so LocateKeyN redistributes its positions to the survivors. The
-	// survivors then enter the overlap-Acquire path with this node as
-	// predecessor and forward writes to it (via the stored predecessor address)
-	// while it keeps serving throughout the drain. The REAL membership.Leave()
-	// + transport Shutdown stay in the existing Close teardown, run AFTER this
-	// drain returns.
+	// SET THIS NODE DRAINING and gossip it. The node stays ALIVE, a full
+	// addressable member, AND a CURRENT OWNER in the ring (it is NOT removed from
+	// ownership - the include/exclude split is per-op in replicasForKey). The
+	// moment the Draining Meta gossips, every node's replicasForKey computes the
+	// PENDING split (ring-minus-this-node) for this node's positions, forms the
+	// routed union, and dual-writes this node + its pending successors. This node
+	// keeps serving its mounts (receiving union writes + reads) throughout the
+	// drain. The REAL membership.Leave() + transport Shutdown stay in the existing
+	// Close teardown, run AFTER this drain returns.
 	if c.membership != nil {
 		_ = c.membership.SetDraining(true)
 	}
 
-	// Drive reconcile + drainCheck and poll for completion until this node owns
-	// no positions or ctx is done. The first drive runs immediately so a fast
-	// hand-off does not pay one interval of latency.
+	// Drive reconcile + drainCheck and poll for completion until every owned
+	// position has a serving successor or ctx is done. The first drive runs
+	// immediately so a fast hand-off does not pay one interval of latency.
 	t := time.NewTicker(drainPollInterval)
 	defer t.Stop()
 	for {
-		// Re-drive the unit reconcile so this node's now-shrunken desired set
-		// (it excluded itself from the ownership ring the moment it gossiped
-		// Draining) converts its yielded positions to Draining, then drainCheck
+		// Re-drive the unit reconcile so this node's positions (current-but-not-
+		// pending under its own Draining bit) convert to Draining, then drainCheck
 		// releases the ones whose successors wrote a serving marker. runReconcile is
 		// idempotent + runs the overlap reconcile + runDrainChecks.
-		//
-		// NOTE: this drives the UNIT reconcile only, NOT reconcileRingFromMembership.
-		// The membership-driven ring refresh (which drops this Draining node from
-		// its own ownership ring) is left to the background runReconcileLoop tick.
-		// Driving the ring reconcile here on the tight poll cadence was tried and
-		// REVERTED: it amplifies transient membership-snapshot dips into eager
-		// plain-releases of this node's still-needed positions, collapsing the
-		// during-leave availability. See the KNOWN RESIDUAL note below.
-		//
-		// KNOWN RESIDUAL (handed to the next session): the survivors' ownership
-		// convergence under this scale-down is not yet reliable - a survivor's ring
-		// can transiently collapse, so the successor for some of this node's
-		// replica-0 (primary) positions never writes a serving marker, drainCheck
-		// never releases them, and the drain runs to the timeout. During-leave
-		// availability holds (this node keeps serving its mounts throughout), but
-		// the post-leave loss oracle can still see a primary position that no
-		// survivor mounted. The root cause is survivor-side ring convergence.
 		c.runReconcile()
-		if c.ownedPositionCount() == 0 {
+		if c.allOwnedPositionsHandedOff() {
 			return nil
 		}
 		select {
@@ -117,11 +114,49 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 	}
 }
 
+// allOwnedPositionsHandedOff is the DrainForLeave completion gate: it reports
+// whether EVERY position this node still has mounted (under a Draining phase, or
+// any mount it has not yet released) has a PENDING SUCCESSOR provably serving -
+// i.e. a serving marker present at an epoch STRICTLY ABOVE this node's open epoch
+// for that ReplicaUnit. A position with no such marker is still being handed off
+// (its successor has not mounted) and blocks completion.
+//
+// It snapshots the mounted set under mountMu, then reads the durable serving
+// marker for each position OUTSIDE the lock (a slow shared-storage read must not
+// block routed ops' mountMap reads). The strict (>) gate matches drainCheck's
+// release rule: a marker strictly above the leaver's open epoch is positive proof
+// a live SUCCESSOR is serving (the leaver's own stale gain-marker at exactly its
+// open epoch does not count). A position that drainCheck has already RELEASED is
+// no longer mounted, so it is not in the snapshot and trivially satisfies the
+// gate. With no positions mounted, the gate is true (the leaver has handed off
+// everything).
+func (c *Cluster) allOwnedPositionsHandedOff() bool {
+	if c.replicaFactory == nil {
+		return true
+	}
+	c.mountMu.RLock()
+	mounted := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
+	for ru := range c.mountMap {
+		mounted = append(mounted, ru)
+	}
+	c.mountMu.RUnlock()
+
+	for _, ru := range mounted {
+		open := c.openEpochForReplica(ru)
+		markerEpoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
+		if err != nil || !ok || markerEpoch <= open {
+			// No successor serving this position above the leaver's epoch yet: still
+			// handing off (or a transient marker-read error - retry next poll).
+			return false
+		}
+	}
+	return true
+}
+
 // ownedPositionCount returns how many ReplicaUnit positions this node still has
-// mounted. It is the completion signal for DrainForLeave: a Draining position
-// keeps its mount until drainCheck releases it (deletes mountMap[ru]), and a
-// plain-released position is deleted eagerly, so mountMap emptying to zero means
-// every position has been handed off or released. Reads under mountMu.
+// mounted. Reads under mountMu. Kept as an introspection helper for tests; the
+// DrainForLeave completion gate is allOwnedPositionsHandedOff (which the leaver
+// can satisfy while still serving its mounts), not mountMap emptying.
 func (c *Cluster) ownedPositionCount() int {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()

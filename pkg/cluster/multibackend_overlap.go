@@ -1,31 +1,40 @@
-// Overlap handoff (v0.8 Phase 2e, Option B) controller for an R>1
-// multi-backend membership change. It replaces the position-CHANGE branch of
-// reconcileReplicaUnits (the clean-cut RELEASE-then-ACQUIRE) with an
-// ACQUIRE-then-RELEASE driven by a single per-ReplicaUnit ownership-transition
-// state machine (the pure storageunit.HandoffState FSM):
+// Pending-ranges handoff (v0.8 Phase 2e) controller for an R>1 multi-backend
+// membership transition. It replaces the position-CHANGE branch of the
+// clean-cut reconcile (RELEASE-then-ACQUIRE) with an ACQUIRE-then-RELEASE driven
+// by a single per-ReplicaUnit transition state machine (the pure
+// storageunit.HandoffState FSM) and the current/pending split:
 //
-//   - a position MOVING AWAY from this node -> set Draining (DO NOT release;
-//     keep serving directly AND for the new owner's forwards).
-//   - a position MOVING IN to this node from a single identifiable predecessor
-//     -> set Acquiring + record the predecessor + start acquireReplicaUnitOverlap
-//     (the new owner forwards routed ops to the predecessor while it mounts).
-//   - a pure NEW mount (initial convergence, no predecessor) OR an
-//     AMBIGUOUS/multi-hop predecessor -> fall through to the existing clean-cut
-//     acquire (the Option-A belt); overlap is best-effort single-hop.
-//   - a node simply DROPPING OUT of the replica set entirely -> existing plain
-//     clean-cut release (NOT the overlap machine).
+//   - CURRENT = unitReplicas over the ring INCLUDING draining members (who owns
+//     a position TODAY). PENDING = unitReplicas over the ring EXCLUDING draining
+//     members (who owns it once the leaver is gone). A position is IN TRANSITION
+//     when CURRENT != PENDING.
+//   - a position this node holds in CURRENT but not in PENDING -> set Draining
+//     (DO NOT release; STAY a routed current owner and keep serving, dual-written
+//     via the union, until the successor's serving marker gates the release).
+//   - a position this node holds in PENDING but not in CURRENT (it WILL own it
+//     once the leaver departs) -> set Acquiring + start acquireReplicaUnitOverlap
+//     (mount the per-(unit, replica) database in the background; the union covers
+//     the position via the still-mounted current owner during the mount, then on
+//     mount-complete this node writes its SERVING MARKER which gates the leaver's
+//     release). There is NO predecessor to remember and NO per-position forward:
+//     the union routes writes + reads DIRECTLY to both the current and pending
+//     owners.
+//   - a pure NEW mount (initial convergence, no transition) -> the existing
+//     clean-cut acquire.
+//   - a position simply DROPPING OUT of this node's replica set with no pending
+//     successor taking its exact slot -> the existing plain clean-cut release.
 //
 // The complete state of an in-flight position is the phase value + the mount
-// entry + (Acquiring) the recorded predecessor, all keyed by ReplicaUnit; there
-// are NO scattered isDraining/hasFlipped booleans. The old owner's release is
-// POLL-ONLY via drainCheck (multibackend_overlap.go below): it reads the durable
-// SERVING MARKER on the settle / self-heal cadence and releases only on a
-// positive readiness (a marker at an epoch >= its own open epoch), NEVER on a
-// bare durable fence-epoch advance.
+// entry, both keyed by ReplicaUnit; there are NO scattered booleans and NO
+// predecessor address. The old owner's release is POLL-ONLY via drainCheck
+// (below): it reads the durable SERVING MARKER on the settle / self-heal cadence
+// and releases only on a positive readiness (a marker at an epoch strictly above
+// its own open epoch), NEVER on a bare durable fence-epoch advance.
 //
-// See docs/SPEC.md "v0.8 Phase 2e" and docs/design/overlap-handoff.md. Option B
-// lives behind multiReplicated(); the legacy per-node path, the R=1 multi-backend
-// lease handoff (Phase 3), and the reshard (Phase 4) are untouched.
+// See docs/SPEC.md "v0.8 Phase 2e" and docs/design/overlap-handoff.md. The
+// pending-ranges path lives behind multiReplicated(); the legacy per-node path,
+// the R=1 multi-backend lease handoff (Phase 3), and the reshard (Phase 4) are
+// untouched.
 
 package cluster
 
@@ -33,28 +42,40 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
-// reconcileReplicaUnitsOverlap is the Option B (overlap handoff) reconcile,
-// replacing reconcileReplicaUnits for the R>1 path. It makes this node's mounted
-// + in-flight set match the units it replicates under the LIVE ring, but unlike
+// reconcileReplicaUnitsOverlap is the pending-ranges reconcile, replacing
+// reconcileReplicaUnits for the R>1 path. It makes this node's mounted +
+// in-flight set match the units it replicates under the LIVE ring, but unlike
 // the clean-cut reconcile it SEQUENCES the two halves of a position move via the
-// handoffPhase FSM so the position is never stranded.
+// handoffPhase FSM so the position is never stranded:
 //
-// Per position it consults priorDesiredReplicas (captured at the END of the
-// previous run) to tell a MOVE (one specific predecessor hands a specific
-// successor) from a pure new mount or a plain drop-out. At the END it captures
-// the live desired sets as the next priorDesiredReplicas snapshot.
+//   - DRAIN half: a mounted position this node holds in CURRENT but not in
+//     PENDING is set Draining (it keeps serving + receiving union dual-writes;
+//     drainCheck releases it on the successor's serving marker).
+//   - ACQUIRE half: a position this node holds in PENDING but not in CURRENT, not
+//     yet mounted, is set Acquiring + mounted in the background (the gainer); on
+//     mount-complete it writes its serving marker. A pure new mount with no
+//     transition takes the clean-cut acquire.
 //
 // Caller MUST hold reconcileMu; mount + phase mutations take mountMu.
 func (c *Cluster) reconcileReplicaUnitsOverlap() {
-	// live: the desired replica sets as of the LIVE ring, as GenUnit -> ordered
-	// holders. This is the authoritative routing truth; the snapshot below is
-	// consulted ONLY for predecessor identification.
-	live := c.liveDesiredReplicaSets()
+	draining := c.drainingIDs()
 
-	desired := c.desiredReplicaUnits()
-	desiredSet := make(map[storageunit.ReplicaUnit]struct{}, len(desired))
-	for _, ru := range desired {
-		desiredSet[ru] = struct{}{}
+	// current = positions the LIVE ring (including draining members) assigns this
+	// node. desired = current here: the set this node owns + must keep mounted
+	// (current owners stay mounted throughout a transition).
+	current := c.desiredReplicaUnits()
+	currentSet := make(map[storageunit.ReplicaUnit]struct{}, len(current))
+	for _, ru := range current {
+		currentSet[ru] = struct{}{}
+	}
+
+	// pending = positions this node WILL own once the draining members depart
+	// (the ring EXCLUDING draining). In steady state (no draining members)
+	// pending == current and the transition halves below are empty.
+	pending := c.desiredPendingReplicaUnits(draining)
+	pendingSet := make(map[storageunit.ReplicaUnit]struct{}, len(pending))
+	for _, ru := range pending {
+		pendingSet[ru] = struct{}{}
 	}
 
 	c.mountMu.RLock()
@@ -62,8 +83,6 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	for ru := range c.mountMap {
 		mounted = append(mounted, ru)
 	}
-	prior := c.priorDesiredReplicas
-	priorAddrs := c.priorAddrs
 	c.mountMu.RUnlock()
 
 	mountedSet := make(map[storageunit.ReplicaUnit]struct{}, len(mounted))
@@ -72,16 +91,16 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	}
 
 	// RECLAIM half: a position this node is DRAINING (gave up on an earlier pass)
-	// but now DESIRES again, while it is STILL mounted. This happens when the ring
-	// flip-flops a position away from this node then back (e.g. during a draining
-	// node's gradual gossip convergence). The drain is waiting for a SUCCESSOR's
-	// serving marker, but there is no successor anymore - this node is the live
-	// holder again - so drainCheck would never release it and the position would be
-	// stranded in Draining forever. Abort the drain: clear the in-flight phase so
-	// the position returns to Owned (it is still mounted + serving the whole time,
-	// so no availability gap). Reads under mountMu; the phase clear takes the lock.
+	// but now holds in CURRENT again, while it is STILL mounted. This happens when
+	// the ring flip-flops a position back (e.g. a draining node's gradual gossip
+	// convergence, or a draining member that recovered). The drain is waiting for
+	// a SUCCESSOR's serving marker, but this node is the live holder again, so
+	// drainCheck would never release it and the position would be stranded in
+	// Draining forever. Abort the drain: clear the in-flight phase so the position
+	// returns to Owned (it has been mounted + serving the whole time, so no
+	// availability gap). Reads under mountMu; the phase clear takes the lock.
 	for _, ru := range mounted {
-		if _, ok := desiredSet[ru]; !ok {
+		if _, ok := currentSet[ru]; !ok {
 			continue
 		}
 		if c.handoffPhaseOf(ru).Phase.IsLoser() {
@@ -89,115 +108,130 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		}
 	}
 
-	// RELEASE / DRAIN half: a mounted ReplicaUnit no longer desired here.
+	// DRAIN half: a mounted position this node holds in CURRENT but no longer in
+	// PENDING (a draining successor split removed it). Set Draining + KEEP SERVING
+	// (stay a routed current owner; the union dual-writes it; drainCheck releases
+	// on the successor's marker).
 	//
-	//   - if some OTHER node is the LIVE holder of this exact position (the
-	//     position MOVED to a successor), set Draining and KEEP SERVING - the
-	//     new owner will forward to us and release us on its readiness.
-	//   - otherwise the position simply VANISHED from our set (nobody took our
-	//     exact position; the remaining replicas cover W): plain clean-cut
-	//     release, the existing eager-delete path.
-	//
-	// A position already in an in-flight phase (Draining from a previous pass,
-	// or Acquiring/Ready as a gainer) is skipped: drainCheck drives the loser
-	// side to completion; the gainer side is handled in the ACQUIRE half.
+	// A position that VANISHED from CURRENT entirely (nobody, not even via a
+	// draining split, keeps it here - e.g. this node simply dropped out of the
+	// replica set) takes the plain clean-cut release: there is no pending
+	// successor mounting this exact slot, so there is nothing to drain.
 	for _, ru := range mounted {
-		if _, ok := desiredSet[ru]; ok {
-			continue
-		}
-		if c.handoffPhaseOf(ru).Phase != 0 {
-			// Already mid-transition (Draining set on an earlier pass). Leave it
-			// to drainCheck; re-arming it here would be an illegal Owned->Draining
-			// edge.
-			continue
-		}
-		if c.positionHasLiveSuccessor(ru, live) {
+		if _, inCurrent := currentSet[ru]; inCurrent {
+			// Still a current owner. Drain it only if it is leaving the PENDING set
+			// (a draining successor is taking it over); otherwise keep it Owned.
+			if _, inPending := pendingSet[ru]; inPending {
+				continue // owned in both current + pending: steady state, keep it.
+			}
+			if c.handoffPhaseOf(ru).Phase != 0 {
+				// Already mid-transition (Draining from an earlier pass). Leave it to
+				// drainCheck; re-arming would be an illegal Owned->Draining edge.
+				continue
+			}
 			c.beginDrain(ru)
 			continue
 		}
-		// Plain drop-out: nobody takes our exact position. Clean-cut release.
+		// Not in CURRENT at all: this node is no longer a live owner of this exact
+		// position. If it is already mid-transition (Draining), leave it to
+		// drainCheck. Otherwise plain clean-cut release (no successor mounts THIS
+		// node's exact slot; the surviving replicas cover W).
+		if c.handoffPhaseOf(ru).Phase != 0 {
+			continue
+		}
 		c.releaseReplicaUnit(ru)
 	}
 
-	// ACQUIRE half: a desired ReplicaUnit not currently mounted.
-	for _, ru := range desired {
-		if _, ok := mountedSet[ru]; ok {
+	// ACQUIRE half (PENDING owner): a position this node holds in PENDING but not
+	// in CURRENT, and not yet mounted. This is the pending-owner acquire TRIGGER:
+	// the draining-exclusion split makes this node the future owner of the
+	// leaver's exact slot, so it mounts that ReplicaUnit (the leaver's durable
+	// copy in shared storage) in the background and writes its serving marker on
+	// mount-complete, which gates the leaver's release. The union covers the
+	// position via the still-mounted leaver during the mount.
+	for _, ru := range pending {
+		if _, inCurrent := currentSet[ru]; inCurrent {
+			continue // already a current owner + mounted; nothing to acquire.
+		}
+		if _, isMounted := mountedSet[ru]; isMounted {
+			// Already mounted this pending position (a prior pass acquired it). If it
+			// is still PhaseAcquiring with the mount present (the flip races), let it
+			// resolve; otherwise it is Owned and serving.
 			continue
 		}
-		// A position in a LOSER phase (Draining/Releasing) that is now RE-DESIRED
-		// (the ring flip-flopped this position away then back, as can happen
-		// during a draining node's gradual gossip propagation) must NOT be
-		// re-acquired here: that would either illegally overwrite the Draining
-		// state via beginAcquire or mount via the clean-cut path while leaving a
-		// stale Draining phase entry, stranding the FSM. Let drainCheck finish the
-		// drain first (it deletes the phase entry on release); a later reconcile
-		// then sees Phase 0 + unmounted + desired and acquires cleanly.
-		if c.handoffPhaseOf(ru).Phase.IsLoser() {
+		st := c.handoffPhaseOf(ru)
+		if st.Phase.IsLoser() {
+			// A loser-phase entry that is now RE-DESIRED as a pending position must
+			// NOT be re-acquired here: drainCheck must finish the drain first (it
+			// deletes the phase entry on release); a later reconcile then sees Phase 0
+			// + unmounted + pending and acquires cleanly.
 			continue
 		}
-		// A position already PhaseAcquiring but NOT mounted means a prior pass
-		// recorded Acquiring (and forwards to the predecessor) but the mount has
-		// not completed - either it is genuinely in flight in this same pass, or a
-		// previous pass's OpenReplicaUnit failed and left it Acquiring. RE-DRIVE
-		// the mount on every reconcile / self-heal tick so a failed open is
-		// retried (idempotent: a successful re-open just flips it to Owned). The
-		// recorded predecessor is preserved, so routed ops keep forwarding
-		// meanwhile. Do NOT re-run beginAcquire (that would reset the predecessor
-		// to a possibly-stale one); just retry the open.
-		if c.handoffPhaseOf(ru).Phase.IsGainer() {
+		if st.Phase.IsGainer() {
+			// Already Acquiring but not mounted: a prior pass recorded Acquiring but
+			// the mount has not completed, or a previous OpenReplicaUnit failed. RE-DRIVE
+			// the mount on every tick so a failed open retries (idempotent: a
+			// successful re-open flips it to Owned).
 			c.acquireReplicaUnitOverlap(ru)
 			continue
 		}
-		pred, ok := predecessorOf(ru, prior, live)
-		if !ok {
-			// Pure new mount (initial convergence, no prior holder) OR an
-			// ambiguous / multi-hop predecessor (prior holder gone / already
-			// released). Overlap is single-hop best-effort: fall through to the
-			// clean-cut acquire (the Option-A belt). No forwarding; a routed op
-			// gets errUnitAcquiring + the WriteTimeout-bounded retry.
-			c.acquireReplicaUnit(ru)
-			continue
-		}
-		// Single unambiguous predecessor: overlap. Resolve its DIAL ADDRESS from
-		// the PRIOR-ring snapshot (where the predecessor was still a member) so the
-		// forward survives the predecessor leaving the ring on a scale-down - a
-		// live-ring walk could not resolve a departed node. Record Acquiring (with
-		// the predecessor + its address) BEFORE starting the mount, so a routed op
-		// arriving during the mount forwards to the predecessor instead of being
-		// refused.
-		predAddr := priorAddrs[pred]
-		c.beginAcquire(ru, pred, predAddr)
+		// Fresh pending acquire: record Acquiring BEFORE the mount starts so a
+		// routed op arriving during the mount returns errUnitAcquiring (the union
+		// covers it via the current owner) rather than racing an absent mount.
+		c.beginAcquire(ru)
 		c.acquireReplicaUnitOverlap(ru)
 	}
 
-	// Capture the live desired sets AND the live member addresses as the prior
-	// snapshot for the NEXT reconcile, at the END of the run (before the next run
-	// can read it). Both are taken from the SAME live ring so that during the
-	// NEXT reconcile a soon-to-leave predecessor's address is still resolvable.
-	addrs := c.liveMemberAddrs()
-	c.mountMu.Lock()
-	c.priorDesiredReplicas = live
-	c.priorAddrs = addrs
-	c.mountMu.Unlock()
+	// ACQUIRE half (pure new mount / initial convergence): a CURRENT position not
+	// yet mounted with no transition. This is the Phase 2b initial convergence
+	// (each node mounting the units the ring assigns it as peers join). It is the
+	// clean-cut acquire (no overlap sequencing needed: no predecessor is serving
+	// this exact slot, so there is nothing to drain from).
+	for _, ru := range current {
+		if _, isMounted := mountedSet[ru]; isMounted {
+			continue
+		}
+		st := c.handoffPhaseOf(ru)
+		if st.Phase.IsLoser() {
+			// Re-desired while still draining: let drainCheck finish first.
+			continue
+		}
+		if st.Phase.IsGainer() {
+			c.acquireReplicaUnitOverlap(ru)
+			continue
+		}
+		c.acquireReplicaUnit(ru)
+	}
 }
 
-// liveMemberAddrs snapshots every live ring member's NodeID -> gRPC dial
-// address. Captured at the END of a reconcile alongside priorDesiredReplicas so
-// the NEXT reconcile can resolve a predecessor's address even after that
-// predecessor has LEFT the ring (a scale-down): the departed node was a member
-// of THIS prior ring, so its address is in this map. A live-ring walk at
-// forward time (addrForNodeID) cannot resolve a departed node; this snapshot
-// can. With a nil/empty ring it returns just the local node.
-func (c *Cluster) liveMemberAddrs() map[storageunit.NodeID]string {
-	if c.ring == nil || c.ring.Empty() {
-		return map[storageunit.NodeID]string{
-			storageunit.NodeID(c.cfg.NodeID): c.cfg.GRPCAddr,
-		}
+// desiredPendingReplicaUnits returns the positions this node owns under the
+// PENDING view (the ring EXCLUDING draining members): the slots it WILL hold once
+// every draining member departs. It is the pending-owner acquire trigger's input.
+// With no draining members it is identical to desiredReplicaUnits (steady state),
+// so the transition halves of the reconcile are empty.
+//
+// It mirrors desiredReplicaUnits exactly but supplies the DRAINING-EXCLUDED
+// replica lookup (pendingUnitReplicas) to the pure storageunit.OwnedReplicaUnits.
+func (c *Cluster) desiredPendingReplicaUnits(draining map[string]struct{}) []storageunit.ReplicaUnit {
+	if len(draining) == 0 {
+		return c.desiredReplicaUnits()
 	}
-	members := c.ring.Members()
-	out := make(map[storageunit.NodeID]string, len(members))
-	for _, m := range members {
-		out[storageunit.NodeID(m.ID)] = m.Addr
+	gs := c.genSnapshot()
+	self := storageunit.NodeID(c.cfg.NodeID)
+
+	replicas := storageunit.ReplicaLookupFunc(func(u storageunit.UnitID) []storageunit.NodeID {
+		set := c.pendingUnitReplicas(storageunit.NewGenUnit(gs.gen, u), draining)
+		nodes := make([]storageunit.NodeID, len(set))
+		for i, m := range set {
+			nodes[i] = storageunit.NodeID(m.ID)
+		}
+		return nodes
+	})
+
+	owned := storageunit.OwnedReplicaUnits(self, gs.count, replicas)
+	out := make([]storageunit.ReplicaUnit, 0, len(owned))
+	for _, o := range owned {
+		out = append(out, storageunit.NewReplicaUnit(storageunit.NewGenUnit(gs.gen, o.Unit), o.Replica))
 	}
 	return out
 }
@@ -205,13 +239,13 @@ func (c *Cluster) liveMemberAddrs() map[storageunit.NodeID]string {
 // reconcileReplicaUnitsCleanCut is the pre-2e clean-cut RELEASE-then-ACQUIRE
 // reconcile for the R>1 path, used ONLY by the break-demo (Config.
 // TestingForceCleanCut). It diffs desired-vs-mounted and, with NO overlap
-// sequencing and NO predecessor forwarding, eagerly RELEASES every position no
-// longer desired here and ACQUIRES every newly-desired one. A position moving
-// away thus has a window where neither the old owner (released) nor the new
-// owner (still mounting) serves it; a routed op to the still-Acquiring new owner
-// gets errUnitAcquiring. Paired with TestingForceCleanCut also disabling the
-// Option-A retry, this is the regime the gate proves collapses. Caller holds
-// reconcileMu; mount mutations take mountMu.
+// sequencing and NO pending split, eagerly RELEASES every position no longer
+// desired here and ACQUIRES every newly-desired one. A position moving away thus
+// has a window where neither the old owner (released) nor the new owner (still
+// mounting) serves it; a routed op to the still-Acquiring new owner gets
+// errUnitAcquiring. Paired with TestingForceCleanCut also disabling the Option-A
+// retry, this is the regime the gate proves collapses. Caller holds reconcileMu;
+// mount mutations take mountMu.
 func (c *Cluster) reconcileReplicaUnitsCleanCut() {
 	desired := c.desiredReplicaUnits()
 	desiredSet := make(map[storageunit.ReplicaUnit]struct{}, len(desired))
@@ -247,81 +281,6 @@ func (c *Cluster) reconcileReplicaUnitsCleanCut() {
 	}
 }
 
-// liveDesiredReplicaSets returns the replica sets the LIVE ring assigns, as a
-// map from GenUnit (at the live generation) to the ordered NodeIDs holding each
-// replica position. It is the basis for predecessor identification (diffed
-// against priorDesiredReplicas) and for telling a MOVE from a plain drop-out
-// (does some other node hold this exact position now?). It enumerates the same
-// unit set desiredReplicaUnits derives from, but keeps the FULL holder list per
-// unit (not just this node's position).
-func (c *Cluster) liveDesiredReplicaSets() map[storageunit.GenUnit][]storageunit.NodeID {
-	gs := c.genSnapshot()
-	ids := gs.count.IDs()
-	out := make(map[storageunit.GenUnit][]storageunit.NodeID, len(ids))
-	for _, u := range ids {
-		gu := storageunit.NewGenUnit(gs.gen, u)
-		set := c.unitReplicas(gu)
-		holders := make([]storageunit.NodeID, len(set))
-		for j, m := range set {
-			holders[j] = storageunit.NodeID(m.ID)
-		}
-		out[gu] = holders
-	}
-	return out
-}
-
-// positionHasLiveSuccessor reports whether some OTHER node is the LIVE holder of
-// ru's exact replica position (ru.Replica of ru.Unit). True means the position
-// MOVED to a successor (drain + overlap); false means it simply vanished from
-// this node's set (plain clean-cut release). Self being the live holder cannot
-// happen here (the caller only asks for positions no longer desired by self).
-func (c *Cluster) positionHasLiveSuccessor(ru storageunit.ReplicaUnit, live map[storageunit.GenUnit][]storageunit.NodeID) bool {
-	holders, ok := live[ru.Unit]
-	if !ok || int(ru.Replica) >= len(holders) {
-		return false
-	}
-	return holders[ru.Replica] != storageunit.NodeID(c.cfg.NodeID)
-}
-
-// predecessorOf identifies the SINGLE-HOP predecessor of a position MOVING IN to
-// this node: the node that held ru's exact position in the PRIOR snapshot and
-// does NOT hold it in the LIVE set (prior-holder \ live-holder). It returns
-// ok=false (no predecessor) for:
-//
-//   - a pure new mount: no prior snapshot, or the position had no prior holder.
-//   - an ambiguous / multi-hop move: the prior holder STILL holds the position
-//     live (so it did not move away from anyone identifiable), or the prior and
-//     live holders are the same node (no move at this position).
-//
-// In every ok=false case the caller degrades to the Option-A clean-cut acquire
-// (single-hop scope, NEW-P1-2). The function is pure over its arguments.
-func predecessorOf(
-	ru storageunit.ReplicaUnit,
-	prior, live map[storageunit.GenUnit][]storageunit.NodeID,
-) (storageunit.NodeID, bool) {
-	if prior == nil {
-		return "", false
-	}
-	priorHolders, ok := prior[ru.Unit]
-	if !ok || int(ru.Replica) >= len(priorHolders) {
-		return "", false
-	}
-	priorHolder := priorHolders[ru.Replica]
-	if priorHolder == "" {
-		return "", false
-	}
-	// The predecessor must NOT be the live holder of the position (it must have
-	// moved away). If the prior holder is still the live holder, this is not a
-	// move away from it; bail to Option A.
-	liveHolders, ok := live[ru.Unit]
-	if ok && int(ru.Replica) < len(liveHolders) {
-		if liveHolders[ru.Replica] == priorHolder {
-			return "", false
-		}
-	}
-	return priorHolder, true
-}
-
 // handoffPhaseOf returns the in-flight HandoffState for ru (the zero value, with
 // Phase 0, when ru is not in flight). Reads under mountMu.
 func (c *Cluster) handoffPhaseOf(ru storageunit.ReplicaUnit) storageunit.HandoffState {
@@ -331,11 +290,12 @@ func (c *Cluster) handoffPhaseOf(ru storageunit.ReplicaUnit) storageunit.Handoff
 }
 
 // beginDrain puts a position into PhaseDraining (the loser side): the node no
-// longer desires it but a live successor is taking it over, so it KEEPS SERVING
-// the still-mounted entry until the successor is Ready. It does NOT release the
-// mount. The OpenEpoch recorded is the epoch this node opened the position at -
-// drainCheck compares the serving marker against it. Caller holds reconcileMu;
-// the phase write takes mountMu.
+// longer owns it under the PENDING view but a pending successor is taking it
+// over, so it KEEPS SERVING the still-mounted entry (dual-written via the union)
+// until the successor is Ready. It does NOT release the mount. The OpenEpoch
+// recorded is the epoch this node opened the position at - drainCheck compares
+// the serving marker against it. Caller holds reconcileMu; the phase write takes
+// mountMu.
 func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	open := c.openEpochForReplica(ru)
 	c.mountMu.Lock()
@@ -358,22 +318,17 @@ func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	c.mountMu.Unlock()
 }
 
-// beginAcquire records PhaseAcquiring for a position MOVING IN, carrying the
-// predecessor (NodeID + its dial address) so a routed op arriving during the
-// mount forwards to it (the overlap window). The address is captured from the
-// PRIOR ring (where the predecessor was still a member) and stored here for the
-// entry's lifetime, so the forward reaches the predecessor even after it LEAVES
-// the ring on a scale-down. It is set BEFORE the mount starts so there is no
-// instant where routing targets this node, the mount is incomplete, AND no
-// predecessor is recorded (which would force the Option-A refusal). Caller holds
-// reconcileMu; the phase write takes mountMu.
-func (c *Cluster) beginAcquire(ru storageunit.ReplicaUnit, pred storageunit.NodeID, predAddr string) {
+// beginAcquire records PhaseAcquiring for a pending position MOVING IN. There is
+// NO predecessor address: under the pending-ranges model the union routes ops
+// DIRECTLY to both the current owner (still serving) and this pending owner, so a
+// routed op arriving on this node during the mount simply returns errUnitAcquiring
+// (the union covers the position via the current owner). The phase is set BEFORE
+// the mount starts so there is no instant where routing targets this node, the
+// mount is incomplete, AND no phase entry exists. Caller holds reconcileMu; the
+// phase write takes mountMu.
+func (c *Cluster) beginAcquire(ru storageunit.ReplicaUnit) {
 	c.mountMu.Lock()
-	c.handoffPhase[ru] = storageunit.HandoffState{
-		Phase:           storageunit.PhaseAcquiring,
-		Predecessor:     pred,
-		PredecessorAddr: predAddr,
-	}
+	c.handoffPhase[ru] = storageunit.HandoffState{Phase: storageunit.PhaseAcquiring}
 	c.mountMu.Unlock()
 }
 
@@ -413,25 +368,26 @@ func (c *Cluster) openEpochForReplica(ru storageunit.ReplicaUnit) storageunit.Ep
 	return e
 }
 
-// acquireReplicaUnitOverlap is the GAINER's mount under overlap: it opens the
-// position (the slow MinIO mount happens here, during which routed ops forward
-// to the recorded predecessor), then performs THE MOUNT FLIP - inserts
-// mountMap[ru] under mountMu and advances Acquiring -> Ready -> drops the phase
-// entry (Owned) - and writes the durable SERVING MARKER exactly once so the old
-// owner's drainCheck poll releases. On open failure it leaves the Acquiring
-// phase in place (a routed op keeps forwarding to the predecessor) and the next
-// reconcile / self-heal retries. Caller holds reconcileMu.
+// acquireReplicaUnitOverlap is the GAINER's mount under the pending-ranges model:
+// it opens the position (the slow MinIO mount happens here, during which the
+// union covers the position via the still-mounted current owner), then performs
+// THE MOUNT FLIP - inserts mountMap[ru] under mountMu and advances Acquiring ->
+// Ready -> drops the phase entry (Owned) - and writes the durable SERVING MARKER
+// exactly once so the old owner's drainCheck poll releases. On open failure it
+// leaves the Acquiring phase in place (the union still covers the position via
+// the current owner) and the next reconcile / self-heal retries. Caller holds
+// reconcileMu.
+//
 // acquireReplicaUnitOverlap spawns the GAINER's slow mount in a BACKGROUND
 // goroutine so a node gaining many positions at once mounts them CONCURRENTLY
 // rather than serializing one multi-second OpenReplicaUnit after another inside
 // the reconcile (which holds reconcileMu). Serial opens would make a graceful
 // scale-down's drain exceed its budget - the leaving node would depart with
-// positions still un-handed-off, stranding the only durable copy of writes that
-// were forwarded to it. The position stays PhaseAcquiring (routed ops keep
-// forwarding to the predecessor) until the goroutine completes the mount flip.
-// The acquireInFlight set (under mountMu) is the idempotency guard: a reconcile
-// that re-drives an already-in-flight acquire does not spawn a second open. The
-// goroutine is tracked by loopWG so Close awaits it.
+// positions still un-handed-off. The position stays PhaseAcquiring (the union
+// covers it) until the goroutine completes the mount flip. The acquireInFlight
+// set (under mountMu) is the idempotency guard: a reconcile that re-drives an
+// already-in-flight acquire does not spawn a second open. The goroutine is
+// tracked by loopWG so Close awaits it.
 func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 	c.mountMu.Lock()
 	if c.closed.Load() {
@@ -466,9 +422,8 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) {
 	b, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 	if err != nil {
-		// Mount failed; stay Acquiring (keep forwarding to the predecessor). The
-		// position is not stranded: the old owner is still Draining + serving via
-		// the forward.
+		// Mount failed; stay Acquiring. The position is not stranded: the old owner
+		// is still a routed current owner serving via the union.
 		return
 	}
 
@@ -485,9 +440,9 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	}
 	cur := c.handoffPhase[ru]
 	if cur.Phase != storageunit.PhaseAcquiring {
-		// The phase entry is gone or not Acquiring (a concurrent reconcile
-		// already flipped or dropped it). Still install the mount (it is the
-		// authoritative durable owner) and drop any stale phase entry.
+		// The phase entry is gone or not Acquiring (a concurrent reconcile already
+		// flipped or dropped it). Still install the mount (it is the authoritative
+		// durable owner) and drop any stale phase entry.
 		c.mountMap[ru] = b
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
@@ -496,8 +451,8 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	}
 	ready, err := storageunit.NextOnReady(cur, openedEpoch)
 	if err != nil {
-		// Illegal edge should not happen (cur is Acquiring); install the mount
-		// and drop the phase to converge to Owned regardless.
+		// Illegal edge should not happen (cur is Acquiring); install the mount and
+		// drop the phase to converge to Owned regardless.
 		c.mountMap[ru] = b
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
@@ -505,52 +460,51 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		return
 	}
 	c.mountMap[ru] = b
-	// Ready is transient: once the mount entry is present the node serves
-	// locally and stops forwarding, so the steady state is Owned (no phase
-	// entry). Drop the entry rather than parking in Ready - Owned = mounted +
-	// no phase, per the FSM's steady-state poles.
+	// Ready is transient: once the mount entry is present the node serves locally,
+	// so the steady state is Owned (no phase entry). Drop the entry rather than
+	// parking in Ready - Owned = mounted + no phase, per the FSM's steady-state
+	// poles.
 	_ = ready
 	delete(c.handoffPhase, ru)
 	c.mountMu.Unlock()
 
 	// Write the serving marker EXACTLY ONCE, AFTER the mount flip (outside the
-	// lock: it is shared-storage I/O). This is the durable, poll-observable
-	// release signal the old owner's drainCheck polls. No RPC is sent.
+	// lock: it is shared-storage I/O). This is the durable, poll-observable release
+	// signal the old owner's drainCheck polls. No RPC is sent.
 	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
 }
 
 // drainCheck is the OLD owner's POLL-ONLY release-check for a Draining position,
 // armed on the periodic settle / self-heal cadence (runReconcile). It releases
 // the position ONLY on a POSITIVE readiness: a durable serving marker at an
-// epoch STRICTLY ABOVE (>) this node's own open epoch (proof a live new owner
-// is actually SERVING). The gate is strict to reject this node's OWN stale
-// gain-marker (written at exactly its open epoch); a genuine successor opens
-// at durable+1 and writes a marker strictly higher. A bare durable
-// fence-epoch advance NEVER releases (it bumps at
-// open-START, before the mount; only the marker proves serving).
+// epoch STRICTLY ABOVE (>) this node's own open epoch (proof a live new owner is
+// actually SERVING). The gate is strict to reject this node's OWN stale
+// gain-marker (written at exactly its open epoch); a genuine successor opens at
+// durable+1 and writes a marker strictly higher. A bare durable fence-epoch
+// advance NEVER releases (it bumps at open-START, before the mount; only the
+// marker proves serving).
 //
 // Lock discipline (review P1-3): the ReadServingMarker I/O runs OUTSIDE any
-// cluster lock (a slow MinIO read must not block routed ops' mountMap reads).
-// The phase compare-and-advance (Draining -> Releasing) and the mountMap
-// compare-and-delete are ONE critical section under mountMu, made exactly-once
-// by the CAS-on-mountMap-delete (delete only if it still points at the same
-// backend). CloseReplicaUnit runs AFTER the lock is dropped (the entry is
-// already removed), so a slow close does not hold mountMu. Caller holds
-// reconcileMu (so two passes do not both enter the edge); the exactly-once guard
-// is the mountMap CAS regardless.
+// cluster lock (a slow MinIO read must not block routed ops' mountMap reads). The
+// phase compare-and-advance (Draining -> Releasing) and the mountMap
+// compare-and-delete are ONE critical section under mountMu, made exactly-once by
+// the CAS-on-mountMap-delete (delete only if it still points at the same
+// backend). CloseReplicaUnit runs AFTER the lock is dropped (the entry is already
+// removed), so a slow close does not hold mountMu. Caller holds reconcileMu (so
+// two passes do not both enter the edge); the exactly-once guard is the mountMap
+// CAS regardless.
 func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	state := c.handoffPhaseOf(ru)
 	if state.Phase != storageunit.PhaseDraining {
 		return
 	}
 
-	// An ORPHANED Draining phase (the mount is already gone) converges straight
-	// to Absent regardless of marker readiness. Without this, a Draining phase
-	// whose mount was evicted but whose successor never wrote a marker would loop
-	// forever in the readiness poll below (which returns early on a not-ready
-	// marker), and the acquire half's loser-phase skip would never let the
-	// position re-mount - permanently stranding a re-desired position as
-	// unowned/unserved. The mount being gone means there is nothing to drain.
+	// An ORPHANED Draining phase (the mount is already gone) converges straight to
+	// Absent regardless of marker readiness. Without this, a Draining phase whose
+	// mount was evicted but whose successor never wrote a marker would loop forever
+	// in the readiness poll below, and the acquire half's loser-phase skip would
+	// never let the position re-mount - permanently stranding a re-desired position
+	// as unowned/unserved. The mount being gone means there is nothing to drain.
 	c.mountMu.Lock()
 	if cur, ok := c.handoffPhase[ru]; ok && cur.Phase == storageunit.PhaseDraining {
 		if _, mounted := c.mountMap[ru]; !mounted {
@@ -566,17 +520,15 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	if err != nil {
 		return
 	}
-	// Positive readiness: a live SUCCESSOR is serving at an epoch STRICTLY
-	// ABOVE my open epoch. The gate is STRICT (>, not >=) to reject this
-	// node's OWN stale gain-marker: a node that GAINED ru at open epoch E
-	// wrote WriteServingMarker(ru, E); if the ring later moves ru OFF this
-	// node, beginDrain sets OpenEpoch = DurableEpochReplica(ru) = E (unchanged
-	// until the NEW gainer opens), so a >= gate would read this node's OWN
-	// marker E (E >= E true) and RELEASE while the real successor is still
-	// mid-mount, degrading a TWICE-churning position to clean-cut. A genuine
-	// successor always opens at durable+1 >= E+1 and writes a marker strictly
-	// above E, so > still releases on a real successor. This matches
-	// CanRelease's already-strict durable > open boundary.
+	// Positive readiness: a live SUCCESSOR is serving at an epoch STRICTLY ABOVE
+	// my open epoch. The gate is STRICT (>, not >=) to reject this node's OWN
+	// stale gain-marker: a node that GAINED ru at open epoch E wrote
+	// WriteServingMarker(ru, E); if the ring later moves ru OFF this node,
+	// beginDrain sets OpenEpoch = DurableEpochReplica(ru) = E (unchanged until the
+	// NEW gainer opens), so a >= gate would read this node's OWN marker E and
+	// RELEASE while the real successor is still mid-mount. A genuine successor
+	// always opens at durable+1 >= E+1 and writes a marker strictly above E, so >
+	// still releases on a real successor.
 	ready := ok && markerEpoch > state.OpenEpoch
 	if !storageunit.Releasable(state, ready) {
 		// No marker yet (or below my epoch): stay Draining + keep serving.
@@ -584,8 +536,8 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	}
 
 	// ONE mountMu critical section: advance Draining -> Releasing and
-	// compare-and-delete the mount entry. The CAS-delete (delete only if the
-	// entry is still the backend we drained) is the real exactly-once guard.
+	// compare-and-delete the mount entry. The CAS-delete (delete only if the entry
+	// is still the backend we drained) is the real exactly-once guard.
 	c.mountMu.Lock()
 	cur, inFlight := c.handoffPhase[ru]
 	if !inFlight || cur.Phase != storageunit.PhaseDraining {
@@ -608,8 +560,8 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	// Exactly-once CAS-delete: only this critical section removes THIS entry.
 	delete(c.mountMap, ru)
 	// Drop the phase entry: Releasing is transient, the steady state after the
-	// release is Absent (no mount, no phase). next is computed to validate the
-	// edge; we converge straight to Absent.
+	// release is Absent (no mount, no phase). next validates the edge; we converge
+	// straight to Absent.
 	_ = next
 	delete(c.handoffPhase, ru)
 	c.mountMu.Unlock()

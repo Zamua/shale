@@ -314,10 +314,6 @@ func assertNoAckedLossSurvivors(t *testing.T, r gracefulLeaveResult) {
 	for k, v := range r.want {
 		got, err := getOracleReadback(t, r.survivors[0].Cluster, k, 30*time.Second)
 		if err != nil {
-			for _, n := range r.survivors {
-				mounted, owns := n.Cluster.DebugKeyState([]byte(k))
-				t.Logf("DEBUGKEY key=%q node=%s mountedHere=%v ownsHere=%v", k, n.ID, mounted, owns)
-			}
 			t.Fatalf("ACKED WRITE LOST: key %q unreadable after leave: %v", k, err)
 		}
 		if !bytes.Equal(got, v) {

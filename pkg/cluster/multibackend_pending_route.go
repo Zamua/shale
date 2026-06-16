@@ -36,6 +36,7 @@ package cluster
 
 import (
 	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 // drainingIDs returns the set of node IDs currently advertising the Draining
@@ -45,6 +46,12 @@ import (
 // allocation. A nil membership (legacy / test harness without gossip) yields no
 // draining members, collapsing every key to its stable set.
 func (c *Cluster) drainingIDs() map[string]struct{} {
+	// Test hook: white-box tests without a membership layer inject the draining
+	// set directly. In production c.draining is nil and the snapshot is
+	// authoritative.
+	if c.draining != nil {
+		return c.draining
+	}
 	if c.membership == nil {
 		return nil
 	}
@@ -96,24 +103,17 @@ func (c *Cluster) routedReplicasForKey(key []byte) (routed []ring.Member, stable
 	return unionMembers(current, pending), stableR
 }
 
-// pendingReplicasForKey resolves the PENDING replica set for a key: the
-// unit's replica set over the ring with the draining members EXCLUDED. Removing
-// a node from a consistent-hash ring shifts each of its keys to the next
-// clockwise survivor, which is exactly the next distinct member in the
-// GetClosestN successor chain - so locating (R + |draining|) members over the
-// FULL ring and dropping the draining ones, keeping the first R survivors, is
-// equivalent to re-locating R over a ring that never had the draining members,
-// WITHOUT mutating the shared ring. (At most |draining| of the first
-// R+|draining| chain entries can be draining, so R survivors always remain when
-// the ring has R non-draining members.)
-func (c *Cluster) pendingReplicasForKey(key []byte, draining map[string]struct{}) []ring.Member {
-	gu := c.genUnitForKey(key)
+// pendingUnitReplicas resolves the PENDING replica set for an explicit GenUnit:
+// the unit's replica set over the ring with the draining members EXCLUDED. It is
+// the unit-addressed sibling of pendingReplicasForKey (which takes a key), used
+// by the reconcile to enumerate this node's pending positions per unit. Same
+// successor-chain semantics: locate (R + |draining|) over the full ring and drop
+// the draining hits, keeping the first R survivors.
+func (c *Cluster) pendingUnitReplicas(gu storageunit.GenUnit, draining map[string]struct{}) []ring.Member {
 	if c.ring == nil || c.ring.Empty() {
 		return c.unitReplicas(gu)
 	}
 	r := c.replicationFactor()
-	// Locate enough of the chain that dropping every draining hit still leaves
-	// R survivors: R + |draining|, clamped inside LocateKeyN to the ring size.
 	chain := c.ring.LocateKeyN(genUnitBytes(gu), r+len(draining))
 	out := make([]ring.Member, 0, r)
 	for _, m := range chain {
@@ -126,6 +126,75 @@ func (c *Cluster) pendingReplicasForKey(key []byte, draining map[string]struct{}
 		}
 	}
 	return out
+}
+
+// routedReplica pairs a routed union member with the ReplicaUnit it physically
+// holds for the key's unit. The position index differs for a CURRENT owner (its
+// index in the current set) versus a PENDING owner (its index in the pending
+// set), so a position-addressed write must carry the member-specific ru. This is
+// what lets a union dual-write land on the exact mounted copy a pending owner
+// acquired, without the receiver re-deriving the position from its (current-set)
+// ring index (where a pending owner does not appear).
+type routedReplica struct {
+	member ring.Member
+	ru     storageunit.ReplicaUnit
+}
+
+// routedReplicasWithUnit resolves a key to its ROUTED union members, each paired
+// with the ReplicaUnit it holds, AND the stable replica count for the ack bar. A
+// current owner is paired with (gu, currentIndex); a pending-only owner (a node
+// in the union solely because the draining-excluded split adds it) is paired with
+// (gu, pendingIndex) - exactly the position the reconcile's pending-acquire
+// mounted. In steady state every member is a current owner and pending == current.
+func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, stableR int) {
+	gu := c.genUnitForKey(key)
+	current := c.unitReplicas(gu)
+	stableR = len(current)
+
+	withUnit := func(members []ring.Member) []routedReplica {
+		out := make([]routedReplica, len(members))
+		for i, m := range members {
+			out[i] = routedReplica{member: m, ru: storageunit.NewReplicaUnit(gu, uint8(i))}
+		}
+		return out
+	}
+
+	draining := c.drainingIDs()
+	if len(draining) == 0 {
+		return withUnit(current), stableR
+	}
+	pending := c.pendingUnitReplicas(gu, draining)
+	if sameMemberSet(current, pending) {
+		return withUnit(current), stableR
+	}
+
+	// Union, current-first, each member paired with the ru it holds: current
+	// owners keep their current index; a pending-only member takes its pending
+	// index (the slot it acquired).
+	curRR := withUnit(current)
+	out := make([]routedReplica, 0, len(curRR)+len(pending))
+	out = append(out, curRR...)
+	for i, m := range pending {
+		if containsMember(current, m.ID) {
+			continue // already added at its current index.
+		}
+		out = append(out, routedReplica{member: m, ru: storageunit.NewReplicaUnit(gu, uint8(i))})
+	}
+	return out, stableR
+}
+
+// pendingReplicasForKey resolves the PENDING replica set for a key: the
+// unit's replica set over the ring with the draining members EXCLUDED. Removing
+// a node from a consistent-hash ring shifts each of its keys to the next
+// clockwise survivor, which is exactly the next distinct member in the
+// GetClosestN successor chain - so locating (R + |draining|) members over the
+// FULL ring and dropping the draining ones, keeping the first R survivors, is
+// equivalent to re-locating R over a ring that never had the draining members,
+// WITHOUT mutating the shared ring. (At most |draining| of the first
+// R+|draining| chain entries can be draining, so R survivors always remain when
+// the ring has R non-draining members.)
+func (c *Cluster) pendingReplicasForKey(key []byte, draining map[string]struct{}) []ring.Member {
+	return c.pendingUnitReplicas(c.genUnitForKey(key), draining)
 }
 
 // writeAckBar computes the write ack target W for a fan-out over routedN

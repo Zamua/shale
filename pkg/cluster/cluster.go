@@ -403,30 +403,11 @@ type Cluster struct {
 	// mountMu.
 	acquireInFlight map[storageunit.ReplicaUnit]struct{}
 
-	// priorDesiredReplicas is the DESIRED replica sets as of the ring the LAST
-	// reconcile acted on: a map from GenUnit to the ordered NodeIDs that held
-	// each replica position. It is the multi-backend analogue of the legacy
-	// per-node path's lastEvalRing (cluster.go's lastEvalRing field), captured
-	// at the END of each reconcileReplicaUnitsOverlap run, BEFORE the next run
-	// can read it. It is consulted ONLY to identify a moving position's
-	// predecessor (predecessor = prior-holder of the position \ live-holder),
-	// NEVER for routing (routing is always live-ring-derived). Guarded by
-	// mountMu (taken inside the reconcileMu-held reconcile). Nil until the first
-	// reconcile; an empty/missing entry yields no predecessor (the Option-A
-	// fallback). See docs/design/overlap-handoff.md "Predecessor identification".
-	priorDesiredReplicas map[storageunit.GenUnit][]storageunit.NodeID
-
-	// priorAddrs is the dial-address sibling of priorDesiredReplicas: a map from
-	// NodeID to the gRPC dial address that node had in the PRIOR ring (the ring
-	// that produced the priorDesiredReplicas snapshot), captured at the SAME
-	// point at the END of each reconcileReplicaUnitsOverlap run. It exists so a
-	// predecessor that LEAVES the ring on a scale-down can still be reached: the
-	// predecessor address is resolved from THIS snapshot (where it was still a
-	// member) and stored in the Acquiring HandoffState, surviving the leave. A
-	// live-ring walk (addrForNodeID) cannot resolve a departed node; this prior
-	// snapshot can. Guarded by mountMu, same as priorDesiredReplicas. See
-	// docs/design/overlap-handoff.md "Predecessor identification".
-	priorAddrs map[storageunit.NodeID]string
+	// draining is a TEST-ONLY override for the gossiped Draining set: when
+	// non-nil, drainingIDs returns it directly instead of reading the membership
+	// snapshot. It lets the white-box pending-ranges tests inject a transition
+	// without a memberlist. Nil in production (the snapshot is authoritative).
+	draining map[string]struct{}
 
 	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
 	// capability view of factory: non-nil iff the factory implements
@@ -914,18 +895,6 @@ func (c *Cluster) OwnsKey(key []byte) bool {
 	}
 	_, local := c.ownerOf(key)
 	return local
-}
-
-// DebugKeyState reports, for diagnostics, whether this node has the key's unit
-// physically MOUNTED (any replica index) and whether the ring places the key's
-// unit on this node (OwnsKey). Used by the graceful-leave gate to distinguish a
-// MIS-ROUTED key (mounted somewhere, but a survivor's ring routes elsewhere)
-// from an ORPHANED key (mounted nowhere). Multi-backend only.
-func (c *Cluster) DebugKeyState(key []byte) (mountedHere, ownsHere bool) {
-	if c.multi {
-		_, mountedHere = c.localMountedBackendForKey(key)
-	}
-	return mountedHere, c.OwnsKey(key)
 }
 
 // LocalScanPrefix returns an iterator over the LOCAL backend's keys

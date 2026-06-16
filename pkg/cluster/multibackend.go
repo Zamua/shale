@@ -209,11 +209,11 @@ func (c *Cluster) initMultiBackend() error {
 	}
 
 	c.mountMap = make(map[storageunit.ReplicaUnit]backend.Backend)
-	// handoffPhase (v0.8 Phase 2e, Option B) tracks in-flight overlap-handoff
-	// transitions per ReplicaUnit, guarded by mountMu alongside mountMap. Empty
-	// at Open (no transition in flight); populated by reconcileReplicaUnitsOverlap
-	// when a position moves. priorDesiredReplicas is filled at the END of the
-	// first overlap reconcile.
+	// handoffPhase (v0.8 Phase 2e, pending ranges) tracks in-flight handoff
+	// transitions per ReplicaUnit, guarded by mountMu alongside mountMap. Empty at
+	// Open (no transition in flight); populated by reconcileReplicaUnitsOverlap
+	// when a draining-excluded split moves a position (Acquiring on the pending
+	// owner, Draining on the leaver).
 	c.handoffPhase = make(map[storageunit.ReplicaUnit]storageunit.HandoffState)
 	c.acquireInFlight = make(map[storageunit.ReplicaUnit]struct{})
 
