@@ -358,6 +358,11 @@ func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	// opens, which would push the release threshold above the successor's serving
 	// marker and hang the drain to its timeout (the graceful-scale-down
 	// availability gap). The recorded value is stable across reclaim/re-drain.
+	// Read OUTSIDE mountMu (ownOpenEpoch's defensive fallback can do shared-storage
+	// I/O, which must never run under the lock routed ops need). The read races the
+	// mountMap check below only benignly: myOpenEpoch never holds a LOWER epoch for
+	// a live mount, so a stale read can only INFLATE the gate (hang direction, self-
+	// corrected next poll), never release early.
 	open := c.ownOpenEpoch(ru)
 	c.mountMu.Lock()
 	if _, mounted := c.mountMap[ru]; !mounted {
@@ -601,11 +606,12 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	// my open epoch. The gate is STRICT (>, not >=) to reject this node's OWN
 	// stale gain-marker: a node that GAINED ru at open epoch E wrote
 	// WriteServingMarker(ru, E); if the ring later moves ru OFF this node,
-	// beginDrain sets OpenEpoch = DurableEpochReplica(ru) = E (unchanged until the
-	// NEW gainer opens), so a >= gate would read this node's OWN marker E and
-	// RELEASE while the real successor is still mid-mount. A genuine successor
-	// always opens at durable+1 >= E+1 and writes a marker strictly above E, so >
-	// still releases on a real successor.
+	// beginDrain sets OpenEpoch = ownOpenEpoch(ru) = E (this node's EXACT open
+	// epoch, recorded from the OpenReplicaUnit return value and FIXED for the life
+	// of the mount - NOT a re-read of the climbing durable), so a >= gate would
+	// read this node's OWN marker E and RELEASE while the real successor is still
+	// mid-mount. A genuine successor always opens at durable+1 >= E+1 and writes a
+	// marker strictly above E, so > still releases on a real successor.
 	ready := ok && markerEpoch > state.OpenEpoch
 	if !storageunit.Releasable(state, ready) {
 		// No marker yet (or below my epoch): stay Draining + keep serving.
