@@ -18,8 +18,6 @@
 package cluster
 
 import (
-	"errors"
-
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -148,22 +146,15 @@ func (c *Cluster) applyEnvelopeIfNewerToBackend(b backend.Backend, ru storageuni
 
 	apply, aerr := txApplyIfNewer(tx, key, incoming.Stamp)
 	if aerr != nil {
-		return aerr
+		return c.fenceToTransient(ru, b, "Put", aerr)
 	}
 	if apply {
 		if err := tx.Put(key, incomingEnvBytes); err != nil {
-			return err
+			return c.fenceToTransient(ru, b, "Put", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		if errors.Is(err, backend.ErrFenced) {
-			// Fenced at Commit (real slatedb) on the position-addressed union target
-			// -> transient, same as the Begin-fence path above: the fenced leg is
-			// non-acking + RETRYABLE so the union write retries, not a hard failure.
-			c.evictStaleMount(ru, b)
-			return errUnitAcquiring("Put")
-		}
-		return err
+		return c.fenceToTransient(ru, b, "Put", err)
 	}
 	committed = true
 	return nil

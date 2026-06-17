@@ -106,12 +106,23 @@ type StdConfig struct {
 	// by Validate (a Go duration string, e.g. "90s").
 	GracefulLeaveDrainTimeout time.Duration
 
+	// WriteTimeout, when > 0, overrides cluster.Config.WriteTimeout (the
+	// wall-clock budget for a Put/Delete, INCLUDING the Option-A
+	// transient-retry loop). 0 (default) leaves the cluster default (5s).
+	// Raising it above the successor MOUNT window lets a write that lands
+	// on a transiently-fenced/acquiring leg during a graceful scale-down
+	// RETRY in-call until the successor is serving, instead of returning a
+	// client-retryable error - the during-leave write-availability knob.
+	// Populated from --write-timeout / SHALE_WRITE_TIMEOUT by Validate.
+	WriteTimeout time.Duration
+
 	// replicationFactorRaw + unitCountRaw hold the parsed int flag values
 	// pre-validation. Populated by BindStdFlags; ReplicationFactor +
 	// UnitCount are derived from them inside Validate.
 	replicationFactorRaw  int
 	unitCountRaw          int
 	gracefulLeaveDrainRaw string
+	writeTimeoutRaw       string
 }
 
 // BindStdFlags registers the standard cluster/node flags into fs and
@@ -150,6 +161,9 @@ func BindStdFlags(fs *flag.FlagSet) *StdConfig {
 	fs.StringVar(&std.gracefulLeaveDrainRaw, "graceful-leave-drain",
 		envOr("SHALE_GRACEFUL_LEAVE_DRAIN_TIMEOUT", ""),
 		"on shutdown, drain owned units to successors for up to this Go duration before closing (e.g. 90s); empty/0 disables")
+	fs.StringVar(&std.writeTimeoutRaw, "write-timeout",
+		envOr("SHALE_WRITE_TIMEOUT", ""),
+		"override the per-write wall-clock budget incl. transient-retry (e.g. 12s); empty/0 keeps the 5s default")
 	return std
 }
 
@@ -176,6 +190,16 @@ func (s *StdConfig) Validate() error {
 			return errors.New("--graceful-leave-drain must not be negative")
 		}
 		s.GracefulLeaveDrainTimeout = d
+	}
+	if raw := strings.TrimSpace(s.writeTimeoutRaw); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return fmt.Errorf("--write-timeout: %w (want a Go duration like 12s)", err)
+		}
+		if d < 0 {
+			return errors.New("--write-timeout must not be negative")
+		}
+		s.WriteTimeout = d
 	}
 	return nil
 }
@@ -390,6 +414,7 @@ func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 		Seeds:                     cfg.Std.Seeds,
 		ReplicationFactor:         cfg.Std.ReplicationFactor,
 		GracefulLeaveDrainTimeout: cfg.Std.GracefulLeaveDrainTimeout,
+		WriteTimeout:              cfg.Std.WriteTimeout, // 0 -> cluster default (5s)
 	}
 	if cfg.BackendFactory != nil {
 		clusterCfg.BackendFactory = cfg.BackendFactory

@@ -193,32 +193,41 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 
 	apply, aerr := txApplyIfNewer(tx, key, incoming.Stamp)
 	if aerr != nil {
-		return aerr
+		return c.fenceToTransient(ru, b, "Put", aerr)
 	}
 	if apply {
 		if err := tx.Put(key, incomingEnvBytes); err != nil {
-			return err
+			return c.fenceToTransient(ru, b, "Put", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		if errors.Is(err, backend.ErrFenced) {
-			// A higher-epoch owner fenced this writer between Begin and Commit
-			// (slatedb surfaces CloseReasonFenced HERE, at Commit, not at Begin like
-			// the in-memory double). Recode to the TRANSIENT acquiring-window error -
-			// exactly as the Begin-fence path above does - so the fan-out treats this
-			// leg as non-acking + RETRYABLE (retries onto the re-resolved union)
-			// rather than a HARD failure that fast-fails the write. The fenced commit
-			// did NOT durably apply here, so not counting it as an ack is correct; the
-			// successor that fenced it serves the write once it finishes mounting.
-			// This keeps during-leave write availability up on real object storage
-			// (the in-memory tests never reach here - they fence at Begin).
-			c.evictStaleMount(ru, b)
-			return errUnitAcquiring("Put")
-		}
-		return err
+		return c.fenceToTransient(ru, b, "Put", err)
 	}
 	committed = true
 	return nil
+}
+
+// fenceToTransient recodes a FENCED apply error (backend.ErrFenced, surfaced when
+// a higher-epoch owner of this position fenced this now-stale writer) to the
+// TRANSIENT acquiring-window error, evicting the stale mount, so the fan-out
+// RETRIES the write onto the re-resolved union instead of HARD-failing it (a hard
+// error fast-fails the write once too many legs miss the stable-R quorum). The
+// fenced op did NOT durably apply, so not counting it as an ack is correct; the
+// successor that fenced this leg serves the write once it finishes mounting (the
+// cost is added latency in the mount window, not a lost or rejected write). The
+// fence can surface at ANY apply op on real slatedb - the Get inside
+// txApplyIfNewer, the buffered Put, or the Commit flush - so EVERY apply error
+// site routes through here, not just Commit. evictStaleMount is a no-op for a
+// Draining mount (the fence is the expected handoff signal there) and re-acquires
+// a stale non-draining one. A non-fence error passes through unchanged (stays a
+// hard failure). The in-memory test double fences at Begin (already recoded by
+// the Begin path); only real slatedb / the fence-at-commit double reach here.
+func (c *Cluster) fenceToTransient(ru storageunit.ReplicaUnit, b backend.Backend, op string, err error) error {
+	if errors.Is(err, backend.ErrFenced) {
+		c.evictStaleMount(ru, b)
+		return errUnitAcquiring(op)
+	}
+	return err
 }
 
 // acquireReplicaUnit mounts replica position ru.Replica of unit ru.Unit via
@@ -329,24 +338,17 @@ func (c *Cluster) applyBatchToUnit(writes []EnvelopeWrite) error {
 		}
 		apply, aerr := txApplyIfNewer(tx, w.Key, incoming.Stamp)
 		if aerr != nil {
-			return aerr
+			return c.fenceToTransient(ru, b, "ApplyBatch", aerr)
 		}
 		if !apply {
 			continue
 		}
 		if err := tx.Put(w.Key, w.Envelope); err != nil {
-			return err
+			return c.fenceToTransient(ru, b, "ApplyBatch", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		if errors.Is(err, backend.ErrFenced) {
-			// Fenced at Commit (real slatedb) -> transient, same as the Begin-fence
-			// path above + the single-Put apply: a fenced batch leg is non-acking +
-			// RETRYABLE, not a hard fan-out failure.
-			c.evictStaleMount(ru, b)
-			return errUnitAcquiring("ApplyBatch")
-		}
-		return err
+		return c.fenceToTransient(ru, b, "ApplyBatch", err)
 	}
 	committed = true
 	return nil

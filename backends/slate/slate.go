@@ -316,20 +316,23 @@ func IsFenced(err error) bool {
 	return errors.As(err, &closed) && closed.Reason == slatedb.CloseReasonFenced
 }
 
-// fencedCommitErr wraps a slatedb commit error and, when it is a writer-epoch
-// fence, ADDITIONALLY tags it with backend.ErrFenced (multi-%w) so the cluster
-// layer recognizes the fence backend-agnostically (errors.Is(err,
+// fenceTag wraps a slatedb operation error under prefix and, when it is a
+// writer-epoch fence, ADDITIONALLY tags it with backend.ErrFenced (multi-%w) so
+// the cluster layer recognizes the fence backend-agnostically (errors.Is(err,
 // backend.ErrFenced)) and recodes the leg to the TRANSIENT acquiring-window
-// error instead of hard-failing the write. The slatedb fence surfaces HERE, at
-// Commit (not at Begin like the in-memory test double), so this is the real
-// object-storage path the cluster's commit-fence recode relies on. errors.As
-// against *ErrorClosed still resolves through the multi-wrap, so IsFenced and
-// the rendered slatedb reason are both preserved.
-func fencedCommitErr(err error) error {
+// error instead of hard-failing the write. EVERY write/read op of a transaction
+// routes through here, NOT just Commit: the writer-epoch fence can surface at
+// whichever op (Get/Put/Delete/Commit/ScanPrefix) runs first against a now-stale
+// writer (slatedb's background manifest-epoch poll lands it on the next op), so
+// the apply sequence Begin->Get->Put->Commit could fence at any step. errors.As
+// against *ErrorClosed still resolves through the multi-wrap, so IsFenced and the
+// rendered slatedb reason are both preserved. A non-fence error keeps the plain
+// %w wrap.
+func fenceTag(prefix string, err error) error {
 	if IsFenced(err) {
-		return fmt.Errorf("slate: tx commit: %w: %w", err, backend.ErrFenced)
+		return fmt.Errorf("%s: %w: %w", prefix, err, backend.ErrFenced)
 	}
-	return fmt.Errorf("slate: tx commit: %w", err)
+	return fmt.Errorf("%s: %w", prefix, err)
 }
 
 // -- iterator -------------------------------------------------------
@@ -386,7 +389,7 @@ func (t *transaction) Get(key []byte) ([]byte, error) {
 	}
 	raw, err := t.tx.Get(key)
 	if err != nil {
-		return nil, fmt.Errorf("slate: tx get: %w", err)
+		return nil, fenceTag("slate: tx get", err)
 	}
 	if raw == nil {
 		return nil, backend.ErrNotFound
@@ -399,7 +402,7 @@ func (t *transaction) Put(key, value []byte) error {
 		return backend.ErrClosed
 	}
 	if err := t.tx.Put(key, value); err != nil {
-		return fmt.Errorf("slate: tx put: %w", err)
+		return fenceTag("slate: tx put", err)
 	}
 	return nil
 }
@@ -409,7 +412,7 @@ func (t *transaction) Delete(key []byte) error {
 		return backend.ErrClosed
 	}
 	if err := t.tx.Delete(key); err != nil {
-		return fmt.Errorf("slate: tx delete: %w", err)
+		return fenceTag("slate: tx delete", err)
 	}
 	return nil
 }
@@ -420,7 +423,7 @@ func (t *transaction) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	}
 	it, err := t.tx.ScanPrefix(prefix)
 	if err != nil {
-		return nil, fmt.Errorf("slate: tx scan prefix: %w", err)
+		return nil, fenceTag("slate: tx scan prefix", err)
 	}
 	return &iterator{it: it}, nil
 }
@@ -432,12 +435,12 @@ func (t *transaction) Commit() error {
 	t.done = true
 	if t.writeOpts != nil {
 		if _, err := t.tx.CommitWithOptions(*t.writeOpts); err != nil {
-			return fencedCommitErr(err)
+			return fenceTag("slate: tx commit", err)
 		}
 		return nil
 	}
 	if _, err := t.tx.Commit(); err != nil {
-		return fencedCommitErr(err)
+		return fenceTag("slate: tx commit", err)
 	}
 	return nil
 }
