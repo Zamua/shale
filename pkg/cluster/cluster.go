@@ -34,6 +34,7 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/membership"
 	"github.com/Zamua/shale/pkg/rebalance"
+	"github.com/Zamua/shale/pkg/reshard"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -123,6 +124,24 @@ type Config struct {
 	// per-unit replication interplay is out of scope).
 	BackendFactory storageunit.BackendFactory
 	UnitCount      storageunit.UnitCount
+
+	// ConditionalStore is the create-if-absent + compare-and-set object
+	// store backing the DECLARATIVE, DECENTRALIZED reshard agreement (v0.9;
+	// see docs/decentralized-reshard-design.md). When set on an R>1
+	// multi-backend cluster, Open constructs and seeds a reshard.Arbiter over
+	// it: the cluster's agreed reshard epoch ({count, target, plan}) lives in
+	// a single durable object every node reads and advances by a
+	// conditional-write race, replacing an elected coordinator. The same
+	// MinIO/S3 If-None-Match / If-Match primitive slatedb already uses for
+	// manifest fencing (backends/slate supplies MinioConditionalStore; tests
+	// use storageunit.MemConditionalStore).
+	//
+	// Optional and decoupled: nil leaves the arbiter unconstructed and the
+	// cluster on the existing static / coordinated-freeze reshard paths
+	// (byte-for-byte unchanged). It is a no-op outside R>1 multi-backend mode
+	// (the decentralized online reshard is R>1 only; the R=1 multi-node path
+	// keeps the coordinated freeze barrier).
+	ConditionalStore storageunit.ConditionalStore
 
 	// BindAddr is the host:port memberlist listens on (UDP + TCP).
 	// Non-empty enables multi-node mode. Format: "host:port" (host
@@ -454,6 +473,17 @@ type Cluster struct {
 	reshardMu  sync.Mutex
 	pauseMu    sync.Mutex
 	pauseUnits map[storageunit.UnitID]*sync.RWMutex
+
+	// arbiter is the DECENTRALIZED reshard agreement (v0.9): the cluster's
+	// agreed reshard epoch ({count, target, plan}) in a single CAS-guarded
+	// durable object every node reads + advances by a conditional-write race
+	// (no elected coordinator; see docs/decentralized-reshard-design.md). Non-
+	// nil only when cfg.ConditionalStore is set AND this is an R>1 multi-backend
+	// cluster (initReshardArbiter); nil leaves the cluster on the existing
+	// static / coordinated-freeze reshard paths. It holds no per-node state, so
+	// no extra lock: the durable object's CAS version is the concurrency
+	// control. Reads/retargets/advances go through reshard.Arbiter.
+	arbiter *reshard.Arbiter
 
 	// freeze is the cluster-wide WRITE-FREEZE flag for the v0.8 multi-node
 	// reshard (cluster-wide freeze barrier; see multibackend_reshard_barrier.go).

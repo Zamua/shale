@@ -224,6 +224,14 @@ func (c *Cluster) initMultiBackend() error {
 	// single owner. STATIC topology: the replica set is fixed at Open (no
 	// membership-change handoff at R>1 yet - a later phase).
 	c.initReplicatedFactory()
+	// Decentralized reshard agreement (v0.9): construct + seed the Arbiter when
+	// opted in (ConditionalStore set) on an R>1 cluster. No-op otherwise. Done
+	// after initReplicatedFactory (replicaFactory gates it) and before the mount
+	// so the agreed epoch object exists from node start.
+	if err := c.initReshardArbiter(); err != nil {
+		_ = c.closeMountedUnits()
+		return err
+	}
 	if c.replicaFactory != nil {
 		return c.mountReplicaUnits()
 	}
