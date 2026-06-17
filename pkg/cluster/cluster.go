@@ -1029,7 +1029,7 @@ func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (ba
 			unlock()
 			return nil, errUnitAcquiring("CommitCASApply")
 		}
-		return &pausedTx{Transaction: tx, unlock: unlock}, nil
+		return &pausedTx{Transaction: tx, unlock: unlock, ru: ru, b: b}, nil
 	}
 	return c.backend.Begin(level)
 }
@@ -1038,10 +1038,21 @@ func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (ba
 // held while the transaction was opened is released exactly once, when the
 // transaction terminates (Commit or Rollback). It keeps a CAS validate-and-
 // apply bound to a single generation across the whole commit window.
+//
+// ru + b carry the resolved pin-unit position and its mounted backend so the
+// CAS validate-and-apply (CommitCASApply) can recode a FENCED tx op (Get / Put
+// / Commit, which surface on real slatedb AFTER a successful Begin) to the
+// TRANSIENT acquiring-window error via c.fenceToTransient(ru, b, ...) - the
+// same recode the single-key Put fan-out applies. They are zero-valued on the
+// R=1 / non-multi branch (a bare c.backend.Begin tx, no pausedTx wrapper), so a
+// fence recode is a no-op there: that branch has a single backend with no epoch
+// handoff, so no mounted-unit fence can surface.
 type pausedTx struct {
 	backend.Transaction
 	unlock   func()
 	released bool
+	ru       storageunit.ReplicaUnit
+	b        backend.Backend
 }
 
 func (t *pausedTx) Commit() error {

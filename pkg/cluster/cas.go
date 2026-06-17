@@ -149,7 +149,7 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 		got, found, err := c.casReadPayload(tx, r.Key, replicated)
 		if r.ExpectAbsent {
 			if err != nil {
-				return backend.CASResult{Err: err}
+				return backend.CASResult{Err: c.casFenceToTransient(tx, "CommitCASApply", err)}
 			}
 			if found {
 				return backend.CASResult{Conflict: true}
@@ -157,7 +157,7 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 			continue
 		}
 		if err != nil {
-			return backend.CASResult{Err: err}
+			return backend.CASResult{Err: c.casFenceToTransient(tx, "CommitCASApply", err)}
 		}
 		if !found {
 			// Client observed a value; key is now absent (or a tombstone):
@@ -187,12 +187,12 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 		if !replicated {
 			if w.Del {
 				if err := tx.Delete(w.Key); err != nil {
-					return backend.CASResult{Err: err}
+					return backend.CASResult{Err: c.casFenceToTransient(tx, "CommitCASApply", err)}
 				}
 				continue
 			}
 			if err := tx.Put(w.Key, w.Value); err != nil {
-				return backend.CASResult{Err: err}
+				return backend.CASResult{Err: c.casFenceToTransient(tx, "CommitCASApply", err)}
 			}
 			continue
 		}
@@ -206,7 +206,7 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 		}
 		envBytes := Encode(Envelope{Stamp: stamp, Payload: payload})
 		if err := tx.Put(w.Key, envBytes); err != nil {
-			return backend.CASResult{Err: err}
+			return backend.CASResult{Err: c.casFenceToTransient(tx, "CommitCASApply", err)}
 		}
 		encodedWrites = append(encodedWrites, EnvelopeWrite{
 			Key:      append([]byte(nil), w.Key...),
@@ -215,7 +215,7 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 	}
 
 	if err := tx.Commit(); err != nil {
-		return backend.CASResult{Err: err}
+		return backend.CASResult{Err: c.casFenceToTransient(tx, "CommitCASApply", err)}
 	}
 	committed = true
 
@@ -275,6 +275,34 @@ func (c *Cluster) casReadPayload(tx backend.Transaction, key []byte, replicated 
 	return env.Payload, true, nil
 }
 
+// casFenceToTransient recodes a FENCED owner-local CAS apply error to the
+// TRANSIENT acquiring-window error, mirroring the single-key Put fan-out's
+// fenceToTransient. When a graceful leave is in flight, a successor opens the
+// shared slatedb at a higher epoch and FENCES this leaver's owner-local CAS
+// writer; the fence surfaces as backend.ErrFenced on a tx Get / Put / Commit
+// (AFTER a successful Begin, on real slatedb). Left raw, that fence is a HARD
+// failure the CAS retry classifier (commitRetryable) does not treat as
+// retryable, so Transact gives up and the CAS write hard-fails the client. This
+// recode evicts the stale mount and returns errUnitAcquiring (codes.Unavailable)
+// instead, which commitRetryable DOES treat as retryable, so Transact re-runs fn
+// (re-validating the read-set on the re-resolved owner, the successor once it
+// serves). A fenced commit did NOT durably apply, so recoding it retryable (not
+// counting it applied) is correct; the OCC re-read makes the retry idempotent
+// (no double-apply, no lost update).
+//
+// ru + b come from the pin tx's *pausedTx wrapper (localBeginForKey, multi mode).
+// On the R=1 / non-multi path the tx is a bare backend.Transaction (no pausedTx,
+// no mounted-unit epoch handoff), so the assert fails and the raw error passes
+// through unchanged - the v0.6 behavior. A non-fence error also passes through
+// unchanged (it stays a hard failure).
+func (c *Cluster) casFenceToTransient(tx backend.Transaction, op string, err error) error {
+	pt, ok := tx.(*pausedTx)
+	if !ok {
+		return err
+	}
+	return c.fenceToTransient(pt.ru, pt.b, op, err)
+}
+
 // commitRetryable reports whether a CommitCAS error is a TRANSIENT
 // reshard-window signal that Transact should ride out by re-running fn
 // (re-resolving the owner from the live ring each attempt), rather than a
@@ -296,6 +324,20 @@ func (c *Cluster) casReadPayload(tx backend.Transaction, key []byte, replicated 
 // fires inside fn as backend.ErrCrossShard and aborts before any commit, so it
 // never reaches this classifier.
 func commitRetryable(err error) bool {
+	// Belt-and-suspenders: a FENCED owner-local CAS apply (a graceful-leave
+	// successor fenced this leaver mid-commit) is a transient retry, the same
+	// shape the single-key Put path treats it. The owner-local recode in
+	// CommitCASApply (casFenceToTransient) already converts the fence to the
+	// codes.Unavailable acquiring-window error that the status switch below
+	// catches; this guard is a second net for any raw multi-%w-wrapped
+	// backend.ErrFenced that reaches the classifier WITHOUT a gRPC status (a
+	// multi-wrapped fence has errors.Is == true but status.FromError ok == false,
+	// so the status switch alone would mis-class it NOT-retryable -> a hard
+	// client failure). A fenced commit did not durably apply, so retrying it
+	// (with the OCC read-set re-validation) is safe + idempotent.
+	if errors.Is(err, backend.ErrFenced) {
+		return true
+	}
 	st, ok := status.FromError(err)
 	if !ok {
 		return false
