@@ -96,19 +96,28 @@ func (c *Cluster) initReplicatedFactory() {
 // desiredReplicaUnits returns the units this node should have mounted at R>1,
 // each paired with the replica POSITION this node holds it at. A unit gu is
 // desired iff self appears anywhere in unitReplicas(gu); the position is
-// self's index in that set. Static-topology only (the cluster's generation is
-// fixed at Open in Phase 2b), so this is computed once at mount time. It is
-// the R>1 analogue of desiredGenUnits, generation-aware via genSnapshot.
-//
-// The per-unit enumeration + position-finding is the pure domain function
-// storageunit.OwnedReplicaUnits: this method just supplies the ring-backed
-// replica set (a ReplicaLookupFunc adapter over unitReplicas) and qualifies
-// each returned OwnedReplica with the live generation. UNLIKE its R=1 sibling
-// desiredGenUnits (which CANNOT use the pure storageunit.OwnedUnits because it
-// must also handle reshard cutover: hasCutOver + the gen-(g+1) children),
-// Phase 2b is STATIC topology with no cutover, so the unit set maps cleanly
-// onto the single-generation pure function.
+// self's index in that set. It is the R>1 analogue of desiredGenUnits,
+// generation-aware via genSnapshot, and (v0.9) reshard-aware: while a split is
+// in flight it ALSO desires the gen-(g+1) children (desiredReplicaUnitsVia).
 func (c *Cluster) desiredReplicaUnits() []storageunit.ReplicaUnit {
+	return c.desiredReplicaUnitsVia(c.unitReplicas)
+}
+
+// desiredReplicaUnitsVia is the shared core of desiredReplicaUnits and its
+// draining-excluded sibling desiredPendingReplicaUnits: the two differ ONLY in
+// how a unit's replica set is resolved (the live ring vs the ring with draining
+// members excluded), so both pass that resolver in as replicaAt and share
+// everything else. This keeps the two desired-set producers in lockstep - a
+// requirement for the overlap reconcile, which derives both its current and
+// pending sets from them and would treat any divergence as a spurious
+// transition.
+//
+// The gen-g pass uses the pure domain function storageunit.OwnedReplicaUnits to
+// enumerate the units this node replicates at the live generation. When a split
+// is in flight (genState.nextCount != 0) it then appends the gen-(g+1) split
+// children this node should also hold (splitChildrenVia); that augmentation is
+// a no-op in steady state, so the common path is unchanged.
+func (c *Cluster) desiredReplicaUnitsVia(replicaAt func(gu storageunit.GenUnit) []ring.Member) []storageunit.ReplicaUnit {
 	gs := c.genSnapshot()
 	self := storageunit.NodeID(c.cfg.NodeID)
 
@@ -116,12 +125,7 @@ func (c *Cluster) desiredReplicaUnits() []storageunit.ReplicaUnit {
 	// map a UnitID to its replica nodes at the live generation, projecting each
 	// ring member id into a storageunit.NodeID.
 	replicas := storageunit.ReplicaLookupFunc(func(u storageunit.UnitID) []storageunit.NodeID {
-		set := c.unitReplicas(storageunit.NewGenUnit(gs.gen, u))
-		nodes := make([]storageunit.NodeID, len(set))
-		for i, m := range set {
-			nodes[i] = storageunit.NodeID(m.ID)
-		}
-		return nodes
+		return memberNodeIDs(replicaAt(storageunit.NewGenUnit(gs.gen, u)))
 	})
 
 	owned := storageunit.OwnedReplicaUnits(self, gs.count, replicas)
@@ -129,7 +133,21 @@ func (c *Cluster) desiredReplicaUnits() []storageunit.ReplicaUnit {
 	for _, o := range owned {
 		out = append(out, storageunit.NewReplicaUnit(storageunit.NewGenUnit(gs.gen, o.Unit), o.Replica))
 	}
+	// Reshard in flight: also desire the gen-(g+1) children (v0.9 split).
+	if !gs.nextCount.IsZero() {
+		out = append(out, c.splitChildrenVia(gs, self, replicaAt)...)
+	}
 	return out
+}
+
+// memberNodeIDs projects a ring member set into the pure-domain NodeID slice the
+// ReplicaLookup contract speaks.
+func memberNodeIDs(set []ring.Member) []storageunit.NodeID {
+	nodes := make([]storageunit.NodeID, len(set))
+	for i, m := range set {
+		nodes[i] = storageunit.NodeID(m.ID)
+	}
+	return nodes
 }
 
 // mountReplicaUnits opens every unit this node replicates at its replica

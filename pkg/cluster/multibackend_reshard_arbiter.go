@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"github.com/Zamua/shale/pkg/reshard"
+	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -99,6 +100,39 @@ func reshardGenStep(local genState, S reshard.State) (next genState, changed boo
 	// S.Count < local.count is a merge (Phase D); S.Count == local.count is
 	// steady at the agreed count. Neither changes genState here.
 	return local, false
+}
+
+// splitChildrenVia returns the gen-(g+1) child ReplicaUnits this node should
+// hold during an in-flight split (genState.nextCount != 0). Each child is
+// CO-LOCATED with its gen-g parent: this node desires child unit C at the same
+// replica SLOT it holds C's parent, using the SAME replica resolver (replicaAt)
+// the gen-g pass uses (so the pending/current views stay in lockstep).
+//
+// Co-location is what makes the online copy + dual-write LOCAL: the node holding
+// parent slot s copies its parent bytes (gen-g .../r<s>) into the child's slot-s
+// database (gen-(g+1) .../r<s>) and dual-writes there, so every one of the
+// child's R slot-databases is populated by the corresponding parent slot. After
+// cut-over the children redistribute from these parent-co-located slots to their
+// gen-(g+1) ring homes by the normal zero-copy lease handoff (the slot's durable
+// bytes have a fixed prefix; only which node holds the slot changes) - design
+// §3.5. The whole key-space doubles, so EVERY child of EVERY parent this node
+// holds is desired up-front (not just cut-over ones); the cutOver set governs
+// ROUTING (which generation serves a key), not which children are mounted.
+func (c *Cluster) splitChildrenVia(gs genState, self storageunit.NodeID, replicaAt func(gu storageunit.GenUnit) []ring.Member) []storageunit.ReplicaUnit {
+	out := make([]storageunit.ReplicaUnit, 0, gs.nextCount.N())
+	for _, child := range gs.nextCount.IDs() {
+		parent, err := storageunit.ParentUnit(child, gs.nextCount)
+		if err != nil {
+			continue
+		}
+		for slot, m := range replicaAt(storageunit.NewGenUnit(gs.gen, parent)) {
+			if storageunit.NodeID(m.ID) == self {
+				out = append(out, storageunit.NewReplicaUnit(storageunit.NewGenUnit(gs.gen+1, child), uint8(slot)))
+				break
+			}
+		}
+	}
+	return out
 }
 
 // allCutOver reports whether every old (gen-g) unit in an in-flight split has

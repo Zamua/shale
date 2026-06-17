@@ -39,6 +39,7 @@
 package cluster
 
 import (
+	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -302,30 +303,18 @@ func (c *Cluster) ownOpenEpoch(ru storageunit.ReplicaUnit) storageunit.Epoch {
 // With no draining members it is identical to desiredReplicaUnits (steady state),
 // so the transition halves of the reconcile are empty.
 //
-// It mirrors desiredReplicaUnits exactly but supplies the DRAINING-EXCLUDED
-// replica lookup (pendingUnitReplicas) to the pure storageunit.OwnedReplicaUnits.
+// It mirrors desiredReplicaUnits exactly (including the v0.9 gen-(g+1) split
+// children) but supplies the DRAINING-EXCLUDED replica lookup
+// (pendingUnitReplicas) as replicaAt, sharing the core desiredReplicaUnitsVia.
+// Keeping it a thin call over the shared core is what guarantees the current and
+// pending sets stay in lockstep.
 func (c *Cluster) desiredPendingReplicaUnits(draining map[string]struct{}) []storageunit.ReplicaUnit {
 	if len(draining) == 0 {
 		return c.desiredReplicaUnits()
 	}
-	gs := c.genSnapshot()
-	self := storageunit.NodeID(c.cfg.NodeID)
-
-	replicas := storageunit.ReplicaLookupFunc(func(u storageunit.UnitID) []storageunit.NodeID {
-		set := c.pendingUnitReplicas(storageunit.NewGenUnit(gs.gen, u), draining)
-		nodes := make([]storageunit.NodeID, len(set))
-		for i, m := range set {
-			nodes[i] = storageunit.NodeID(m.ID)
-		}
-		return nodes
+	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []ring.Member {
+		return c.pendingUnitReplicas(gu, draining)
 	})
-
-	owned := storageunit.OwnedReplicaUnits(self, gs.count, replicas)
-	out := make([]storageunit.ReplicaUnit, 0, len(owned))
-	for _, o := range owned {
-		out = append(out, storageunit.NewReplicaUnit(storageunit.NewGenUnit(gs.gen, o.Unit), o.Replica))
-	}
-	return out
 }
 
 // reconcileReplicaUnitsCleanCut is the pre-2e clean-cut RELEASE-then-ACQUIRE

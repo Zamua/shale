@@ -219,6 +219,88 @@ func TestShouldAdvanceArbiter(t *testing.T) {
 	}
 }
 
+// enterSplit puts the cluster into an in-flight split to 2x the current count
+// (sets genState.nextCount), the state the desired-set / router machinery keys
+// off. White-box helper: it commits a cloned genState the way the controller
+// would once the per-unit machinery is wired.
+func enterSplit(t *testing.T, c *Cluster) {
+	t.Helper()
+	gs := c.genSnapshot().clone()
+	nc, err := gs.count.Double()
+	if err != nil {
+		t.Fatalf("double: %v", err)
+	}
+	gs.nextCount = nc
+	c.commitGenState(gs)
+}
+
+// assertSplitChildrenColocated checks that desired is a steady gen-g set PLUS,
+// during a split, the gen-(g+1) children co-located at their parent's slot:
+// every gen-(g+1) child maps (ParentUnit) to a desired gen-g unit at the SAME
+// replica slot, and each held parent contributes BOTH of its children.
+func assertSplitChildrenColocated(t *testing.T, desired []storageunit.ReplicaUnit, newCount int) {
+	t.Helper()
+	parents := map[storageunit.ReplicaUnit]bool{}
+	var children []storageunit.ReplicaUnit
+	for _, ru := range desired {
+		switch ru.Unit.Gen {
+		case 0:
+			parents[ru] = true
+		case 1:
+			children = append(children, ru)
+		default:
+			t.Fatalf("unexpected generation %d in desired set: %v", ru.Unit.Gen, ru)
+		}
+	}
+	if len(children) == 0 {
+		t.Fatalf("in-flight split should desire gen-1 children, got none (parents=%d)", len(parents))
+	}
+	for _, ch := range children {
+		parent, err := storageunit.ParentUnit(ch.Unit.ID, storageunit.MustUnitCount(newCount))
+		if err != nil {
+			t.Fatalf("ParentUnit(%d): %v", ch.Unit.ID, err)
+		}
+		want := storageunit.NewReplicaUnit(storageunit.NewGenUnit(0, parent), ch.Replica)
+		if !parents[want] {
+			t.Fatalf("child %v not co-located: want a desired parent %v at slot %d", ch, want, ch.Replica)
+		}
+	}
+	if len(children) != 2*len(parents) {
+		t.Fatalf("got %d children for %d parents, want both children of each (=%d)", len(children), len(parents), 2*len(parents))
+	}
+}
+
+// TestDesiredReplicaUnits_SplitChildren pins that the current-view desired set is
+// the steady gen-g units in steady state, and adds the co-located gen-(g+1)
+// children when a split is in flight.
+func TestDesiredReplicaUnits_SplitChildren(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2", "n3")
+
+	for _, ru := range c.desiredReplicaUnits() {
+		if ru.Unit.Gen != 0 {
+			t.Fatalf("steady state should desire only gen-0 units, got %v", ru)
+		}
+	}
+
+	enterSplit(t, c)
+	assertSplitChildrenColocated(t, c.desiredReplicaUnits(), 8)
+}
+
+// TestDesiredPendingReplicaUnits_SplitChildren pins that the PENDING-view desired
+// set stays in lockstep: it also surfaces the co-located children during a split
+// (computed under the draining-excluded ring), so the overlap reconcile never
+// sees a child as a spurious transition.
+func TestDesiredPendingReplicaUnits_SplitChildren(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2", "n3")
+	enterSplit(t, c)
+
+	// A draining member exercises the pending (draining-excluded) resolver.
+	pending := c.desiredPendingReplicaUnits(map[string]struct{}{"n3": {}})
+	assertSplitChildrenColocated(t, pending, 8)
+}
+
 // TestReshardController_MarchesSplit_2to8 drives the real Arbiter together with
 // the pure controller functions through a full 2 -> 8 split, simulating the
 // per-unit cut-over the (not-yet-built) unit machinery performs. It proves the
