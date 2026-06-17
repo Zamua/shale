@@ -57,6 +57,11 @@ func openSlateFactory(cfg slateConfig, logger *log.Logger) (storageunit.BackendF
 		SecretKey: cfg.SecretKey,
 		UseSSL:    cfg.UseSSL,
 		KeyPrefix: cfg.KeyPrefix,
+		// RelaxedReplicaDurability opts the R>=2 replica path into ack-at-
+		// memtable writes (durability via replication + background WAL flush)
+		// when the operator set --slate-relaxed-durability / SHALE_SLATE_
+		// RELAXED_DURABILITY. No-op on the R=1 path. See BackingConfig.
+		RelaxedReplicaDurability: cfg.RelaxedDurability,
 		// Settings + Cache intentionally nil: shaled-slate exposes the
 		// "operator runs slate with defaults" surface, same as the single
 		// backend. Operators who need a shared block cache or non-default
@@ -66,8 +71,8 @@ func openSlateFactory(cfg slateConfig, logger *log.Logger) (storageunit.BackendF
 		return nil, nil, fmt.Errorf("open slate backing: %w", err)
 	}
 	handle := backing.Handle()
-	logger.Printf("shaled-slate: multi-backend slate bucket=%s key-prefix=%q endpoint=%s region=%s units=%d",
-		cfg.Bucket, cfg.KeyPrefix, cfg.Endpoint, cfg.Region, cfg.UnitCount.N())
+	logger.Printf("shaled-slate: multi-backend slate bucket=%s key-prefix=%q endpoint=%s region=%s units=%d relaxed-durability=%v",
+		cfg.Bucket, cfg.KeyPrefix, cfg.Endpoint, cfg.Region, cfg.UnitCount.N(), cfg.RelaxedDurability)
 	// CloseFactory releases any unit the Handle still has mounted after
 	// Cluster.Close. Cluster.Close already closes the mounted units it
 	// tracks; Handle.Close is the backing-level safety net (best-effort

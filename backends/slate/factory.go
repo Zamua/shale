@@ -96,6 +96,25 @@ type BackingConfig struct {
 	// for how to build one; the operator owns its lifecycle and Destroys
 	// it once on shutdown.
 	Cache *slatedb.DbCache
+
+	// RelaxedReplicaDurability, when true, opens every R>1 REPLICA unit with
+	// WriteOptions{AwaitDurable:false}: a write acks at memtable insert and
+	// becomes durable via the background WAL flush, instead of blocking on
+	// the object-store flush per write. This is the relaxed-durability mode
+	// where durability comes from REPLICATION (the peer replica's memtable
+	// holds the write if one replica crashes pre-flush), not from a per-write
+	// object-store round-trip - so it is SAFE ONLY at R>=2.
+	//
+	// It affects openSlateReplica ONLY (the R>=2 path the cluster opens replica
+	// units through); the R=1 openSlate path stays AwaitDurable=true
+	// unconditionally, because relaxed durability at R=1 loses any un-flushed
+	// write on a single-replica crash. Graceful perturbations stay lossless
+	// regardless: CloseUnit/Shutdown forces a flush before the unit releases.
+	//
+	// Default false (strict per-write durability, byte-exact with the
+	// pre-flag behavior). See docs/SPEC.md "Relaxed durability at R>=2
+	// (multi-backend)".
+	RelaxedReplicaDurability bool
 }
 
 func (c BackingConfig) validate() error {
@@ -636,8 +655,11 @@ func (b *Backing) openSlate(gu storageunit.GenUnit) (*Slate, error) {
 }
 
 // openSlateReplica is the R>1 analogue of openSlate: it opens the per-replica
-// slatedb instance at dbNameReplica(ru) with AwaitDurable=true and the
-// backing's Settings/Cache. Because the DbName encodes the replica position,
+// slatedb instance at dbNameReplica(ru) with the backing's Settings/Cache.
+// AwaitDurable is true by default, or false when BackingConfig.
+// RelaxedReplicaDurability is set (relaxed durability is safe here because this
+// is the R>=2 path; see that field). Because the DbName encodes the replica
+// position,
 // the instance's WAL/LSM/manifest live at a prefix disjoint from every other
 // replica's, which is the structural replica-independence guarantee.
 func (b *Backing) openSlateReplica(ru storageunit.ReplicaUnit) (*Slate, error) {
@@ -645,7 +667,13 @@ func (b *Backing) openSlateReplica(ru storageunit.ReplicaUnit) (*Slate, error) {
 	if err != nil {
 		return nil, err
 	}
-	wopts := &slatedb.WriteOptions{AwaitDurable: true}
+	// AwaitDurable defaults true (every acked write durable in the bucket
+	// before ack). When the operator opted into relaxed durability AND we are
+	// here (the R>=2 replica path), ack at memtable insert instead and let the
+	// background WAL flush carry durability; the peer replica's memtable is the
+	// safety net for a single-replica pre-flush crash. See BackingConfig.
+	awaitDurable := !b.cfg.RelaxedReplicaDurability
+	wopts := &slatedb.WriteOptions{AwaitDurable: awaitDurable}
 	db, err := buildDb(b.cfg.dbNameReplica(ru), store, b.cfg.Settings, b.cfg.Cache)
 	if err != nil {
 		store.Destroy()

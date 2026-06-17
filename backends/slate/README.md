@@ -157,6 +157,20 @@ test double the chaos harness validates against.
 - `CloseUnit(gu)` flushes + shuts down one unit WITHOUT touching the
   bucket bytes (data stays durable for the next owner) - a copy-free
   handoff moves only the open handle, never bytes.
+- `OpenReplicaUnit(ru, epoch)` is the R>=2 analogue of `OpenUnit`: it opens
+  one replica position's database (DbName encodes the position, so each
+  replica's WAL/LSM/manifest is disjoint). By default it too opens with
+  `AwaitDurable=true`; set `BackingConfig.RelaxedReplicaDurability` (the
+  `--slate-relaxed-durability` / `SHALE_SLATE_RELAXED_DURABILITY` flag on
+  `shaled-slate`) to open replica units with `AwaitDurable=false` instead.
+  That is the relaxed-durability mode described above, applied at the per-unit
+  factory layer: durability comes from the R>=2 replication (the peer
+  replica's memtable holds the write if one replica crashes pre-flush) plus
+  the background WAL flush, not from a per-write object-store round-trip, so
+  writes ack at memtable speed. It is intentionally a no-op on the R=1
+  `OpenUnit` path, where relaxed durability would be unsafe (no peer replica).
+  Graceful releases stay lossless either way: `CloseReplicaUnit` flushes
+  before the unit lets go.
 - `Backing.PresentUnits(ctx)` lists the units whose databases EXIST in the
   bucket (a minio-go bucket scan, since slatedb-go exposes no list API),
   distinct from `Handle.OpenUnits()` (the locally-mounted set).

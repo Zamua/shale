@@ -30,6 +30,7 @@
 //	--slate-secret-key   SHALE_SLATE_SECRET_KEY  secret access key (required)
 //	--slate-use-ssl      SHALE_SLATE_USE_SSL     TLS to endpoint (default true)
 //	--slate-key-prefix   SHALE_SLATE_KEY_PREFIX  shared-bucket prefix (multi-backend only)
+//	--slate-relaxed-durability SHALE_SLATE_RELAXED_DURABILITY  R>=2 replica relaxed durability (default false)
 //	--multi-backend      SHALE_MULTI_BACKEND     one slatedb per unit (default false)
 //
 // In multi-backend mode (--multi-backend=true, paired with the std
@@ -90,6 +91,15 @@ type slateConfig struct {
 	// mode (carried over from the std --unit-count flag). Consumed only when
 	// MultiBackend is true.
 	UnitCount storageunit.UnitCount
+
+	// RelaxedDurability opts the multi-backend R>=2 replica path into relaxed
+	// durability (WriteOptions{AwaitDurable:false}): a write acks at memtable
+	// insert and is carried to the bucket by the background WAL flush, so
+	// durability comes from REPLICATION rather than a per-write object-store
+	// round-trip. Safe only at R>=2 (the peer replica's memtable holds the
+	// write if one replica crashes pre-flush); ignored on the R=1 path, which
+	// stays strict. Consumed only when MultiBackend is true. Default false.
+	RelaxedDurability bool
 }
 
 func run(argv []string, stderr *os.File) error {
@@ -116,6 +126,8 @@ func run(argv []string, stderr *os.File) error {
 		"slate: shared-bucket key prefix for per-unit databases (multi-backend mode only)")
 	multiBackend := fs.String("multi-backend", shaled.EnvOr("SHALE_MULTI_BACKEND", "false"),
 		"run in multi-backend mode: one slatedb per storage unit over a shared bucket (true|false)")
+	slateRelaxedDurability := fs.String("slate-relaxed-durability", shaled.EnvOr("SHALE_SLATE_RELAXED_DURABILITY", "false"),
+		"slate: relaxed durability on the R>=2 replica path - ack at memtable insert, durable via background WAL flush (true|false). Safe only at R>=2")
 
 	if err := fs.Parse(argv); err != nil {
 		return err
@@ -125,16 +137,17 @@ func run(argv []string, stderr *os.File) error {
 	}
 
 	cfg := slateConfig{
-		Bucket:       *slateBucket,
-		DbName:       *slateDbName,
-		Endpoint:     *slateEndpoint,
-		Region:       *slateRegion,
-		AccessKey:    *slateAccessKey,
-		SecretKey:    *slateSecretKey,
-		UseSSL:       strings.EqualFold(*slateUseSSL, "true"),
-		MultiBackend: strings.EqualFold(*multiBackend, "true"),
-		KeyPrefix:    *slateKeyPrefix,
-		UnitCount:    std.UnitCount,
+		Bucket:            *slateBucket,
+		DbName:            *slateDbName,
+		Endpoint:          *slateEndpoint,
+		Region:            *slateRegion,
+		AccessKey:         *slateAccessKey,
+		SecretKey:         *slateSecretKey,
+		UseSSL:            strings.EqualFold(*slateUseSSL, "true"),
+		MultiBackend:      strings.EqualFold(*multiBackend, "true"),
+		KeyPrefix:         *slateKeyPrefix,
+		UnitCount:         std.UnitCount,
+		RelaxedDurability: strings.EqualFold(*slateRelaxedDurability, "true"),
 	}
 	if err := cfg.validate(); err != nil {
 		return err
