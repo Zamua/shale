@@ -363,3 +363,40 @@ one false alarm, and logged these follow-ups:
 - **Out of scope here (later phases):** the MERGE direction (§4); joiner-mid-reshard
   wire fields; `Transact` mid-split; orphan-child GC + per-split abort deadline;
   composition with a concurrent membership change on the same unit.
+
+## 9. Phase D (MERGE) build outcomes + follow-ups (post adversarial review)
+
+Phase D MERGE (`2N -> N`) is built, committed, and gate-validated (the
+lossless-merge gate: zero acked loss through a live staggered `8 -> 4`, a
+break-demo, a WriteOne-across-finalize variant, and a CONCURRENT-reconcile variant
+all `-race` clean). It reuses the whole split driver / marker / finalize-quiesce
+machinery and adds the cross-node deltas (survivor at its gen-(g+1) ring home; the
+two-source quorum forward; the dual-parent caught-up gate). A focused 3-lens
+adversarial review found **0 P0** and adjudicated:
+
+- **Verdict: lossless by construction.** The authoritative-leg ack bar + the
+  finalize strict-recopy-under-write-pause backstop guarantee no acked write is
+  lost. The hypothesized cross-node finalize DEADLOCK is a FALSE ALARM (verified
+  lock graph: the receive-side survivor apply is gen-(g+1) so takes no parent pause,
+  only `mountMu`/`applyMu` leaves - no cyclic wait), empirically confirmed by the
+  concurrent-reconcile gate under `-race`.
+- **FIXED (P1-A, availability).** finalize held the parent pause WRITE side across a
+  synchronous cross-node forward bounded by a 60s blanket timeout; now each forward
+  is bounded by `WriteTimeout` (one RTT), so a slow/down survivor leg defers the
+  retire and retries next tick instead of pinning the pause.
+- **FIXED (P1-B, test coverage).** The merge shipped with zero white-box tests and a
+  serial reconcile pump. Added `TestCopyParentIntoSurvivor_ForwardsToLocalSurvivor`
+  (white-box copy) + `TestDecentralizedMergeGate_ConcurrentReconcile` (all nodes
+  finalize simultaneously, `-race`).
+- **FIXED (P2-A, spec-first).** The SPEC claimed the survivor "provably holds both
+  sources before either parent flips" - the split's clean-re-scan property the merge
+  omits. Corrected to the as-of-scan wording (in-flight stragglers are a flip-to-
+  finalize STALENESS covered by the finalize backstop, not a loss).
+- **NICE-TO-HAVE (P2-B).** At `WriteOne` the finalize forward retires the parent
+  with the survivor on a single leg (no worse than `WriteOne`'s R=1 contract, and
+  default `WriteQuorum` forces both). Optional: escalate the finalize forward to
+  `WriteAll` at the retire boundary regardless of configured consistency.
+- **NICE-TO-HAVE (P2-C, liveness).** A permanently-down survivor leg hard-fails the
+  quorum forward, so `driveMergeCopies` `continue`s and the merge wedges (no loss -
+  parents keep serving). Wants the per-reshard abort deadline already listed as a
+  not-yet-built item.
