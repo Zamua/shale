@@ -325,3 +325,41 @@ the cross-node cut-over window the freeze used to eliminate.
    `If-Match` on the metadata store (MinIO/S3 conditional writes / R2). Confirm the
    deployed store provides it for the epoch + cut-over + survivor objects (slatedb
    already requires CAS for manifest fencing, so this is the same dependency).
+
+## 8. Phase C build outcomes + follow-ups (post adversarial review)
+
+Phase C SPLIT is built, committed, and gate-validated (the lossless-split oracle:
+zero acked loss through a live staggered `4 -> 8`, break-demo catches loss, `-race`
+clean). A 4-lens adversarial review then found and we fixed ONE real P0, cleared
+one false alarm, and logged these follow-ups:
+
+- **FIXED (P0, acked-write loss).** `finalizeSplit` retired a parent with no
+  write-quiesce, so a lagging-node parent-leg write could land after the final copy
+  but before the retire and be lost (trivially at WriteOne). Fix: a per-unit
+  write-quiesce - finalize takes the unit's pause WRITE side around its final copy +
+  retire; every parent-leg apply takes the read side (`resolveAndApplyReplicaPut`),
+  so a racing write blocks then resolves the retired mount as absent (transient,
+  re-routed to the child). Pinned by `TestFinalizeSplit_QuiescesParentWrites`
+  (white-box, deterministic) + `TestDecentralizedSplitGate_WriteOneAcrossFinalize`
+  (end-to-end, widened window).
+- **FALSE ALARM (cleared).** Post-finalize child redistribution does NOT strand
+  data on a slot mismatch: the durable identity is `{gen, unit, slot}` in SHARED
+  backing, both child slots are populated during the split (the dual-write fans the
+  child legs to all parent slots), and the ring-home node opens the same slot bytes
+  zero-copy. Verified empirically (0 empty ring-home slots immediately after
+  finalize).
+- **SHOULD (P1, read staleness, not loss).** Reads resolve a single generation
+  (the node's local `cutOver` view), so a node that has flipped can read the child
+  and miss a write still only on the parent during the staggered flip. The P0 fix
+  makes this a bounded STALENESS (finalize's quiesced copy guarantees the child gets
+  it before the parent retires), never a loss. Follow-up: union reads across both
+  generations during the in-flight window.
+- **P2 (hardening, slow object store).** The copy is synchronous under
+  `reconcileMu` (fine + proven for the in-memory gate; background it for slow stores)
+  and the pre-flip caught-up scan uses a bounded `copyMaxPasses` (under sustained
+  load a hot unit may not reach a strictly-clean pre-flip pass; the finalize copy is
+  the strict gate, but liveness wants a brief quiesce at the caught-up point too).
+  These two are coupled and only matter on a real slow store.
+- **Out of scope here (later phases):** the MERGE direction (§4); joiner-mid-reshard
+  wire fields; `Transact` mid-split; orphan-child GC + per-split abort deadline;
+  composition with a concurrent membership change on the same unit.
