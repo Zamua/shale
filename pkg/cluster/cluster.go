@@ -660,6 +660,12 @@ func Open(cfg Config) (*Cluster, error) {
 		GRPCAddr:  cfg.GRPCAddr,
 		Seeds:     cfg.Seeds,
 		LogOutput: cfg.LogOutput,
+		// Periodic seed re-Join heals a post-startup gossip split (e.g. a
+		// mass rolling restart fragmenting the ring). Wired with the
+		// production default; only active when Seeds is non-empty, so a
+		// founder (no seeds) and in-process tests that pass no seeds run no
+		// loop. See membership.Config.RejoinInterval.
+		RejoinInterval: membership.DefaultRejoinInterval,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cluster: membership: %w", err)

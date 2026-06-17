@@ -154,7 +154,30 @@ type Config struct {
 	// means stderr (memberlist's default). Tests pass io.Discard to
 	// stay quiet.
 	LogOutput io.Writer
+	// RejoinInterval is how often a background goroutine re-contacts
+	// Seeds (via memberlist.Join) to re-bridge a gossip split. memberlist's
+	// own PushPull anti-entropy only syncs with members ALREADY in the
+	// local member list, so once a mass rolling restart (every pod gets a
+	// NEW address; old addresses are reaped while new ones join in disjoint
+	// waves) fragments the ring into two groups that have pruned each other
+	// out, neither group can reach the other and the seed (the only stable
+	// bridge) is never re-dialed - the startup split becomes PERMANENT.
+	// A periodic re-Join heals it: Join is idempotent (a no-op when the seed
+	// is already a known live member, a MERGE when split). The loop runs
+	// only when Seeds is non-empty, stops on Close, and does NOT rejoin once
+	// the node has called Leave (a departing node must not re-advertise
+	// itself). Zero DISABLES the loop (the default for in-process tests that
+	// do not churn addresses); production sets a non-zero interval.
+	RejoinInterval time.Duration
 }
+
+// DefaultRejoinInterval is the production re-Join cadence used when a
+// caller wires periodic seed anti-entropy without an explicit interval.
+// 30s matches memberlist's DefaultLANConfig PushPull cadence: frequent
+// enough that a mass-restart gossip split heals within a couple of
+// gossip rounds, infrequent enough that the idempotent no-op Join on a
+// healthy cluster is negligible overhead.
+const DefaultRejoinInterval = 30 * time.Second
 
 // Membership is the running gossip layer for one node. All exported
 // methods are safe for concurrent use.
@@ -167,6 +190,26 @@ type Membership struct {
 
 	mu     sync.Mutex
 	closed bool
+	// leaving is set by Leave(): once the node has gracefully announced
+	// its departure, the periodic rejoin loop must NOT re-Join the seeds
+	// (that would re-advertise a draining / departing node back into the
+	// cluster it is leaving). It is a distinct flag from closed because
+	// Leave() does NOT mark the Membership closed (the transport stays up
+	// so Members / Snapshot keep returning the live view).
+	leaving bool
+
+	// rejoinDone is closed by Close to stop the periodic rejoin goroutine.
+	// nil when no rejoin loop is running (no seeds or RejoinInterval == 0).
+	rejoinDone chan struct{}
+	// rejoinWG tracks the rejoin goroutine so Close can wait for it to
+	// exit cleanly before returning.
+	rejoinWG sync.WaitGroup
+	// rejoinAttempts counts how many times the loop actually called
+	// ml.Join (it was alive + not leaving). rejoinSkips counts ticks the
+	// loop skipped because the node was leaving or closing. Both are
+	// observability hooks, surfaced for tests + debugging.
+	rejoinAttempts atomic.Uint64
+	rejoinSkips    atomic.Uint64
 
 	// cache holds the authoritative Member snapshot keyed by node ID.
 	// Reads (Members, Snapshot) consult this map under cacheMu instead
@@ -435,8 +478,69 @@ func Open(cfg Config) (*Membership, error) {
 		m.cacheMu.Unlock()
 	}
 
+	// Start the periodic seed re-Join (anti-entropy that heals a
+	// post-startup gossip split, e.g. after a mass rolling restart). Only
+	// runs when there is a seed to re-bridge to AND a non-zero interval was
+	// configured; tests that do not churn addresses leave RejoinInterval 0
+	// to disable it.
+	if len(cfg.Seeds) > 0 && cfg.RejoinInterval > 0 {
+		m.rejoinDone = make(chan struct{})
+		m.rejoinWG.Add(1)
+		go m.rejoinLoop(cfg.Seeds, cfg.RejoinInterval)
+	}
+
 	return m, nil
 }
+
+// rejoinLoop periodically re-contacts the seeds via memberlist.Join to
+// re-bridge a gossip split. Join is idempotent: a no-op when the seed is
+// already a known live member, a MERGE (PushPull reconciles the two member
+// lists) when the ring has fragmented. The loop exits when rejoinDone is
+// closed (by Close) and SKIPS the Join while the node is leaving or closed
+// (a departing node must not re-advertise itself back into the cluster).
+func (m *Membership) rejoinLoop(seeds []string, interval time.Duration) {
+	defer m.rejoinWG.Done()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.rejoinDone:
+			return
+		case <-t.C:
+			m.mu.Lock()
+			skip := m.closed || m.leaving
+			m.mu.Unlock()
+			if skip {
+				m.rejoinSkips.Add(1)
+				continue
+			}
+			before := len(m.ml.Members())
+			if _, err := m.ml.Join(seeds); err != nil {
+				// Best-effort: a transient seed-unreachable error is
+				// expected during churn; the next tick retries.
+				continue
+			}
+			m.rejoinAttempts.Add(1)
+			if after := len(m.ml.Members()); after > before {
+				// Only log when the re-Join actually merged new members
+				// (a split was healed); the healthy-cluster no-op stays
+				// quiet. memberlist's logger is the package's only sink.
+				if m.cfg.LogOutput != nil {
+					_, _ = fmt.Fprintf(m.cfg.LogOutput, "[DEBUG] membership: rejoin merged members (%d -> %d) node=%s\n", before, after, m.cfg.NodeID)
+				}
+			}
+		}
+	}
+}
+
+// RejoinAttempts returns how many times the periodic rejoin loop has
+// actually called memberlist.Join (the node was alive + not leaving).
+// Observability hook for tests + debugging; 0 when no rejoin loop runs.
+func (m *Membership) RejoinAttempts() uint64 { return m.rejoinAttempts.Load() }
+
+// RejoinSkips returns how many rejoin ticks were skipped because the node
+// was leaving or closing. Observability hook for tests + debugging.
+func (m *Membership) RejoinSkips() uint64 { return m.rejoinSkips.Load() }
 
 // Members returns a snapshot of currently known cluster members,
 // sorted by ID for deterministic iteration. Returns nil if the
@@ -557,6 +661,10 @@ func (m *Membership) Leave() error {
 		m.mu.Unlock()
 		return nil
 	}
+	// Mark leaving so the periodic rejoin loop stops re-Joining: a node
+	// that has gracefully announced its departure must not re-advertise
+	// itself back into the cluster it is draining out of.
+	m.leaving = true
 	m.mu.Unlock()
 	return m.ml.Leave(leaveTimeout)
 }
@@ -580,7 +688,17 @@ func (m *Membership) Close() error {
 		return nil
 	}
 	m.closed = true
+	rejoinDone := m.rejoinDone
 	m.mu.Unlock()
+
+	// Stop the periodic rejoin goroutine and wait for it to exit BEFORE
+	// tearing the transport down, so it can never call ml.Join on a
+	// shut-down memberlist. closed=true (set above) already makes any
+	// in-flight tick skip; closing the channel wakes a blocked select.
+	if rejoinDone != nil {
+		close(rejoinDone)
+		m.rejoinWG.Wait()
+	}
 
 	// Best-effort graceful leave; ignore errors so Shutdown still runs.
 	// A bounded timeout (not 0) is load-bearing: Leave(0) blocks forever
