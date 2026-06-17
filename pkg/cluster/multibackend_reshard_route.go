@@ -124,6 +124,35 @@ func (c *Cluster) fireSupplementary(ctx context.Context, legs []routedReplica, k
 	go drainResults(ch)
 }
 
+// parentSlotMidSplit reports whether ru is a gen-g (PARENT) unit while a split is
+// in flight on this node - the writes that must be quiesced around finalize.
+func (c *Cluster) parentSlotMidSplit(ru storageunit.ReplicaUnit) bool {
+	gs := c.genSnapshot()
+	return !gs.nextCount.IsZero() && ru.Unit.Gen == gs.gen
+}
+
+// resolveAndApplyReplicaPut resolves ru's mounted backend and applies the
+// envelope apply-if-newer. When ru is a parent slot mid-split it takes the unit's
+// write-pause READ side around the RESOLVE + apply, so finalizeSplit's retire
+// (which holds the WRITE side around its final copy) is atomic w.r.t. this write:
+// a write racing the retire blocks, then resolves the now-retired mount as !ok and
+// returns the transient acquiring error - re-routed to the child, never a lost
+// ack. Outside a split / for child units it is the plain resolve + apply. This is
+// the multi-backend analogue of localWriteBackendForKey's pause discipline, on
+// the position-addressed (union/dual-write) apply path.
+func (c *Cluster) resolveAndApplyReplicaPut(ru storageunit.ReplicaUnit, key, envBytes []byte) error {
+	if c.parentSlotMidSplit(ru) {
+		pause := c.pauseLockFor(ru.Unit.ID)
+		pause.RLock()
+		defer pause.RUnlock()
+	}
+	b, ok := c.localBackendForReplicaUnit(ru)
+	if !ok {
+		return errUnitAcquiring("Put")
+	}
+	return c.applyEnvelopeIfNewerToBackend(b, ru, key, envBytes)
+}
+
 // membersOf projects the routed legs onto their member slice for fanout.
 func membersOf(legs []routedReplica) []ring.Member {
 	out := make([]ring.Member, len(legs))

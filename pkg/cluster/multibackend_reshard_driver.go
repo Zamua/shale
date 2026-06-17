@@ -32,6 +32,8 @@
 package cluster
 
 import (
+	"time"
+
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -140,19 +142,21 @@ func (c *Cluster) observeCutoverMarkers(gs genState) {
 	c.commitGenState(next)
 }
 
-// finalizeSplit completes the generation once EVERY old unit has cut over: a
-// final clean copy of every owned parent (the strict no-loss backstop - the
-// child slot provably holds everything the parent slot holds before the parent
-// is closed), then advance the live generation and retire the parent mounts. If
-// any final copy is not clean this tick, finalize is deferred to the next tick.
+// finalizeSplit completes the generation once EVERY old unit has cut over. For
+// each owned parent slot it takes that unit's write-PAUSE (the WRITE side), so
+// the final copy + retire is ATOMIC w.r.t. parent-leg writes (which take the read
+// side in applyEnvelopeIfNewerToBackendReport): the final copy provably captures
+// every write that landed before the pause, and a write that arrives during the
+// pause blocks, then fails on the retired parent (transient, never acked) and is
+// re-routed to the child. Without this quiesce a lagging-node parent write could
+// land between the final scan and the retire and be lost (the P0 the single-node
+// bisect's pause also prevents). Once every owned parent is retired the live
+// generation advances; the overlap reconcile then redistributes the children.
+// A unit whose final copy is not clean this tick defers finalize to the next.
 func (c *Cluster) finalizeSplit(gs genState) {
-	parents := c.ownedParentSlots(gs)
-	if !c.cfg.TestingForceUncleanReshard {
-		for _, ru := range parents {
-			clean, err := c.copyParentUntilCaughtUp(ru, gs)
-			if err != nil || !clean {
-				return // not safe to retire yet; retry next tick
-			}
+	for _, ru := range c.ownedParentSlots(gs) {
+		if !c.finalizeParent(ru, gs) {
+			return // not safe to retire this unit yet; retry next tick
 		}
 	}
 	c.commitGenState(genState{
@@ -160,7 +164,27 @@ func (c *Cluster) finalizeSplit(gs genState) {
 		count:   gs.nextCount,
 		cutOver: make(map[storageunit.UnitID]struct{}),
 	})
-	for _, ru := range parents {
-		c.releaseReplicaUnit(ru)
+}
+
+// finalizeParent quiesces parent slot ru (its unit's write-pause WRITE side),
+// runs the strict final copy under the pause, and retires the parent. It reports
+// whether the parent was retired (false = defer; the copy was not clean). The
+// gen advance stays with the caller (it is cluster-generation-level, after every
+// owned parent has retired).
+func (c *Cluster) finalizeParent(ru storageunit.ReplicaUnit, gs genState) bool {
+	pause := c.pauseLockFor(ru.Unit.ID)
+	pause.Lock()
+	defer pause.Unlock()
+
+	if !c.cfg.TestingForceUncleanReshard {
+		clean, err := c.copyParentUntilCaughtUp(ru, gs)
+		if err != nil || !clean {
+			return false
+		}
 	}
+	if d := c.cfg.TestingFinalizeRetireDelay; d > 0 {
+		time.Sleep(d) // widen the post-final-copy / pre-retire window (test-only)
+	}
+	c.releaseReplicaUnit(ru)
+	return true
 }

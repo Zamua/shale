@@ -66,14 +66,25 @@ func pumpReconciles(nodes []*sharedNode) {
 	}
 }
 
-func runDecentralizedSplit(t *testing.T, forceUnclean bool) splitGateResult {
+type splitGateOpts struct {
+	forceUnclean  bool          // break-demo: flip + retire without copying
+	writeOne      bool          // WriteOne (single-slot ack) - the harshest loss regime
+	finalizeDelay time.Duration // widen the finalize retire window
+}
+
+func runDecentralizedSplit(t *testing.T, opts splitGateOpts) splitGateResult {
 	t.Helper()
 	const unitCount = 4
 	backing := sharedfactory.NewBacking()
 	store := storageunit.NewMemConditionalStore()
 	mutate := func(cfg *cluster.Config) {
 		cfg.ConditionalStore = store
-		cfg.TestingForceUncleanReshard = forceUnclean
+		cfg.TestingForceUncleanReshard = opts.forceUnclean
+		cfg.TestingFinalizeRetireDelay = opts.finalizeDelay
+		if opts.writeOne {
+			cfg.WriteConsistency = cluster.WriteOne
+			cfg.ReadConsistency = cluster.ReadAll
+		}
 	}
 
 	n1 := startReplicatedNodeCfg(t, "dsp-a", "", unitCount, 2, backing, mutate)
@@ -186,7 +197,7 @@ func runDecentralizedSplit(t *testing.T, forceUnclean bool) splitGateResult {
 // continuous writes + staggered cut-over loses ZERO acked writes and stays
 // available.
 func TestDecentralizedSplitGate(t *testing.T) {
-	r := runDecentralizedSplit(t, false)
+	r := runDecentralizedSplit(t, splitGateOpts{})
 
 	// (1) THE ORACLE: zero acked loss, readable from every node.
 	assertNoAckedLoss(t, overlapGateResult{want: r.want, nodes: r.nodes})
@@ -216,7 +227,7 @@ func TestDecentralizedSplitGate(t *testing.T) {
 // their data), the split drops acked writes and the oracle MUST catch it. If this
 // run ever passed the loss check, the gate above would be rubber-stamping.
 func TestDecentralizedSplitGate_BreakDemoCatchesLoss(t *testing.T) {
-	r := runDecentralizedSplit(t, true)
+	r := runDecentralizedSplit(t, splitGateOpts{forceUnclean: true})
 
 	lost := 0
 	for k, v := range r.want {
@@ -229,4 +240,28 @@ func TestDecentralizedSplitGate_BreakDemoCatchesLoss(t *testing.T) {
 		t.Fatalf("BREAK NOT CAUGHT: an unclean reshard (no copy) lost no acked write - the oracle would rubber-stamp")
 	}
 	t.Logf("break-demo: unclean reshard lost %d/%d acked keys (oracle correctly catches it)", lost, len(r.want))
+}
+
+// TestDecentralizedSplitGate_WriteOneAcrossFinalize is the harshest durability
+// regime, targeting the P0 the adversarial review found: WriteOne (a single
+// parent-slot ack is enough) + a WIDENED finalize retire window
+// (TestingFinalizeRetireDelay) + writers running THROUGH the staggered finalize.
+// A parent-leg write that lands after a parent's final copy but before it retires
+// would be lost WITHOUT the per-unit finalize write-quiesce; with it, every acked
+// write is captured into the child or rejected (re-routed), so loss stays ZERO.
+// (Run against the un-quiesced finalize this loses writes; it is the end-to-end
+// counterpart of the white-box TestFinalizeSplit_QuiescesParentWrites.)
+func TestDecentralizedSplitGate_WriteOneAcrossFinalize(t *testing.T) {
+	r := runDecentralizedSplit(t, splitGateOpts{writeOne: true, finalizeDelay: 40 * time.Millisecond})
+
+	assertNoAckedLoss(t, overlapGateResult{want: r.want, nodes: r.nodes})
+	for _, n := range r.nodes {
+		g, c := n.Cluster.GenStateSnapshot()
+		if g != 1 || c != 2*4 {
+			t.Fatalf("node %s ended at gen %d count %d, want gen 1 count 8", n.ID, g, c)
+		}
+	}
+	rate := float64(r.acked) / float64(r.attempted)
+	t.Logf("WriteOne-across-finalize: %d/%d acked (%.1f%%), zero acked loss through a widened finalize window",
+		r.acked, r.attempted, 100*rate)
 }

@@ -271,6 +271,17 @@ type Config struct {
 	// code path sets this. See multibackend_reshard_driver.go.
 	TestingForceUncleanReshard bool
 
+	// TestingFinalizeRetireDelay, when > 0, makes finalizeSplit sleep this long
+	// between a parent's final catch-up copy and retiring it. It deterministically
+	// WIDENS the post-final-scan / pre-retire window so a concurrent parent-leg
+	// write provably lands inside it - the regime that exposes the acked-write
+	// loss when the finalize retire boundary is NOT write-quiesced. The lossless
+	// gate sets it to prove the per-unit pause across finalize is load-bearing
+	// (without the pause the gate loses writes; with it the blocked write is
+	// rejected transient and re-routed). Test-only; no production code path sets
+	// this. See multibackend_reshard_driver.go.
+	TestingFinalizeRetireDelay time.Duration
+
 	// GracefulLeaveDrainTimeout bounds the graceful-leave drain on shutdown
 	// (v0.8 Phase 2e, scale-down). When > 0 AND the cluster runs the
 	// multi-backend overlap path (multiReplicated()), Close() FIRST broadcasts

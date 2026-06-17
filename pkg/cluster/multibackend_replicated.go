@@ -470,11 +470,10 @@ func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Membe
 			// the static bisect.
 			return errWriteFrozen("Put")
 		}
-		b, ok := c.localBackendForReplicaUnit(ru)
-		if !ok {
-			return errUnitAcquiring("Put")
-		}
-		return c.applyEnvelopeIfNewerToBackend(b, ru, key, envBytes)
+		// resolveAndApplyReplicaPut quiesces a parent-slot write around the v0.9
+		// finalize retire (pause read side) so no acked write lands on a retiring
+		// parent; outside a split it is the plain resolve + apply.
+		return c.resolveAndApplyReplicaPut(ru, key, envBytes)
 	}
 	cli, err := c.clientFor(replica.Addr)
 	if err != nil {

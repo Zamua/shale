@@ -5,7 +5,9 @@ package cluster
 // flip, zero acked loss) is the lossless-split oracle (tests/integration).
 
 import (
+	"bytes"
 	"testing"
+	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -100,5 +102,72 @@ func TestFinalizeSplit_AdvancesAndRetiresParents(t *testing.T) {
 	c.mountMu.RUnlock()
 	if stillMounted {
 		t.Fatalf("parent %v should be retired after finalize", parentRU)
+	}
+}
+
+// TestFinalizeSplit_QuiescesParentWrites is the regression pin for the P0
+// acked-write-loss the adversarial review found: a lagging-node parent-leg write
+// that lands AFTER finalize's final copy but BEFORE the parent is retired must
+// not be silently dropped. The retire boundary must be write-quiesced (a per-unit
+// pause): the write is either captured into the child or rejected (the apply
+// fails on the quiesced+retired parent so it was never acked) - never
+// applied-to-parent-then-vanished. The TestingFinalizeRetireDelay widens the
+// window so the race is deterministic; without the pause this FAILS, with it the
+// injected write is blocked then rejected.
+func TestFinalizeSplit_QuiescesParentWrites(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2", "n3")
+	enterSplit(t, c)
+	gs := c.genSnapshot()
+	parentRU := mountParentAndChildren(t, c, 0, storageunit.MustUnitCount(4))
+	parentB := c.mountMap[parentRU]
+
+	for _, k := range keysInUnit(t, c, 0, storageunit.MustUnitCount(4), 4) {
+		env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "n1"}, Payload: []byte("base")})
+		if err := parentB.Put(k, env); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := c.copyParentUntilCaughtUp(parentRU, gs); err != nil {
+		t.Fatal(err)
+	}
+
+	// A key in unit 0 (whichever child it lands in); grab that child's backend.
+	xKey := keysInUnit(t, c, 0, storageunit.MustUnitCount(4), 1)[0]
+	h := storageunit.HashShardKey(c.shardKey(xKey))
+	childRU := storageunit.NewReplicaUnit(storageunit.NewGenUnit(1, storageunit.UnitForHash(h, storageunit.MustUnitCount(8))), 0)
+	childB := c.mountMap[childRU]
+
+	next := gs.clone()
+	for _, u := range next.count.IDs() {
+		next.cutOver[u] = struct{}{}
+	}
+	c.commitGenState(next)
+	c.cfg.TestingFinalizeRetireDelay = 300 * time.Millisecond
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		c.finalizeSplit(c.genSnapshot())
+	}()
+	time.Sleep(80 * time.Millisecond) // let the final copy finish + enter the widened window
+
+	// Inject the lagging-node parent-leg write through the PRODUCTION apply path
+	// (resolve + apply), which is what the dual-write fan-out uses. With the
+	// quiesce it blocks until the parent retires, then resolves !ok (transient);
+	// without it the write lands on the about-to-retire parent and is lost.
+	xEnv := Encode(Envelope{Stamp: Stamp{TimestampNanos: 99, NodeID: "nLagger"}, Payload: []byte("X")})
+	applyErr := c.resolveAndApplyReplicaPut(parentRU, xKey, xEnv)
+	<-done
+	_ = parentB
+
+	got, getErr := childB.Get(xKey)
+	inChild := false
+	if getErr == nil {
+		d, _ := Decode(got)
+		inChild = bytes.Equal(d.Payload, []byte("X"))
+	}
+	if applyErr == nil && !inChild {
+		t.Fatalf("P0: a parent write applied (would ack) but is ABSENT from the child after finalize - acked-write LOST (retire boundary not quiesced)")
 	}
 }

@@ -71,11 +71,10 @@ func (c *Cluster) LocalReplicaPutAt(ru storageunit.ReplicaUnit, key, bytesToWrit
 	if c.isFrozen() {
 		return errWriteFrozen("Put")
 	}
-	b, ok := c.localBackendForReplicaUnit(ru)
-	if !ok {
-		return recodeForwardedReplicaErr(errUnitAcquiring("Put"))
-	}
-	return recodeForwardedReplicaErr(c.applyEnvelopeIfNewerToBackend(b, ru, key, bytesToWrite))
+	// resolveAndApplyReplicaPut quiesces a parent-slot write around the v0.9
+	// finalize retire (pause read side) so a forwarded dual-write cannot land on a
+	// retiring parent and be lost; outside a split it is the plain resolve + apply.
+	return recodeForwardedReplicaErr(c.resolveAndApplyReplicaPut(ru, key, bytesToWrite))
 }
 
 // LocalReplicaGetAt serves a position-addressed union read DIRECTLY from the
