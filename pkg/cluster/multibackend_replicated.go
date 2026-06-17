@@ -201,6 +201,20 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		if errors.Is(err, backend.ErrFenced) {
+			// A higher-epoch owner fenced this writer between Begin and Commit
+			// (slatedb surfaces CloseReasonFenced HERE, at Commit, not at Begin like
+			// the in-memory double). Recode to the TRANSIENT acquiring-window error -
+			// exactly as the Begin-fence path above does - so the fan-out treats this
+			// leg as non-acking + RETRYABLE (retries onto the re-resolved union)
+			// rather than a HARD failure that fast-fails the write. The fenced commit
+			// did NOT durably apply here, so not counting it as an ack is correct; the
+			// successor that fenced it serves the write once it finishes mounting.
+			// This keeps during-leave write availability up on real object storage
+			// (the in-memory tests never reach here - they fence at Begin).
+			c.evictStaleMount(ru, b)
+			return errUnitAcquiring("Put")
+		}
 		return err
 	}
 	committed = true
@@ -325,6 +339,13 @@ func (c *Cluster) applyBatchToUnit(writes []EnvelopeWrite) error {
 		}
 	}
 	if err := tx.Commit(); err != nil {
+		if errors.Is(err, backend.ErrFenced) {
+			// Fenced at Commit (real slatedb) -> transient, same as the Begin-fence
+			// path above + the single-Put apply: a fenced batch leg is non-acking +
+			// RETRYABLE, not a hard fan-out failure.
+			c.evictStaleMount(ru, b)
+			return errUnitAcquiring("ApplyBatch")
+		}
 		return err
 	}
 	committed = true

@@ -316,6 +316,22 @@ func IsFenced(err error) bool {
 	return errors.As(err, &closed) && closed.Reason == slatedb.CloseReasonFenced
 }
 
+// fencedCommitErr wraps a slatedb commit error and, when it is a writer-epoch
+// fence, ADDITIONALLY tags it with backend.ErrFenced (multi-%w) so the cluster
+// layer recognizes the fence backend-agnostically (errors.Is(err,
+// backend.ErrFenced)) and recodes the leg to the TRANSIENT acquiring-window
+// error instead of hard-failing the write. The slatedb fence surfaces HERE, at
+// Commit (not at Begin like the in-memory test double), so this is the real
+// object-storage path the cluster's commit-fence recode relies on. errors.As
+// against *ErrorClosed still resolves through the multi-wrap, so IsFenced and
+// the rendered slatedb reason are both preserved.
+func fencedCommitErr(err error) error {
+	if IsFenced(err) {
+		return fmt.Errorf("slate: tx commit: %w: %w", err, backend.ErrFenced)
+	}
+	return fmt.Errorf("slate: tx commit: %w", err)
+}
+
 // -- iterator -------------------------------------------------------
 
 // iterator wraps a *slatedb.DbIterator, translating its (KeyValue,
@@ -416,12 +432,12 @@ func (t *transaction) Commit() error {
 	t.done = true
 	if t.writeOpts != nil {
 		if _, err := t.tx.CommitWithOptions(*t.writeOpts); err != nil {
-			return fmt.Errorf("slate: tx commit: %w", err)
+			return fencedCommitErr(err)
 		}
 		return nil
 	}
 	if _, err := t.tx.Commit(); err != nil {
-		return fmt.Errorf("slate: tx commit: %w", err)
+		return fencedCommitErr(err)
 	}
 	return nil
 }
