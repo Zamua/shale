@@ -121,3 +121,40 @@ func TestUnitCount_Double(t *testing.T) {
 		t.Fatalf("Double() at MaxUnitCount should error")
 	}
 }
+
+func TestUnitCount_Halve(t *testing.T) {
+	c := storageunit.MustUnitCount(8)
+	h, err := c.Halve()
+	if err != nil {
+		t.Fatalf("Halve() unexpected error: %v", err)
+	}
+	if h.N() != 4 {
+		t.Fatalf("Halve() of N=8 = %s, want N=4", h)
+	}
+
+	// Halving at the minimum must fail: N=1 is the whole keyspace in one
+	// database, with no smaller power of two to merge into. This is the floor
+	// the merge direction stops at (count=0 is invalid and never constructed).
+	minCount := storageunit.MustUnitCount(storageunit.MinUnitCount)
+	if _, err := minCount.Halve(); err == nil {
+		t.Fatalf("Halve() at MinUnitCount should error")
+	}
+
+	// Double then Halve is identity across the legal range: the inverse
+	// property the merge direction relies on (a unit that splits and later
+	// merges back must land on the same count).
+	for _, n := range []int{1, 2, 4, 8, 16, 256, 1024} {
+		c := storageunit.MustUnitCount(n)
+		d, err := c.Double()
+		if err != nil {
+			t.Fatalf("Double() of %s: %v", c, err)
+		}
+		back, err := d.Halve()
+		if err != nil {
+			t.Fatalf("Halve() of %s: %v", d, err)
+		}
+		if back.N() != c.N() {
+			t.Fatalf("Double then Halve of %s = %s, want round-trip identity %s", c, back, c)
+		}
+	}
+}

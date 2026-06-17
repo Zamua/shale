@@ -123,5 +123,21 @@ func (c UnitCount) Double() (UnitCount, error) {
 	return NewUnitCount(int(c.n) * 2)
 }
 
+// Halve returns the UnitCount for N/2, the result of one merging step and the
+// exact inverse of Double. It errors if N is already at MinUnitCount: a single
+// unit is the whole keyspace in one database and cannot merge further (and the
+// zero/invalid counts never reach here, NewUnitCount having rejected them).
+// Halving is the only supported shrink operation, mirroring Double: every pair
+// of units {K, K+N/2} collapses into the single parent K (see ParentUnit in
+// doubling.go). Because N is a power of two >= 2 here, N/2 is always a valid
+// power of two, so the NewUnitCount re-check never rejects a halve above the
+// floor; the explicit floor guard is what gives a clear error at N == 1.
+func (c UnitCount) Halve() (UnitCount, error) {
+	if c.n <= MinUnitCount {
+		return UnitCount{}, fmt.Errorf("storageunit: %s cannot be halved (already at minimum N=%d)", c, MinUnitCount)
+	}
+	return NewUnitCount(int(c.n) / 2)
+}
+
 // String renders the count as "N=<n>" for logs and test failures.
 func (c UnitCount) String() string { return fmt.Sprintf("N=%d", c.n) }
