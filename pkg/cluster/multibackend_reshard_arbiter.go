@@ -18,6 +18,7 @@ import (
 	"fmt"
 
 	"github.com/Zamua/shale/pkg/reshard"
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 // initReshardArbiter constructs and seeds the decentralized reshard Arbiter when
@@ -46,4 +47,80 @@ func (c *Cluster) initReshardArbiter() error {
 	}
 	c.arbiter = a
 	return nil
+}
+
+// reshardGenStep computes the next genState given the local routing state and
+// the cluster's agreed reshard State S, stepping the LIVE generation ONE step at
+// a time toward S.Count. It is pure (no I/O, no locks) so the whole state
+// machine is table-testable in isolation; the live reconcile reads S, calls
+// this, and commits the result.
+//
+// Two transitions, in priority order:
+//
+//  1. FINALIZE the in-flight generation. While a split is in flight
+//     (nextCount != 0) the per-unit machinery adds each old unit to cutOver as
+//     its durable caught-up marker is observed. Once EVERY old unit has cut over
+//     (allCutOver), the live generation advances: gen -> gen+1, count ->
+//     nextCount, the reshard is no longer in flight, cutOver clears. This is the
+//     same final-commit the imperative bisect does, but gated on the durable
+//     per-unit markers rather than a coordinator.
+//
+//  2. ENTER IN-FLIGHT, one generation at a time. When steady (nextCount == 0)
+//     and the agreed count differs from ours, begin the immediate next step
+//     toward it: a split sets nextCount = count.Double(). Crucially it steps to
+//     OUR next generation's count (count*2), NOT S.Count, and never reads
+//     S.Epoch - so a node that was asleep while the agreed count moved several
+//     steps still performs each intermediate split in order (the
+//     non-contiguous-epoch invariant: never skip a generation's work). Merge
+//     (S.Count < count) is handled in the merge phase; here it is a no-op.
+//
+// changed reports whether next differs from local (whether the caller should
+// commitGenState).
+func reshardGenStep(local genState, S reshard.State) (next genState, changed bool) {
+	if !local.nextCount.IsZero() {
+		if allCutOver(local) {
+			return genState{
+				gen:     local.gen + 1,
+				count:   local.nextCount,
+				cutOver: make(map[storageunit.UnitID]struct{}),
+			}, true
+		}
+		return local, false // mid-split: the per-unit machinery is still working
+	}
+	if S.Count.N() > local.count.N() {
+		nc, err := local.count.Double()
+		if err != nil {
+			return local, false // already at MaxUnitCount; cannot split further
+		}
+		next = local.clone()
+		next.nextCount = nc
+		return next, true
+	}
+	// S.Count < local.count is a merge (Phase D); S.Count == local.count is
+	// steady at the agreed count. Neither changes genState here.
+	return local, false
+}
+
+// allCutOver reports whether every old (gen-g) unit in an in-flight split has
+// cut over to its gen-(g+1) children. The cutOver set is keyed by old unit id
+// 0..count-1, so a full set (len == count) means the whole key-space has flipped
+// and the live generation can advance.
+func allCutOver(g genState) bool {
+	return !g.nextCount.IsZero() && len(g.cutOver) == int(g.count.N())
+}
+
+// shouldAdvanceArbiter reports whether this node should race to Advance the
+// agreed reshard epoch one generation toward its Target. It advances ONLY when
+// this node is steady (no split in flight) AND has fully applied the currently
+// agreed count (local.count == S.Count) AND the Target still wants a different
+// count. The "fully applied" gate is the non-contiguous-epoch safeguard: a node
+// reaches local.count == S.Count only after finalizing the current generation,
+// which requires every old unit's durable cut-over marker (the current
+// generation's reshard is cluster-wide complete), so advancing cannot outrun an
+// unfinished generation. The CAS race in Arbiter.Advance then lets exactly one
+// node perform the step; the rest adopt it.
+func shouldAdvanceArbiter(local genState, S reshard.State) bool {
+	return local.nextCount.IsZero() &&
+		local.count.N() == S.Count.N() &&
+		S.Count.N() != S.Target.N()
 }

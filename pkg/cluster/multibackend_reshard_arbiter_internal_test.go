@@ -94,3 +94,183 @@ func TestInitReshardArbiter_JoinerAdoptsExisting(t *testing.T) {
 		t.Fatalf("joiner adopted %+v, want the founder's seeded count8 target8", st)
 	}
 }
+
+// gs builds a genState for the controller table tests. cutOver lists the old
+// unit ids already flipped.
+func gs(gen storageunit.Generation, count, nextCount int, cutOver ...storageunit.UnitID) genState {
+	g := genState{
+		gen:     gen,
+		count:   storageunit.MustUnitCount(count),
+		cutOver: make(map[storageunit.UnitID]struct{}),
+	}
+	if nextCount != 0 {
+		g.nextCount = storageunit.MustUnitCount(nextCount)
+	}
+	for _, u := range cutOver {
+		g.cutOver[u] = struct{}{}
+	}
+	return g
+}
+
+// st builds a reshard.State for the controller table tests.
+func stt(epoch uint64, count, target int, plan reshard.Plan) reshard.State {
+	return reshard.State{
+		Epoch:  epoch,
+		Count:  storageunit.MustUnitCount(count),
+		Target: storageunit.MustUnitCount(target),
+		Plan:   plan,
+	}
+}
+
+func TestReshardGenStep(t *testing.T) {
+	cases := []struct {
+		name        string
+		local       genState
+		S           reshard.State
+		wantChanged bool
+		wantGen     storageunit.Generation
+		wantCount   int
+		wantNext    int // 0 == not in flight
+	}{
+		{
+			name:        "steady, agreed count higher: enter split one step",
+			local:       gs(0, 2, 0),
+			S:           stt(1, 4, 4, reshard.PlanSplit),
+			wantChanged: true, wantGen: 0, wantCount: 2, wantNext: 4,
+		},
+		{
+			name:        "non-contiguous: agreed count two steps ahead, still steps ONE gen",
+			local:       gs(0, 2, 0),
+			S:           stt(2, 8, 8, reshard.PlanSplit),
+			wantChanged: true, wantGen: 0, wantCount: 2, wantNext: 4,
+		},
+		{
+			name:        "mid-split, not all cut over: no change",
+			local:       gs(0, 2, 4, 0), // unit 0 flipped, unit 1 not
+			S:           stt(1, 4, 4, reshard.PlanSplit),
+			wantChanged: false, wantGen: 0, wantCount: 2, wantNext: 4,
+		},
+		{
+			name:        "all cut over: finalize to next generation",
+			local:       gs(0, 2, 4, 0, 1), // both old units flipped
+			S:           stt(1, 4, 4, reshard.PlanSplit),
+			wantChanged: true, wantGen: 1, wantCount: 4, wantNext: 0,
+		},
+		{
+			name:        "steady at agreed count: no change",
+			local:       gs(1, 4, 0),
+			S:           stt(1, 4, 4, reshard.PlanNone),
+			wantChanged: false, wantGen: 1, wantCount: 4, wantNext: 0,
+		},
+		{
+			name:        "agreed count lower (merge): no change in split phase",
+			local:       gs(2, 8, 0),
+			S:           stt(3, 4, 2, reshard.PlanMerge),
+			wantChanged: false, wantGen: 2, wantCount: 8, wantNext: 0,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			next, changed := reshardGenStep(tc.local, tc.S)
+			if changed != tc.wantChanged {
+				t.Fatalf("changed = %v, want %v", changed, tc.wantChanged)
+			}
+			if next.gen != tc.wantGen {
+				t.Fatalf("gen = %d, want %d", next.gen, tc.wantGen)
+			}
+			if int(next.count.N()) != tc.wantCount {
+				t.Fatalf("count = %d, want %d", next.count.N(), tc.wantCount)
+			}
+			gotNext := 0
+			if !next.nextCount.IsZero() {
+				gotNext = int(next.nextCount.N())
+			}
+			if gotNext != tc.wantNext {
+				t.Fatalf("nextCount = %d, want %d", gotNext, tc.wantNext)
+			}
+		})
+	}
+}
+
+func TestAllCutOver(t *testing.T) {
+	if allCutOver(gs(0, 4, 0)) {
+		t.Fatalf("not in flight should not be allCutOver")
+	}
+	if allCutOver(gs(0, 4, 8, 0, 1)) {
+		t.Fatalf("2 of 4 cut over should not be allCutOver")
+	}
+	if !allCutOver(gs(0, 4, 8, 0, 1, 2, 3)) {
+		t.Fatalf("4 of 4 cut over should be allCutOver")
+	}
+}
+
+func TestShouldAdvanceArbiter(t *testing.T) {
+	if !shouldAdvanceArbiter(gs(1, 4, 0), stt(1, 4, 8, reshard.PlanNone)) {
+		t.Fatalf("steady at applied count with a farther target should advance")
+	}
+	if shouldAdvanceArbiter(gs(1, 4, 0), stt(1, 4, 4, reshard.PlanNone)) {
+		t.Fatalf("steady at target should NOT advance")
+	}
+	if shouldAdvanceArbiter(gs(0, 2, 4), stt(1, 4, 8, reshard.PlanSplit)) {
+		t.Fatalf("mid-split should NOT advance (non-contiguous safeguard)")
+	}
+	if shouldAdvanceArbiter(gs(0, 2, 0), stt(1, 4, 8, reshard.PlanSplit)) {
+		t.Fatalf("a node BEHIND the agreed count should NOT advance")
+	}
+}
+
+// TestReshardController_MarchesSplit_2to8 drives the real Arbiter together with
+// the pure controller functions through a full 2 -> 8 split, simulating the
+// per-unit cut-over the (not-yet-built) unit machinery performs. It proves the
+// state machine converges: each generation's split is entered, completed, and
+// finalized in order before the arbiter advances to the next.
+func TestReshardController_MarchesSplit_2to8(t *testing.T) {
+	store := storageunit.NewMemConditionalStore()
+	a := reshard.NewArbiter(store)
+	if _, err := a.Seed(storageunit.MustUnitCount(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Retarget(storageunit.MustUnitCount(8)); err != nil {
+		t.Fatal(err)
+	}
+
+	g := gs(0, 2, 0)
+	var splits int
+	for range 200 {
+		S, _, err := a.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Converged?
+		if g.count.N() == 8 && g.nextCount.IsZero() && S.Count.N() == 8 {
+			if splits != 2 {
+				t.Fatalf("2 -> 8 took %d split generations, want 2 (2->4->8)", splits)
+			}
+			return
+		}
+		// 1) Advance the agreed epoch when settled + behind target.
+		if shouldAdvanceArbiter(g, S) {
+			if _, _, err := a.Advance(); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		// 2) Reflect the agreed State into genState (enter in-flight / finalize).
+		if next, changed := reshardGenStep(g, S); changed {
+			if next.gen == g.gen+1 {
+				splits++
+			}
+			g = next
+			continue
+		}
+		// 3) Simulate the per-unit machinery completing every cut-over.
+		if !g.nextCount.IsZero() && !allCutOver(g) {
+			for _, u := range g.count.IDs() {
+				g.cutOver[u] = struct{}{}
+			}
+			continue
+		}
+		t.Fatalf("stuck: g=%+v S=%+v", g, S)
+	}
+	t.Fatalf("did not converge: g=%+v", g)
+}
