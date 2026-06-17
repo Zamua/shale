@@ -86,14 +86,23 @@ shared object store**, coordinated by conditional writes (`If-None-Match` /
 `If-Match` — the SAME MinIO/S3 CAS slatedb already relies on for manifest fencing,
 and that the SPEC already requires of the metadata store):
 
-- **`__reshard/epoch`** — `{epoch, count, plan, prevCount}`. To start a reshard, a
-  node that observes `agreed-desired != live-count` computes the next step
-  (`Double()` to split, `Halve()` to merge) and CAS-advances `epoch -> epoch+1`
-  with the new `(count, plan)`. Exactly one writer wins the conditional write;
-  every other node reads the winning `(epoch, count, plan)` and adopts it. This is
-  Redis's monotonic `configEpoch` made durable: **determinism + a CAS race replace
-  the elected coordinator.** A split and a merge cannot both claim `epoch+1` —
-  the CAS serializes them; the loser re-derives against the new epoch.
+- **`__reshard/epoch`** — `{v, epoch, count, target, plan}` (implemented in
+  `pkg/reshard`; `prevCount` is derived from `plan`, and `v` is a schema version
+  that makes a node fail closed on an unknown/newer object in a mixed-version
+  cluster). The agreed final **`target`** lives IN this durable object, not as a
+  per-node value: `Advance()` reads the target from the State and steps `count`
+  one generation toward it (`Double()` to split, `Halve()` to merge), CAS-advancing
+  `epoch -> epoch+1`. Exactly one writer wins; the rest read the winner and adopt.
+  This is Redis's monotonic `configEpoch` made durable: **determinism + a CAS race
+  replace the elected coordinator.** Declaring a new shard count is the explicit,
+  serialized **`Retarget()`** op (CAS the `target` field). Putting the target in
+  the single durable object is what prevents the **flap** the v2 review found: if
+  each node carried its own desired count, a rolling config change would let one
+  node split while another merges it back forever; with one agreed target every
+  node plans the same direction. **Non-contiguous-epoch invariant (Phase C):** the
+  reconcile advances ONE generation at a time and only after the current
+  generation's reshard is fully cut over — a node must never skip a generation's
+  split/merge work just because the epoch jumped while it was not looking.
 - **Per-unit cut-over markers** — `__reshard/cutover/g<gen>/u<K>` written (CAS,
   once) when unit `K`'s successors are **caught-up** (3.3). This durable marker —
   not node-local `cutOver` — is the per-unit flip signal *every* node observes
