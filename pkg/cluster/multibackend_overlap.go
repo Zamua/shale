@@ -91,17 +91,30 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	}
 
 	// RECLAIM half: a position this node is DRAINING (gave up on an earlier pass)
-	// but now holds in CURRENT again, while it is STILL mounted. This happens when
-	// the ring flip-flops a position back (e.g. a draining node's gradual gossip
-	// convergence, or a draining member that recovered). The drain is waiting for
-	// a SUCCESSOR's serving marker, but this node is the live holder again, so
+	// but now holds in CURRENT again AND back in PENDING, while it is STILL
+	// mounted. This happens when the ring flip-flops a position back (e.g. a
+	// draining member that recovered): the position re-enters this node's PENDING
+	// set, so it will keep it post-transition. The drain is waiting for a
+	// SUCCESSOR's serving marker, but this node is the stable holder again, so
 	// drainCheck would never release it and the position would be stranded in
 	// Draining forever. Abort the drain: clear the in-flight phase so the position
 	// returns to Owned (it has been mounted + serving the whole time, so no
 	// availability gap). Reads under mountMu; the phase clear takes the lock.
+	//
+	// The PENDING gate is load-bearing: a position in CURRENT but NOT in PENDING is
+	// being HANDED OFF (this node is itself draining, or a draining successor split
+	// moved it out of pending), so its drain MUST run to completion - it is never
+	// reclaimed. Without the pending check a gracefully-leaving node (still a ring
+	// member, hence still a CURRENT owner of all its positions) reclaims every
+	// position every tick and re-drains it, re-capturing a climbing open epoch each
+	// pass, so the release gate never catches the successor's marker and the drain
+	// hangs to the GracefulLeaveDrainTimeout (the real on-object-storage gap, #410).
 	for _, ru := range mounted {
 		if _, ok := currentSet[ru]; !ok {
 			continue
+		}
+		if _, inPending := pendingSet[ru]; !inPending {
+			continue // current-but-not-pending: being handed off, never reclaim.
 		}
 		if c.handoffPhaseOf(ru).Phase.IsLoser() {
 			c.reclaimDrainingPosition(ru)
@@ -132,10 +145,21 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 			c.beginDrain(ru)
 			continue
 		}
-		// Not in CURRENT at all: this node is no longer a live owner of this exact
-		// position. If it is already mid-transition (Draining), leave it to
-		// drainCheck. Otherwise plain clean-cut release (no successor mounts THIS
-		// node's exact slot; the surviving replicas cover W).
+		// Not in CURRENT at all. If it is in PENDING, this node is a SUCCESSOR
+		// holding the leaver's position as a pending mount (acquired + serving-
+		// marked, serving via the union): HOLD it - it becomes the stable owner the
+		// moment the draining member leaves (it then enters CURRENT and the steady-
+		// state branch keeps it). Releasing it here would tear down the very handoff
+		// target the leaver's drainCheck is polling, and the successor would churn
+		// release -> re-acquire -> re-mark at a climbing epoch, destabilizing the
+		// handoff (the successor-side half of the #410 oscillation).
+		if _, inPending := pendingSet[ru]; inPending {
+			continue
+		}
+		// Absent from BOTH current and pending: genuinely abandoned. If it is
+		// already mid-transition (Draining), leave it to drainCheck. Otherwise plain
+		// clean-cut release (no successor mounts THIS node's exact slot; the
+		// surviving replicas cover W).
 		if c.handoffPhaseOf(ru).Phase != 0 {
 			continue
 		}
