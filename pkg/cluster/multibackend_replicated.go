@@ -402,6 +402,13 @@ func (c *Cluster) putReplicatedUnit(key, value []byte) error {
 // writeAttempt the retry wrapper classifies (acks-met vs acquiring-shortfall
 // vs hard-failure). It carries no retry policy of its own.
 func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []byte) writeAttempt {
+	// v0.9 (decentralized online split): while a split is in flight, DUAL-WRITE
+	// to the key's parent + child generations, acking over the AUTHORITATIVE legs
+	// only (parent pre-cut-over, child after). Takes precedence over the
+	// single-generation path below; inactive (ok=false) when no split is running.
+	if legs, ok := c.routedReplicasForReshard(key); ok {
+		return c.putReshardDualWrite(ctx, legs, key, envBytes)
+	}
 	// v0.8 Phase 2e (pending ranges): route to the UNION of current + pending
 	// owners during a membership transition (DUAL-WRITE), but hold the ack bar W
 	// at the STABLE R quorum (over stableR = len(current)), NOT raised to cover
