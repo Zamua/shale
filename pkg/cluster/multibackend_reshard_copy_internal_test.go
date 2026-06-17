@@ -154,6 +154,79 @@ func TestCopyParentIntoChildren_RoutesAndLWW(t *testing.T) {
 	}
 }
 
+// TestCopyParentIntoSurvivor_ForwardsToLocalSurvivor exercises the cross-node
+// merge copy's local-leg path: it forwards a parent slot's keys into the survivor
+// and (at WriteOne, so the single local survivor-leg ack satisfies the quorum)
+// lands them in the local survivor replica. The full cross-node forward is
+// covered by the integration merge gate; this pins the routing + apply locally.
+func TestCopyParentIntoSurvivor_ForwardsToLocalSurvivor(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 8, 2, backing, "n1", "n2", "n3")
+	c.cfg.WriteConsistency = WriteOne // one local survivor-leg ack satisfies the quorum
+	c.peerClientsBlocked = true       // no gRPC peers in this white-box harness; remote legs fail fast
+	enterMerge(t, c)                  // 8 -> 4
+	gs := c.genSnapshot()
+
+	// Find a parent unit n1 owns whose survivor n1 ALSO replicates, so the forward
+	// has a local survivor leg.
+	var parentRU, survivorRU storageunit.ReplicaUnit
+	found := false
+	for _, p := range storageunit.MustUnitCount(8).IDs() {
+		pos, ok := c.localReplicaPos(storageunit.NewGenUnit(0, p))
+		if !ok {
+			continue
+		}
+		sID, err := storageunit.ParentUnit(p, storageunit.MustUnitCount(8))
+		if err != nil {
+			t.Fatal(err)
+		}
+		spos, sok := c.localReplicaPos(storageunit.NewGenUnit(1, sID))
+		if !sok {
+			continue
+		}
+		parentRU = storageunit.NewReplicaUnit(storageunit.NewGenUnit(0, p), pos)
+		survivorRU = storageunit.NewReplicaUnit(storageunit.NewGenUnit(1, sID), spos)
+		found = true
+		break
+	}
+	if !found {
+		t.Skip("no parent whose survivor is also owned by n1 in this topology")
+	}
+
+	for _, ru := range []storageunit.ReplicaUnit{parentRU, survivorRU} {
+		b, _, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
+		if err != nil {
+			t.Fatalf("open %v: %v", ru, err)
+		}
+		c.mountMap[ru] = b
+	}
+
+	keys := keysInUnit(t, c, parentRU.Unit.ID, storageunit.MustUnitCount(8), 5)
+	pb := c.mountMap[parentRU]
+	for _, k := range keys {
+		env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 7, NodeID: "n1"}, Payload: append([]byte("m-"), k...)})
+		if err := pb.Put(k, env); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if err := c.copyParentIntoSurvivor(parentRU, gs); err != nil {
+		t.Fatalf("copyParentIntoSurvivor: %v", err)
+	}
+
+	sb := c.mountMap[survivorRU]
+	for _, k := range keys {
+		got, err := sb.Get(k)
+		if err != nil {
+			t.Fatalf("survivor missing forwarded key %q: %v", k, err)
+		}
+		dec, _ := Decode(got)
+		if !bytes.Equal(dec.Payload, append([]byte("m-"), k...)) {
+			t.Fatalf("survivor key %q payload = %q", k, dec.Payload)
+		}
+	}
+}
+
 func TestCopyParentUntilCaughtUp_Clean(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2", "n3")

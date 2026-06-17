@@ -21,10 +21,21 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
-// mergeCopyTimeout bounds one parent-into-survivor copy pass (the cross-node
-// forwards). Generous because the pass forwards every key in the parent slot;
-// the in-memory gate completes far under this.
-const mergeCopyTimeout = 60 * time.Second
+// defaultReshardForwardTimeout bounds ONE cross-node merge forward when no
+// WriteTimeout is configured. Per-key (not per-pass) so a slow/down survivor leg
+// defers the parent's finalize after one RTT rather than holding the parent's
+// write-pause for a whole-pass timeout - the finalize re-tries on the next tick.
+const defaultReshardForwardTimeout = 5 * time.Second
+
+// reshardForwardTimeout is the per-forward deadline for the merge copy: the
+// configured WriteTimeout (so a finalize forward under the parent pause is bounded
+// like any write), falling back to the default.
+func (c *Cluster) reshardForwardTimeout() time.Duration {
+	if c.cfg.WriteTimeout > 0 {
+		return c.cfg.WriteTimeout
+	}
+	return defaultReshardForwardTimeout
+}
 
 // copyMaxPasses bounds the re-scan loop in copyParentUntilCaughtUp so continuous
 // write load (which keeps leaving a few un-delivered stragglers for the next
@@ -116,8 +127,6 @@ func (c *Cluster) copyParentIntoSurvivor(ru storageunit.ReplicaUnit, gs genState
 	}
 	defer func() { _ = it.Close() }()
 
-	ctx, cancel := context.WithTimeout(context.Background(), mergeCopyTimeout)
-	defer cancel()
 	for {
 		key, envBytes, nerr := it.Next()
 		if nerr != nil {
@@ -126,7 +135,14 @@ func (c *Cluster) copyParentIntoSurvivor(ru storageunit.ReplicaUnit, gs genState
 		if key == nil {
 			return nil
 		}
-		if err := c.forwardKeyQuorum(ctx, legs, key, envBytes); err != nil {
+		// Per-key deadline: a down survivor leg fails THIS forward after one
+		// WriteTimeout and aborts the pass, so finalize (which runs the copy under
+		// the parent's write-pause WLock) holds the pause for at most one RTT, not a
+		// whole-pass timeout. The next reconcile tick retries.
+		kctx, kcancel := context.WithTimeout(context.Background(), c.reshardForwardTimeout())
+		err := c.forwardKeyQuorum(kctx, legs, key, envBytes)
+		kcancel()
+		if err != nil {
 			return err
 		}
 	}

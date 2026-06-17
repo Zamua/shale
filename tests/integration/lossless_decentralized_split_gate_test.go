@@ -59,19 +59,35 @@ func genStatesOf(nodes []*sharedNode) string {
 }
 
 // pumpReconciles drives one reconcile tick on every node (the periodic self-heal
-// loop, accelerated for the test).
-func pumpReconciles(nodes []*sharedNode) {
-	for _, n := range nodes {
-		n.Cluster.TestingRunReconcile()
+// loop, accelerated for the test). When concurrent is true it drives all nodes'
+// reconciles SIMULTANEOUSLY (each on its own goroutine, as production does), so
+// two nodes can be in finalizeParent (pause + cross-node forward) at the same
+// instant - the cross-node-concurrency dimension a serial pump never exercises.
+func pumpReconciles(nodes []*sharedNode, concurrent bool) {
+	if !concurrent {
+		for _, n := range nodes {
+			n.Cluster.TestingRunReconcile()
+		}
+		return
 	}
+	var wg sync.WaitGroup
+	for _, n := range nodes {
+		wg.Add(1)
+		go func(n *sharedNode) {
+			defer wg.Done()
+			n.Cluster.TestingRunReconcile()
+		}(n)
+	}
+	wg.Wait()
 }
 
 type splitGateOpts struct {
-	forceUnclean  bool          // break-demo: flip + retire without copying
-	writeOne      bool          // WriteOne (single-slot ack) - the harshest loss regime
-	finalizeDelay time.Duration // widen the finalize retire window
-	startCount    int           // initial unit count (default 4)
-	targetCount   int           // declared count to converge to (default 2*startCount, a split)
+	forceUnclean        bool          // break-demo: flip + retire without copying
+	writeOne            bool          // WriteOne (single-slot ack) - the harshest loss regime
+	finalizeDelay       time.Duration // widen the finalize retire window
+	startCount          int           // initial unit count (default 4)
+	targetCount         int           // declared count to converge to (default 2*startCount, a split)
+	concurrentReconcile bool          // drive all nodes' reconciles simultaneously (cross-node overlap)
 }
 
 // runDecentralizedReshard drives a live, online reshard (split OR merge per
@@ -169,7 +185,7 @@ func runDecentralizedReshard(t *testing.T, opts splitGateOpts) splitGateResult {
 	// gen 1 (targetCount units), bounded.
 	deadline := time.Now().Add(45 * time.Second)
 	for !allAtGeneration(nodes, 1, uint32(targetCount)) {
-		pumpReconciles(nodes)
+		pumpReconciles(nodes, opts.concurrentReconcile)
 		if time.Now().After(deadline) {
 			stop.Store(true)
 			wg.Wait()
@@ -188,7 +204,7 @@ func runDecentralizedReshard(t *testing.T, opts splitGateOpts) splitGateResult {
 		n.Handle.SetAcquireDelay(0)
 	}
 	for range 60 {
-		pumpReconciles(nodes)
+		pumpReconciles(nodes, opts.concurrentReconcile)
 		time.Sleep(25 * time.Millisecond)
 	}
 
@@ -339,5 +355,25 @@ func TestDecentralizedMergeGate_WriteOneAcrossFinalize(t *testing.T) {
 		}
 	}
 	t.Logf("merge WriteOne-across-finalize: %d/%d acked, zero acked loss through a widened finalize window",
+		r.acked, r.attempted)
+}
+
+// TestDecentralizedMergeGate_ConcurrentReconcile drives all three nodes'
+// reconciles SIMULTANEOUSLY through the merge (not serially), so two nodes can be
+// in finalizeParent (parent write-pause + cross-node forward into the survivor) at
+// the same instant - the cross-node-concurrency dimension the serial pump cannot
+// reach (the review's P1-B). Run under -race it would surface any deadlock or data
+// race the merge's cross-node forwards introduce. Asserts ZERO acked loss.
+func TestDecentralizedMergeGate_ConcurrentReconcile(t *testing.T) {
+	r := runDecentralizedReshard(t, splitGateOpts{startCount: 8, targetCount: 4, concurrentReconcile: true})
+
+	assertNoAckedLoss(t, overlapGateResult{want: r.want, nodes: r.nodes})
+	for _, n := range r.nodes {
+		g, c := n.Cluster.GenStateSnapshot()
+		if g != 1 || c != 4 {
+			t.Fatalf("node %s ended at gen %d count %d, want gen 1 count 4", n.ID, g, c)
+		}
+	}
+	t.Logf("merge concurrent-reconcile: %d/%d acked, zero acked loss with all nodes finalizing concurrently",
 		r.acked, r.attempted)
 }
