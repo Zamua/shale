@@ -352,15 +352,25 @@ func Run(cfg RunConfig) error {
 		return errors.New("grpc serve returned unexpectedly")
 	}
 
-	// Graceful shutdown: stop accepting new RPCs, drain in-flight,
-	// then release backend resources.
+	// Graceful shutdown ORDER MATTERS for the overlap scale-down drain. Run
+	// c.Close() FIRST: it runs DrainForLeave at its top (while c.closed is still
+	// false), and the leaving node must keep RECEIVING UNION WRITES over its gRPC
+	// transport throughout that drain - the whole point of the overlap handoff
+	// (it serves W=quorum for its moving units alongside the stable replica, so
+	// the writes ride through instead of waiting on the successor mount). ONLY
+	// AFTER the drain + cluster teardown do we GracefulStop the gRPC server.
+	// DrainForLeave's own contract pins this: "the REAL membership.Leave() +
+	// transport Shutdown ... run AFTER this drain returns." The previous order
+	// (GracefulStop first) tore the transport down BEFORE the drain, so every
+	// union write a peer dual-wrote to this draining node got connection-refused
+	// for the entire drain window (W=quorum unmet on its moving units = the
+	// observed during-leave write blip).
+	if err := c.Close(); err != nil {
+		logger.Printf("shaled: cluster close: %v", err)
+	}
 	grpcServer.GracefulStop()
 	if err := <-serveErr; err != nil {
 		logger.Printf("shaled: grpc serve returned: %v", err)
-	}
-
-	if err := c.Close(); err != nil {
-		logger.Printf("shaled: cluster close: %v", err)
 	}
 	if closeOwned != nil {
 		if err := closeOwned(); err != nil {
