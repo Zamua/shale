@@ -188,6 +188,15 @@ func (c *Cluster) runReconcile() {
 // inside acquireUnit / releaseUnit take mountMu.
 func (c *Cluster) reconcileUnits() {
 	if c.replicaFactory != nil {
+		// v0.9 decentralized online reshard: when an Arbiter is wired (opt-in via
+		// ConditionalStore), drive this node's share of any in-flight split FIRST -
+		// enter/finalize the generation, copy owned parents into their children,
+		// publish/observe the durable markers, flip routing, retire finalized
+		// parents. No-op without an Arbiter / split, so the existing R>1 paths are
+		// unchanged. Run before the overlap reconcile so a just-entered split's
+		// children are in the desired set this same pass, and a just-finalized
+		// generation's redistribution runs against the advanced generation.
+		c.observeReshard()
 		// R>1 (replicated multi-backend, v0.8 Phase 2b): the desired set is the
 		// replica-set membership, not single ownership. This runs on the INITIAL
 		// multi-node convergence (each node mounting the units it replicates as
