@@ -259,6 +259,18 @@ type Config struct {
 	// and multibackend_handoff_retry.go (the single-attempt branch).
 	TestingForceCleanCut bool
 
+	// TestingForceUncleanReshard, when true, BREAKS the v0.9 decentralized split's
+	// no-acked-write-loss safeguard: the driver publishes a unit's caught-up +
+	// cut-over markers WITHOUT first copying the parent into its children, and
+	// finalize skips its final clean-copy backstop before retiring the parents. So
+	// the cluster flips routing to children + retires parents that never received
+	// the parents' data, and acked writes are dropped. It exists solely to keep the
+	// lossless-split oracle honest: the break-demo runs the SAME split with this
+	// set and asserts the oracle CATCHES the loss, proving the copy + caught-up
+	// gate is load-bearing rather than rubber-stamped. Test-only; no production
+	// code path sets this. See multibackend_reshard_driver.go.
+	TestingForceUncleanReshard bool
+
 	// GracefulLeaveDrainTimeout bounds the graceful-leave drain on shutdown
 	// (v0.8 Phase 2e, scale-down). When > 0 AND the cluster runs the
 	// multi-backend overlap path (multiReplicated()), Close() FIRST broadcasts

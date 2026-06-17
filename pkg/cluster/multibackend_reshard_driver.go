@@ -97,10 +97,15 @@ func (c *Cluster) driveSplitCopies(gs genState) {
 		if gs.hasCutOver(k) {
 			continue // already flipped; its copy is done
 		}
-		clean, err := c.copyParentUntilCaughtUp(ru, gs)
-		if err != nil || !clean {
-			continue
+		if !c.cfg.TestingForceUncleanReshard {
+			clean, err := c.copyParentUntilCaughtUp(ru, gs)
+			if err != nil || !clean {
+				continue
+			}
 		}
+		// BREAK-DEMO (TestingForceUncleanReshard): the copy above is skipped, so
+		// the markers below publish over children that never received the parent's
+		// data - the oracle must catch the resulting acked-write loss.
 		if err := c.publishCaughtupMarker(gs.gen, k, ru.Replica); err != nil {
 			continue
 		}
@@ -142,10 +147,12 @@ func (c *Cluster) observeCutoverMarkers(gs genState) {
 // any final copy is not clean this tick, finalize is deferred to the next tick.
 func (c *Cluster) finalizeSplit(gs genState) {
 	parents := c.ownedParentSlots(gs)
-	for _, ru := range parents {
-		clean, err := c.copyParentUntilCaughtUp(ru, gs)
-		if err != nil || !clean {
-			return // not safe to retire yet; retry next tick
+	if !c.cfg.TestingForceUncleanReshard {
+		for _, ru := range parents {
+			clean, err := c.copyParentUntilCaughtUp(ru, gs)
+			if err != nil || !clean {
+				return // not safe to retire yet; retry next tick
+			}
 		}
 	}
 	c.commitGenState(genState{
