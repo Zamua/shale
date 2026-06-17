@@ -163,10 +163,22 @@ func TestReshardGenStep(t *testing.T) {
 			wantChanged: false, wantGen: 1, wantCount: 4, wantNext: 0,
 		},
 		{
-			name:        "agreed count lower (merge): no change in split phase",
+			name:        "steady, agreed count lower: enter merge one step",
 			local:       gs(2, 8, 0),
 			S:           stt(3, 4, 2, reshard.PlanMerge),
-			wantChanged: false, wantGen: 2, wantCount: 8, wantNext: 0,
+			wantChanged: true, wantGen: 2, wantCount: 8, wantNext: 4,
+		},
+		{
+			name:        "non-contiguous merge: agreed two steps lower, still steps ONE gen",
+			local:       gs(3, 8, 0),
+			S:           stt(5, 2, 2, reshard.PlanMerge),
+			wantChanged: true, wantGen: 3, wantCount: 8, wantNext: 4,
+		},
+		{
+			name:        "merge all cut over: finalize to the halved generation",
+			local:       gs(2, 8, 4, 0, 1, 2, 3, 4, 5, 6, 7), // all 8 old units flipped
+			S:           stt(3, 4, 4, reshard.PlanMerge),
+			wantChanged: true, wantGen: 3, wantCount: 4, wantNext: 0,
 		},
 	}
 	for _, tc := range cases {
@@ -353,6 +365,57 @@ func TestReshardController_MarchesSplit_2to8(t *testing.T) {
 			continue
 		}
 		t.Fatalf("stuck: g=%+v S=%+v", g, S)
+	}
+	t.Fatalf("did not converge: g=%+v", g)
+}
+
+// TestReshardController_MarchesMerge_8to2 is the merge-direction analogue: the
+// controller + real Arbiter converge 8 -> 2 in two halving generations
+// (8 -> 4 -> 2), one generation entered, completed, and finalized before the
+// next.
+func TestReshardController_MarchesMerge_8to2(t *testing.T) {
+	store := storageunit.NewMemConditionalStore()
+	a := reshard.NewArbiter(store)
+	if _, err := a.Seed(storageunit.MustUnitCount(8)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Retarget(storageunit.MustUnitCount(2)); err != nil {
+		t.Fatal(err)
+	}
+
+	g := gs(0, 8, 0)
+	var merges int
+	for range 200 {
+		s, _, err := a.Read()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if g.count.N() == 2 && g.nextCount.IsZero() && s.Count.N() == 2 {
+			if merges != 2 {
+				t.Fatalf("8 -> 2 took %d merge generations, want 2 (8->4->2)", merges)
+			}
+			return
+		}
+		if shouldAdvanceArbiter(g, s) {
+			if _, _, err := a.Advance(); err != nil {
+				t.Fatal(err)
+			}
+			continue
+		}
+		if next, changed := reshardGenStep(g, s); changed {
+			if next.gen == g.gen+1 {
+				merges++
+			}
+			g = next
+			continue
+		}
+		if !g.nextCount.IsZero() && !allCutOver(g) {
+			for _, u := range g.count.IDs() {
+				g.cutOver[u] = struct{}{}
+			}
+			continue
+		}
+		t.Fatalf("stuck: g=%+v s=%+v", g, s)
 	}
 	t.Fatalf("did not converge: g=%+v", g)
 }

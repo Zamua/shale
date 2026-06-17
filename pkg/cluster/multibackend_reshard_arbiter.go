@@ -68,12 +68,12 @@ func (c *Cluster) initReshardArbiter() error {
 //
 //  2. ENTER IN-FLIGHT, one generation at a time. When steady (nextCount == 0)
 //     and the agreed count differs from ours, begin the immediate next step
-//     toward it: a split sets nextCount = count.Double(). Crucially it steps to
-//     OUR next generation's count (count*2), NOT S.Count, and never reads
-//     S.Epoch - so a node that was asleep while the agreed count moved several
-//     steps still performs each intermediate split in order (the
-//     non-contiguous-epoch invariant: never skip a generation's work). Merge
-//     (S.Count < count) is handled in the merge phase; here it is a no-op.
+//     toward it: a split sets nextCount = count.Double(), a merge sets
+//     nextCount = count.Halve(). Crucially it steps to OUR next generation's
+//     count (count*2 or count/2), NOT S.Count, and never reads S.Epoch - so a
+//     node that was asleep while the agreed count moved several steps still
+//     performs each intermediate generation in order (the non-contiguous-epoch
+//     invariant: never skip a generation's work).
 //
 // changed reports whether next differs from local (whether the caller should
 // commitGenState).
@@ -88,7 +88,8 @@ func reshardGenStep(local genState, S reshard.State) (next genState, changed boo
 		}
 		return local, false // mid-split: the per-unit machinery is still working
 	}
-	if S.Count.N() > local.count.N() {
+	switch {
+	case S.Count.N() > local.count.N(): // SPLIT one generation toward the agreed count
 		nc, err := local.count.Double()
 		if err != nil {
 			return local, false // already at MaxUnitCount; cannot split further
@@ -96,9 +97,16 @@ func reshardGenStep(local genState, S reshard.State) (next genState, changed boo
 		next = local.clone()
 		next.nextCount = nc
 		return next, true
+	case S.Count.N() < local.count.N(): // MERGE one generation toward the agreed count
+		nc, err := local.count.Halve()
+		if err != nil {
+			return local, false // already at MinUnitCount; cannot merge further
+		}
+		next = local.clone()
+		next.nextCount = nc
+		return next, true
 	}
-	// S.Count < local.count is a merge (Phase D); S.Count == local.count is
-	// steady at the agreed count. Neither changes genState here.
+	// S.Count == local.count: steady at the agreed count, no change.
 	return local, false
 }
 
