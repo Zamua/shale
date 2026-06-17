@@ -128,8 +128,18 @@ deterministically derives `K -> {K, K+N}` (`ChildUnits`). Extend the desired-set
 derivation so the gen-(g+1) child positions this node's ring owns enter its
 **pending** set (close blocking hole 4 / the #1 gap): mirror `desiredGenUnits`'
 cut-over-child branch into the R>1 `desiredReplicaUnits` /
-`desiredPendingReplicaUnits`, keyed on the live epoch's `nextCount`. The existing
-`reconcileReplicaUnitsOverlap` ACQUIRE half then background-mounts each child as a
+`desiredPendingReplicaUnits`, keyed on the live epoch's `nextCount`.
+
+**Refinement (grounding C2, NOT a literal `desiredGenUnits` mirror):**
+`desiredGenUnits` adds a unit's children only AFTER that unit cuts over
+(`for u := range gs.cutOver`), because the coordinated bisect cuts over and adds
+children atomically. The decentralized split is the opposite order: a child must
+MOUNT and dual-receive during the whole online copy, BEFORE cut-over. So while a
+reshard is in flight (`nextCount != 0`), desire the gen-(g+1) children of EVERY
+old unit this node owns on the ring (the whole key-space is doubling), not just
+the cut-over ones; the `cutOver` set then governs ROUTING (which generation
+serves a key), not which children are mounted. The existing
+`reconcileReplicaUnitsOverlap` ACQUIRE half background-mounts each child as a
 fresh disjoint DB (`acquireInFlight`-guarded), with the in-flight child placed in
 the desired set the instant it mounts so the self-heal reconcile never RELEASEs it
 (close major hole: self-heal vs in-flight).
