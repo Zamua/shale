@@ -39,13 +39,18 @@ type reshardLegs struct {
 	stableR int             // R; the ack bar is requiredWriteAcks over this
 }
 
-// routedReplicasForReshard resolves a key during an in-flight split to its
-// dual-write legs. ok is false when no split is in flight (nextCount zero), so
+// routedReplicasForReshard resolves a key during an in-flight reshard to its
+// dual-write legs. ok is false when no reshard is in flight (nextCount zero), so
 // the caller falls back to the single-generation routedReplicas* path.
 //
-// Parent and child legs share the parent member set (co-location), so the same R
-// nodes are touched, each at two ReplicaUnits (parent gen and child gen). Which
-// set is authoritative follows this node's local cut-over view for K.
+// A write dual-writes to its gen-g PARENT and the one gen-(g+1) OTHER unit it
+// hashes into at nextCount (a SPLIT child, or a MERGE survivor - both are
+// UnitForHash(h, nextCount) at gen+1). The two differ only in where the other
+// unit lives: a split child is CO-LOCATED at the parent's slots (local copy +
+// dual-write), a merge survivor lives at its OWN gen-(g+1) ring home (the
+// two-source copy + dual-write are cross-node, since two parents collapse into
+// one survivor on different nodes). The ack bar is over the AUTHORITATIVE legs:
+// the parent until this node observes K's cut-over marker, the other unit after.
 func (c *Cluster) routedReplicasForReshard(key []byte) (reshardLegs, bool) {
 	gs := c.genSnapshot()
 	if gs.nextCount.IsZero() {
@@ -54,20 +59,26 @@ func (c *Cluster) routedReplicasForReshard(key []byte) (reshardLegs, bool) {
 	h := storageunit.HashShardKey(c.shardKey(key))
 	k := storageunit.UnitForHash(h, gs.count)
 	parentGU := storageunit.NewGenUnit(gs.gen, k)
-	childGU := storageunit.NewGenUnit(gs.gen+1, storageunit.UnitForHash(h, gs.nextCount))
+	otherGU := storageunit.NewGenUnit(gs.gen+1, storageunit.UnitForHash(h, gs.nextCount))
 
-	members := c.unitReplicas(parentGU) // co-location: child shares these slots
-	if len(members) == 0 {
+	parentMembers := c.unitReplicas(parentGU)
+	if len(parentMembers) == 0 {
 		return reshardLegs{}, false
 	}
-	parentLegs := legsAt(parentGU, members)
-	childLegs := legsAt(childGU, members)
+	parentLegs := legsAt(parentGU, parentMembers)
 
-	legs := reshardLegs{stableR: len(members)}
-	if gs.hasCutOver(k) {
-		legs.auth, legs.supp = childLegs, parentLegs
+	var otherLegs []routedReplica
+	if gs.nextCount.N() > gs.count.N() {
+		otherLegs = legsAt(otherGU, parentMembers) // SPLIT: child co-located at the parent's slots
 	} else {
-		legs.auth, legs.supp = parentLegs, childLegs
+		otherLegs = legsAt(otherGU, c.unitReplicas(otherGU)) // MERGE: survivor at its own gen+1 ring home
+	}
+
+	legs := reshardLegs{stableR: len(parentMembers)}
+	if gs.hasCutOver(k) {
+		legs.auth, legs.supp = otherLegs, parentLegs
+	} else {
+		legs.auth, legs.supp = parentLegs, otherLegs
 	}
 	return legs, true
 }

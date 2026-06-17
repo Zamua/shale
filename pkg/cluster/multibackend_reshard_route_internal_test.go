@@ -67,6 +67,58 @@ func TestRoutedReplicasForReshard(t *testing.T) {
 	}
 }
 
+func TestRoutedReplicasForReshard_Merge(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 8, 2, backing, "n1", "n2", "n3")
+	enterMerge(t, c) // 8 -> 4
+
+	key := []byte("merge-key")
+	legs, ok := c.routedReplicasForReshard(key)
+	if !ok {
+		t.Fatalf("merge in flight: want ok=true")
+	}
+	if legs.stableR != 2 {
+		t.Fatalf("stableR=%d, want 2", legs.stableR)
+	}
+	h := storageunit.HashShardKey(c.shardKey(key))
+	parent := storageunit.UnitForHash(h, storageunit.MustUnitCount(8))
+	survivor := storageunit.UnitForHash(h, storageunit.MustUnitCount(4))
+
+	// Pre-cut-over: auth = parent (gen 0, count-8 unit), supp = survivor (gen 1).
+	for _, l := range legs.auth {
+		if l.ru.Unit.Gen != 0 || l.ru.Unit.ID != parent {
+			t.Fatalf("auth leg = %v, want gen0 parent unit %d", l.ru, parent)
+		}
+	}
+	for _, l := range legs.supp {
+		if l.ru.Unit.Gen != 1 || l.ru.Unit.ID != survivor {
+			t.Fatalf("supp leg = %v, want gen1 survivor unit %d", l.ru, survivor)
+		}
+	}
+	// The survivor legs use the survivor's OWN gen-1 ring members (its home), not
+	// the parent's slots - the two-source merge copy/dual-write is cross-node.
+	survivorMembers := c.unitReplicas(storageunit.NewGenUnit(1, survivor))
+	if len(legs.supp) != len(survivorMembers) {
+		t.Fatalf("survivor legs=%d, want %d (its gen-1 ring set)", len(legs.supp), len(survivorMembers))
+	}
+	for i, l := range legs.supp {
+		if l.member.ID != survivorMembers[i].ID {
+			t.Fatalf("survivor leg %d on %s, want %s (gen-1 ring home)", i, l.member.ID, survivorMembers[i].ID)
+		}
+	}
+
+	// Post-cut-over: auth flips to the survivor.
+	g := c.genSnapshot().clone()
+	g.cutOver[parent] = struct{}{}
+	c.commitGenState(g)
+	legs2, _ := c.routedReplicasForReshard(key)
+	for _, l := range legs2.auth {
+		if l.ru.Unit.Gen != 1 {
+			t.Fatalf("post-cutover auth = %v, want gen1 survivor authoritative", l.ru)
+		}
+	}
+}
+
 func TestPutReshardDualWrite_LandsInBothGenerations(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2", "n3")
