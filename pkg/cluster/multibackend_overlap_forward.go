@@ -124,9 +124,19 @@ func (c *Cluster) LocalReplicaDeleteAt(ru storageunit.ReplicaUnit, key, _ []byte
 // race. A stale mount (the entry was evicted mid-apply) is evicted + reported as
 // acquiring so the originator retries.
 func (c *Cluster) applyEnvelopeIfNewerToBackend(b backend.Backend, ru storageunit.ReplicaUnit, key, incomingEnvBytes []byte) error {
+	_, err := c.applyEnvelopeIfNewerToBackendReport(b, ru, key, incomingEnvBytes)
+	return err
+}
+
+// applyEnvelopeIfNewerToBackendReport is applyEnvelopeIfNewerToBackend that also
+// reports whether the incoming envelope was actually APPLIED (its stamp strictly
+// beat the stored one / there was no stored value). The v0.9 online split copy
+// uses the bool to detect a CLEAN re-scan pass (applied nothing == the child
+// already holds everything the parent holds at this instant).
+func (c *Cluster) applyEnvelopeIfNewerToBackendReport(b backend.Backend, ru storageunit.ReplicaUnit, key, incomingEnvBytes []byte) (applied bool, err error) {
 	incoming, err := Decode(incomingEnvBytes)
 	if err != nil {
-		return err
+		return false, err
 	}
 
 	c.applyMu.Lock()
@@ -135,7 +145,7 @@ func (c *Cluster) applyEnvelopeIfNewerToBackend(b backend.Backend, ru storageuni
 	tx, err := b.Begin(backend.SnapshotIsolation)
 	if err != nil {
 		c.evictStaleMount(ru, b)
-		return errUnitAcquiring("Put")
+		return false, errUnitAcquiring("Put")
 	}
 	committed := false
 	defer func() {
@@ -146,16 +156,16 @@ func (c *Cluster) applyEnvelopeIfNewerToBackend(b backend.Backend, ru storageuni
 
 	apply, aerr := txApplyIfNewer(tx, key, incoming.Stamp)
 	if aerr != nil {
-		return c.fenceToTransient(ru, b, "Put", aerr)
+		return false, c.fenceToTransient(ru, b, "Put", aerr)
 	}
 	if apply {
 		if err := tx.Put(key, incomingEnvBytes); err != nil {
-			return c.fenceToTransient(ru, b, "Put", err)
+			return false, c.fenceToTransient(ru, b, "Put", err)
 		}
 	}
 	if err := tx.Commit(); err != nil {
-		return c.fenceToTransient(ru, b, "Put", err)
+		return false, c.fenceToTransient(ru, b, "Put", err)
 	}
 	committed = true
-	return nil
+	return apply, nil
 }
