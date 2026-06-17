@@ -142,7 +142,12 @@ func (c *Cluster) allOwnedPositionsHandedOff() bool {
 	c.mountMu.RUnlock()
 
 	for _, ru := range mounted {
-		open := c.openEpochForReplica(ru)
+		// Gate on THIS node's OWN open epoch (the recorded factory return), NOT the
+		// live durable: the durable climbs as the successor opens, which would push
+		// `open` up to the successor's serving-marker epoch and make this gate (a
+		// strict marker > open) stay false forever - the leave would never complete
+		// and the preStop drain would run to its timeout (the #410 availability gap).
+		open := c.ownOpenEpoch(ru)
 		markerEpoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
 		if err != nil || !ok || markerEpoch <= open {
 			// No successor serving this position above the leaver's epoch yet: still

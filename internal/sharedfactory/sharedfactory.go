@@ -344,11 +344,11 @@ func (h *Handle) SetAcquireDelay(d time.Duration) {
 // prior writes, and so its writes start failing the instant a higher-epoch
 // owner of the same position acquires it. Distinct replica positions are
 // independent stores: opening replica 1 never touches replica 0.
-func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, error) {
+func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
 	h.mu.Lock()
 	if cur, held := h.openReplica[ru]; held && epoch <= cur {
 		h.mu.Unlock()
-		return nil, fmt.Errorf("sharedfactory: replica %s already open on this handle at epoch %d, refusing open at %d", ru, cur, epoch)
+		return nil, 0, fmt.Errorf("sharedfactory: replica %s already open on this handle at epoch %d, refusing open at %d", ru, cur, epoch)
 	}
 	h.mu.Unlock()
 
@@ -364,7 +364,9 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	h.mu.Lock()
 	h.openReplica[ru] = opened
 	h.mu.Unlock()
-	return &fencedReplicaBackend{backing: h.backing, unit: ru, epoch: opened, store: store}, nil
+	// opened is the EXACT fence epoch this open landed at (max(intended,
+	// durable+1)); the caller uses it as this node's open epoch.
+	return &fencedReplicaBackend{backing: h.backing, unit: ru, epoch: opened, store: store}, opened, nil
 }
 
 // DurableEpochReplica reports replica ru's DURABLE writer-epoch from the

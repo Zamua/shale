@@ -241,10 +241,23 @@ func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
 	delete(c.handoffPhase, ru) // mounted + no phase = Owned (serving locally).
 	c.mountMu.Unlock()
 
-	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at the
-	// durable open epoch - exactly what the in-goroutine flip would have written.
-	openedEpoch := c.openEpochForReplica(ru)
-	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at THIS
+	// node's EXACT open epoch (the recorded factory return) - exactly what the
+	// in-goroutine flip would have written, NOT a re-read of the climbing durable.
+	_ = c.replicaFactory.WriteServingMarker(ru, c.ownOpenEpoch(ru))
+}
+
+// ownOpenEpoch returns the EXACT epoch this node opened ru at (recorded from
+// OpenReplicaUnit's return value), which is the drain-release gate AND the
+// serving-marker epoch. It falls back to the live durable epoch ONLY if no open
+// epoch was recorded (defensive; a mounted position this node opened always has
+// one). It must NOT be replaced by openEpochForReplica at the call sites: that
+// re-reads the shared, climbing durable, which is the bug this fix removes.
+func (c *Cluster) ownOpenEpoch(ru storageunit.ReplicaUnit) storageunit.Epoch {
+	if v, ok := c.myOpenEpoch.Load(ru); ok {
+		return v.(storageunit.Epoch)
+	}
+	return c.openEpochForReplica(ru)
 }
 
 // desiredPendingReplicaUnits returns the positions this node owns under the
@@ -340,7 +353,12 @@ func (c *Cluster) handoffPhaseOf(ru storageunit.ReplicaUnit) storageunit.Handoff
 // the serving marker against it. Caller holds reconcileMu; the phase write takes
 // mountMu.
 func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
-	open := c.openEpochForReplica(ru)
+	// Gate the drain on THIS node's EXACT open epoch (recorded from the factory
+	// return), NOT the live durable: the live durable climbs as the SUCCESSOR
+	// opens, which would push the release threshold above the successor's serving
+	// marker and hang the drain to its timeout (the graceful-scale-down
+	// availability gap). The recorded value is stable across reclaim/re-drain.
+	open := c.ownOpenEpoch(ru)
 	c.mountMu.Lock()
 	if _, mounted := c.mountMap[ru]; !mounted {
 		// Lost the mount under us (a concurrent evict); nothing to drain.
@@ -463,7 +481,7 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 // deterministic blocking behavior. It must NOT be called while holding mountMu
 // (it takes mountMu for the flip).
 func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) {
-	b, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
+	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 	if err != nil {
 		// SELF-HEAL the same factory/cluster desync as the clean-cut path (#408):
 		// this position is mid-acquire with no mount installed yet, so if the
@@ -471,7 +489,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		// open"), that handle state is stale - close it to re-sync, then reopen
 		// once. Safe: no mount entry points at the stale handle.
 		_ = c.replicaFactory.CloseReplicaUnit(ru)
-		b, err = c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
+		b, openedEpoch, err = c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 		if err != nil {
 			// Mount still failing; stay Acquiring. The position is not stranded: the
 			// old owner is still a routed current owner serving via the union.
@@ -481,7 +499,11 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	}
 	c.lastAcquireErr.Delete(ru)
 
-	openedEpoch := c.openEpochForReplica(ru)
+	// openedEpoch is THIS node's EXACT open epoch (factory return), used as the
+	// serving-marker epoch + recorded as this node's drain gate. NOT a re-read of
+	// the climbing durable. Record it before the mount flip so a beginDrain that
+	// sees mountMap[ru] also sees the epoch.
+	c.myOpenEpoch.Store(ru, openedEpoch)
 
 	// THE MOUNT FLIP: insert the mount entry + advance the phase to Ready under
 	// ONE mountMu hold so a routed op never sees the mount present without the
@@ -489,6 +511,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	c.mountMu.Lock()
 	if c.closed.Load() {
 		c.mountMu.Unlock()
+		c.myOpenEpoch.Delete(ru) // no mount installed; don't leak the recorded epoch.
 		_ = c.replicaFactory.CloseReplicaUnit(ru)
 		return
 	}
@@ -613,6 +636,7 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	}
 	// Exactly-once CAS-delete: only this critical section removes THIS entry.
 	delete(c.mountMap, ru)
+	c.myOpenEpoch.Delete(ru) // released; a re-acquire records a fresh open epoch.
 	// Drop the phase entry: Releasing is transient, the steady state after the
 	// release is Absent (no mount, no phase). next validates the edge; we converge
 	// straight to Absent.

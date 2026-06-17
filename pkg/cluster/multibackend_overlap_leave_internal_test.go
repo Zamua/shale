@@ -28,7 +28,7 @@ func seedOwnedPositions(t *testing.T, c *Cluster, backing *sharedfactory.Backing
 	}
 	h := backing.Handle()
 	for _, target := range desired {
-		b, err := h.OpenReplicaUnit(target, 1)
+		b, _, err := h.OpenReplicaUnit(target, 1)
 		if err != nil {
 			t.Fatalf("seed mount %v: %v", target, err)
 		}
@@ -143,7 +143,7 @@ func TestLeave_ownedPositionCount(t *testing.T) {
 	}
 	h := backing.Handle()
 	target := ru(0, 0, 0)
-	b, err := h.OpenReplicaUnit(target, 1)
+	b, _, err := h.OpenReplicaUnit(target, 1)
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}

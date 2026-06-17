@@ -553,11 +553,11 @@ func TestFactory_OpenReplicaUnit_IndependentPositions(t *testing.T) {
 	r0 := storageunit.NewReplicaUnit(unit, 0)
 	r1 := storageunit.NewReplicaUnit(unit, 1)
 
-	be0, err := h.OpenReplicaUnit(r0, storageunit.Epoch(1))
+	be0, _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("open replica 0: %v", err)
 	}
-	be1, err := h.OpenReplicaUnit(r1, storageunit.Epoch(1))
+	be1, _, err := h.OpenReplicaUnit(r1, storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("open replica 1: %v", err)
 	}
@@ -609,11 +609,11 @@ func TestFactory_OpenReplicaUnit_IndependentPositions(t *testing.T) {
 		t.Fatalf("close r1: %v", err)
 	}
 
-	re0, err := h.OpenReplicaUnit(r0, storageunit.Epoch(2))
+	re0, _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(2))
 	if err != nil {
 		t.Fatalf("reopen r0: %v", err)
 	}
-	re1, err := h.OpenReplicaUnit(r1, storageunit.Epoch(2))
+	re1, _, err := h.OpenReplicaUnit(r1, storageunit.Epoch(2))
 	if err != nil {
 		t.Fatalf("reopen r1: %v", err)
 	}
@@ -646,19 +646,19 @@ func TestFactory_ReplicaDoubleOpenRejected(t *testing.T) {
 	h := b.Handle()
 	r0 := storageunit.NewReplicaUnit(gu(0, 4), 0)
 
-	if _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(5)); err != nil {
+	if _, _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(5)); err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(5)); err == nil {
+	if _, _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(5)); err == nil {
 		t.Fatalf("re-open at the same epoch should be rejected (double-open), got nil")
 	}
-	if _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(6)); err == nil {
+	if _, _, err := h.OpenReplicaUnit(r0, storageunit.Epoch(6)); err == nil {
 		t.Fatalf("re-open at a higher epoch (without CloseReplicaUnit) should be rejected, got nil")
 	}
 	// Opening a DIFFERENT position of the same unit is NOT a double-open: the
 	// positions are independent.
 	r1 := storageunit.NewReplicaUnit(gu(0, 4), 1)
-	if _, err := h.OpenReplicaUnit(r1, storageunit.Epoch(5)); err != nil {
+	if _, _, err := h.OpenReplicaUnit(r1, storageunit.Epoch(5)); err != nil {
 		t.Fatalf("opening a different position should succeed: %v", err)
 	}
 	// CloseReplicaUnit clears the slot; closing a position not held is a no-op.

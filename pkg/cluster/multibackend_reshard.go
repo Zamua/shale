@@ -264,6 +264,7 @@ func (c *Cluster) evictStaleMount(ru storageunit.ReplicaUnit, failed backend.Bac
 	evicted := false
 	if cur, ok := c.mountMap[ru]; ok && cur == failed {
 		delete(c.mountMap, ru)
+		c.myOpenEpoch.Delete(ru) // re-acquire records a fresh open epoch.
 		evicted = true
 	}
 	c.mountMu.Unlock()

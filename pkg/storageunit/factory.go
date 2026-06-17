@@ -118,7 +118,15 @@ type ReplicaBackendFactory interface {
 	// node holding one position leaves the other a complete copy. Epoch
 	// semantics match OpenUnit (open higher to fence a prior writer of the SAME
 	// replica position).
-	OpenReplicaUnit(ru ReplicaUnit, epoch Epoch) (backend.Backend, error)
+	//
+	// It RETURNS the EXACT epoch it opened at (the fence epoch
+	// max(intended, durableEpochReplica+1)). The caller MUST use this returned
+	// value as "the epoch this node opened the position at" - for the
+	// drain-release gate and the serving marker - rather than re-reading
+	// DurableEpochReplica, which is a SHARED monotone counter that any node's
+	// later open bumps (a re-read is a moving target). The returned epoch is
+	// fixed for the life of this mount.
+	OpenReplicaUnit(ru ReplicaUnit, epoch Epoch) (backend.Backend, Epoch, error)
 
 	// CloseReplicaUnit releases the durable database for replica position
 	// ru.Replica of unit ru.Unit, WITHOUT affecting any other replica or unit.

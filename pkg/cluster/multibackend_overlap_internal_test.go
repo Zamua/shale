@@ -134,7 +134,7 @@ func TestOverlap_Reconcile_DrainSplit_SetsDrainingKeepsMount(t *testing.T) {
 	}
 	h := backing.Handle()
 	for _, target := range current {
-		b, err := h.OpenReplicaUnit(target, 1)
+		b, _, err := h.OpenReplicaUnit(target, 1)
 		if err != nil {
 			t.Fatalf("seed mount %v: %v", target, err)
 		}
@@ -165,7 +165,7 @@ func TestOverlap_Reconcile_PlainDropOut_Releases(t *testing.T) {
 	// current nor the pending set (R=2, index 5 has no holder).
 	target := ru(0, 0, 5)
 	h := backing.Handle()
-	b, err := h.OpenReplicaUnit(target, 1)
+	b, _, err := h.OpenReplicaUnit(target, 1)
 	if err != nil {
 		t.Fatalf("seed mount: %v", err)
 	}
@@ -203,7 +203,7 @@ func TestOverlap_Reconcile_PendingOwner_AcquiresAndMarks(t *testing.T) {
 	// Mount the positions self currently owns (it is a current owner of them).
 	h := backing.Handle()
 	for _, target := range current {
-		b, err := h.OpenReplicaUnit(target, 1)
+		b, _, err := h.OpenReplicaUnit(target, 1)
 		if err != nil {
 			t.Fatalf("seed current mount %v: %v", target, err)
 		}
@@ -299,7 +299,7 @@ func TestOverlap_drainCheck_ReleasesOnServingMarker(t *testing.T) {
 
 	target := ru(0, 0, 0)
 	h := backing.Handle()
-	b, err := h.OpenReplicaUnit(target, 1) // open epoch 1 on self
+	b, _, err := h.OpenReplicaUnit(target, 1) // open epoch 1 on self
 	if err != nil {
 		t.Fatalf("seed mount: %v", err)
 	}
@@ -346,7 +346,7 @@ func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 	h := backing.Handle()
 
 	// 1) self GAINED ru at open epoch E and wrote its own serving marker at E.
-	b, err := h.OpenReplicaUnit(target, E)
+	b, _, err := h.OpenReplicaUnit(target, E)
 	if err != nil {
 		t.Fatalf("seed gain mount: %v", err)
 	}
@@ -372,7 +372,7 @@ func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 	// 3) a genuine SUCCESSOR opens at durable+1 and writes a marker STRICTLY above
 	//    E. Now drainCheck must release.
 	h2 := backing.Handle()
-	if _, err := h2.OpenReplicaUnit(target, E+1); err != nil {
+	if _, _, err := h2.OpenReplicaUnit(target, E+1); err != nil {
 		t.Fatalf("successor open: %v", err)
 	}
 	if err := h2.WriteServingMarker(target, E+1); err != nil {
@@ -397,7 +397,7 @@ func TestOverlap_drainCheck_NeverReleasesOnBareFenceEpoch(t *testing.T) {
 
 	target := ru(0, 0, 0)
 	h := backing.Handle()
-	b, err := h.OpenReplicaUnit(target, 1)
+	b, _, err := h.OpenReplicaUnit(target, 1)
 	if err != nil {
 		t.Fatalf("seed mount: %v", err)
 	}
@@ -407,7 +407,7 @@ func TestOverlap_drainCheck_NeverReleasesOnBareFenceEpoch(t *testing.T) {
 	// Simulate a new owner FENCING (advancing the durable epoch) WITHOUT ever
 	// writing the serving marker (it crashed mid-mount).
 	h2 := backing.Handle()
-	if _, err := h2.OpenReplicaUnit(target, 5); err != nil {
+	if _, _, err := h2.OpenReplicaUnit(target, 5); err != nil {
 		t.Fatalf("fence open: %v", err)
 	}
 	if got, _ := h.DurableEpochReplica(target); got < 5 {

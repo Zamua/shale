@@ -65,7 +65,7 @@ func TestServingMarker_WriteBeforeFenceVisibleAfterHandoff(t *testing.T) {
 	p := ruSM(3, 1)
 
 	// OLD acquires P at epoch 1 and writes a recorded, acked dataset.
-	beOld, err := oldOwner.OpenReplicaUnit(p, storageunit.Epoch(1))
+	beOld, _, err := oldOwner.OpenReplicaUnit(p, storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("OLD OpenReplicaUnit: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestServingMarker_WriteBeforeFenceVisibleAfterHandoff(t *testing.T) {
 		t.Fatalf("DurableEpochReplica: %v", err)
 	}
 	openEpoch := durable + 1
-	beNew, err := newOwner.OpenReplicaUnit(p, openEpoch)
+	beNew, _, err := newOwner.OpenReplicaUnit(p, openEpoch)
 	if err != nil {
 		t.Fatalf("NEW OpenReplicaUnit: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestServingMarker_ForwardConcurrentWithFlipVisibleAfterHandoff(t *testing.T
 	newOwner := b.Handle()
 	p := ruSM(4, 0)
 
-	beOld, err := oldOwner.OpenReplicaUnit(p, storageunit.Epoch(1))
+	beOld, _, err := oldOwner.OpenReplicaUnit(p, storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("OLD OpenReplicaUnit: %v", err)
 	}
@@ -187,7 +187,7 @@ func TestServingMarker_ForwardConcurrentWithFlipVisibleAfterHandoff(t *testing.T
 		t.Fatalf("DurableEpochReplica: %v", err)
 	}
 	openEpoch := durable + 1
-	beNew, err := newOwner.OpenReplicaUnit(p, openEpoch)
+	beNew, _, err := newOwner.OpenReplicaUnit(p, openEpoch)
 	if err != nil {
 		t.Fatalf("NEW OpenReplicaUnit: %v", err)
 	}

@@ -699,7 +699,7 @@ func (h *Handle) CloseUnit(gu storageunit.GenUnit) error {
 // The whole open runs under a per-ru latch so a same-position concurrent open
 // SERIALIZES rather than both passing a stale held-check around the slow
 // slatedb open. Opens of different positions proceed concurrently.
-func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, error) {
+func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
 	latch := h.latchForReplica(ru)
 	latch.Lock()
 	defer latch.Unlock()
@@ -708,7 +708,7 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	cur, held := h.openReplica[ru]
 	h.mu.Unlock()
 	if held {
-		return nil, fmt.Errorf("slate: replica %s already open on this handle at epoch %d; CloseReplicaUnit first to re-open", ru, cur.epoch)
+		return nil, 0, fmt.Errorf("slate: replica %s already open on this handle at epoch %d; CloseReplicaUnit first to re-open", ru, cur.epoch)
 	}
 
 	// FENCE <= RECOVERY ORDERING INVARIANT (v0.8 Phase 2e, NEW-P1-4). The new
@@ -751,18 +751,20 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	// pins pass on real slate, Phase 2e is BLOCKED per the spec's P0 gate.
 	opened, err := h.backing.fenceEpochReplica(ru, epoch)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	s, err := h.backing.openSlateReplica(ru)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 
 	h.mu.Lock()
 	h.openReplica[ru] = &mountedUnit{slate: s, epoch: opened}
 	h.mu.Unlock()
-	return s, nil
+	// opened is the EXACT fence epoch this open landed at; the caller uses it as
+	// this node's open epoch (gate + serving marker), never re-reading the durable.
+	return s, opened, nil
 }
 
 // WriteServingMarker writes replica ru's durable serving marker carrying epoch

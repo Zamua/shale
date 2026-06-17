@@ -139,11 +139,12 @@ func (c *Cluster) desiredReplicaUnits() []storageunit.ReplicaUnit {
 // cleanly. Caller (initMultiBackend) has already wired replicaFactory.
 func (c *Cluster) mountReplicaUnits() error {
 	for _, ru := range c.desiredReplicaUnits() {
-		b, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
+		b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
 		if err != nil {
 			_ = c.closeMountedUnits()
 			return err
 		}
+		c.myOpenEpoch.Store(ru, openedEpoch) // this node's exact open epoch (drain gate)
 		c.mountMu.Lock()
 		c.mountMap[ru] = b
 		c.mountMu.Unlock()
@@ -225,7 +226,7 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 // pure new mount (no draining leaver) is a harmless no-op observer-wise.
 func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	epoch := acquireBaseEpoch
-	b, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
+	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
 	if err != nil {
 		// SELF-HEAL a factory/cluster desync (the mass-restart auto-recovery wedge,
 		// #408): this path only runs for a DESIRED-but-UNMOUNTED position, so the
@@ -237,16 +238,20 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 		// so no routed op can be reading it. If the reopen still fails (a genuine
 		// open failure, e.g. a peer holds the durable db), record it + retry next tick.
 		_ = c.replicaFactory.CloseReplicaUnit(ru)
-		b, err = c.replicaFactory.OpenReplicaUnit(ru, epoch)
+		b, openedEpoch, err = c.replicaFactory.OpenReplicaUnit(ru, epoch)
 		if err != nil {
 			c.lastAcquireErr.Store(ru, err.Error())
 			return
 		}
 	}
 	c.lastAcquireErr.Delete(ru)
+	// Record THIS node's exact open epoch (from the factory return) BEFORE the
+	// mount, so a beginDrain that sees mountMap[ru] also sees the epoch.
+	c.myOpenEpoch.Store(ru, openedEpoch)
 	c.mountMu.Lock()
 	if c.closed.Load() {
 		c.mountMu.Unlock()
+		c.myOpenEpoch.Delete(ru)
 		_ = c.replicaFactory.CloseReplicaUnit(ru)
 		return
 	}
@@ -254,11 +259,10 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	c.mountMu.Unlock()
 
 	// Write the durable serving marker AFTER the mount (outside the lock: shared
-	// storage I/O), at the epoch this node opened the position at. This is the
-	// poll-observable release signal a DRAINING predecessor of this position
-	// reads (drainCheck); without it a clean-cut-acquired successor of a leaving
-	// node never releases that node's drain.
-	openedEpoch := c.openEpochForReplica(ru)
+	// storage I/O), at THIS node's EXACT open epoch (the factory return value, NOT
+	// a re-read of the climbing durable). This is the poll-observable release
+	// signal a DRAINING predecessor reads (drainCheck); without it a clean-cut
+	// successor of a leaving node never releases that node's drain.
 	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
 }
 
@@ -269,6 +273,7 @@ func (c *Cluster) releaseReplicaUnit(ru storageunit.ReplicaUnit) {
 	c.mountMu.Lock()
 	delete(c.mountMap, ru)
 	c.mountMu.Unlock()
+	c.myOpenEpoch.Delete(ru) // a re-acquire records a fresh open epoch.
 	_ = c.replicaFactory.CloseReplicaUnit(ru)
 }
 

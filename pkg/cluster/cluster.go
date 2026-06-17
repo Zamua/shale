@@ -376,6 +376,18 @@ type Cluster struct {
 	// sync.Map so it needs no Open-time init and no extra lock ordering.
 	lastAcquireErr sync.Map // storageunit.ReplicaUnit -> string
 
+	// myOpenEpoch records the EXACT epoch THIS node opened each mounted
+	// ReplicaUnit at, captured from OpenReplicaUnit's RETURN VALUE (not a re-read
+	// of the shared, climbing DurableEpochReplica). It is the STABLE drain-release
+	// gate (beginDrain) AND the epoch the serving marker carries: both must be
+	// THIS node's exact open epoch, captured once, immutable for the mount's life,
+	// so a successor's marker (at the successor's open epoch == leaver's + 1) is
+	// permanently strictly above the leaver's gate. Recorded just before
+	// mountMap[ru] at every open site (so a beginDrain that sees the mount also
+	// sees the epoch); cleared on release. See docs/SPEC.md v0.8 Phase 2e. sync.Map
+	// (no Open-time init).
+	myOpenEpoch sync.Map // storageunit.ReplicaUnit -> storageunit.Epoch
+
 	// handoffPhase holds, per IN-FLIGHT ReplicaUnit, the pure
 	// ownership-transition state of an overlap handoff (v0.8 Phase 2e,
 	// Option B). Absence means steady state: Owned if mountMap[ru] is present,
