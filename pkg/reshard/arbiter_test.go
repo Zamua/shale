@@ -1,6 +1,7 @@
 package reshard_test
 
 import (
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,26 @@ import (
 
 func uc(n int) storageunit.UnitCount { return storageunit.MustUnitCount(n) }
 
+// converge advances a to its stored Target and returns the settled count.
+func converge(t *testing.T, a *reshard.Arbiter) int {
+	t.Helper()
+	for range 64 {
+		_, stepped, err := a.Advance()
+		if err != nil {
+			t.Fatalf("advance: %v", err)
+		}
+		if !stepped {
+			s, _, err := a.Read()
+			if err != nil {
+				t.Fatal(err)
+			}
+			return int(s.Count.N())
+		}
+	}
+	t.Fatal("did not converge")
+	return 0
+}
+
 func TestArbiter_SeedIdempotent(t *testing.T) {
 	store := storageunit.NewMemConditionalStore()
 	a := reshard.NewArbiter(store)
@@ -19,101 +40,92 @@ func TestArbiter_SeedIdempotent(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed: %v", err)
 	}
-	if s1.Epoch != 0 || s1.Count.N() != 2 || s1.Plan != reshard.PlanNone {
-		t.Fatalf("seed = %+v, want epoch0 count2 none", s1)
+	if s1.Epoch != 0 || s1.Count.N() != 2 || s1.Target.N() != 2 || s1.Plan != reshard.PlanNone {
+		t.Fatalf("seed = %+v, want epoch0 count2 target2 none", s1)
 	}
 
-	// A second Seed (even at a different count) must adopt the existing seed,
-	// never overwrite it.
+	// A second Seed (even at a different count) must adopt the existing seed.
 	s2, err := a.Seed(uc(8))
 	if err != nil {
 		t.Fatalf("re-seed: %v", err)
 	}
-	if s2.Epoch != 0 || s2.Count.N() != 2 {
-		t.Fatalf("re-seed = %+v, want the original epoch0 count2", s2)
+	if s2.Epoch != 0 || s2.Count.N() != 2 || s2.Target.N() != 2 {
+		t.Fatalf("re-seed = %+v, want the original epoch0 count2 target2", s2)
 	}
 }
 
-func TestArbiter_AdvanceSplit(t *testing.T) {
-	store := storageunit.NewMemConditionalStore()
-	a := reshard.NewArbiter(store)
+func TestArbiter_AdvanceBeforeSeed(t *testing.T) {
+	a := reshard.NewArbiter(storageunit.NewMemConditionalStore())
+	if _, _, err := a.Advance(); !errors.Is(err, storageunit.ErrCondNotFound) {
+		t.Fatalf("Advance before Seed = %v, want ErrCondNotFound (retry-after-seed contract)", err)
+	}
+}
+
+func TestArbiter_RetargetThenSplit(t *testing.T) {
+	a := reshard.NewArbiter(storageunit.NewMemConditionalStore())
 	if _, err := a.Seed(uc(2)); err != nil {
 		t.Fatal(err)
 	}
+	st, err := a.Retarget(uc(8))
+	if err != nil {
+		t.Fatalf("retarget: %v", err)
+	}
+	if st.Target.N() != 8 || st.Count.N() != 2 {
+		t.Fatalf("after retarget = %+v, want target8 count2 (target changes, count does not)", st)
+	}
 
-	s, stepped, err := a.Advance(uc(8))
+	s, stepped, err := a.Advance()
 	if err != nil {
 		t.Fatal(err)
 	}
 	if !stepped || s.Epoch != 1 || s.Count.N() != 4 || s.Plan != reshard.PlanSplit {
-		t.Fatalf("advance 2->8 step1 = %+v stepped=%v, want epoch1 count4 split", s, stepped)
+		t.Fatalf("advance step1 = %+v, want epoch1 count4 split", s)
 	}
-
-	s, stepped, err = a.Advance(uc(8))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !stepped || s.Epoch != 2 || s.Count.N() != 8 || s.Plan != reshard.PlanSplit {
-		t.Fatalf("advance step2 = %+v, want epoch2 count8 split", s)
-	}
-
-	// Already at desired: no-op.
-	s, stepped, err = a.Advance(uc(8))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if stepped || s.Count.N() != 8 {
-		t.Fatalf("advance at desired = %+v stepped=%v, want no-op count8", s, stepped)
+	if got := converge(t, a); got != 8 {
+		t.Fatalf("converged to %d, want 8", got)
 	}
 }
 
-func TestArbiter_AdvanceMerge(t *testing.T) {
-	store := storageunit.NewMemConditionalStore()
-	a := reshard.NewArbiter(store)
+func TestArbiter_RetargetThenMerge(t *testing.T) {
+	a := reshard.NewArbiter(storageunit.NewMemConditionalStore())
 	if _, err := a.Seed(uc(8)); err != nil {
 		t.Fatal(err)
 	}
-
-	s, stepped, err := a.Advance(uc(2))
+	if _, err := a.Retarget(uc(2)); err != nil {
+		t.Fatal(err)
+	}
+	s, stepped, err := a.Advance()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !stepped || s.Epoch != 1 || s.Count.N() != 4 || s.Plan != reshard.PlanMerge {
-		t.Fatalf("merge 8->2 step1 = %+v, want epoch1 count4 merge", s)
+	if !stepped || s.Count.N() != 4 || s.Plan != reshard.PlanMerge {
+		t.Fatalf("merge step1 = %+v, want count4 merge", s)
 	}
-
-	s, _, err = a.Advance(uc(2))
-	if err != nil {
-		t.Fatal(err)
-	}
-	if s.Epoch != 2 || s.Count.N() != 2 {
-		t.Fatalf("merge step2 = %+v, want epoch2 count2", s)
+	if got := converge(t, a); got != 2 {
+		t.Fatalf("converged to %d, want 2", got)
 	}
 }
 
-func TestArbiter_ReachFarTargetByRepeatedAdvance(t *testing.T) {
-	store := storageunit.NewMemConditionalStore()
-	a := reshard.NewArbiter(store)
+func TestArbiter_ReachFarTarget(t *testing.T) {
+	a := reshard.NewArbiter(storageunit.NewMemConditionalStore())
 	if _, err := a.Seed(uc(2)); err != nil {
 		t.Fatal(err)
 	}
-
-	// 2 -> 16 must take exactly 3 split steps.
+	if _, err := a.Retarget(uc(16)); err != nil {
+		t.Fatal(err)
+	}
 	steps := 0
 	for {
-		s, stepped, err := a.Advance(uc(16))
+		_, stepped, err := a.Advance()
 		if err != nil {
 			t.Fatal(err)
 		}
 		if !stepped {
-			if s.Count.N() != 16 {
-				t.Fatalf("stopped at count %d, want 16", s.Count.N())
-			}
 			break
 		}
 		steps++
 		if steps > 10 {
-			t.Fatal("did not converge to 16")
+			t.Fatal("did not converge")
 		}
 	}
 	if steps != 3 {
@@ -121,13 +133,49 @@ func TestArbiter_ReachFarTargetByRepeatedAdvance(t *testing.T) {
 	}
 }
 
-// TestArbiter_ConcurrentAdvanceStepsExactlyOnce is the agreement property: many
-// nodes (each its own Arbiter over the SAME store) concurrently Advance the
-// single available step from the same epoch. The CAS race lets EXACTLY ONE
-// perform it; the rest adopt the winner. No two nodes ever fork the epoch.
+// TestArbiter_NoFlap is the fix for the review's major finding: because the
+// Target lives in the durable State, a node cannot reverse another node's
+// reshard by calling Advance. Once converged to the agreed Target, Advance is a
+// no-op; only an explicit Retarget changes direction.
+func TestArbiter_NoFlap(t *testing.T) {
+	a := reshard.NewArbiter(storageunit.NewMemConditionalStore())
+	if _, err := a.Seed(uc(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.Retarget(uc(8)); err != nil {
+		t.Fatal(err)
+	}
+	if got := converge(t, a); got != 8 {
+		t.Fatalf("converge = %d, want 8", got)
+	}
+	// Repeated Advance must NOT drift away from the agreed target.
+	for range 5 {
+		if _, stepped, err := a.Advance(); err != nil || stepped {
+			t.Fatalf("Advance at target: stepped=%v err=%v, want a no-op (no flap)", stepped, err)
+		}
+	}
+	if s, _, _ := a.Read(); s.Count.N() != 8 {
+		t.Fatalf("count drifted to %d, want a stable 8", s.Count.N())
+	}
+	// Direction only changes via an explicit Retarget.
+	if _, err := a.Retarget(uc(2)); err != nil {
+		t.Fatal(err)
+	}
+	if got := converge(t, a); got != 2 {
+		t.Fatalf("after retarget converge = %d, want 2", got)
+	}
+}
+
+// TestArbiter_ConcurrentAdvanceStepsExactlyOnce: many nodes (each its own
+// Arbiter over the SAME store) concurrently Advance the single available step.
+// The CAS race lets EXACTLY ONE perform it; the rest adopt the winner.
 func TestArbiter_ConcurrentAdvanceStepsExactlyOnce(t *testing.T) {
 	store := storageunit.NewMemConditionalStore()
-	if _, err := reshard.NewArbiter(store).Seed(uc(2)); err != nil {
+	seed := reshard.NewArbiter(store)
+	if _, err := seed.Seed(uc(2)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := seed.Retarget(uc(4)); err != nil { // one step away
 		t.Fatal(err)
 	}
 
@@ -139,7 +187,7 @@ func TestArbiter_ConcurrentAdvanceStepsExactlyOnce(t *testing.T) {
 		done.Go(func() {
 			a := reshard.NewArbiter(store) // each node its own arbiter
 			start.Wait()
-			_, stepped, err := a.Advance(uc(4)) // a single step away: 2 -> 4
+			_, stepped, err := a.Advance()
 			if err != nil {
 				t.Errorf("advance: %v", err)
 				return
@@ -155,7 +203,7 @@ func TestArbiter_ConcurrentAdvanceStepsExactlyOnce(t *testing.T) {
 	if stepWins != 1 {
 		t.Fatalf("concurrent Advance of one step: %d performed it, want exactly 1", stepWins)
 	}
-	final, _, err := reshard.NewArbiter(store).Read()
+	final, _, err := seed.Read()
 	if err != nil {
 		t.Fatal(err)
 	}
