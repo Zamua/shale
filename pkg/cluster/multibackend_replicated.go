@@ -112,30 +112,44 @@ func (c *Cluster) desiredReplicaUnits() []storageunit.ReplicaUnit {
 // pending sets from them and would treat any divergence as a spurious
 // transition.
 //
-// The gen-g pass uses the pure domain function storageunit.OwnedReplicaUnits to
-// enumerate the units this node replicates at the live generation. When a split
-// is in flight (genState.nextCount != 0) it then appends the gen-(g+1) split
-// children this node should also hold (splitChildrenVia); that augmentation is
-// a no-op in steady state, so the common path is unchanged.
+// The gen-g pass uses ownedReplicaUnitsAt to enumerate the units this node
+// replicates at the live generation. When a reshard is in flight
+// (genState.nextCount != 0) it then appends this node's gen-(g+1) targets: a
+// SPLIT's children co-located at their parent's slot (splitChildrenVia), or a
+// MERGE's survivors at their own gen-(g+1) ring home (ownedReplicaUnitsAt at
+// gen+1). Both augmentations are no-ops in steady state, so the common path is
+// unchanged.
 func (c *Cluster) desiredReplicaUnitsVia(replicaAt func(gu storageunit.GenUnit) []ring.Member) []storageunit.ReplicaUnit {
 	gs := c.genSnapshot()
 	self := storageunit.NodeID(c.cfg.NodeID)
 
-	// Adapt the ring-backed replica lookup to the pure ReplicaLookup contract:
-	// map a UnitID to its replica nodes at the live generation, projecting each
-	// ring member id into a storageunit.NodeID.
-	replicas := storageunit.ReplicaLookupFunc(func(u storageunit.UnitID) []storageunit.NodeID {
-		return memberNodeIDs(replicaAt(storageunit.NewGenUnit(gs.gen, u)))
-	})
+	out := c.ownedReplicaUnitsAt(gs.gen, gs.count, self, replicaAt)
+	if !gs.nextCount.IsZero() {
+		if gs.nextCount.N() > gs.count.N() { // SPLIT: co-located children
+			out = append(out, c.splitChildrenVia(gs, self, replicaAt)...)
+		} else { // MERGE: survivors at their gen-(g+1) ring home
+			out = append(out, c.ownedReplicaUnitsAt(gs.gen+1, gs.nextCount, self, replicaAt)...)
+		}
+	}
+	return out
+}
 
-	owned := storageunit.OwnedReplicaUnits(self, gs.count, replicas)
+// ownedReplicaUnitsAt returns the ReplicaUnits this node replicates among the
+// `count` units at generation `gen`, resolving each unit's replica set via
+// replicaAt (the live ring, or the draining-excluded ring for the pending set).
+// It is the shared core for both the gen-g pass and a merge's gen-(g+1) survivor
+// pass.
+func (c *Cluster) ownedReplicaUnitsAt(gen storageunit.Generation, count storageunit.UnitCount, self storageunit.NodeID, replicaAt func(gu storageunit.GenUnit) []ring.Member) []storageunit.ReplicaUnit {
+	// Adapt the ring-backed replica lookup to the pure ReplicaLookup contract:
+	// map a UnitID to its replica nodes at `gen`, projecting each ring member id
+	// into a storageunit.NodeID.
+	replicas := storageunit.ReplicaLookupFunc(func(u storageunit.UnitID) []storageunit.NodeID {
+		return memberNodeIDs(replicaAt(storageunit.NewGenUnit(gen, u)))
+	})
+	owned := storageunit.OwnedReplicaUnits(self, count, replicas)
 	out := make([]storageunit.ReplicaUnit, 0, len(owned))
 	for _, o := range owned {
-		out = append(out, storageunit.NewReplicaUnit(storageunit.NewGenUnit(gs.gen, o.Unit), o.Replica))
-	}
-	// Reshard in flight: also desire the gen-(g+1) children (v0.9 split).
-	if !gs.nextCount.IsZero() {
-		out = append(out, c.splitChildrenVia(gs, self, replicaAt)...)
+		out = append(out, storageunit.NewReplicaUnit(storageunit.NewGenUnit(gen, o.Unit), o.Replica))
 	}
 	return out
 }

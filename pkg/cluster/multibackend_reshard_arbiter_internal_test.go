@@ -246,6 +246,65 @@ func enterSplit(t *testing.T, c *Cluster) {
 	c.commitGenState(gs)
 }
 
+// enterMerge puts the cluster into an in-flight merge to half the current count
+// (sets genState.nextCount = count.Halve()).
+func enterMerge(t *testing.T, c *Cluster) {
+	t.Helper()
+	gs := c.genSnapshot().clone()
+	nc, err := gs.count.Halve()
+	if err != nil {
+		t.Fatalf("halve: %v", err)
+	}
+	gs.nextCount = nc
+	c.commitGenState(gs)
+}
+
+// TestDesiredReplicaUnits_MergeSurvivors pins that during a merge the desired set
+// adds this node's gen-(g+1) SURVIVOR units at their own gen-(g+1) ring home (no
+// co-location - the two-source merge copy is cross-node), alongside the gen-g
+// parents.
+func TestDesiredReplicaUnits_MergeSurvivors(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 8, 2, backing, "n1", "n2", "n3")
+
+	for _, ru := range c.desiredReplicaUnits() {
+		if ru.Unit.Gen != 0 {
+			t.Fatalf("steady state should desire only gen-0 units, got %v", ru)
+		}
+	}
+
+	enterMerge(t, c) // 8 -> 4
+	survivors := map[storageunit.UnitID]bool{}
+	for _, ru := range c.desiredReplicaUnits() {
+		switch ru.Unit.Gen {
+		case 0: // parent, fine
+		case 1:
+			survivors[ru.Unit.ID] = true
+		default:
+			t.Fatalf("unexpected generation %d in desired set: %v", ru.Unit.Gen, ru)
+		}
+	}
+	if len(survivors) == 0 {
+		t.Fatalf("in-flight merge should desire gen-1 survivors, got none")
+	}
+	// Every desired survivor must be a gen-1 unit (count 4) this node owns on the
+	// gen-1 ring - its final home, not a co-located slot.
+	for s := range survivors {
+		if int(s) >= 4 {
+			t.Fatalf("survivor %d out of range for the halved count 4", s)
+		}
+		owns := false
+		for _, m := range c.unitReplicas(storageunit.NewGenUnit(1, s)) {
+			if m.ID == "n1" {
+				owns = true
+			}
+		}
+		if !owns {
+			t.Fatalf("survivor %d desired but n1 is not in its gen-1 ring replica set", s)
+		}
+	}
+}
+
 // assertSplitChildrenColocated checks that desired is a steady gen-g set PLUS,
 // during a split, the gen-(g+1) children co-located at their parent's slot:
 // every gen-(g+1) child maps (ParentUnit) to a desired gen-g unit at the SAME
