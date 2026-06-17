@@ -14,8 +14,17 @@
 package cluster
 
 import (
+	"context"
+	"time"
+
+	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
+
+// mergeCopyTimeout bounds one parent-into-survivor copy pass (the cross-node
+// forwards). Generous because the pass forwards every key in the parent slot;
+// the in-memory gate completes far under this.
+const mergeCopyTimeout = 60 * time.Second
 
 // copyMaxPasses bounds the re-scan loop in copyParentUntilCaughtUp so continuous
 // write load (which keeps leaving a few un-delivered stragglers for the next
@@ -75,6 +84,66 @@ func (c *Cluster) copyParentIntoChildren(ru storageunit.ReplicaUnit, gs genState
 			applied++
 		}
 	}
+}
+
+// copyParentIntoSurvivor forwards every key in parent slot ru into its
+// gen-(g+1) SURVIVOR's replicas APPLY-IF-NEWER. The merge is the cross-node
+// case: the survivor lives at its OWN ring home (two parents K and K+N collapse
+// into survivor K), so the copy forwards each key to the survivor's R replica
+// legs through the normal dispatch (local-self for a co-resident replica, gRPC
+// otherwise), requiring a WRITE QUORUM of acks per key. A stale forwarded value
+// loses to a newer dual-write (LWW); a key that cannot reach quorum returns an
+// error so the caller defers (the finalize copy must be strict before the parent
+// retires). Idempotent: re-running re-delivers only what a leg has not applied.
+func (c *Cluster) copyParentIntoSurvivor(ru storageunit.ReplicaUnit, gs genState) error {
+	src, ok := c.localBackendForReplicaUnit(ru)
+	if !ok {
+		return errUnitAcquiring("merge-copy")
+	}
+	survivorID, err := storageunit.ParentUnit(ru.Unit.ID, gs.count)
+	if err != nil {
+		return err
+	}
+	survivorGU := storageunit.NewGenUnit(gs.gen+1, survivorID)
+	legs := legsAt(survivorGU, c.unitReplicas(survivorGU))
+	if len(legs) == 0 {
+		return errUnitAcquiring("merge-copy")
+	}
+
+	it, err := src.ScanPrefix(nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = it.Close() }()
+
+	ctx, cancel := context.WithTimeout(context.Background(), mergeCopyTimeout)
+	defer cancel()
+	for {
+		key, envBytes, nerr := it.Next()
+		if nerr != nil {
+			return nerr
+		}
+		if key == nil {
+			return nil
+		}
+		if err := c.forwardKeyQuorum(ctx, legs, key, envBytes); err != nil {
+			return err
+		}
+	}
+}
+
+// forwardKeyQuorum applies one envelope APPLY-IF-NEWER to a unit's replica legs,
+// requiring the configured write quorum of acks (over the leg count). It reuses
+// the replicated write fan-out, so a transient/acquiring leg is tolerated and a
+// quorum shortfall returns the retryable error.
+func (c *Cluster) forwardKeyQuorum(ctx context.Context, legs []routedReplica, key, envBytes []byte) error {
+	w := c.writeAckBar(len(legs))
+	acks, errs, ch := fanout(ctx, membersOf(legs), w,
+		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
+			return nil, c.dispatchReplicaPutUnit(opCtx, replica, legs[idx].ru, key, envBytes)
+		})
+	go drainResults(ch)
+	return classifyWriteAttempt(acks, w, errs).err
 }
 
 // copyParentUntilCaughtUp re-scans parent slot ru into its children until a pass

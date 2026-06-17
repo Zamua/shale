@@ -59,11 +59,15 @@ func (c *Cluster) observeReshard() {
 	}
 
 	if !gs.nextCount.IsZero() {
-		c.driveSplitCopies(gs)
+		if gs.nextCount.N() > gs.count.N() {
+			c.driveSplitCopies(gs)
+		} else {
+			c.driveMergeCopies(gs)
+		}
 		c.observeCutoverMarkers(gs)
 		gs = c.genSnapshot()
 		if allCutOver(gs) {
-			c.finalizeSplit(gs)
+			c.finalizeReshard(gs)
 			gs = c.genSnapshot()
 		}
 	}
@@ -117,6 +121,46 @@ func (c *Cluster) driveSplitCopies(gs genState) {
 	}
 }
 
+// driveMergeCopies is the merge analogue of driveSplitCopies. Each owned parent
+// slot is copied into its gen-(g+1) SURVIVOR (cross-node, quorum-acked) and
+// publishes its slot caught-up marker. Because TWO parents (K and K+N) collapse
+// into one survivor, a survivor is only caught up once BOTH its parents are, so
+// this publishes the cut-over markers for BOTH parents together, gated on both
+// parents' slots all being caught up.
+func (c *Cluster) driveMergeCopies(gs genState) {
+	r := c.replicationFactor()
+	for _, ru := range c.ownedParentSlots(gs) {
+		k := ru.Unit.ID
+		if gs.hasCutOver(k) {
+			continue // already flipped; its copy is done
+		}
+		if !c.cfg.TestingForceUncleanReshard {
+			if err := c.copyParentIntoSurvivor(ru, gs); err != nil {
+				continue
+			}
+		}
+		if err := c.publishCaughtupMarker(gs.gen, k, ru.Replica); err != nil {
+			continue
+		}
+		// The two parents of this survivor are ChildUnits(survivorID, nextCount):
+		// publish BOTH cut-over markers once both parents' slots are all caught up.
+		survivorID, err := storageunit.ParentUnit(k, gs.count)
+		if err != nil {
+			continue
+		}
+		low, high, err := storageunit.ChildUnits(survivorID, gs.nextCount)
+		if err != nil {
+			continue
+		}
+		lowDone, e1 := c.allSlotsCaughtUp(gs.gen, low, r)
+		highDone, e2 := c.allSlotsCaughtUp(gs.gen, high, r)
+		if e1 == nil && e2 == nil && lowDone && highDone {
+			_ = c.publishCutoverMarker(gs.gen, low)
+			_ = c.publishCutoverMarker(gs.gen, high)
+		}
+	}
+}
+
 // observeCutoverMarkers polls every old unit's durable cut-over marker and sets
 // local cutOver for any newly-flipped unit. The durable marker - not node-local
 // state - is the authority, so every node flips a unit in cluster-agreed order
@@ -142,18 +186,19 @@ func (c *Cluster) observeCutoverMarkers(gs genState) {
 	c.commitGenState(next)
 }
 
-// finalizeSplit completes the generation once EVERY old unit has cut over. For
+// finalizeReshard completes the generation once EVERY old unit has cut over. For
 // each owned parent slot it takes that unit's write-PAUSE (the WRITE side), so
 // the final copy + retire is ATOMIC w.r.t. parent-leg writes (which take the read
-// side in applyEnvelopeIfNewerToBackendReport): the final copy provably captures
-// every write that landed before the pause, and a write that arrives during the
-// pause blocks, then fails on the retired parent (transient, never acked) and is
-// re-routed to the child. Without this quiesce a lagging-node parent write could
-// land between the final scan and the retire and be lost (the P0 the single-node
-// bisect's pause also prevents). Once every owned parent is retired the live
-// generation advances; the overlap reconcile then redistributes the children.
-// A unit whose final copy is not clean this tick defers finalize to the next.
-func (c *Cluster) finalizeSplit(gs genState) {
+// side in resolveAndApplyReplicaPut): the final copy provably captures every
+// write that landed before the pause, and a write that arrives during the pause
+// blocks, then fails on the retired parent (transient, never acked) and is
+// re-routed to the child/survivor. Without this quiesce a lagging-node parent
+// write could land between the final scan and the retire and be lost (the P0 the
+// single-node bisect's pause also prevents). Once every owned parent is retired
+// the live generation advances; the overlap reconcile then redistributes a
+// split's children (a merge's survivors are already at their ring home). A unit
+// whose final copy is not strict this tick defers finalize to the next.
+func (c *Cluster) finalizeReshard(gs genState) {
 	for _, ru := range c.ownedParentSlots(gs) {
 		if !c.finalizeParent(ru, gs) {
 			return // not safe to retire this unit yet; retry next tick
@@ -167,8 +212,8 @@ func (c *Cluster) finalizeSplit(gs genState) {
 }
 
 // finalizeParent quiesces parent slot ru (its unit's write-pause WRITE side),
-// runs the strict final copy under the pause, and retires the parent. It reports
-// whether the parent was retired (false = defer; the copy was not clean). The
+// runs the STRICT final copy under the pause, and retires the parent. It reports
+// whether the parent was retired (false = defer; the copy was not strict). The
 // gen advance stays with the caller (it is cluster-generation-level, after every
 // owned parent has retired).
 func (c *Cluster) finalizeParent(ru storageunit.ReplicaUnit, gs genState) bool {
@@ -176,15 +221,24 @@ func (c *Cluster) finalizeParent(ru storageunit.ReplicaUnit, gs genState) bool {
 	pause.Lock()
 	defer pause.Unlock()
 
-	if !c.cfg.TestingForceUncleanReshard {
-		clean, err := c.copyParentUntilCaughtUp(ru, gs)
-		if err != nil || !clean {
-			return false
-		}
+	if !c.cfg.TestingForceUncleanReshard && !c.finalCopyUnderPause(ru, gs) {
+		return false
 	}
 	if d := c.cfg.TestingFinalizeRetireDelay; d > 0 {
 		time.Sleep(d) // widen the post-final-copy / pre-retire window (test-only)
 	}
 	c.releaseReplicaUnit(ru)
 	return true
+}
+
+// finalCopyUnderPause runs the strict final copy for one parent slot (caller
+// holds its write-pause). A SPLIT copies into the co-located children and
+// requires a clean re-scan; a MERGE forwards into the survivor with a quorum ack
+// per key. Returns whether it succeeded (false defers the retire).
+func (c *Cluster) finalCopyUnderPause(ru storageunit.ReplicaUnit, gs genState) bool {
+	if gs.nextCount.N() > gs.count.N() { // SPLIT
+		clean, err := c.copyParentUntilCaughtUp(ru, gs)
+		return err == nil && clean
+	}
+	return c.copyParentIntoSurvivor(ru, gs) == nil // MERGE
 }

@@ -91,7 +91,7 @@ func TestFinalizeSplit_AdvancesAndRetiresParents(t *testing.T) {
 	}
 	c.commitGenState(next)
 
-	c.finalizeSplit(c.genSnapshot())
+	c.finalizeReshard(c.genSnapshot())
 
 	after := c.genSnapshot()
 	if after.gen != 1 || after.count.N() != 8 || !after.nextCount.IsZero() || len(after.cutOver) != 0 {
@@ -148,7 +148,7 @@ func TestFinalizeSplit_QuiescesParentWrites(t *testing.T) {
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		c.finalizeSplit(c.genSnapshot())
+		c.finalizeReshard(c.genSnapshot())
 	}()
 	time.Sleep(80 * time.Millisecond) // let the final copy finish + enter the widened window
 

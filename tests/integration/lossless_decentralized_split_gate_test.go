@@ -70,11 +70,24 @@ type splitGateOpts struct {
 	forceUnclean  bool          // break-demo: flip + retire without copying
 	writeOne      bool          // WriteOne (single-slot ack) - the harshest loss regime
 	finalizeDelay time.Duration // widen the finalize retire window
+	startCount    int           // initial unit count (default 4)
+	targetCount   int           // declared count to converge to (default 2*startCount, a split)
 }
 
-func runDecentralizedSplit(t *testing.T, opts splitGateOpts) splitGateResult {
+// runDecentralizedReshard drives a live, online reshard (split OR merge per
+// start/target count) on a 3-node R=2 cluster under continuous writes + staggered
+// child/survivor mounts, and returns the ack tally + the want set (baseline +
+// acked) + the nodes for the loss oracle.
+func runDecentralizedReshard(t *testing.T, opts splitGateOpts) splitGateResult {
 	t.Helper()
-	const unitCount = 4
+	unitCount := opts.startCount
+	if unitCount == 0 {
+		unitCount = 4
+	}
+	targetCount := opts.targetCount
+	if targetCount == 0 {
+		targetCount = 2 * unitCount
+	}
 	backing := sharedfactory.NewBacking()
 	store := storageunit.NewMemConditionalStore()
 	mutate := func(cfg *cluster.Config) {
@@ -146,16 +159,16 @@ func runDecentralizedSplit(t *testing.T, opts splitGateOpts) splitGateResult {
 	n2.Handle.SetAcquireDelay(80 * time.Millisecond)
 	n3.Handle.SetAcquireDelay(160 * time.Millisecond)
 
-	// Declare the doubled shard count (the whole point: declarative).
+	// Declare the target shard count (the whole point: declarative).
 	arb := reshard.NewArbiter(store)
-	if _, err := arb.Retarget(storageunit.MustUnitCount(2 * unitCount)); err != nil {
+	if _, err := arb.Retarget(storageunit.MustUnitCount(targetCount)); err != nil {
 		t.Fatalf("retarget: %v", err)
 	}
 
-	// Drive the split to completion by pumping reconciles until every node is at
-	// gen 1 (2N units), bounded.
+	// Drive the reshard to completion by pumping reconciles until every node is at
+	// gen 1 (targetCount units), bounded.
 	deadline := time.Now().Add(45 * time.Second)
-	for !allAtGeneration(nodes, 1, 2*unitCount) {
+	for !allAtGeneration(nodes, 1, uint32(targetCount)) {
 		pumpReconciles(nodes)
 		if time.Now().After(deadline) {
 			stop.Store(true)
@@ -197,7 +210,7 @@ func runDecentralizedSplit(t *testing.T, opts splitGateOpts) splitGateResult {
 // continuous writes + staggered cut-over loses ZERO acked writes and stays
 // available.
 func TestDecentralizedSplitGate(t *testing.T) {
-	r := runDecentralizedSplit(t, splitGateOpts{})
+	r := runDecentralizedReshard(t, splitGateOpts{})
 
 	// (1) THE ORACLE: zero acked loss, readable from every node.
 	assertNoAckedLoss(t, overlapGateResult{want: r.want, nodes: r.nodes})
@@ -227,7 +240,7 @@ func TestDecentralizedSplitGate(t *testing.T) {
 // their data), the split drops acked writes and the oracle MUST catch it. If this
 // run ever passed the loss check, the gate above would be rubber-stamping.
 func TestDecentralizedSplitGate_BreakDemoCatchesLoss(t *testing.T) {
-	r := runDecentralizedSplit(t, splitGateOpts{forceUnclean: true})
+	r := runDecentralizedReshard(t, splitGateOpts{forceUnclean: true})
 
 	lost := 0
 	for k, v := range r.want {
@@ -252,7 +265,7 @@ func TestDecentralizedSplitGate_BreakDemoCatchesLoss(t *testing.T) {
 // (Run against the un-quiesced finalize this loses writes; it is the end-to-end
 // counterpart of the white-box TestFinalizeSplit_QuiescesParentWrites.)
 func TestDecentralizedSplitGate_WriteOneAcrossFinalize(t *testing.T) {
-	r := runDecentralizedSplit(t, splitGateOpts{writeOne: true, finalizeDelay: 40 * time.Millisecond})
+	r := runDecentralizedReshard(t, splitGateOpts{writeOne: true, finalizeDelay: 40 * time.Millisecond})
 
 	assertNoAckedLoss(t, overlapGateResult{want: r.want, nodes: r.nodes})
 	for _, n := range r.nodes {
@@ -264,4 +277,67 @@ func TestDecentralizedSplitGate_WriteOneAcrossFinalize(t *testing.T) {
 	rate := float64(r.acked) / float64(r.attempted)
 	t.Logf("WriteOne-across-finalize: %d/%d acked (%.1f%%), zero acked loss through a widened finalize window",
 		r.acked, r.attempted, 100*rate)
+}
+
+// TestDecentralizedMergeGate is the merge-direction gate: a live, online 8 -> 4
+// merge (two parents collapse into one survivor at its gen-(g+1) ring home, a
+// CROSS-NODE two-source copy) under continuous writes + staggered timing loses
+// ZERO acked writes and converges every node to gen 1 (4 units).
+func TestDecentralizedMergeGate(t *testing.T) {
+	r := runDecentralizedReshard(t, splitGateOpts{startCount: 8, targetCount: 4})
+
+	assertNoAckedLoss(t, overlapGateResult{want: r.want, nodes: r.nodes})
+	if r.attempted == 0 {
+		t.Fatalf("no writes attempted")
+	}
+	rate := float64(r.acked) / float64(r.attempted)
+	if rate < splitAckThreshold {
+		t.Fatalf("ack rate %.3f below %.2f through the merge", rate, splitAckThreshold)
+	}
+	for _, n := range r.nodes {
+		g, c := n.Cluster.GenStateSnapshot()
+		if g != 1 || c != 4 {
+			t.Fatalf("node %s ended at gen %d count %d, want gen 1 count 4", n.ID, g, c)
+		}
+	}
+	t.Logf("decentralized merge: %d/%d acked (%.1f%%), zero acked loss, all nodes at gen 1 (4 units)",
+		r.acked, r.attempted, 100*rate)
+}
+
+// TestDecentralizedMergeGate_BreakDemoCatchesLoss keeps the merge gate honest:
+// flip + retire parents WITHOUT copying their data into the survivor drops acked
+// writes, which the oracle must catch.
+func TestDecentralizedMergeGate_BreakDemoCatchesLoss(t *testing.T) {
+	r := runDecentralizedReshard(t, splitGateOpts{startCount: 8, targetCount: 4, forceUnclean: true})
+
+	lost := 0
+	for k, v := range r.want {
+		got, err := getWithRetryUnavailable(t, r.nodes[0].Cluster, k, 5*time.Second)
+		if err != nil || !bytes.Equal(got, v) {
+			lost++
+		}
+	}
+	if lost == 0 {
+		t.Fatalf("BREAK NOT CAUGHT: an unclean merge (no copy) lost no acked write - the oracle would rubber-stamp")
+	}
+	t.Logf("merge break-demo: unclean merge lost %d/%d acked keys (oracle correctly catches it)", lost, len(r.want))
+}
+
+// TestDecentralizedMergeGate_WriteOneAcrossFinalize confirms the per-unit finalize
+// write-quiesce also holds on the cross-node MERGE path (shared finalizeParent):
+// WriteOne + a widened finalize window + writers through the flip lose ZERO acked
+// writes.
+func TestDecentralizedMergeGate_WriteOneAcrossFinalize(t *testing.T) {
+	r := runDecentralizedReshard(t, splitGateOpts{
+		startCount: 8, targetCount: 4, writeOne: true, finalizeDelay: 40 * time.Millisecond,
+	})
+	assertNoAckedLoss(t, overlapGateResult{want: r.want, nodes: r.nodes})
+	for _, n := range r.nodes {
+		g, c := n.Cluster.GenStateSnapshot()
+		if g != 1 || c != 4 {
+			t.Fatalf("node %s ended at gen %d count %d, want gen 1 count 4", n.ID, g, c)
+		}
+	}
+	t.Logf("merge WriteOne-across-finalize: %d/%d acked, zero acked loss through a widened finalize window",
+		r.acked, r.attempted)
 }
