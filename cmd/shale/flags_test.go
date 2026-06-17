@@ -3,6 +3,7 @@ package main
 import (
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestParseGlobalDefaults(t *testing.T) {
@@ -58,6 +59,41 @@ func TestParseGlobalEqualsForm(t *testing.T) {
 	}
 	if sub != "stats" {
 		t.Fatalf("sub: want stats, got %q", sub)
+	}
+}
+
+func TestParseGlobalTimeoutFlag(t *testing.T) {
+	t.Setenv(envAddr, "")
+	// space form
+	opts, sub, _, err := parseGlobal([]string{"--timeout", "15s", "put", "k", "v"})
+	if err != nil {
+		t.Fatalf("parseGlobal: %v", err)
+	}
+	if opts.timeout != 15*time.Second {
+		t.Fatalf("timeout: want 15s, got %v", opts.timeout)
+	}
+	if sub != "put" {
+		t.Fatalf("sub: want put, got %q", sub)
+	}
+	// equals form
+	opts, _, _, err = parseGlobal([]string{"--timeout=20s", "put", "k", "v"})
+	if err != nil {
+		t.Fatalf("parseGlobal equals: %v", err)
+	}
+	if opts.timeout != 20*time.Second {
+		t.Fatalf("timeout equals: want 20s, got %v", opts.timeout)
+	}
+	// default when absent
+	opts, _, _, err = parseGlobal([]string{"put", "k", "v"})
+	if err != nil {
+		t.Fatalf("parseGlobal default: %v", err)
+	}
+	if opts.timeout != defaultTimeout {
+		t.Fatalf("timeout default: want %v, got %v", defaultTimeout, opts.timeout)
+	}
+	// invalid duration is a usage error
+	if _, _, _, err := parseGlobal([]string{"--timeout", "notaduration", "put"}); err == nil {
+		t.Fatalf("invalid --timeout must be a usage error")
 	}
 }
 

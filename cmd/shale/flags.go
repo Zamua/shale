@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -57,6 +58,23 @@ func parseGlobal(args []string) (opts globalOpts, sub string, subArgs []string, 
 			} else {
 				opts.addr = a[6:]
 			}
+			i++
+		case a == "--timeout" || a == "-timeout":
+			if i+1 >= len(args) {
+				return opts, "", nil, fmt.Errorf("flag --timeout requires a value")
+			}
+			d, perr := time.ParseDuration(args[i+1])
+			if perr != nil {
+				return opts, "", nil, fmt.Errorf("flag --timeout: %w (want a Go duration like 15s)", perr)
+			}
+			opts.timeout = d
+			i += 2
+		case strings.HasPrefix(a, "--timeout=") || strings.HasPrefix(a, "-timeout="):
+			d, perr := time.ParseDuration(a[strings.IndexByte(a, '=')+1:])
+			if perr != nil {
+				return opts, "", nil, fmt.Errorf("flag --timeout: %w (want a Go duration like 15s)", perr)
+			}
+			opts.timeout = d
 			i++
 		case a == "--json" || a == "-json":
 			opts.json = true
