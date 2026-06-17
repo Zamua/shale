@@ -217,6 +217,18 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	// clean-cut acquire (no overlap sequencing needed: no predecessor is serving
 	// this exact slot, so there is nothing to drain from).
 	for _, ru := range current {
+		if _, inPending := pendingSet[ru]; !inPending {
+			// Current-but-not-pending = being HANDED OFF (this node is itself
+			// draining, or a draining split moved it out of pending). The DRAIN half
+			// + drainCheck own these positions; the ACQUIRE half must NOT (re-)mount
+			// one. After drainCheck RELEASES a drained position its phase is cleared
+			// to 0, so it is no longer caught by the IsLoser skip below - without this
+			// gate it would fall through to acquireReplicaUnit and the leaver would
+			// RE-GRAB a position it just handed off (re-fencing the successor at a
+			// climbed epoch), so ownedPositionCount never reaches 0 and the graceful
+			// leave never completes (the leaver-side half of the #410 oscillation).
+			continue
+		}
 		if _, isMounted := mountedSet[ru]; isMounted {
 			// A mounted current position stuck in a gainer phase with no acquire
 			// goroutine in flight is the same stuck-flip race: finish it.

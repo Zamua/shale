@@ -153,3 +153,108 @@ func TestOverlap_Reconcile_PendingMount_HeldAcrossReconciles(t *testing.T) {
 		}
 	}
 }
+
+// TestOverlap_Reconcile_SelfDraining_ReleasedPositionNotReacquired is the LEAVER
+// COMPLETION guard: once drainCheck RELEASES a drained position (on the successor's
+// marker), the position is unmounted with its phase cleared to 0 - but it is STILL
+// in CURRENT (the leaver is still a ring member). The ACQUIRE-new half must NOT
+// re-acquire it: re-grabbing a handed-off position re-fences the successor at a
+// climbed epoch and ownedPositionCount never reaches 0, so the graceful leave never
+// completes. The IsLoser skip in the ACQUIRE-new half does NOT cover this (the
+// phase is 0 after release, not a loser phase); the pending-membership gate does.
+func TestOverlap_Reconcile_SelfDraining_ReleasedPositionNotReacquired(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
+	c.draining = map[string]struct{}{"self": {}}
+
+	current := c.desiredReplicaUnits()
+	if len(current) == 0 {
+		t.Fatal("self owns no positions; ring fixture broken")
+	}
+	h := backing.Handle()
+	for _, target := range current {
+		b, ep, err := h.OpenReplicaUnit(target, 1)
+		if err != nil {
+			t.Fatalf("seed mount %v: %v", target, err)
+		}
+		c.mountMap[target] = b
+		c.myOpenEpoch.Store(target, ep)
+	}
+
+	c.reconcileReplicaUnitsOverlap()
+	for _, target := range current {
+		if c.handoffPhaseOf(target).Phase != storageunit.PhaseDraining {
+			t.Fatalf("%v should be Draining", target)
+		}
+	}
+
+	// Successors open + serving-mark above the leaver's gate; drainCheck releases.
+	hs := backing.Handle()
+	for _, target := range current {
+		_, se, err := hs.OpenReplicaUnit(target, 1)
+		if err != nil {
+			t.Fatalf("successor open %v: %v", target, err)
+		}
+		if err := hs.WriteServingMarker(target, se); err != nil {
+			t.Fatalf("successor marker %v: %v", target, err)
+		}
+		c.drainCheck(target)
+		if _, mounted := c.localBackendForReplicaUnit(target); mounted {
+			t.Fatalf("%v should have RELEASED on the successor marker", target)
+		}
+	}
+
+	// CRITICAL: a subsequent reconcile must NOT re-acquire the released positions.
+	c.reconcileReplicaUnitsOverlap()
+	c.loopWG.Wait()
+	for _, target := range current {
+		if _, mounted := c.localBackendForReplicaUnit(target); mounted {
+			t.Fatalf("RE-GRABBED A HANDED-OFF POSITION: %v was re-acquired by the reconcile after drainCheck released it. A self-draining leaver must NOT re-acquire its current-but-not-pending positions, or ownedPositionCount never reaches 0 and the leave never completes.",
+				target)
+		}
+		if st := c.handoffPhaseOf(target); st.Phase != 0 {
+			t.Fatalf("%v should stay released (no phase), got %v", target, st.Phase)
+		}
+	}
+}
+
+// TestOverlap_evictStaleMount_DoesNotEvictDrainingPosition guards the write-path
+// half: a union write that lands on the leaver's now-fenced handle (the successor
+// opened the shared db at a higher epoch) returns a fence error and calls
+// evictStaleMount. It must NOT drop a Draining mount - that is the expected
+// successor-fence signal, not a stale-handle desync. Evicting it drops the leaver's
+// mount before the successor's marker and triggers the re-acquire ping-pong.
+func TestOverlap_evictStaleMount_DoesNotEvictDrainingPosition(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
+	c.draining = map[string]struct{}{"self": {}}
+
+	current := c.desiredReplicaUnits()
+	if len(current) == 0 {
+		t.Fatal("self owns no positions; ring fixture broken")
+	}
+	target := current[0]
+	h := backing.Handle()
+	b, ep, err := h.OpenReplicaUnit(target, 1)
+	if err != nil {
+		t.Fatalf("mount: %v", err)
+	}
+	c.mountMap[target] = b
+	c.myOpenEpoch.Store(target, ep)
+
+	c.reconcileReplicaUnitsOverlap()
+	if c.handoffPhaseOf(target).Phase != storageunit.PhaseDraining {
+		t.Fatalf("%v should be Draining", target)
+	}
+
+	// A fenced union write calls evictStaleMount with the failed (fenced) backend.
+	c.evictStaleMount(target, b)
+
+	got, mounted := c.localBackendForReplicaUnit(target)
+	if !mounted || got != b {
+		t.Fatalf("evictStaleMount must NOT drop a Draining mount (a fenced write is the expected handoff signal): mounted=%v same-backend=%v", mounted, got == b)
+	}
+	if c.handoffPhaseOf(target).Phase != storageunit.PhaseDraining {
+		t.Fatalf("%v must stay Draining after a fenced write, got %v", target, c.handoffPhaseOf(target).Phase)
+	}
+}

@@ -261,6 +261,20 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, ru st
 // the NO-ACKED-WRITE-LOST invariant by never acking a write that did not land.
 func (c *Cluster) evictStaleMount(ru storageunit.ReplicaUnit, failed backend.Backend) {
 	c.mountMu.Lock()
+	// Do NOT evict a position mid-DRAIN: a fenced/failed write on a Draining
+	// position is the EXPECTED successor-fence signal (the successor opened the
+	// shared db at a higher epoch, fencing the leaver's handle), NOT the stale-
+	// handle factory desync this eviction+re-acquire path exists for (#408).
+	// Evicting here would drop the leaver's mount before the successor's serving
+	// marker proves it is serving, and the cleared mount would then be re-grabbed
+	// by the reconcile - the mutual-fencing ping-pong that hangs the graceful
+	// drain to its timeout (the write-path half of #410). The fenced write simply
+	// fails on the leaver's leg and retries onto the union (the successor's leg
+	// acked it); drainCheck completes the drain on the successor's marker.
+	if st, ok := c.handoffPhase[ru]; ok && st.Phase.IsLoser() {
+		c.mountMu.Unlock()
+		return
+	}
 	evicted := false
 	if cur, ok := c.mountMap[ru]; ok && cur == failed {
 		delete(c.mountMap, ru)
