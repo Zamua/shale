@@ -220,8 +220,15 @@ func (c *Cluster) reconcileUnits() {
 			c.reconcileReplicaUnitsCleanCut()
 			return
 		}
+		// PHASE 2g: record gossip-membership stability BEFORE the acquire diff so the
+		// CAS-steal convergence gate (claimReplicaLease) decides off a settled ring,
+		// and REFRESH the heartbeat on every position this node serves AFTER the diff
+		// (the lease window is several reconcile ticks, so once-per-pass keeps a live
+		// owner's lease fresh). Both are no-ops of cost outside a transition.
+		c.noteMembershipForConvergence(c.liveMemberSet())
 		c.reconcileReplicaUnitsOverlap()
 		c.runDrainChecks()
+		c.refreshOwnedLeases()
 		return
 	}
 	desired := c.desiredGenUnits()

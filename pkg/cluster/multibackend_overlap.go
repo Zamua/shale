@@ -278,10 +278,12 @@ func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
 	delete(c.handoffPhase, ru) // mounted + no phase = Owned (serving locally).
 	c.mountMu.Unlock()
 
-	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at THIS
+	// Record the serving lease OUTSIDE the lock (shared-storage I/O), at THIS
 	// node's EXACT open epoch (the recorded factory return) - exactly what the
 	// in-goroutine flip would have written, NOT a re-read of the climbing durable.
-	_ = c.replicaFactory.WriteServingMarker(ru, c.ownOpenEpoch(ru))
+	// The mount is already present (no fresh open here), so this reads the current
+	// lease etag and CASes (recordServingLease) rather than using a pre-won etag.
+	c.recordServingLease(ru, c.ownOpenEpoch(ru))
 }
 
 // ownOpenEpoch returns the EXACT epoch this node opened ru at (recorded from
@@ -511,6 +513,19 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 // deterministic blocking behavior. It must NOT be called while holding mountMu
 // (it takes mountMu for the flip).
 func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) {
+	// PHASE 2g: win the lease CAS BEFORE opening, even on the overlap-handoff path.
+	// This is the legitimate ownership-change path (the ring assigned this node the
+	// position a draining predecessor still serves), so it STEALS the predecessor's
+	// live lease (claimReplicaLeaseForHandoff, no live-defer) rather than deferring.
+	// The CAS serializes against any concurrent claimer so at most one node opens
+	// the position; a lost CAS backs off + retries next tick (the union still covers
+	// the position via the current owner during the gap).
+	won, wonETag := c.claimReplicaLeaseForHandoff(ru, acquireBaseEpoch)
+	if !won {
+		c.lastAcquireErr.Store(ru, "overlap-acquire-deferred: lost the lease CAS to a peer; retrying next reconcile")
+		return
+	}
+
 	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 	if err != nil {
 		// SELF-HEAL the same factory/cluster desync as the clean-cut path (#408):
@@ -553,7 +568,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		c.mountMap[ru] = b
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
-		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+		c.recordOpenEpochInLease(ru, wonETag, openedEpoch)
 		return
 	}
 	ready, err := storageunit.NextOnReady(cur, openedEpoch)
@@ -563,7 +578,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		c.mountMap[ru] = b
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
-		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+		c.recordOpenEpochInLease(ru, wonETag, openedEpoch)
 		return
 	}
 	c.mountMap[ru] = b
@@ -578,7 +593,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	// Write the serving marker EXACTLY ONCE, AFTER the mount flip (outside the
 	// lock: it is shared-storage I/O). This is the durable, poll-observable release
 	// signal the old owner's drainCheck polls. No RPC is sent.
-	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	c.recordOpenEpochInLease(ru, wonETag, openedEpoch)
 }
 
 // drainCheck is the OLD owner's POLL-ONLY release-check for a Draining position,

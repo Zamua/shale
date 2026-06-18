@@ -189,10 +189,36 @@ func (c *Cluster) mountReplicaUnits() error {
 		// SHOULD take over), so a genuine cold start (no markers) still mounts
 		// everything, and a true sole-survivor re-acquires a stale-marked position
 		// once the ring converges.
-		if epoch, ok, merr := c.replicaFactory.ReadServingMarker(ru); merr == nil && ok && epoch > 0 {
-			c.lastAcquireErr.Store(ru, fmt.Sprintf("boot-deferred: a peer is serving this position (serving marker epoch %d); not fenced - reconcile hands off after convergence", epoch))
-			c.logf("shale: boot defer - NOT opening replica %s: a peer is serving it (marker epoch %d); "+
-				"avoiding a fence; reconcile will acquire it after ring convergence", ru, epoch)
+		// PHASE 2g: read the LEASE (owner + heartbeat), not a bare epoch. Defer ONLY
+		// to a LIVE lease (owner in the live member set AND heartbeat fresh) - the
+		// Phase 2f bare "marker present -> defer" wedged a full-cluster restart
+		// (every marker present-but-stale -> every node defers to ghosts -> "0
+		// mounted, N DEFERRED"). With the liveness predicate, after an all-pods
+		// restart NO recorded owner is in the freshly-formed member set, so every
+		// marker is stale and the CAS claim below re-forms ownership. A single-node
+		// restart still defers to its live peers' fresh leases.
+		live := c.liveMemberSet()
+		if lease, _, present, merr := c.replicaFactory.ReadServingLease(ru); merr == nil && present &&
+			c.leaseIsLiveDeferred(lease, live, nowUnixMs()) {
+			c.lastAcquireErr.Store(ru, fmt.Sprintf("boot-deferred: a LIVE peer holds the lease (owner=%q epoch %d); not fenced - reconcile hands off after convergence", lease.Owner, lease.Epoch))
+			c.logf("shale: boot defer - NOT opening replica %s: a LIVE peer holds the lease (owner=%q epoch %d); "+
+				"avoiding a fence; reconcile will acquire it after ring convergence", ru, lease.Owner, lease.Epoch)
+			deferred++
+			continue
+		}
+
+		// Absent or stale lease: win the CAS claim BEFORE opening (single-winner
+		// fence). A lost CAS (a peer claimed it concurrently) defers without
+		// fencing; the reconcile retries. This is what makes the all-at-once boot
+		// converge to one owner per position instead of a fence-fight.
+		won, wonETag, deferLive := c.claimReplicaLease(ru, epochAtOpen)
+		if !won {
+			if deferLive {
+				c.lastAcquireErr.Store(ru, "boot-deferred: a live owner holds the lease (CAS not attempted)")
+			} else {
+				c.lastAcquireErr.Store(ru, "boot-deferred: lost the lease CAS to a peer; reconcile will acquire after convergence")
+				c.logf("shale: boot defer - NOT opening replica %s: lost the lease CAS to a peer; reconcile retries", ru)
+			}
 			deferred++
 			continue
 		}
@@ -223,6 +249,11 @@ func (c *Cluster) mountReplicaUnits() error {
 		c.mountMu.Lock()
 		c.mountMap[ru] = b
 		c.mountMu.Unlock()
+		// Record the ACTUAL open epoch in the lease we won (CAS If-Match the won
+		// etag): owner=me, heartbeat=now, epoch=the factory-returned open epoch. This
+		// makes the lease LIVE so a slow-booting peer defers to it, and is the
+		// poll-observable release signal for any draining predecessor.
+		c.recordOpenEpochInLease(ru, wonETag, openedEpoch)
 		mounted++
 	}
 	if skipped > 0 || deferred > 0 {
@@ -347,6 +378,20 @@ func (c *Cluster) fenceToTransient(ru storageunit.ReplicaUnit, b backend.Backend
 // pure new mount (no draining leaver) is a harmless no-op observer-wise.
 func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	epoch := acquireBaseEpoch
+
+	// PHASE 2g: win the lease CAS BEFORE opening. Only the single CAS winner opens
+	// the writer, so its fence is uncontested and a full-restart fence-fight is
+	// impossible. A live owner -> defer; a lost race -> back off (retry next tick).
+	won, wonETag, deferLive := c.claimReplicaLease(ru, epoch)
+	if !won {
+		if deferLive {
+			c.lastAcquireErr.Store(ru, "acquire-deferred: a live owner holds the lease (CAS not attempted)")
+		} else {
+			c.lastAcquireErr.Store(ru, "acquire-deferred: lost the lease CAS to a peer; retrying next reconcile")
+		}
+		return
+	}
+
 	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
 	if err != nil {
 		// SELF-HEAL a factory/cluster desync (the mass-restart auto-recovery wedge,
@@ -379,12 +424,13 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	c.mountMap[ru] = b
 	c.mountMu.Unlock()
 
-	// Write the durable serving marker AFTER the mount (outside the lock: shared
-	// storage I/O), at THIS node's EXACT open epoch (the factory return value, NOT
-	// a re-read of the climbing durable). This is the poll-observable release
-	// signal a DRAINING predecessor reads (drainCheck); without it a clean-cut
-	// successor of a leaving node never releases that node's drain.
-	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	// Record the ACTUAL open epoch in the lease we won (CAS If-Match the won etag),
+	// carrying this node's owner id + a fresh heartbeat. This is the poll-observable
+	// release signal a DRAINING predecessor reads (drainCheck, via the epoch
+	// projection) AND it makes the lease LIVE for predicate (B) so a booting peer
+	// defers to it. The claim wrote the intended floor; this records the exact
+	// factory-returned epoch.
+	c.recordOpenEpochInLease(ru, wonETag, openedEpoch)
 }
 
 // releaseReplicaUnit unmounts the ReplicaUnit ru via the per-replica factory.

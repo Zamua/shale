@@ -464,6 +464,19 @@ type Cluster struct {
 	// mountMu.
 	acquireInFlight map[storageunit.ReplicaUnit]struct{}
 
+	// convergence tracks gossip-membership stability for the Phase 2g CAS-lease
+	// acquire gate (the "decide off a settled ring" rule). lastMemberSet is the
+	// live member-id set observed on the previous reconcile pass; stableSince is
+	// when the set last CHANGED. A node may only CAS-STEAL a stale-looking lease
+	// (owner-not-in-live-set) once the set has been UNCHANGED for at least
+	// convergenceSettleWindow - so a live peer whose gossip simply has not arrived
+	// yet is not stolen from mid-convergence. Guarded by convergenceMu. The lease
+	// heartbeat is the backstop when convergence is imperfect.
+	convergenceMu    sync.Mutex
+	lastMemberSet    map[string]bool
+	convergedSince   time.Time
+	convergenceReady bool
+
 	// draining is a TEST-ONLY override for the gossiped Draining set: when
 	// non-nil, drainingIDs returns it directly instead of reading the membership
 	// snapshot. It lets the white-box pending-ranges tests inject a transition

@@ -306,7 +306,7 @@ func TestMountReplicaUnits_DoesNotFenceServingPeer(t *testing.T) {
 	if _, ok := c.mountMap[served]; ok {
 		t.Fatalf("position %s a peer is serving must NOT be mounted at boot", served)
 	}
-	if v, ok := c.lastAcquireErr.Load(served); !ok || !strings.Contains(v.(string), "serving") {
+	if v, ok := c.lastAcquireErr.Load(served); !ok || !strings.Contains(v.(string), "deferred") {
 		t.Fatalf("served position should be recorded boot-deferred; ok=%v v=%v", ok, v)
 	}
 	// THE FIX: the peer was NOT fenced - its writes still succeed.
