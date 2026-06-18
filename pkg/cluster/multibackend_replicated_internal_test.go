@@ -263,3 +263,61 @@ func TestMountReplicaUnits_DegradedBoot(t *testing.T) {
 		t.Fatalf("lastAcquireErr for %s must be cleared after a successful re-acquire", bad)
 	}
 }
+
+// TestMountReplicaUnits_DoesNotFenceServingPeer pins the v0.8 Phase 2f fencing-
+// safety refinement: the boot mount must NOT open (hence must NOT fence) a
+// position a live peer is already serving. It reads the fence-free serving
+// marker first and DEFERS such positions to reconcile. This is the fix for the
+// prod incident where a re-bootstrapping seed opened every position and fenced
+// every serving peer cluster-wide.
+//
+// BREAK DEMONSTRATION: without the serving-marker pre-check, mountReplicaUnits
+// would OpenReplicaUnit(served) at durable+1, fencing the peer, and the peer's
+// second Put below would fail with ErrFenced - which is exactly what this test
+// asserts must NOT happen.
+func TestMountReplicaUnits_DoesNotFenceServingPeer(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 8, 2, backing, "n1", "n2", "n3")
+	desired := c.desiredReplicaUnits()
+	if len(desired) < 2 {
+		t.Fatalf("test needs n1 to desire >=2 positions, got %d", len(desired))
+	}
+	served := desired[0] // a position a peer is already serving
+
+	// A PEER opens this position and writes its serving marker (it reached Ready).
+	peer := backing.Handle()
+	pb, peerEpoch, err := peer.OpenReplicaUnit(served, storageunit.Epoch(1))
+	if err != nil {
+		t.Fatalf("peer open: %v", err)
+	}
+	if err := peer.WriteServingMarker(served, peerEpoch); err != nil {
+		t.Fatalf("peer write serving marker: %v", err)
+	}
+	if err := pb.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("peer put (pre-boot): %v", err)
+	}
+
+	// Founder boot-mount: it desires `served` too, but a peer is serving it.
+	if err := c.mountReplicaUnits(); err != nil {
+		t.Fatalf("mountReplicaUnits: %v", err)
+	}
+
+	// `served` is DEFERRED: not mounted, recorded, and - crucially - NOT fenced.
+	if _, ok := c.mountMap[served]; ok {
+		t.Fatalf("position %s a peer is serving must NOT be mounted at boot", served)
+	}
+	if v, ok := c.lastAcquireErr.Load(served); !ok || !strings.Contains(v.(string), "serving") {
+		t.Fatalf("served position should be recorded boot-deferred; ok=%v v=%v", ok, v)
+	}
+	// THE FIX: the peer was NOT fenced - its writes still succeed.
+	if err := pb.Put([]byte("k2"), []byte("v2")); err != nil {
+		t.Fatalf("FENCE REGRESSION: boot mount fenced the serving peer (%v); the serving-marker pre-check failed", err)
+	}
+
+	// Cold-mount still works: the other desired positions (no marker) ARE mounted.
+	for _, ru := range desired[1:] {
+		if _, ok := c.mountMap[ru]; !ok {
+			t.Fatalf("un-marked position %s should mount normally at boot", ru)
+		}
+	}
+}

@@ -172,8 +172,30 @@ func memberNodeIDs(set []ring.Member) []storageunit.NodeID {
 // loop. On any open error it rolls back what it already mounted so Open fails
 // cleanly. Caller (initMultiBackend) has already wired replicaFactory.
 func (c *Cluster) mountReplicaUnits() error {
-	var mounted, skipped int
+	var mounted, skipped, deferred int
 	for _, ru := range c.desiredReplicaUnits() {
+		// FENCING SAFETY (Phase 2f): never OPEN a position a live peer is already
+		// serving. The open ITSELF fences the peer - slatedb bumps the durable
+		// writer-epoch inside DbBuilder.Build(), so even an open that later ERRORS
+		// has ALREADY fenced any peer holding the position (the peer then fails
+		// every op with "detected newer DB client"). A re-bootstrapping seed pod
+		// (empty/unreachable seeds -> a 1-node ring -> it desires EVERY position)
+		// that opened everything would fence every serving peer, turning a one-node
+		// restart into a cluster-wide write outage. So read the FENCE-FREE serving
+		// marker FIRST (a sibling object, not a slatedb open): if a peer reached
+		// Ready serving this position, SKIP it at boot (desired-but-unmounted),
+		// never fencing the live peer. BOOT-ONLY: the reconcile-time acquire does
+		// NOT consult the marker (it is the legitimate ownership-change path that
+		// SHOULD take over), so a genuine cold start (no markers) still mounts
+		// everything, and a true sole-survivor re-acquires a stale-marked position
+		// once the ring converges.
+		if epoch, ok, merr := c.replicaFactory.ReadServingMarker(ru); merr == nil && ok && epoch > 0 {
+			c.lastAcquireErr.Store(ru, fmt.Sprintf("boot-deferred: a peer is serving this position (serving marker epoch %d); not fenced - reconcile hands off after convergence", epoch))
+			c.logf("shale: boot defer - NOT opening replica %s: a peer is serving it (marker epoch %d); "+
+				"avoiding a fence; reconcile will acquire it after ring convergence", ru, epoch)
+			deferred++
+			continue
+		}
 		b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
 		if err != nil {
 			// DEGRADED BOOT (Phase 2f): a replica position whose backing store
@@ -203,10 +225,10 @@ func (c *Cluster) mountReplicaUnits() error {
 		c.mountMu.Unlock()
 		mounted++
 	}
-	if skipped > 0 {
-		c.logf("shale: degraded boot complete - %d replica position(s) mounted, %d SKIPPED "+
-			"(un-openable backing store); skipped units are read-only until repaired; see /debug/shale/state",
-			mounted, skipped)
+	if skipped > 0 || deferred > 0 {
+		c.logf("shale: degraded boot complete - %d mounted, %d SKIPPED (un-openable), %d DEFERRED "+
+			"(a peer is already serving - NOT fenced; reconcile hands off after convergence); see /debug/shale/state",
+			mounted, skipped, deferred)
 	}
 	return nil
 }
