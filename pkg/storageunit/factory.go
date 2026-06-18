@@ -197,5 +197,56 @@ type ReplicaBackendFactory interface {
 	// inside the release lock (I/O under the lock is forbidden). err is non-nil
 	// only on an I/O failure reading the durable record; a never-written marker
 	// is NOT an error (it is ok == false, epoch 0).
+	//
+	// Phase 2g: the durable marker object is now a ServingMarker LEASE (carrying
+	// owner + heartbeat alongside the epoch). ReadServingMarker is the
+	// EPOCH-ONLY projection of that lease, RETAINED unchanged so the strict-`>`
+	// release gate (drainCheck) keeps reading just the epoch field. The owner +
+	// heartbeat liveness is read via ReadServingLease, and the single-winner
+	// claim is performed via CasServingLease.
 	ReadServingMarker(ru ReplicaUnit) (epoch Epoch, ok bool, err error)
+
+	// ReadServingLease reads replica position ru's durable SERVING LEASE object
+	// AND its object-store ETag WITHOUT opening (mounting) the position (v0.8
+	// Phase 2g). It is the read half of the single-winner CAS claim and of the
+	// liveness-aware boot/acquire defer:
+	//
+	//   - lease is the decoded ServingMarker {Epoch, Owner, HeartbeatUnixMs}. A
+	//     legacy bare-epoch marker decodes as {Epoch:n, Owner:"", Heartbeat:0},
+	//     which ServingMarker.IsStale treats as stale (owner unknown) - the safe
+	//     default that lets a node CAS-claim a ghost rather than defer to it.
+	//   - etag is the object-store entity tag the caller passes back to
+	//     CasServingLease as the If-Match precondition (so a CAS swaps ONLY the
+	//     exact version the caller observed). It is opaque to the caller.
+	//   - present is false when no lease object exists yet (a genuine cold start);
+	//     lease + etag are zero in that case and CasServingLease is called with an
+	//     empty expectedETag (create-only / If-None-Match: *).
+	//
+	// err is non-nil only on a real I/O failure; an absent object is present ==
+	// false, NOT an error.
+	ReadServingLease(ru ReplicaUnit) (lease ServingMarker, etag string, present bool, err error)
+
+	// CasServingLease conditionally writes replica position ru's durable SERVING
+	// LEASE, succeeding ONLY when the object's current version matches
+	// expectedETag (v0.8 Phase 2g). It is the single-winner ownership claim: of N
+	// nodes racing to acquire a position, exactly ONE wins the CAS and only that
+	// winner opens the writer (the fence is then uncontested), so the fence-fight
+	// is impossible by construction.
+	//
+	//   - expectedETag == "" is CREATE-ONLY (If-None-Match: *): the CAS succeeds
+	//     ONLY when no lease object exists. Used to claim an ABSENT lease.
+	//   - expectedETag != "" is SWAP-ONLY (If-Match: <etag>): the CAS succeeds
+	//     ONLY when the stored object's ETag equals expectedETag. Used to steal a
+	//     present-but-stale lease (If-Match the observed ETag), to record the
+	//     true open epoch after winning (If-Match the just-won ETag), and to
+	//     refresh a held lease's heartbeat.
+	//
+	// ok == true means this node won: the lease now holds `next` and newETag is
+	// its new version (pass it to the next CAS - the post-open epoch rewrite or a
+	// heartbeat refresh). ok == false means this node LOST the race (the object
+	// was created or moved under it): newETag is empty, the object is UNCHANGED,
+	// and the caller must back off WITHOUT opening the writer. err is non-nil
+	// only on a real I/O failure (distinct from a lost CAS, which is err == nil,
+	// ok == false).
+	CasServingLease(ru ReplicaUnit, expectedETag string, next ServingMarker) (newETag string, ok bool, err error)
 }
