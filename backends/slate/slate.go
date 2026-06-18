@@ -30,6 +30,9 @@ package slate
 import (
 	"errors"
 	"fmt"
+	"os"
+	"strings"
+	"time"
 
 	slatedb "slatedb.io/slatedb-go/uniffi"
 
@@ -155,6 +158,40 @@ func defaultPutOptions() slatedb.PutOptions {
 // default (no block cache - every read re-fetches SST blocks from the
 // object store).
 func buildDb(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, cache *slatedb.DbCache) (*slatedb.Db, error) {
+	// slatedb's open (DbBuilder.Build) does object-store I/O with NO internal
+	// timeout, so a stalled request against a busy/degraded distributed object
+	// store hangs the open FOREVER. That is catastrophic for the multi-backend
+	// cold start, which opens many unit DBs SEQUENTIALLY (cluster mount loop):
+	// one stalled open wedges the whole Open and the node never becomes ready.
+	// (Observed on a 3-node distributed MinIO under load; a single-backend node
+	// opens one DB so it almost never hits it, which is why this lay latent.)
+	//
+	// Bound the open: if it does not complete within openTimeout, return an
+	// error so the caller (e.g. the cluster mount loop) can fail cleanly and the
+	// process restart + re-mount from a fresh state - far better than hanging.
+	// We deliberately do NOT retry the same DB name here: the goroutine running
+	// the stalled Build cannot be cancelled (uniffi has no context), so a second
+	// concurrent open of the same name would trip slatedb's writer-epoch fence.
+	// The leaked goroutine is reaped when the process restarts after the error.
+	to := openTimeout()
+	r, timedOut := runWithTimeout(to, func() buildResult {
+		db, err := openDbBlocking(dbName, store, settings, cache)
+		return buildResult{db: db, err: err}
+	})
+	if timedOut {
+		return nil, fmt.Errorf("slate: open %q timed out after %s (slatedb open stalled on object-store I/O)", dbName, to)
+	}
+	return r.db, r.err
+}
+
+// buildResult carries the (db, err) pair across the runWithTimeout boundary.
+type buildResult struct {
+	db  *slatedb.Db
+	err error
+}
+
+// openDbBlocking is the actual (blocking, un-cancellable) DbBuilder pipeline.
+func openDbBlocking(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, cache *slatedb.DbCache) (*slatedb.Db, error) {
 	builder := slatedb.NewDbBuilder(dbName, store)
 	defer builder.Destroy()
 	if settings != nil {
@@ -172,6 +209,42 @@ func buildDb(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settin
 		return nil, err
 	}
 	return db, nil
+}
+
+// defaultDbOpenTimeout bounds a single slatedb DB open. Generous enough that a
+// healthy open never trips it (a cold open is sub-second to a few seconds even
+// against object storage), tight enough that a stalled open fails fast so the
+// caller can restart + retry instead of hanging forever.
+const defaultDbOpenTimeout = 25 * time.Second
+
+// openTimeout is the per-open bound, overridable via SLATE_DB_OPEN_TIMEOUT (a Go
+// duration string, e.g. "40s"). An empty/invalid/non-positive value uses the
+// default. Operators tune this up only if a deployment's object store is
+// legitimately slow to open (vs stalled).
+func openTimeout() time.Duration {
+	if v := strings.TrimSpace(os.Getenv("SLATE_DB_OPEN_TIMEOUT")); v != "" {
+		if d, err := time.ParseDuration(v); err == nil && d > 0 {
+			return d
+		}
+	}
+	return defaultDbOpenTimeout
+}
+
+// runWithTimeout runs fn in a goroutine and returns (result, false) if it
+// completes within timeout, or (zero, true) on timeout. On timeout the fn
+// goroutine KEEPS RUNNING until fn returns - fn here is an un-cancellable uniffi
+// call, so callers must tolerate the leak (it is reaped on process restart). The
+// result channel is buffered so a late completion never blocks that goroutine.
+func runWithTimeout[T any](timeout time.Duration, fn func() T) (T, bool) {
+	done := make(chan T, 1)
+	go func() { done <- fn() }()
+	select {
+	case r := <-done:
+		return r, false
+	case <-time.After(timeout):
+		var zero T
+		return zero, true
+	}
 }
 
 // Put stores value under key. When Config.WriteOptions is non-nil,
