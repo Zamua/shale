@@ -101,20 +101,21 @@ func looksLikeLegacyEpoch(payload []byte) bool {
 
 // IsStale reports whether a PRESENT marker should be treated as a ghost: NOT
 // deferred to at boot and ELIGIBLE to be CAS-stolen at acquire. It is the pure
-// staleness predicate from the Phase 2g spec. A present marker is stale when
-// ANY of:
+// staleness predicate from the Phase 2g spec, and the SINGLE source of truth for
+// owner/heartbeat staleness (the cluster acquire path layers ONLY its convergence
+// gate on top of this; it does not re-implement the comparison). A present marker
+// is stale when ANY of:
 //
 //   - Owner is "" (owner unknown - a legacy bare-epoch marker, or a corrupt
 //     write); OR
 //   - Owner is NOT in the live gossip member set liveMembers (the recorded
 //     owner is not a currently-alive peer); OR
-//   - now - HeartbeatUnixMs > leaseWindowMs (the heartbeat is older than the
-//     lease window, so even a still-listed owner is not trusted as live).
+//   - HeartbeatAgedOut(now, leaseWindowMs) - the heartbeat is older than the
+//     lease window, so even a still-listed owner is not trusted as live.
 //
 // A nil / empty liveMembers means no owner is live, so every present marker is
 // stale - the all-pods-at-once restart case, where the booting node has not yet
-// learned any peer, must NOT defer to anyone. The heartbeat comparison is
-// STRICT (`>`): a marker exactly at the window edge is still fresh.
+// learned any peer, must NOT defer to anyone.
 //
 // now and leaseWindowMs are caller-supplied (no clock here) so the predicate is
 // a pure function of its inputs.
@@ -125,10 +126,27 @@ func (m ServingMarker) IsStale(now int64, leaseWindowMs int64, liveMembers map[s
 	if !liveMembers[m.Owner] {
 		return true
 	}
-	if now-m.HeartbeatUnixMs > leaseWindowMs {
-		return true
+	return m.HeartbeatAgedOut(now, leaseWindowMs)
+}
+
+// HeartbeatAgedOut reports whether the lease heartbeat is older than the lease
+// window: now - HeartbeatUnixMs > leaseWindowMs. The comparison is STRICT (`>`):
+// a heartbeat exactly at the window edge is still fresh. A non-positive
+// leaseWindowMs (<= 0) DISABLES the age check (returns false) - the caller has
+// opted out of the heartbeat backstop and relies on owner-liveness alone.
+//
+// It is split out from IsStale so the convergence-gated acquire path can tell the
+// two staleness reasons apart: a heartbeat that has aged out is a DEAD owner,
+// reclaimable regardless of ring convergence (the backstop), whereas an
+// owner-not-in-the-live-set marker whose heartbeat is still fresh might just be a
+// live peer whose gossip has not arrived yet, so it is only reclaimable once the
+// ring has settled. Keeping both behind this one predicate keeps the comparison
+// in a single place.
+func (m ServingMarker) HeartbeatAgedOut(now int64, leaseWindowMs int64) bool {
+	if leaseWindowMs <= 0 {
+		return false
 	}
-	return false
+	return now-m.HeartbeatUnixMs > leaseWindowMs
 }
 
 // NewerEpochThan reports whether m's epoch is STRICTLY greater than other's. It

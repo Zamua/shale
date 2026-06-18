@@ -153,6 +153,29 @@ func TestServingMarker_IsStale(t *testing.T) {
 	}
 }
 
+func TestServingMarker_HeartbeatAgedOut(t *testing.T) {
+	cases := []struct {
+		name     string
+		m        ServingMarker
+		now      int64
+		windowMs int64
+		want     bool
+	}{
+		{"fresh", ServingMarker{HeartbeatUnixMs: 5000}, 5500, 1000, false},
+		{"exactly-at-window-is-fresh", ServingMarker{HeartbeatUnixMs: 5000}, 6000, 1000, false},
+		{"just-past-window-is-aged", ServingMarker{HeartbeatUnixMs: 5000}, 6001, 1000, true},
+		{"zero-window-disables-check", ServingMarker{HeartbeatUnixMs: 0}, 1_000_000, 0, false},
+		{"negative-window-disables-check", ServingMarker{HeartbeatUnixMs: 0}, 1_000_000, -1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.m.HeartbeatAgedOut(tc.now, tc.windowMs); got != tc.want {
+				t.Fatalf("HeartbeatAgedOut=%v want %v (m=%+v now=%d win=%d)", got, tc.want, tc.m, tc.now, tc.windowMs)
+			}
+		})
+	}
+}
+
 func TestServingMarker_NewerEpochThan(t *testing.T) {
 	cases := []struct {
 		name string

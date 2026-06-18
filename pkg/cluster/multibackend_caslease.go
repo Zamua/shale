@@ -114,31 +114,46 @@ func sameStringSet(a, b map[string]bool) bool {
 	return true
 }
 
+// leaseWindowMs returns the lease window expressed in the milliseconds that the
+// pure ServingMarker predicates speak (HeartbeatUnixMs is Unix millis). A
+// non-positive result (leaseWindow == 0) disables the heartbeat-age backstop in
+// those predicates (owner-liveness alone then decides), matching the documented
+// "zero = no heartbeat-age check" contract on leaseWindow.
+func leaseWindowMs() int64 { return int64(leaseWindow / time.Millisecond) }
+
 // leaseIsLiveDeferred reports whether a present lease should be DEFERRED to (a
-// live owner holds it), applying predicate (B) plus the convergence gate:
+// live owner holds it). It defers entirely to the pure staleness predicate
+// ServingMarker.IsStale for the owner/heartbeat half (the SINGLE source of truth)
+// and layers ONLY the convergence gate on top:
 //
-//   - heartbeat-age stale (now - HeartbeatTS > leaseWindow): NOT live, do not
-//     defer (the backstop - reclaimable regardless of convergence).
-//   - owner not in the live member set: STALE *only once gossip has converged*.
-//     Before convergence this node conservatively DEFERS (it may simply not have
-//     learned the live owner yet), so it returns true (defer) until settled.
-//   - owner in the live set AND heartbeat fresh: LIVE, defer.
+//   - lease NOT stale (known owner in the live set, heartbeat fresh): LIVE, DEFER.
+//   - lease stale BECAUSE the heartbeat aged out: a DEAD owner; do NOT defer
+//     (the backstop - reclaimable regardless of ring convergence).
+//   - lease stale for any OTHER reason (owner "" or owner-not-in-live-set) but
+//     the heartbeat is still fresh: the owner might be a live peer whose gossip
+//     has not arrived yet, so DEFER until gossip has SETTLED. Only a converged
+//     ring lets this node treat owner-not-in-set as grounds to steal.
 //
-// A legacy bare-epoch marker (Owner == "") is never live: owner-unknown is stale,
-// and once converged it is CAS-claimable. now is the caller's wall clock.
+// now is the caller's wall clock (millis). The heartbeat-age comparison and the
+// owner-liveness comparison both live in ServingMarker now; this function adds no
+// staleness logic of its own, only the convergence policy.
 func (c *Cluster) leaseIsLiveDeferred(lease storageunit.ServingMarker, live map[string]bool, now int64) bool {
-	// Heartbeat-age backstop: an owner that stopped refreshing is dead regardless
-	// of whether its id lingers in gossip or whether the ring has converged.
-	if leaseWindow > 0 && lease.Owner != "" && now-lease.HeartbeatUnixMs > int64(leaseWindow/time.Millisecond) {
-		return false
-	}
-	// Owner liveness: a known owner in the live set with a fresh heartbeat is live.
-	if lease.Owner != "" && live[lease.Owner] {
+	winMs := leaseWindowMs()
+	// Owner + heartbeat half: a non-stale lease is a live owner; always defer.
+	if !lease.IsStale(now, winMs, live) {
 		return true
 	}
-	// Owner unknown or not in the live set. Before gossip has settled, DEFER
-	// conservatively (the owner may be a live peer we have not learned yet). Only a
-	// converged ring lets us treat owner-not-in-set as grounds to steal.
+	// Stale. The heartbeat-age backstop overrides the convergence gate: a KNOWN
+	// owner that stopped refreshing is dead regardless of whether its id lingers
+	// in gossip or whether the ring has converged, so do NOT defer. (An empty
+	// owner has no heartbeat to trust as a death signal, so it falls through to
+	// the convergence gate, matching the legacy bare-epoch handling.)
+	if lease.Owner != "" && lease.HeartbeatAgedOut(now, winMs) {
+		return false
+	}
+	// Stale only because the owner is unknown / not in the live set (and, for a
+	// known owner, its heartbeat is still fresh). Before gossip has settled, DEFER
+	// conservatively (the owner may be a live peer we have not learned yet).
 	return !c.convergedEnoughToSteal()
 }
 
