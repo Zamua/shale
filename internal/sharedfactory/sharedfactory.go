@@ -91,18 +91,32 @@ type Backing struct {
 	// concurrently with mounts without taking b.mu.
 	openFaults sync.Map
 
-	// servingMarkers is the durable, poll-observable SERVING MARKER registry
-	// (v0.8 Phase 2e, Option B overlap handoff): per-replica-position, the open
-	// epoch of the latest live owner that reached Ready. It is the in-memory
-	// analogue of the small durable object the slate factory writes to shared
-	// storage keyed by dbNameReplica(ru). It is STRICTLY STRONGER than
-	// replicaEpochs (the fence epoch): a marker exists ONLY after a new owner
-	// completed its mount flip and started serving, whereas the fence epoch
-	// bumps at open-START. The old (draining) owner polls it to release. Stored
-	// in the same shared Backing every per-node Handle references, so the new
-	// owner's WriteServingMarker is visible to the old owner's ReadServingMarker
-	// across nodes. Absence (no entry) is "no live owner yet": ok == false.
-	servingMarkers map[storageunit.ReplicaUnit]storageunit.Epoch
+	// servingMarkers is the durable, poll-observable SERVING LEASE registry
+	// (v0.8 Phase 2e marker, extended to the Phase 2g CAS-guarded lease):
+	// per-replica-position, the lease record of the latest live owner that
+	// reached Ready. It is the in-memory analogue of the small durable object the
+	// slate factory writes to shared storage keyed by dbNameReplica(ru). It is
+	// STRICTLY STRONGER than replicaEpochs (the fence epoch): a marker exists ONLY
+	// after a new owner completed its mount flip and started serving, whereas the
+	// fence epoch bumps at open-START. The old (draining) owner polls it to
+	// release. Stored in the same shared Backing every per-node Handle references,
+	// so the new owner's write is visible to the old owner's read across nodes.
+	// Absence (no entry) is "no live owner yet": ok == false / present == false.
+	//
+	// Phase 2g: each entry is a leaseObject {payload, etag} so CasServingLease can
+	// simulate MinIO's conditional PUT (If-Match / If-None-Match) deterministically
+	// in-process - etag is a monotonic version counter bumped on every successful
+	// write, so two concurrent claimers race exactly one winner.
+	servingMarkers map[storageunit.ReplicaUnit]*leaseObject
+}
+
+// leaseObject is the in-memory model of the durable serving-lease object: the
+// decoded ServingMarker payload plus a monotonic ETag version counter (the
+// analogue of S3's per-object ETag). A successful write bumps etag; a CAS
+// conditions on the observed etag so a stale-version write loses.
+type leaseObject struct {
+	payload storageunit.ServingMarker
+	etag    uint64
 }
 
 // NewBacking returns an empty shared backing (no units written yet).
@@ -112,7 +126,7 @@ func NewBacking() *Backing {
 		epochs:         make(map[storageunit.GenUnit]storageunit.Epoch),
 		replicaStores:  make(map[storageunit.ReplicaUnit]*memory.Memory),
 		replicaEpochs:  make(map[storageunit.ReplicaUnit]storageunit.Epoch),
-		servingMarkers: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		servingMarkers: make(map[storageunit.ReplicaUnit]*leaseObject),
 	}
 }
 
@@ -283,30 +297,111 @@ func (b *Backing) replicaDurableEpoch(ru storageunit.ReplicaUnit) storageunit.Ep
 // it never lowers an already-recorded epoch, so a stale write from a fenced
 // prior owner cannot roll the marker back below a live higher-epoch owner's
 // value. Idempotent at the same-or-higher epoch.
+//
+// Phase 2g: it writes the EPOCH FIELD of the lease object (owner/heartbeat
+// unset). It is RETAINED as the bare-epoch write path used by the existing
+// overlap/drain tests; the CAS-guarded acquire path uses casServingLease. It
+// bumps the etag like any write so a subsequent CAS sees a fresh version.
 func (b *Backing) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if cur, ok := b.servingMarkers[ru]; ok && cur >= epoch {
+	if cur, ok := b.servingMarkers[ru]; ok && cur.payload.Epoch >= epoch {
 		return
 	}
-	b.servingMarkers[ru] = epoch
+	b.putLeaseLocked(ru, storageunit.ServingMarker{Epoch: epoch})
 }
 
 // readServingMarker reports replica ru's serving-marker epoch and whether a
 // marker has been written at all (ok). The point-in-time read the old owner's
 // drainCheck polls. ok == false (no entry) means no live owner has reached
-// Ready for this position yet.
+// Ready for this position yet. Phase 2g: it is the epoch-only projection of the
+// lease object.
 func (b *Backing) readServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	e, ok := b.servingMarkers[ru]
-	return e, ok
+	lo, ok := b.servingMarkers[ru]
+	if !ok {
+		return 0, false
+	}
+	return lo.payload.Epoch, true
+}
+
+// putLeaseLocked stores `next` for ru and bumps its etag (the new version).
+// Caller holds b.mu. The etag is monotonic per position: every successful write
+// (bare-epoch write or CAS) increments it, modeling S3's per-object ETag change.
+func (b *Backing) putLeaseLocked(ru storageunit.ReplicaUnit, next storageunit.ServingMarker) uint64 {
+	cur := b.servingMarkers[ru]
+	var ver uint64 = 1
+	if cur != nil {
+		ver = cur.etag + 1
+	}
+	b.servingMarkers[ru] = &leaseObject{payload: next, etag: ver}
+	return ver
+}
+
+// readServingLease reports replica ru's full lease record, its etag, and whether
+// any lease object is present. The Phase 2g read half: the acquire path passes
+// etag back to casServingLease as the If-Match precondition. An absent object is
+// present == false (zero lease + etag), NOT an error.
+func (b *Backing) readServingLease(ru storageunit.ReplicaUnit) (storageunit.ServingMarker, string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	lo, ok := b.servingMarkers[ru]
+	if !ok {
+		return storageunit.ServingMarker{}, "", false
+	}
+	return lo.payload, etagString(lo.etag), true
+}
+
+// casServingLease conditionally writes ru's lease, the in-memory analogue of
+// MinIO's conditional PUT:
+//
+//   - expectedETag == "" is CREATE-ONLY (If-None-Match: *): succeeds ONLY when
+//     no object is present.
+//   - expectedETag != "" is SWAP-ONLY (If-Match): succeeds ONLY when the stored
+//     object's etag equals expectedETag.
+//
+// On success it stores `next`, bumps the etag, and returns (newETag, true). On a
+// lost race (object exists for create-only, or etag moved for swap-only) it
+// returns ("", false) WITHOUT mutating - so two concurrent claimers under b.mu
+// race exactly one winner.
+func (b *Backing) casServingLease(ru storageunit.ReplicaUnit, expectedETag string, next storageunit.ServingMarker) (string, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	cur, present := b.servingMarkers[ru]
+	if expectedETag == "" {
+		// Create-only: lose if anything is already present.
+		if present {
+			return "", false
+		}
+	} else {
+		// Swap-only: lose if absent or the version moved.
+		if !present || etagString(cur.etag) != expectedETag {
+			return "", false
+		}
+	}
+	ver := b.putLeaseLocked(ru, next)
+	return etagString(ver), true
+}
+
+// etagString renders the monotonic version counter as the opaque ETag string the
+// interface speaks (quoted to mirror S3 ETag formatting, though the value is
+// opaque to callers).
+func etagString(v uint64) string {
+	return fmt.Sprintf("\"%d\"", v)
 }
 
 // ServingMarker is the exported read of the serving marker for tests that
 // assert the new owner wrote it at the expected epoch after the mount flip.
 func (b *Backing) ServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool) {
 	return b.readServingMarker(ru)
+}
+
+// ServingLease is the exported read of the full lease record for tests that
+// assert the owner + heartbeat were written, and that the CAS single-winner
+// protocol left exactly one owner.
+func (b *Backing) ServingLease(ru storageunit.ReplicaUnit) (storageunit.ServingMarker, string, bool) {
+	return b.readServingLease(ru)
 }
 
 // Handle is a per-node factory handle over a shared Backing. It implements
@@ -430,6 +525,25 @@ func (h *Handle) WriteServingMarker(ru storageunit.ReplicaUnit, epoch storageuni
 func (h *Handle) ReadServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool, error) {
 	e, ok := h.backing.readServingMarker(ru)
 	return e, ok, nil
+}
+
+// ReadServingLease reads ru's full lease record + etag from the shared Backing
+// WITHOUT opening it (v0.8 Phase 2g). It is the read half of the single-winner
+// CAS claim. It cannot fail here (the in-memory backing always answers), so err
+// is always nil; an absent object is present == false.
+func (h *Handle) ReadServingLease(ru storageunit.ReplicaUnit) (storageunit.ServingMarker, string, bool, error) {
+	lease, etag, present := h.backing.readServingLease(ru)
+	return lease, etag, present, nil
+}
+
+// CasServingLease conditionally writes ru's lease against the shared Backing,
+// simulating MinIO's conditional PUT (v0.8 Phase 2g): create-only when
+// expectedETag == "", swap-only when it is set. ok == true means this handle won
+// the race; ok == false means it lost (no mutation). It cannot fail here, so err
+// is always nil.
+func (h *Handle) CasServingLease(ru storageunit.ReplicaUnit, expectedETag string, next storageunit.ServingMarker) (string, bool, error) {
+	newETag, ok := h.backing.casServingLease(ru, expectedETag, next)
+	return newETag, ok, nil
 }
 
 // CloseReplicaUnit releases replica ru from THIS handle. Idempotent; the
