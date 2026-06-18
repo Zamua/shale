@@ -271,6 +271,21 @@ type Config struct {
 	// code path sets this. See multibackend_reshard_driver.go.
 	TestingForceUncleanReshard bool
 
+	// TestingForceLeaseClaimWin, when true, BREAKS the v0.8 Phase 2g CAS-lease
+	// single-winner claim back to the PRE-FIX behavior: claimReplicaLease ignores
+	// the live-owner defer AND the CAS result, reporting won == true unconditionally
+	// so EVERY booting node opens EVERY desired position. The pre-fix marker was a
+	// bare epoch written last-write-wins (no CAS, no owner identity, no heartbeat),
+	// so an all-pods-at-once restart had every node treat every stale marker as a
+	// ghost to take over and open in parallel - the FENCE-FIGHT: multiple nodes open
+	// the same position, each open bumps the durable writer-epoch and fences the
+	// others, wedging positions in a permanent re-acquire loop. It exists solely to
+	// keep the all-pods-restart regression gate honest: the break-demo runs the SAME
+	// mass restart with this set and asserts the fence-fight / wedge REAPPEARS,
+	// proving the CAS claim is load-bearing rather than rubber-stamped. Test-only; no
+	// production code path sets this. See multibackend_caslease.go (claimReplicaLease).
+	TestingForceLeaseClaimWin bool
+
 	// TestingFinalizeRetireDelay, when > 0, makes finalizeSplit sleep this long
 	// between a parent's final catch-up copy and retiring it. It deterministically
 	// WIDENS the post-final-scan / pre-retire window so a concurrent parent-leg

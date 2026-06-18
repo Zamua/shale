@@ -51,7 +51,7 @@ import (
 // whose factory is a per-replica handle over backing. seedAddr empty = founder.
 func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicationFactor int, backing *sharedfactory.Backing) *sharedNode {
 	t.Helper()
-	h := backing.Handle()
+	h := backing.HandleFor(id)
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {

@@ -108,6 +108,16 @@ type Backing struct {
 	// in-process - etag is a monotonic version counter bumped on every successful
 	// write, so two concurrent claimers race exactly one winner.
 	servingMarkers map[storageunit.ReplicaUnit]*leaseObject
+
+	// opens is the per-replica-position OPEN ACCOUNTING (test-only, Phase 4
+	// fence-fight gate): every successful acquireReplica records WHICH node opened
+	// the position. The slatedb analogue is the durable writer-epoch climbing one
+	// step per DbBuilder.Build - each open fences the prior owner. A single,
+	// uncontested ownership handoff opens a position on exactly ONE node during a
+	// boot; a fence-fight opens it on MULTIPLE nodes (each fencing the others),
+	// which is the wedge the CAS claim must prevent. OpenerHistory exposes the set
+	// of distinct opener node ids so a test can assert exactly-one-opener.
+	opens map[storageunit.ReplicaUnit][]string
 }
 
 // leaseObject is the in-memory model of the durable serving-lease object: the
@@ -127,7 +137,54 @@ func NewBacking() *Backing {
 		replicaStores:  make(map[storageunit.ReplicaUnit]*memory.Memory),
 		replicaEpochs:  make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 		servingMarkers: make(map[storageunit.ReplicaUnit]*leaseObject),
+		opens:          make(map[storageunit.ReplicaUnit][]string),
 	}
+}
+
+// recordOpen appends opener (a node id, "" for an unlabeled handle) to ru's open
+// history. Caller must hold b.mu. Test-only open accounting for the fence-fight
+// gate; cheap append, never read on the hot path.
+func (b *Backing) recordOpen(ru storageunit.ReplicaUnit, opener string) {
+	b.opens[ru] = append(b.opens[ru], opener)
+}
+
+// OpenerHistory returns ru's full ordered open log (one entry per successful
+// OpenReplicaUnit acquire, labeled by the opening handle's node id). Test-only.
+func (b *Backing) OpenerHistory(ru storageunit.ReplicaUnit) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	out := make([]string, len(b.opens[ru]))
+	copy(out, b.opens[ru])
+	return out
+}
+
+// ResetOpens clears ALL per-position open accounting (test-only). The all-pods-
+// restart gate calls it after the initial convergence so the open log counts only
+// the opens that happen during the RESTART recovery - the window the fence-fight
+// lives in. It does NOT touch the durable bytes, fence epochs, or leases.
+func (b *Backing) ResetOpens() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.opens = make(map[storageunit.ReplicaUnit][]string)
+}
+
+// DistinctOpeners returns the SET of distinct node ids that have opened ru. A
+// single uncontested handoff yields one; a fence-fight (multiple nodes opening +
+// fencing each other) yields several. The exactly-one-opener assertion of the
+// all-pods-restart gate reads this. Test-only.
+func (b *Backing) DistinctOpeners(ru storageunit.ReplicaUnit) []string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	seen := make(map[string]bool, len(b.opens[ru]))
+	out := make([]string, 0, len(b.opens[ru]))
+	for _, id := range b.opens[ru] {
+		if !seen[id] {
+			seen[id] = true
+			out = append(out, id)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // storeFor returns the shared *memory.Memory for gu, creating it on first
@@ -272,8 +329,10 @@ func (b *Backing) WipeReplica(ru storageunit.ReplicaUnit) {
 }
 
 // acquireReplica is the R>1 analogue of acquire: it opens replica ru against
-// the per-replica durable store + epoch, fencing at max(intended, durable+1).
-func (b *Backing) acquireReplica(ru storageunit.ReplicaUnit, intended storageunit.Epoch) (*memory.Memory, storageunit.Epoch) {
+// the per-replica durable store + epoch, fencing at max(intended, durable+1). It
+// records the opener (node id of the acquiring handle) in the open accounting so a
+// test can detect a fence-fight (multiple distinct openers of one position).
+func (b *Backing) acquireReplica(ru storageunit.ReplicaUnit, intended storageunit.Epoch, opener string) (*memory.Memory, storageunit.Epoch) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	opened := intended
@@ -281,6 +340,7 @@ func (b *Backing) acquireReplica(ru storageunit.ReplicaUnit, intended storageuni
 		opened = floor
 	}
 	b.replicaEpochs[ru] = opened
+	b.recordOpen(ru, opener)
 	return b.replicaStoreFor(ru), opened
 }
 
@@ -412,6 +472,12 @@ func (b *Backing) ServingLease(ru storageunit.ReplicaUnit) (storageunit.ServingM
 type Handle struct {
 	backing *Backing
 
+	// nodeID labels this handle's opens in the Backing's open-accounting (the
+	// Phase 4 fence-fight gate). Empty for handles created via Handle() (the
+	// node-agnostic constructor most existing tests use); HandleFor(id) sets it so
+	// the all-pods-restart test can assert exactly-one DISTINCT opener per position.
+	nodeID string
+
 	// acquireDelayNanos, when > 0, makes OpenReplicaUnit (the R>1 acquire path)
 	// SLEEP that long before mounting, simulating the latency of opening a
 	// per-(unit, replica) slatedb manifest from real object storage. It widens
@@ -425,11 +491,21 @@ type Handle struct {
 	openReplica map[storageunit.ReplicaUnit]storageunit.Epoch // replicas THIS handle has open + at what epoch (R>1)
 }
 
-// Handle returns a fresh per-node handle over this backing. Each node in a
-// test gets its own handle; they all share b.
+// Handle returns a fresh node-agnostic handle over this backing (nodeID unset).
+// Each node in a test gets its own handle; they all share b. Most tests use this;
+// the open-accounting opener label is "" for these.
 func (b *Backing) Handle() *Handle {
+	return b.HandleFor("")
+}
+
+// HandleFor returns a fresh per-node handle labeled with nodeID, so the Backing's
+// open-accounting records WHICH node opened each replica position. The all-pods-
+// restart fence-fight gate uses this to assert exactly one DISTINCT opener per
+// position after recovery (a fence-fight shows up as multiple distinct openers).
+func (b *Backing) HandleFor(nodeID string) *Handle {
 	return &Handle{
 		backing:     b,
+		nodeID:      nodeID,
 		open:        make(map[storageunit.GenUnit]storageunit.Epoch),
 		openReplica: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 	}
@@ -483,7 +559,7 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 		time.Sleep(time.Duration(d))
 	}
 
-	store, opened := h.backing.acquireReplica(ru, epoch)
+	store, opened := h.backing.acquireReplica(ru, epoch, h.nodeID)
 	h.mu.Lock()
 	h.openReplica[ru] = opened
 	h.mu.Unlock()

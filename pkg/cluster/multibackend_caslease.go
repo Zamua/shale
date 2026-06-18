@@ -163,6 +163,24 @@ func (c *Cluster) claimReplicaLease(ru storageunit.ReplicaUnit, intended storage
 	live := c.liveMemberSet()
 	now := nowUnixMs()
 
+	// BREAK-DEMO (TestingForceLeaseClaimWin): reproduce the PRE-2g behavior where
+	// claiming a position was "just open the writer" - no live-owner defer, no CAS
+	// single-winner. We still WRITE a bare-epoch-style lease so the marker exists,
+	// but we report won == true REGARDLESS of whether the CAS succeeded, so every
+	// booting node proceeds to open the SAME stale-marked position in parallel and
+	// the opens fence-fight. The wonETag is best-effort (the post-open rewrite CAS
+	// is allowed to lose); the point is that `won` is unconditional.
+	if c.cfg.TestingForceLeaseClaimWin {
+		_, etag, present, _ := c.replicaFactory.ReadServingLease(ru)
+		expected := ""
+		if present {
+			expected = etag
+		}
+		next := storageunit.ServingMarker{Epoch: intended, Owner: c.cfg.NodeID, HeartbeatUnixMs: now}
+		newETag, _, _ := c.replicaFactory.CasServingLease(ru, expected, next)
+		return true, newETag, false
+	}
+
 	lease, etag, present, err := c.replicaFactory.ReadServingLease(ru)
 	if err != nil {
 		// Transient read failure: do not open (could fence a live peer). Treat as a
