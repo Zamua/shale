@@ -8,6 +8,8 @@ package cluster
 // tests/integration/lossless_multibackend_r2_gate_test.go.
 
 import (
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 
@@ -194,5 +196,70 @@ func TestReplicasForKey_CoLocatedKeysShareReplicaSet(t *testing.T) {
 		if a[i].ID != b[i].ID {
 			t.Fatalf("co-located keys diverge at pos %d: %q vs %q", i, a[i].ID, b[i].ID)
 		}
+	}
+}
+
+// TestMountReplicaUnits_DegradedBoot pins v0.8 Phase 2f: a replica position
+// whose backing store cannot be opened is SKIPPED at boot (recorded +
+// observable), not fatal. The node mounts every HEALTHY position and Open
+// succeeds, instead of the whole node bricking on one bad replica.
+//
+// BREAK DEMONSTRATION: the pre-fix mountReplicaUnits returned the open error +
+// closeMountedUnits() here, so on that code this test fails - mountReplicaUnits
+// returns non-nil and mounts nothing. The skip is what holds the node up.
+//
+// It also proves the skipped position RE-MOUNTS once the damage is cleared (the
+// self-heal the periodic reconcile drives in production).
+func TestMountReplicaUnits_DegradedBoot(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 8, 2, backing, "n1", "n2", "n3")
+
+	desired := c.desiredReplicaUnits()
+	if len(desired) < 2 {
+		t.Fatalf("test needs n1 to own >=2 replica positions, got %d", len(desired))
+	}
+	bad := desired[0]
+
+	// Poison ONE of n1's replica positions: its backing store is un-openable,
+	// modeling a corrupt/truncated durable database (slatedb "empty SSTable").
+	injected := errors.New("Data error: empty SSTable (injected)")
+	backing.SetOpenReplicaFault(bad, injected)
+
+	// DEGRADED BOOT: the Open-time mount must NOT abort on the one bad replica.
+	if err := c.mountReplicaUnits(); err != nil {
+		t.Fatalf("mountReplicaUnits must NOT fail on one un-openable replica (degraded boot); got %v", err)
+	}
+
+	// The poisoned position is SKIPPED: unmounted, but recorded for /debug/shale/state.
+	if _, ok := c.mountMap[bad]; ok {
+		t.Fatalf("poisoned replica %s must NOT be mounted", bad)
+	}
+	v, ok := c.lastAcquireErr.Load(bad)
+	if !ok {
+		t.Fatalf("poisoned replica %s must be recorded in lastAcquireErr", bad)
+	}
+	if s, _ := v.(string); !strings.Contains(s, "empty SSTable") {
+		t.Fatalf("lastAcquireErr for %s = %q, want it to carry the open error", bad, s)
+	}
+
+	// Every OTHER desired position IS mounted: the healthy units keep full service.
+	for _, ru := range desired[1:] {
+		if _, ok := c.mountMap[ru]; !ok {
+			t.Fatalf("healthy replica %s must be mounted on a degraded boot", ru)
+		}
+	}
+
+	// SELF-HEAL: once the backing is repaired, re-acquiring the position mounts
+	// it and clears the recorded error (the periodic reconcile drives this in
+	// production; here we drive the acquire primitive directly).
+	backing.SetOpenReplicaFault(bad, nil)
+	c.reconcileMu.Lock()
+	c.acquireReplicaUnit(bad)
+	c.reconcileMu.Unlock()
+	if _, ok := c.mountMap[bad]; !ok {
+		t.Fatalf("repaired replica %s must mount on re-acquire", bad)
+	}
+	if _, ok := c.lastAcquireErr.Load(bad); ok {
+		t.Fatalf("lastAcquireErr for %s must be cleared after a successful re-acquire", bad)
 	}
 }

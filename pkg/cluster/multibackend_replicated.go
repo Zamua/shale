@@ -38,6 +38,8 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
+	"os"
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
@@ -170,18 +172,60 @@ func memberNodeIDs(set []ring.Member) []storageunit.NodeID {
 // loop. On any open error it rolls back what it already mounted so Open fails
 // cleanly. Caller (initMultiBackend) has already wired replicaFactory.
 func (c *Cluster) mountReplicaUnits() error {
+	var mounted, skipped int
 	for _, ru := range c.desiredReplicaUnits() {
 		b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
 		if err != nil {
-			_ = c.closeMountedUnits()
-			return err
+			// DEGRADED BOOT (Phase 2f): a replica position whose backing store
+			// cannot be opened - a corrupt/truncated durable database, or an open
+			// that stalls past SLATE_DB_OPEN_TIMEOUT (buildDb's runWithTimeout
+			// returns an ERROR, not a hang) - is SKIPPED, not fatal. Aborting Open
+			// here (the old behavior) bricked the WHOLE node on one bad replica,
+			// even though every other position it holds is healthy and the damaged
+			// unit is still served by its surviving replica(s). Record the error
+			// for /debug/shale/state (EXACTLY as the reconcile-time
+			// acquireReplicaUnit does for a desired-but-unmountable position) and
+			// log it loudly so a degraded boot is never silent, then CONTINUE. The
+			// position stays DESIRED-BUT-UNMOUNTED; the periodic reconcile retries
+			// the open, so a transient failure self-heals and a permanent one stays
+			// observable until repaired. Reads to the unit are served by the peer;
+			// writes to it block under W (bounded, never lost) until it is restored.
+			c.lastAcquireErr.Store(ru, err.Error())
+			c.logf("shale: DEGRADED BOOT - skipping replica %s: open failed: %v "+
+				"(unit served by peer; desired-but-unmounted, reconcile will retry)", ru, err)
+			skipped++
+			continue
 		}
+		c.lastAcquireErr.Delete(ru)
 		c.myOpenEpoch.Store(ru, openedEpoch) // this node's exact open epoch (drain gate)
 		c.mountMu.Lock()
 		c.mountMap[ru] = b
 		c.mountMu.Unlock()
+		mounted++
+	}
+	if skipped > 0 {
+		c.logf("shale: degraded boot complete - %d replica position(s) mounted, %d SKIPPED "+
+			"(un-openable backing store); skipped units are read-only until repaired; see /debug/shale/state",
+			mounted, skipped)
 	}
 	return nil
+}
+
+// logf writes a one-line cluster-level event to cfg.LogOutput, FALLING BACK to
+// os.Stderr when no sink is wired. The fallback is deliberate: degraded boot is
+// a rare, operator-critical event (a node came up missing a replica), so it must
+// NOT be silent just because the deployment did not wire a log sink - otherwise
+// the crash-loop this change removes is merely replaced by a silently half-
+// functional node. We do NOT route this through the (nil-in-prod) LogOutput-only
+// path that membership's verbose internal logger uses, precisely so this stays
+// visible without re-enabling memberlist's DEBUG spam. It is only ever called
+// for a degraded boot (once, at Open), never on a hot path.
+func (c *Cluster) logf(format string, args ...any) {
+	w := c.cfg.LogOutput
+	if w == nil {
+		w = os.Stderr
+	}
+	_, _ = fmt.Fprintf(w, format+"\n", args...)
 }
 
 // applyEnvelopeIfNewerToUnit is the multi-backend analogue of

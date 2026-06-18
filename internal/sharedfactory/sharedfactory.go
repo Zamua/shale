@@ -81,6 +81,16 @@ type Backing struct {
 	replicaStores map[storageunit.ReplicaUnit]*memory.Memory
 	replicaEpochs map[storageunit.ReplicaUnit]storageunit.Epoch
 
+	// openFaults injects OpenReplicaUnit failures for specific replica positions
+	// (test-only, v0.8 Phase 2f degraded-boot gate). A ReplicaUnit present here
+	// makes EVERY handle's OpenReplicaUnit return the stored error, modeling a
+	// permanently un-openable backing store (a corrupt / truncated durable
+	// database that slatedb cannot open). Keyed by ReplicaUnit -> error; cleared
+	// by SetOpenReplicaFault(ru, nil) so a test can prove the position RE-MOUNTS
+	// once the damage is repaired. A sync.Map so it is safe to arm/clear
+	// concurrently with mounts without taking b.mu.
+	openFaults sync.Map
+
 	// servingMarkers is the durable, poll-observable SERVING MARKER registry
 	// (v0.8 Phase 2e, Option B overlap handoff): per-replica-position, the open
 	// epoch of the latest live owner that reached Ready. It is the in-memory
@@ -337,6 +347,18 @@ func (h *Handle) SetAcquireDelay(d time.Duration) {
 	h.acquireDelayNanos.Store(int64(d))
 }
 
+// SetOpenReplicaFault arms (err != nil) or clears (err == nil) an injected
+// OpenReplicaUnit failure for replica position ru on the SHARED backing, so
+// every handle that tries to open ru sees it - modeling a permanently
+// un-openable backing store. Test-only (v0.8 Phase 2f degraded-boot gate).
+func (b *Backing) SetOpenReplicaFault(ru storageunit.ReplicaUnit, err error) {
+	if err == nil {
+		b.openFaults.Delete(ru)
+		return
+	}
+	b.openFaults.Store(ru, err)
+}
+
 // OpenReplicaUnit opens replica position ru.Replica of unit ru.Unit against
 // the per-replica shared backing, fencing any prior writer of the SAME
 // replica position. It returns a fencedReplicaBackend over the SHARED
@@ -345,6 +367,12 @@ func (h *Handle) SetAcquireDelay(d time.Duration) {
 // owner of the same position acquires it. Distinct replica positions are
 // independent stores: opening replica 1 never touches replica 0.
 func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	// Injected open fault (test-only, Phase 2f): model a permanently un-openable
+	// backing store. Checked BEFORE any state mutation so a faulted open is a
+	// clean no-op, exactly like a real slatedb open that errors before mounting.
+	if f, ok := h.backing.openFaults.Load(ru); ok {
+		return nil, 0, f.(error)
+	}
 	h.mu.Lock()
 	if cur, held := h.openReplica[ru]; held && epoch <= cur {
 		h.mu.Unlock()
