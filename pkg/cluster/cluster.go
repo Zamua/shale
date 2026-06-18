@@ -205,6 +205,17 @@ type Config struct {
 	// HA + LWW conflict resolution is opt-in via ReplicationFactor > 1.
 	ReplicationFactor int
 
+	// OpenConcurrency bounds how many owned replica positions the
+	// boot-time mount (mountReplicaUnits) opens IN PARALLEL. Each
+	// (unit, replica) position is an independent durable database, so
+	// concurrent opens of DISTINCT positions never fence one another;
+	// the cap exists so the cold-start open burst cannot itself
+	// overwhelm the shared object store. Zero (or negative) is
+	// normalized to defaultOpenConcurrency. A value of 1 reproduces the
+	// strictly-sequential mount exactly. Only consulted in multi-backend
+	// R>1 mode (the per-replica mount loop).
+	OpenConcurrency int
+
 	// WriteConsistency picks how many replica acks a Put / Delete
 	// waits for. Zero is normalized to WriteQuorum by Open (the v0.4
 	// default). See WriteConsistency for the per-value semantics.

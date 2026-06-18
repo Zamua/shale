@@ -40,11 +40,13 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -172,63 +174,98 @@ func memberNodeIDs(set []ring.Member) []storageunit.NodeID {
 // loop. On any open error it rolls back what it already mounted so Open fails
 // cleanly. Caller (initMultiBackend) has already wired replicaFactory.
 func (c *Cluster) mountReplicaUnits() error {
-	var mounted, skipped, deferred int
-	for _, ru := range c.desiredReplicaUnits() {
-		// FENCING SAFETY (Phase 2f): never OPEN a position a live peer is already
-		// serving. The open ITSELF fences the peer - slatedb bumps the durable
-		// writer-epoch inside DbBuilder.Build(), so even an open that later ERRORS
-		// has ALREADY fenced any peer holding the position (the peer then fails
-		// every op with "detected newer DB client"). A re-bootstrapping seed pod
-		// (empty/unreachable seeds -> a 1-node ring -> it desires EVERY position)
-		// that opened everything would fence every serving peer, turning a one-node
-		// restart into a cluster-wide write outage. So read the FENCE-FREE serving
-		// marker FIRST (a sibling object, not a slatedb open): if a peer reached
-		// Ready serving this position, SKIP it at boot (desired-but-unmounted),
-		// never fencing the live peer. BOOT-ONLY: the reconcile-time acquire does
-		// NOT consult the marker (it is the legitimate ownership-change path that
-		// SHOULD take over), so a genuine cold start (no markers) still mounts
-		// everything, and a true sole-survivor re-acquires a stale-marked position
-		// once the ring converges.
-		if epoch, ok, merr := c.replicaFactory.ReadServingMarker(ru); merr == nil && ok && epoch > 0 {
-			c.lastAcquireErr.Store(ru, fmt.Sprintf("boot-deferred: a peer is serving this position (serving marker epoch %d); not fenced - reconcile hands off after convergence", epoch))
-			c.logf("shale: boot defer - NOT opening replica %s: a peer is serving it (marker epoch %d); "+
-				"avoiding a fence; reconcile will acquire it after ring convergence", ru, epoch)
-			deferred++
-			continue
-		}
-		b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
-		if err != nil {
-			// DEGRADED BOOT (Phase 2f): a replica position whose backing store
-			// cannot be opened - a corrupt/truncated durable database, or an open
-			// that stalls past SLATE_DB_OPEN_TIMEOUT (buildDb's runWithTimeout
-			// returns an ERROR, not a hang) - is SKIPPED, not fatal. Aborting Open
-			// here (the old behavior) bricked the WHOLE node on one bad replica,
-			// even though every other position it holds is healthy and the damaged
-			// unit is still served by its surviving replica(s). Record the error
-			// for /debug/shale/state (EXACTLY as the reconcile-time
-			// acquireReplicaUnit does for a desired-but-unmountable position) and
-			// log it loudly so a degraded boot is never silent, then CONTINUE. The
-			// position stays DESIRED-BUT-UNMOUNTED; the periodic reconcile retries
-			// the open, so a transient failure self-heals and a permanent one stays
-			// observable until repaired. Reads to the unit are served by the peer;
-			// writes to it block under W (bounded, never lost) until it is restored.
-			c.lastAcquireErr.Store(ru, err.Error())
-			c.logf("shale: DEGRADED BOOT - skipping replica %s: open failed: %v "+
-				"(unit served by peer; desired-but-unmounted, reconcile will retry)", ru, err)
-			skipped++
-			continue
-		}
-		c.lastAcquireErr.Delete(ru)
-		c.myOpenEpoch.Store(ru, openedEpoch) // this node's exact open epoch (drain gate)
-		c.mountMu.Lock()
-		c.mountMap[ru] = b
-		c.mountMu.Unlock()
-		mounted++
+	units := c.desiredReplicaUnits()
+
+	// BOUNDED-CONCURRENCY MOUNT (Phase 2g). Open owned positions through a worker
+	// pool, not strictly one at a time. Each (unit, replica) is an INDEPENDENT
+	// durable database (its own dbName) and the single-writer fence is per-dbName,
+	// so concurrent opens of DISTINCT positions never fence one another; the bound
+	// keeps the cold-start open burst from overwhelming the shared object store.
+	// Time-to-Ready drops from sum(per-open latency) to ~ceil(n/conc) opens.
+	// conc==1 reproduces the strictly-sequential mount exactly. The per-position
+	// rules below (defer-on-marker, skip-on-error, mount-on-success) are
+	// UNCHANGED; only the iteration is parallel, and the set of positions that end
+	// up mounted/skipped/deferred is identical to the serial mount.
+	conc := c.cfg.OpenConcurrency
+	if conc <= 0 {
+		conc = defaultOpenConcurrency
 	}
-	if skipped > 0 || deferred > 0 {
+	if conc > len(units) {
+		conc = len(units)
+	}
+
+	var mounted, skipped, deferred atomic.Int64
+	var g errgroup.Group
+	if conc > 0 {
+		g.SetLimit(conc)
+	}
+
+	for _, ru := range units {
+		ru := ru // capture per iteration (worker closure)
+		g.Go(func() error {
+			// FENCING SAFETY (Phase 2f): never OPEN a position a live peer is already
+			// serving. The open ITSELF fences the peer - slatedb bumps the durable
+			// writer-epoch inside DbBuilder.Build(), so even an open that later ERRORS
+			// has ALREADY fenced any peer holding the position (the peer then fails
+			// every op with "detected newer DB client"). A re-bootstrapping seed pod
+			// (empty/unreachable seeds -> a 1-node ring -> it desires EVERY position)
+			// that opened everything would fence every serving peer, turning a one-node
+			// restart into a cluster-wide write outage. So read the FENCE-FREE serving
+			// marker FIRST (a sibling object, not a slatedb open): if a peer reached
+			// Ready serving this position, SKIP it at boot (desired-but-unmounted),
+			// never fencing the live peer. BOOT-ONLY: the reconcile-time acquire does
+			// NOT consult the marker (it is the legitimate ownership-change path that
+			// SHOULD take over), so a genuine cold start (no markers) still mounts
+			// everything, and a true sole-survivor re-acquires a stale-marked position
+			// once the ring converges.
+			if epoch, ok, merr := c.replicaFactory.ReadServingMarker(ru); merr == nil && ok && epoch > 0 {
+				c.lastAcquireErr.Store(ru, fmt.Sprintf("boot-deferred: a peer is serving this position (serving marker epoch %d); not fenced - reconcile hands off after convergence", epoch))
+				c.logf("shale: boot defer - NOT opening replica %s: a peer is serving it (marker epoch %d); "+
+					"avoiding a fence; reconcile will acquire it after ring convergence", ru, epoch)
+				deferred.Add(1)
+				return nil
+			}
+			b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
+			if err != nil {
+				// DEGRADED BOOT (Phase 2f): a replica position whose backing store
+				// cannot be opened - a corrupt/truncated durable database, or an open
+				// that stalls past SLATE_DB_OPEN_TIMEOUT (buildDb's runWithTimeout
+				// returns an ERROR, not a hang) - is SKIPPED, not fatal. Aborting Open
+				// here (the old behavior) bricked the WHOLE node on one bad replica,
+				// even though every other position it holds is healthy and the damaged
+				// unit is still served by its surviving replica(s). Record the error
+				// for /debug/shale/state (EXACTLY as the reconcile-time
+				// acquireReplicaUnit does for a desired-but-unmountable position) and
+				// log it loudly so a degraded boot is never silent, then CONTINUE. The
+				// position stays DESIRED-BUT-UNMOUNTED; the periodic reconcile retries
+				// the open, so a transient failure self-heals and a permanent one stays
+				// observable until repaired. Reads to the unit are served by the peer;
+				// writes to it block under W (bounded, never lost) until it is restored.
+				c.lastAcquireErr.Store(ru, err.Error())
+				c.logf("shale: DEGRADED BOOT - skipping replica %s: open failed: %v "+
+					"(unit served by peer; desired-but-unmounted, reconcile will retry)", ru, err)
+				skipped.Add(1)
+				return nil
+			}
+			c.lastAcquireErr.Delete(ru)
+			c.myOpenEpoch.Store(ru, openedEpoch) // this node's exact open epoch (drain gate)
+			c.mountMu.Lock()
+			c.mountMap[ru] = b
+			c.mountMu.Unlock()
+			mounted.Add(1)
+			return nil
+		})
+	}
+	// Workers never return an error: degraded boot is non-fatal PER POSITION (skip
+	// + record + reconcile-retry), so a bad position must NOT cancel its siblings.
+	// g.Wait therefore always returns nil here; the bound is the only thing Wait
+	// enforces (it blocks until every queued open has run).
+	_ = g.Wait()
+
+	if skipped.Load() > 0 || deferred.Load() > 0 {
 		c.logf("shale: degraded boot complete - %d mounted, %d SKIPPED (un-openable), %d DEFERRED "+
 			"(a peer is already serving - NOT fenced; reconcile hands off after convergence); see /debug/shale/state",
-			mounted, skipped, deferred)
+			mounted.Load(), skipped.Load(), deferred.Load())
 	}
 	return nil
 }

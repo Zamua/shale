@@ -325,6 +325,13 @@ type Handle struct {
 	// the fix rides it out). Zero = instant (every existing test). Test-only.
 	acquireDelayNanos atomic.Int64
 
+	// openInFlight / openMaxInFlight track concurrent OpenReplicaUnit calls so a
+	// test can assert the boot mount opens positions IN PARALLEL up to a bound
+	// (v0.8 Phase 2g bounded-concurrency mount). openMaxInFlight is the
+	// high-water mark of simultaneously in-flight opens. Test-only.
+	openInFlight    atomic.Int64
+	openMaxInFlight atomic.Int64
+
 	mu          sync.Mutex
 	open        map[storageunit.GenUnit]storageunit.Epoch     // units THIS handle has open + at what epoch (R=1)
 	openReplica map[storageunit.ReplicaUnit]storageunit.Epoch // replicas THIS handle has open + at what epoch (R>1)
@@ -347,6 +354,12 @@ func (h *Handle) SetAcquireDelay(d time.Duration) {
 	h.acquireDelayNanos.Store(int64(d))
 }
 
+// MaxConcurrentOpens reports the high-water mark of simultaneously in-flight
+// OpenReplicaUnit calls on this handle. Test support for the v0.8 Phase 2g
+// bounded-concurrency boot-mount gate (assert the mount opened positions in
+// parallel up to, and never beyond, the configured bound).
+func (h *Handle) MaxConcurrentOpens() int64 { return h.openMaxInFlight.Load() }
+
 // SetOpenReplicaFault arms (err != nil) or clears (err == nil) an injected
 // OpenReplicaUnit failure for replica position ru on the SHARED backing, so
 // every handle that tries to open ru sees it - modeling a permanently
@@ -367,6 +380,19 @@ func (b *Backing) SetOpenReplicaFault(ru storageunit.ReplicaUnit, err error) {
 // owner of the same position acquires it. Distinct replica positions are
 // independent stores: opening replica 1 never touches replica 0.
 func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	// Concurrency high-water tracking (test-only, Phase 2g): record the peak
+	// number of simultaneously in-flight opens so a test can assert the boot
+	// mount runs them in parallel up to its bound. Wraps the whole call (defer)
+	// so every return path decrements.
+	cur := h.openInFlight.Add(1)
+	for {
+		m := h.openMaxInFlight.Load()
+		if cur <= m || h.openMaxInFlight.CompareAndSwap(m, cur) {
+			break
+		}
+	}
+	defer h.openInFlight.Add(-1)
+
 	// Injected open fault (test-only, Phase 2f): model a permanently un-openable
 	// backing store. Checked BEFORE any state mutation so a faulted open is a
 	// clean no-op, exactly like a real slatedb open that errors before mounting.

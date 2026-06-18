@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
@@ -262,6 +263,52 @@ func TestMountReplicaUnits_DegradedBoot(t *testing.T) {
 	if _, ok := c.lastAcquireErr.Load(bad); ok {
 		t.Fatalf("lastAcquireErr for %s must be cleared after a successful re-acquire", bad)
 	}
+}
+
+// TestMountReplicaUnits_BoundedConcurrency pins v0.8 Phase 2g: the boot mount
+// opens owned positions IN PARALLEL up to Config.OpenConcurrency, and NEVER
+// beyond it. A single-member ring makes n1 own one position for every unit (the
+// worst-case founder-alone cold start). Each open is widened with an artificial
+// delay so the pool's workers genuinely overlap, and the factory's high-water
+// mark of simultaneously in-flight opens is read back. limit=4 must reach
+// exactly 4 concurrent opens; limit=1 must degenerate to the exact sequential
+// mount (high-water 1), proving the knob is a strict generalization. Both must
+// still mount EVERY owned position (no faults, no markers).
+func TestMountReplicaUnits_BoundedConcurrency(t *testing.T) {
+	run := func(t *testing.T, limit int, wantMax int64) {
+		t.Helper()
+		backing := sharedfactory.NewBacking()
+		// Single-member ring => n1 owns a position for every unit (16 positions).
+		c := newReplicatedCluster(t, "n1", 16, 2, backing, "n1")
+		owned := len(c.desiredReplicaUnits())
+		if owned < 8 {
+			t.Fatalf("test needs n1 to own >=8 positions to exercise concurrency, got %d", owned)
+		}
+		h, ok := c.factory.(*sharedfactory.Handle)
+		if !ok {
+			t.Fatalf("factory is %T, want *sharedfactory.Handle", c.factory)
+		}
+		// Widen each open so concurrent workers genuinely overlap (without a delay
+		// an open can finish before the next worker is scheduled, hiding the
+		// concurrency the bound permits).
+		h.SetAcquireDelay(40 * time.Millisecond)
+		c.cfg.OpenConcurrency = limit
+
+		if err := c.mountReplicaUnits(); err != nil {
+			t.Fatalf("mountReplicaUnits (limit %d): %v", limit, err)
+		}
+		if got := len(c.mountMap); got != owned {
+			t.Fatalf("limit %d: mounted %d of %d owned positions", limit, got, owned)
+		}
+		if peak := h.MaxConcurrentOpens(); peak != wantMax {
+			t.Fatalf("limit %d: max concurrent opens = %d, want exactly %d (owned=%d)", limit, peak, wantMax, owned)
+		}
+	}
+
+	// Bounded parallel: opens run up to the bound, never beyond.
+	t.Run("limit4_runs_4_in_parallel", func(t *testing.T) { run(t, 4, 4) })
+	// Limit 1 degenerates to the exact strictly-sequential mount.
+	t.Run("limit1_is_sequential", func(t *testing.T) { run(t, 1, 1) })
 }
 
 // TestMountReplicaUnits_DoesNotFenceServingPeer pins the v0.8 Phase 2f fencing-

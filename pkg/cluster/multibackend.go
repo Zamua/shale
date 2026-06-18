@@ -55,6 +55,16 @@ func (c *Cluster) notReady() bool {
 // multibackend_rebalance.go), which is the path that fences a prior owner.
 const epochAtOpen storageunit.Epoch = 0
 
+// defaultOpenConcurrency bounds the boot-time PARALLEL mount of owned replica
+// positions (mountReplicaUnits) when Config.OpenConcurrency is unset. A node
+// owning many units against a multi-second-per-open object store would
+// otherwise have a time-to-Ready equal to the SUM of its per-unit open
+// latencies; opening through a bounded worker pool collapses that to roughly
+// ceil(n/concurrency) while the cap keeps the cold-start open burst from
+// overwhelming the shared store. 8 is a deliberate middle ground: a big cut to
+// cold-start wall-clock without a fan-out that re-creates the overload.
+const defaultOpenConcurrency = 8
+
 // genUnitBytes encodes a GenUnit (the generation-qualified storage identity)
 // as 12 fixed-width big-endian bytes: 8 bytes of Generation followed by 4
 // bytes of UnitID. This is the stable encoding fed to the ring (LocateKey
