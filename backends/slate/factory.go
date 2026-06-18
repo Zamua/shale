@@ -294,25 +294,16 @@ func (b *Backing) minioClient() (*minio.Client, error) {
 	return mc, nil
 }
 
-// writeServingMarker writes replica ru's durable SERVING MARKER object (v0.8
-// Phase 2e): a tiny object at servingMarkerKeyFor(ru) carrying the new owner's
-// open epoch as a decimal string. The new (gaining) owner calls it EXACTLY ONCE
-// at its Acquiring -> Ready mount flip; the old (draining) owner polls it via
-// readServingMarker as the POLL-ONLY release signal.
+// writeServingMarker writes replica ru's durable SERVING LEASE object carrying
+// the bare open epoch (owner/heartbeat unset), the v0.8 Phase 2e bare-epoch
+// write path RETAINED for the drain/overlap call sites. It is MONOTONIC: it
+// reads any existing lease first and refuses to LOWER the recorded epoch. The
+// Phase 2g single-winner acquire path uses casServingLease instead.
 //
-// It is a sibling OBJECT of the position's slatedb database, written WITHOUT
-// opening the database, so it does not perturb the position's WAL/manifest and
-// the old owner can read it without mounting. It is MONOTONIC: it reads any
-// existing marker first and refuses to LOWER the recorded epoch (a stale write
-// from a fenced prior owner must not roll the marker back below a live
-// higher-epoch owner's value). Idempotent at the same-or-higher epoch.
-//
-// NB this read-then-write is NOT atomic against a concurrent marker write, but
-// the marker has a SINGLE legitimate writer at a time (the one live owner that
-// just reached Ready), so the non-atomicity only matters against a stale fenced
-// writer racing the live one - and the monotonic floor is exactly what blocks
-// that stale write from winning. A CAS (If-None-Match / version) would tighten
-// it; the floor is sufficient for the single-live-writer invariant.
+// The payload is the NEW lease JSON (a ServingMarker with only Epoch set), so a
+// later ReadServingLease decodes it as {Epoch, Owner:"", Heartbeat:0} = STALE by
+// predicate, which is the safe default. NB this read-then-write is NOT atomic;
+// the monotonic floor blocks a stale fenced writer, exactly as before.
 func (b *Backing) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) error {
 	cur, ok, err := b.readServingMarker(ru)
 	if err != nil {
@@ -321,53 +312,124 @@ func (b *Backing) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageun
 	if ok && cur >= epoch {
 		return nil // monotonic: never lower a recorded marker.
 	}
+	payload, err := storageunit.ServingMarker{Epoch: epoch}.Marshal()
+	if err != nil {
+		return fmt.Errorf("slate: marshal serving marker %s: %w", ru, err)
+	}
 	mc, err := b.minioClient()
 	if err != nil {
 		return err
 	}
 	key := servingMarkerKeyFor(b.cfg.KeyPrefix, ru)
-	payload := []byte(strconv.FormatUint(uint64(epoch), 10))
 	_, err = mc.PutObject(context.Background(), b.cfg.Bucket, key,
 		bytes.NewReader(payload), int64(len(payload)),
-		minio.PutObjectOptions{ContentType: "text/plain"})
+		minio.PutObjectOptions{ContentType: "application/json"})
 	if err != nil {
 		return fmt.Errorf("slate: write serving marker %s: %w", ru, err)
 	}
 	return nil
 }
 
-// readServingMarker reads replica ru's durable SERVING MARKER object WITHOUT
-// opening the database (v0.8 Phase 2e). It returns (epoch, true, nil) when the
-// marker exists, (0, false, nil) when it has never been written (no live owner
-// has reached Ready for this position), and a non-nil err only on a real I/O
-// failure. It is the point-in-time liveness observation the old owner's
-// drainCheck polls: it releases ONLY on ok == true AND epoch >= its own open
-// epoch.
+// readServingMarker reads replica ru's durable SERVING LEASE object WITHOUT
+// opening the database (v0.8 Phase 2e), returning the EPOCH FIELD only. It
+// returns (epoch, true, nil) when a lease exists, (0, false, nil) when none has
+// been written, and a non-nil err only on a real I/O failure. It is the
+// point-in-time liveness observation the old owner's drainCheck polls (strict-`>`
+// epoch gate). Phase 2g: it is the epoch projection of readServingLease, parsing
+// BOTH the new lease JSON and a legacy bare-epoch payload.
 func (b *Backing) readServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool, error) {
+	lease, _, present, err := b.readServingLease(ru)
+	if err != nil || !present {
+		return 0, false, err
+	}
+	return lease.Epoch, true, nil
+}
+
+// readServingLease reads replica ru's durable SERVING LEASE object AND its
+// object-store ETag WITHOUT opening the database (v0.8 Phase 2g). It returns the
+// decoded lease, the bare (unquoted) ETag for a subsequent If-Match CAS, and
+// present == true when a lease exists. An absent object is (zero, "", false,
+// nil) - NOT an error. It parses BOTH the new lease JSON and a legacy bare-epoch
+// payload (the latter decodes to owner-unknown = stale by predicate).
+func (b *Backing) readServingLease(ru storageunit.ReplicaUnit) (storageunit.ServingMarker, string, bool, error) {
 	mc, err := b.minioClient()
 	if err != nil {
-		return 0, false, err
+		return storageunit.ServingMarker{}, "", false, err
 	}
 	key := servingMarkerKeyFor(b.cfg.KeyPrefix, ru)
 	obj, err := mc.GetObject(context.Background(), b.cfg.Bucket, key, minio.GetObjectOptions{})
 	if err != nil {
-		return 0, false, fmt.Errorf("slate: read serving marker %s: %w", ru, err)
+		return storageunit.ServingMarker{}, "", false, fmt.Errorf("slate: read serving lease %s: %w", ru, err)
 	}
 	defer obj.Close()
+	// Stat first so a missing object is detected without reading a body, and so
+	// the ETag is captured for the CAS precondition.
+	info, err := obj.Stat()
+	if err != nil {
+		if isNotFound(err) {
+			return storageunit.ServingMarker{}, "", false, nil
+		}
+		return storageunit.ServingMarker{}, "", false, fmt.Errorf("slate: stat serving lease %s: %w", ru, err)
+	}
 	raw, err := io.ReadAll(obj)
 	if err != nil {
-		// A missing object surfaces here (or on Stat) as a NoSuchKey error,
-		// which is NOT a failure: it means no marker has been written yet.
 		if isNotFound(err) {
-			return 0, false, nil
+			return storageunit.ServingMarker{}, "", false, nil
 		}
-		return 0, false, fmt.Errorf("slate: read serving marker %s: %w", ru, err)
+		return storageunit.ServingMarker{}, "", false, fmt.Errorf("slate: read serving lease %s: %w", ru, err)
 	}
-	parsed, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
+	lease, err := storageunit.ParseServingMarker(raw)
 	if err != nil {
-		return 0, false, fmt.Errorf("slate: parse serving marker %s (%q): %w", ru, raw, err)
+		return storageunit.ServingMarker{}, "", false, fmt.Errorf("slate: parse serving lease %s: %w", ru, err)
 	}
-	return storageunit.Epoch(parsed), true, nil
+	return lease, normalizeETag(info.ETag), true, nil
+}
+
+// casServingLease conditionally writes ru's lease via a MinIO conditional PUT
+// (v0.8 Phase 2g):
+//
+//   - expectedETag == "" -> If-None-Match: * (SetMatchETagExcept("*")):
+//     CREATE-ONLY, succeeds only when no object exists.
+//   - expectedETag != "" -> If-Match: <etag> (SetMatchETag): SWAP-ONLY, succeeds
+//     only when the stored object's ETag matches.
+//
+// On success it returns (newETag, true, nil). A rejected precondition (S3 412
+// PreconditionFailed, or 409 on a create race) is a LOST CAS: ("", false, nil),
+// NOT an error. Any other failure returns a non-nil err. This is the
+// single-winner ownership claim the acquire path gates the writer-open behind.
+func (b *Backing) casServingLease(ru storageunit.ReplicaUnit, expectedETag string, next storageunit.ServingMarker) (string, bool, error) {
+	payload, err := next.Marshal()
+	if err != nil {
+		return "", false, fmt.Errorf("slate: marshal serving lease %s: %w", ru, err)
+	}
+	mc, err := b.minioClient()
+	if err != nil {
+		return "", false, err
+	}
+	opts := minio.PutObjectOptions{ContentType: "application/json"}
+	if expectedETag == "" {
+		opts.SetMatchETagExcept("*") // If-None-Match: * (create-only)
+	} else {
+		opts.SetMatchETag(normalizeETag(expectedETag)) // If-Match (swap-only)
+	}
+	key := servingMarkerKeyFor(b.cfg.KeyPrefix, ru)
+	info, err := mc.PutObject(context.Background(), b.cfg.Bucket, key,
+		bytes.NewReader(payload), int64(len(payload)), opts)
+	if err != nil {
+		if isPreconditionFailed(err) {
+			return "", false, nil // lost the CAS: back off, do not open.
+		}
+		return "", false, fmt.Errorf("slate: cas serving lease %s: %w", ru, err)
+	}
+	return normalizeETag(info.ETag), true, nil
+}
+
+// normalizeETag strips surrounding double-quotes from an S3 ETag so the stored /
+// compared value is the bare entity tag. minio's SetMatchETag re-wraps the value
+// in quotes when building the If-Match header, so the bare form is what we pass
+// around (and what we compare in the in-memory double).
+func normalizeETag(etag string) string {
+	return strings.Trim(etag, "\"")
 }
 
 // isNotFound reports whether err is the S3 "object does not exist" error, which
@@ -375,6 +437,23 @@ func (b *Backing) readServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epo
 func isNotFound(err error) bool {
 	resp := minio.ToErrorResponse(err)
 	return resp.Code == "NoSuchKey" || resp.StatusCode == 404
+}
+
+// isPreconditionFailed reports whether err is the S3 conditional-write rejection
+// (a LOST CAS): a 412 PreconditionFailed (If-Match etag moved) or a 409
+// (If-None-Match: * race where the object was created concurrently). MinIO's
+// conditional PUT surfaces a lost If-None-Match: * as either, so both are treated
+// as "lost the race, back off," NOT an error.
+func isPreconditionFailed(err error) bool {
+	resp := minio.ToErrorResponse(err)
+	if resp.StatusCode == 412 || resp.StatusCode == 409 {
+		return true
+	}
+	switch resp.Code {
+	case "PreconditionFailed", "At least one of the pre-conditions you specified did not hold":
+		return true
+	}
+	return false
 }
 
 // PresentUnits enumerates the GenUnits whose databases EXIST in the bucket
@@ -813,6 +892,23 @@ func (h *Handle) WriteServingMarker(ru storageunit.ReplicaUnit, epoch storageuni
 // Ready for this position yet (the old owner stays Draining + keeps serving).
 func (h *Handle) ReadServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool, error) {
 	return h.backing.readServingMarker(ru)
+}
+
+// ReadServingLease reads replica ru's durable serving LEASE + its object-store
+// ETag WITHOUT opening the database (v0.8 Phase 2g). It is the read half of the
+// single-winner CAS claim + the liveness-aware boot/acquire defer. Delegates to
+// the Backing (a shared-storage object every node's Handle reaches).
+func (h *Handle) ReadServingLease(ru storageunit.ReplicaUnit) (storageunit.ServingMarker, string, bool, error) {
+	return h.backing.readServingLease(ru)
+}
+
+// CasServingLease conditionally writes replica ru's serving LEASE via a MinIO
+// conditional PUT (v0.8 Phase 2g): create-only (If-None-Match: *) when
+// expectedETag is empty, swap-only (If-Match) otherwise. It is the single-winner
+// ownership claim the acquire path gates the writer-open behind. A rejected
+// precondition is a lost CAS (ok == false, err == nil). Delegates to the Backing.
+func (h *Handle) CasServingLease(ru storageunit.ReplicaUnit, expectedETag string, next storageunit.ServingMarker) (string, bool, error) {
+	return h.backing.casServingLease(ru, expectedETag, next)
 }
 
 // DurableEpochReplica reads replica position ru's durable manifest writer-epoch
