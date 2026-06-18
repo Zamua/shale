@@ -173,6 +173,11 @@ func TestAllPodsRestart_ForceClaimWin_ReproducesFenceFight(t *testing.T) {
 // on forceClaimWin keeps the two halves reading off ONE code path so they cannot
 // drift.
 func runAllPodsRestart(t *testing.T, forceClaimWin bool) {
+	// Pin the CAS-lease timing so the convergence window is a fixed, shorter value
+	// than the production default (recovery is deterministic + faster) without
+	// destabilizing the initial multi-node bring-up. See withDeterministicCASLeaseTiming.
+	withDeterministicCASLeaseTiming(t)
+
 	const (
 		unitCount = 8
 		r         = 2
@@ -449,6 +454,13 @@ func waitForEveryPositionLive(
 // keep serving) and (2) NO position the two SURVIVING peers were serving got opened
 // by the rebooting node during its boot (no steal of a live lease).
 func TestSingleNodeRestart_DefersToLivePeers(t *testing.T) {
+	// Deterministic CAS-lease timing: the 30s lease window is comfortably above the
+	// 5s reconcile interval, so the two SURVIVING peers keep their leases fresh
+	// between refreshes and the rebooting node must DEFER to them (the property
+	// under test). Without a window above the refresh cadence a live peer's lease
+	// would falsely age out between refreshes and the test would be racy.
+	withDeterministicCASLeaseTiming(t)
+
 	const (
 		unitCount = 8
 		r         = 2

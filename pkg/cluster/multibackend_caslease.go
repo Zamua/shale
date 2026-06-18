@@ -164,6 +164,55 @@ func sameStringSet(a, b map[string]bool) bool {
 // "zero = no heartbeat-age check" contract on leaseWindow.
 func leaseWindowMs() int64 { return int64(leaseWindow / time.Millisecond) }
 
+// TestingSetCASLeaseTiming shrinks the CAS-lease timing windows and overrides the
+// two clocks for a deterministic restart test, returning a restore func the caller
+// MUST defer. It sets the heartbeat lease window, the convergence-settle window,
+// the heartbeat clock (nowUnixMs, Unix-millis), and the convergence-settle clock
+// (convergenceClock, a time.Time source). All four are package-level vars the
+// production path reads; an integration test in another package cannot reach them
+// directly, so this exported white-box hook is the seam. Pass nil for either clock
+// to leave that clock at its production default. Test-only; the production defaults
+// are unchanged for every non-test path. Follows the Testing* convention.
+//
+// The two clocks are SEPARATE on purpose: nowUnixMs feeds the lease heartbeat
+// (Unix-millis int that the pure ServingMarker predicates compare), and
+// convergenceClock feeds the settle-window tracker (a time.Time it subtracts). A
+// fast-restart test pins nowUnixMs so heartbeats stay FRESH (younger than
+// leaseWindow) across the restart, forcing recovery through the convergence seed
+// rather than the heartbeat-age backstop.
+func TestingSetCASLeaseTiming(
+	lease, settle time.Duration,
+	nowMs func() int64,
+	convClock func() time.Time,
+) (restore func()) {
+	prevLease, prevSettle := leaseWindow, convergenceSettleWindow
+	prevNow, prevConv := nowUnixMs, convergenceClock
+	leaseWindow = lease
+	convergenceSettleWindow = settle
+	if nowMs != nil {
+		nowUnixMs = nowMs
+	}
+	if convClock != nil {
+		convergenceClock = convClock
+	}
+	return func() {
+		leaseWindow = prevLease
+		convergenceSettleWindow = prevSettle
+		nowUnixMs = prevNow
+		convergenceClock = prevConv
+	}
+}
+
+// TestingConvergedEnoughToSteal exposes the CAS-steal convergence gate for the
+// fast-restart regression test. It reports whether the settle window has elapsed
+// since the membership last changed, which is exactly the signal the boot
+// convergence-seed exists to start EARLY (from boot, not from the first reconcile
+// pass). A test asserts it is TRUE shortly after boot WITHOUT having run a
+// reconcile - true only because mountReplicaUnits seeded the tracker; reverting
+// that seed makes this stay false until a reconcile runs. Test-only white-box hook
+// following the Testing* convention.
+func (c *Cluster) TestingConvergedEnoughToSteal() bool { return c.convergedEnoughToSteal() }
+
 // leaseIsLiveDeferred reports whether a present lease should be DEFERRED to (a
 // live owner holds it). It defers entirely to the pure staleness predicate
 // ServingMarker.IsStale for the owner/heartbeat half (the SINGLE source of truth)
