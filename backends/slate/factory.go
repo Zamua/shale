@@ -397,6 +397,17 @@ func (b *Backing) readServingLease(ru storageunit.ReplicaUnit) (storageunit.Serv
 // PreconditionFailed, or 409 on a create race) is a LOST CAS: ("", false, nil),
 // NOT an error. Any other failure returns a non-nil err. This is the
 // single-winner ownership claim the acquire path gates the writer-open behind.
+//
+// CONTENT-HASH ETAG ASSUMPTION (CLEANUP #2): a real MinIO/S3 ETag is a hash of the
+// object's CONTENT, so two BYTE-IDENTICAL payloads produce the SAME ETag. An
+// If-Match swap from A back to a byte-identical A would therefore be undetectable
+// (an ABA hazard a CAS cannot catch). This is safe ONLY because the caller
+// guarantees every lease write carries a STRICTLY-ADVANCING field: the cluster's
+// nowUnixMs source is monotonic per process, so the HeartbeatUnixMs stamp differs
+// on every consecutive write (even when owner + epoch are unchanged, as in the
+// periodic heartbeat refresh). No two consecutive lease payloads this process
+// writes are byte-identical, so no consecutive CAS can collide on a content-hash
+// ETag. Do NOT introduce a lease write path that re-stamps an identical payload.
 func (b *Backing) casServingLease(ru storageunit.ReplicaUnit, expectedETag string, next storageunit.ServingMarker) (string, bool, error) {
 	payload, err := next.Marshal()
 	if err != nil {
