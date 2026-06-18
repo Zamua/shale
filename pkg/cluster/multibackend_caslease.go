@@ -25,6 +25,7 @@
 package cluster
 
 import (
+	"sync"
 	"time"
 
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -46,8 +47,43 @@ var leaseWindow = 4 * reconcileInterval
 var convergenceSettleWindow = 3 * reconcileInterval
 
 // nowUnixMs is the wall-clock source for lease heartbeats (Unix millis), a var so
-// a test can pin time deterministically.
-var nowUnixMs = func() int64 { return time.Now().UnixMilli() }
+// a test can pin time deterministically. The DEFAULT is monotonicUnixMs, which
+// guarantees a STRICTLY-ADVANCING value per process (see below); a test that
+// overrides this var takes full control of the returned values.
+var nowUnixMs = monotonicUnixMs
+
+// lastHeartbeatMs and lastHeartbeatMu back monotonicUnixMs's strictly-advancing
+// guarantee for the lease heartbeat field.
+var (
+	lastHeartbeatMu sync.Mutex
+	lastHeartbeatMs int64
+)
+
+// monotonicUnixMs returns the current wall clock in Unix millis, but NEVER returns
+// the same value (or a lower one) twice in a process: if the wall clock has not
+// advanced since the last call it returns lastHeartbeatMs + 1.
+//
+// CLEANUP #2 (content-hash-ETag ABA guard): real object stores derive an ETag
+// from the object's CONTENT, so two BYTE-IDENTICAL lease payloads yield the SAME
+// ETag - an ABA hazard a CAS cannot detect. Every lease write stamps the
+// HeartbeatUnixMs field, and most writes (refreshOwnedLeases especially) keep the
+// SAME owner + epoch, so the heartbeat is the only field that distinguishes two
+// consecutive writes by this node. If two such writes landed in the same
+// millisecond the payloads would be identical. Forcing the heartbeat to strictly
+// advance makes every lease this node writes byte-distinct from its predecessor,
+// so no two consecutive CAS writes can collide on a content-hash ETag. The cost is
+// at most a sub-millisecond skew of the recorded heartbeat under a burst, which is
+// far below leaseWindow and harmless to the staleness predicate.
+func monotonicUnixMs() int64 {
+	lastHeartbeatMu.Lock()
+	defer lastHeartbeatMu.Unlock()
+	now := time.Now().UnixMilli()
+	if now <= lastHeartbeatMs {
+		now = lastHeartbeatMs + 1
+	}
+	lastHeartbeatMs = now
+	return now
+}
 
 // convergenceClock is the time source the convergence-settle tracker measures the
 // settle window against. A separate var from nowUnixMs because the tracker needs a
