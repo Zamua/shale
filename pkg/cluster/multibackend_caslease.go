@@ -45,9 +45,16 @@ var leaseWindow = 4 * reconcileInterval
 // peer whose gossip has not yet arrived. A var so tests can shrink it.
 var convergenceSettleWindow = 3 * reconcileInterval
 
-// nowUnixMs is the wall-clock source for lease heartbeats, a var so a test can
-// pin time deterministically.
+// nowUnixMs is the wall-clock source for lease heartbeats (Unix millis), a var so
+// a test can pin time deterministically.
 var nowUnixMs = func() int64 { return time.Now().UnixMilli() }
+
+// convergenceClock is the time source the convergence-settle tracker measures the
+// settle window against. A separate var from nowUnixMs because the tracker needs a
+// time.Time it can subtract (Sub) rather than a Unix-millis int; a test pins it to
+// advance the settle window deterministically without sleeping. Defaults to the
+// real wall clock.
+var convergenceClock = func() time.Time { return time.Now() }
 
 // liveMemberSet returns the set of CURRENTLY-ALIVE member ids from the gossip
 // snapshot (predicate B's "owner in the live member set" input). A nil membership
@@ -77,7 +84,7 @@ func (c *Cluster) liveMemberSet() map[string]bool {
 func (c *Cluster) noteMembershipForConvergence(live map[string]bool) {
 	c.convergenceMu.Lock()
 	defer c.convergenceMu.Unlock()
-	now := time.Now()
+	now := convergenceClock()
 	if !sameStringSet(c.lastMemberSet, live) {
 		c.lastMemberSet = live
 		c.convergedSince = now

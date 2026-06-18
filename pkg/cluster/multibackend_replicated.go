@@ -172,6 +172,26 @@ func memberNodeIDs(set []ring.Member) []storageunit.NodeID {
 // loop. On any open error it rolls back what it already mounted so Open fails
 // cleanly. Caller (initMultiBackend) has already wired replicaFactory.
 func (c *Cluster) mountReplicaUnits() error {
+	// PHASE 2g (fast-restart recovery bound): SEED the convergence-settle tracker
+	// at boot with the membership we open against, so the settle clock starts NOW
+	// rather than at the first reconcile pass. Without this seed convergedSince is
+	// zero until the first reconcile notes membership, so convergedEnoughToSteal
+	// could only ever flip true a settle-window AFTER that first pass - and on a
+	// FAST all-pods restart (every heartbeat still younger than leaseWindow) the
+	// owner-not-in-live-set branch would defer EVERYTHING at boot, leaving recovery
+	// to wait on the (slower) heartbeat-age backstop. Seeding here makes the bound
+	// the SMALLER of (a) convergenceSettleWindow measured from boot (once the ring
+	// stops changing) and (b) leaseWindow heartbeat-age. If a joiner arrives after
+	// the seed the set changes and noteMembershipForConvergence correctly RESTARTS
+	// the clock, so this never lets a node steal from a peer whose gossip is still
+	// arriving. NB on the StatefulSet same-node-id subtlety (a restarted node's id
+	// IS back in the live set, so a marker it wrote in a PRIOR incarnation reads as
+	// owner-in-live-set): that marker is reclaimed purely by the heartbeat-age
+	// backstop (the prior incarnation no longer refreshes it), which is a bounded
+	// leaseWindow wait and needs no incarnation/boot-id - the convergence seed
+	// covers the owner-NOT-in-set (genuinely-departed-id) half.
+	c.noteMembershipForConvergence(c.liveMemberSet())
+
 	var mounted, skipped, deferred int
 	for _, ru := range c.desiredReplicaUnits() {
 		// FENCING SAFETY (Phase 2f): never OPEN a position a live peer is already
