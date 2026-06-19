@@ -31,6 +31,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -169,19 +170,90 @@ func buildDb(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settin
 	// Bound the open: if it does not complete within openTimeout, return an
 	// error so the caller (e.g. the cluster mount loop) can fail cleanly and the
 	// process restart + re-mount from a fresh state - far better than hanging.
-	// We deliberately do NOT retry the same DB name here: the goroutine running
-	// the stalled Build cannot be cancelled (uniffi has no context), so a second
-	// concurrent open of the same name would trip slatedb's writer-epoch fence.
-	// The leaked goroutine is reaped when the process restarts after the error.
-	to := openTimeout()
-	r, timedOut := runWithTimeout(to, func() buildResult {
+	//
+	// RETRY policy (v0.8 Phase 2g): a RETURNED transient error - "empty SSTable",
+	// a too-small SST/WAL object that a momentarily-overloaded object store can
+	// hand back under a concurrent-open CPU spike - IS retried (bounded, with
+	// backoff), so a transient read-truncation self-heals instead of degrading
+	// the position. A TIMEOUT is NEVER retried: the stalled un-cancellable Build
+	// goroutine is still live, and a re-open of the same dbName would race its
+	// writer-epoch fence. A genuinely corrupt object returns the same error every
+	// attempt and falls through after the retries, unchanged.
+	return buildDbRetry(realOpenAttempt, dbName, store, settings, cache)
+}
+
+// openAttemptFunc does ONE timeout-bounded slatedb open, returning (db, err,
+// timedOut). Injected into buildDbRetry so the retry control flow is unit-tested
+// without a real slatedb open.
+type openAttemptFunc func(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, cache *slatedb.DbCache) (*slatedb.Db, error, bool)
+
+// realOpenAttempt is the production openAttemptFunc: the timeout-bounded
+// DbBuilder pipeline.
+func realOpenAttempt(dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, cache *slatedb.DbCache) (*slatedb.Db, error, bool) {
+	r, timedOut := runWithTimeout(openTimeout(), func() buildResult {
 		db, err := openDbBlocking(dbName, store, settings, cache)
 		return buildResult{db: db, err: err}
 	})
-	if timedOut {
-		return nil, fmt.Errorf("slate: open %q timed out after %s (slatedb open stalled on object-store I/O)", dbName, to)
+	return r.db, r.err, timedOut
+}
+
+// buildDbRetry opens dbName via attempt, retrying a RETURNED transient error up
+// to openRetries() extra times with backoff. A timeout (still-running open) is
+// surfaced immediately without retry; a non-transient error returns immediately;
+// a transient error retries until it clears or the budget is exhausted (then the
+// last error is returned, so degraded boot sees the underlying "empty SSTable").
+func buildDbRetry(attempt openAttemptFunc, dbName string, store *slatedb.ObjectStore, settings *slatedb.Settings, cache *slatedb.DbCache) (*slatedb.Db, error) {
+	retries := openRetries()
+	var lastErr error
+	for i := 0; ; i++ {
+		db, err, timedOut := attempt(dbName, store, settings, cache)
+		if timedOut {
+			return nil, fmt.Errorf("slate: open %q timed out after %s (slatedb open stalled on object-store I/O)", dbName, openTimeout())
+		}
+		if err == nil {
+			return db, nil
+		}
+		lastErr = err
+		if !isTransientOpenError(err) || i >= retries {
+			return nil, lastErr
+		}
+		time.Sleep(openRetryBackoff(i))
 	}
-	return r.db, r.err
+}
+
+// isTransientOpenError reports whether a RETURNED slatedb open error is a
+// transient read-truncation worth retrying. "empty SSTable" is slatedb's report
+// of a too-small SST/WAL object, which a momentarily-overloaded/CPU-throttled
+// object store can return under a concurrent-open burst (the 2026-06-18 root
+// cause). A genuinely corrupt object yields the same error on every attempt and
+// thus exhausts the retries -> degraded boot, unchanged.
+func isTransientOpenError(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "empty SSTable")
+}
+
+// defaultOpenRetries is the number of EXTRA open attempts on a transient error.
+const defaultOpenRetries = 3
+
+// openRetries is the transient-open retry budget, overridable via
+// SLATE_DB_OPEN_RETRIES (a non-negative int). 0 disables retry.
+func openRetries() int {
+	if v := strings.TrimSpace(os.Getenv("SLATE_DB_OPEN_RETRIES")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			return n
+		}
+	}
+	return defaultOpenRetries
+}
+
+// openRetryBackoff is the sleep before retry attempt i (0-indexed): 200ms,
+// 400ms, 800ms ... capped at 2s, to let a momentarily-overloaded store recover.
+// A package var so tests can zero it for speed.
+var openRetryBackoff = func(i int) time.Duration {
+	d := 200 * time.Millisecond << uint(i)
+	if d > 2*time.Second || d <= 0 {
+		d = 2 * time.Second
+	}
+	return d
 }
 
 // buildResult carries the (db, err) pair across the runWithTimeout boundary.

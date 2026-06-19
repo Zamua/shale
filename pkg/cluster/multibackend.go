@@ -61,9 +61,17 @@ const epochAtOpen storageunit.Epoch = 0
 // otherwise have a time-to-Ready equal to the SUM of its per-unit open
 // latencies; opening through a bounded worker pool collapses that to roughly
 // ceil(n/concurrency) while the cap keeps the cold-start open burst from
-// overwhelming the shared store. 8 is a deliberate middle ground: a big cut to
-// cold-start wall-clock without a fan-out that re-creates the overload.
-const defaultOpenConcurrency = 8
+// overwhelming the shared store.
+//
+// 4 is deliberately LOW: each open is a heavy burst of object ops, and N
+// concurrent opens multiply that into a CPU spike that can saturate a
+// CPU-constrained store (a throttled store returns truncated reads ->
+// "empty SSTable"; see the 2026-06-18 incident). 4 still gives a 4x cold-start
+// speedup over sequential while keeping the burst small; raise it via
+// Config.OpenConcurrency only when the store has proven headroom. The slate
+// backend additionally RETRIES a transient empty-SSTable open, so a momentary
+// truncation self-heals rather than degrading the position.
+const defaultOpenConcurrency = 4
 
 // genUnitBytes encodes a GenUnit (the generation-qualified storage identity)
 // as 12 fixed-width big-endian bytes: 8 bytes of Generation followed by 4
