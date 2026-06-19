@@ -55,23 +55,25 @@ func (c *Cluster) notReady() bool {
 // multibackend_rebalance.go), which is the path that fences a prior owner.
 const epochAtOpen storageunit.Epoch = 0
 
-// defaultOpenConcurrency bounds the boot-time PARALLEL mount of owned replica
-// positions (mountReplicaUnits) when Config.OpenConcurrency is unset. A node
-// owning many units against a multi-second-per-open object store would
-// otherwise have a time-to-Ready equal to the SUM of its per-unit open
-// latencies; opening through a bounded worker pool collapses that to roughly
-// ceil(n/concurrency) while the cap keeps the cold-start open burst from
-// overwhelming the shared store.
+// defaultOpenConcurrency is the boot-mount worker-pool size when
+// Config.OpenConcurrency is unset. It defaults to 1 = SEQUENTIAL, which is the
+// only mount mode proven safe in production.
 //
-// 4 is deliberately LOW: each open is a heavy burst of object ops, and N
-// concurrent opens multiply that into a CPU spike that can saturate a
-// CPU-constrained store (a throttled store returns truncated reads ->
-// "empty SSTable"; see the 2026-06-18 incident). 4 still gives a 4x cold-start
-// speedup over sequential while keeping the burst small; raise it via
-// Config.OpenConcurrency only when the store has proven headroom. The slate
-// backend additionally RETRIES a transient empty-SSTable open, so a momentary
-// truncation self-heals rather than degrading the position.
-const defaultOpenConcurrency = 4
+// CONCURRENCY IS OPT-IN AND CURRENTLY KNOWN-UNSAFE with the slatedb-go binding we
+// ship (v0.13.1). Opening MULTIPLE units CONCURRENTLY, when those units have REAL
+// durable data to read (WAL replay / SST reads), corrupts the reads and slatedb
+// reports "empty SSTable" - INDEPENDENT of object-store CPU (it reproduced on
+// prod against an UNCAPPED minio with zero throttling, 2026-06-19). The earlier
+// "store CPU saturation" theory was a correlation, not the cause: the concurrent
+// FFI opens themselves are the trigger. Empty/fresh units do NOT reproduce it
+// (no real objects to read), which is why a fresh-data staging cluster passed
+// twice while prod failed.
+//
+// The bounded-concurrency worker pool (Phase 2g) and the per-open transient
+// retry remain in the code, gated behind Config.OpenConcurrency > 1, for if/when
+// the slatedb-go FFI is made concurrency-safe - but a value > 1 MUST be
+// re-validated against PROD-SHAPED DATA before use. Until then the default is 1.
+const defaultOpenConcurrency = 1
 
 // genUnitBytes encodes a GenUnit (the generation-qualified storage identity)
 // as 12 fixed-width big-endian bytes: 8 bytes of Generation followed by 4
