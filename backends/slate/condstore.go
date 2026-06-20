@@ -1,5 +1,6 @@
-// condstore.go: the MinIO/S3 implementation of storageunit.ConditionalStore -
-// the durable, decentralized arbiter the declarative reshard agreement runs on.
+// Package slate provides, in condstore.go, the MinIO/S3 implementation of
+// storageunit.ConditionalStore - the durable, decentralized arbiter the
+// declarative reshard agreement runs on.
 //
 // It is deliberately TAGLESS (no slatedb / cgo): it depends only on minio-go,
 // so it builds and its integration test runs without the slatedb native
