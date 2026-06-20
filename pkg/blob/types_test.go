@@ -2,7 +2,7 @@ package blob
 
 // Unit tests for the PURE domain types: no I/O, no MinIO. These always run with
 // plain `go test ./pkg/blob/...` (no build tags, no env var). They pin the
-// pointer wire format, the shard-keyed key-layout helpers, and blob-id
+// pointer wire format, the UNIT-keyed key-layout helpers, and blob-id
 // generation.
 
 import (
@@ -18,19 +18,19 @@ func TestPointer_EncodeDecodeRoundTrip(t *testing.T) {
 	}{
 		{
 			name: "full",
-			ptr:  Pointer{ObjKey: FinalKey("shard-7", "deadbeef"), Size: 1 << 20, ContentHash: "abc123"},
+			ptr:  Pointer{ObjKey: FinalKey("0-7", "deadbeef"), Size: 1 << 20, ContentHash: "abc123"},
 		},
 		{
 			name: "no content hash",
-			ptr:  Pointer{ObjKey: FinalKey("shard-0", "cafef00d"), Size: 42},
+			ptr:  Pointer{ObjKey: FinalKey("0-0", "cafef00d"), Size: 42},
 		},
 		{
 			name: "zero size",
-			ptr:  Pointer{ObjKey: FinalKey("s", "id"), Size: 0},
+			ptr:  Pointer{ObjKey: FinalKey("legacy", "id"), Size: 0},
 		},
 		{
 			name: "size unknown sentinel preserved",
-			ptr:  Pointer{ObjKey: FinalKey("shard-9", "xyz"), Size: SizeUnknown},
+			ptr:  Pointer{ObjKey: FinalKey("0-9", "xyz"), Size: SizeUnknown},
 		},
 	}
 	for _, tc := range cases {
@@ -105,8 +105,10 @@ func TestDecodePointer_DefaultVersionRejected(t *testing.T) {
 }
 
 func TestFinalKey(t *testing.T) {
-	got := FinalKey("shard-7", "deadbeef")
-	want := "blob/shard-7/deadbeef"
+	// unit tokens are rendered <gen>-<unitID> (e.g. "0-13") by the cluster, or
+	// the "legacy" sentinel; FinalKey treats the unit as an opaque string.
+	got := FinalKey("0-13", "deadbeef")
+	want := "blob/0-13/deadbeef"
 	if got != want {
 		t.Fatalf("FinalKey = %q, want %q", got, want)
 	}
@@ -115,22 +117,27 @@ func TestFinalKey(t *testing.T) {
 	}
 }
 
-func TestFinalPrefixForShard(t *testing.T) {
-	got := FinalPrefixForShard("shard-7")
-	want := "blob/shard-7/"
+func TestFinalPrefixForUnit(t *testing.T) {
+	got := FinalPrefixForUnit("0-13")
+	want := "blob/0-13/"
 	if got != want {
-		t.Fatalf("FinalPrefixForShard = %q, want %q", got, want)
+		t.Fatalf("FinalPrefixForUnit = %q, want %q", got, want)
 	}
-	// The prefix must enumerate exactly the shard's blobs: every FinalKey for
-	// that shard must start with the prefix.
-	fk := FinalKey("shard-7", "abc")
+	// The prefix must enumerate exactly the unit's blobs: every FinalKey for
+	// that unit must start with the prefix.
+	fk := FinalKey("0-13", "abc")
 	if !strings.HasPrefix(fk, got) {
-		t.Fatalf("FinalKey %q is not under FinalPrefixForShard %q", fk, got)
+		t.Fatalf("FinalKey %q is not under FinalPrefixForUnit %q", fk, got)
 	}
-	// And a DIFFERENT shard's key must NOT be under it (namespace isolation).
-	other := FinalKey("shard-70", "abc")
+	// And a DIFFERENT unit's key must NOT be under it. The trailing slash is
+	// what guards against the prefix collision between unit "0-1" and "0-13"
+	// (without it, "blob/0-1" would be a prefix of "blob/0-13/...").
+	other := FinalKey("0-1", "abc")
 	if strings.HasPrefix(other, got) {
-		t.Fatalf("FinalKey %q for a different shard must not match prefix %q (trailing slash guards against prefix collision)", other, got)
+		t.Fatalf("FinalKey %q for a different unit must not match prefix %q (trailing slash guards against prefix collision)", other, got)
+	}
+	if !strings.HasPrefix(other, FinalPrefixForUnit("0-1")) {
+		t.Fatalf("FinalKey %q must be under its own unit prefix %q", other, FinalPrefixForUnit("0-1"))
 	}
 }
 

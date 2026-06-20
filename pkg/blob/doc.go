@@ -15,8 +15,9 @@
 //     no-op). PutStream and GetStream are strictly streaming and never buffer a
 //     whole blob in memory.
 //   - Domain types (pure, no I/O): Pointer (the small versioned record phase 2
-//     persists as a slatedb value, with Encode/DecodePointer) and the object-key
-//     layout helpers (FinalKey, FinalPrefixForShard, NewBlobID).
+//     persists as a slatedb value, with Encode/DecodePointer), the ObjectInfo
+//     listing record, and the object-key layout helpers (FinalKey,
+//     FinalPrefixForUnit, NewBlobID).
 //
 // The single object-store ADAPTER that implements Store (a MinIO/S3 client
 // reusing the slate ConditionalStore's minio-go pattern) does NOT live here: it
@@ -26,15 +27,17 @@
 //
 // # Object-key model: stage to the final key (no staging namespace)
 //
-// Blob bytes are streamed DIRECTLY to their final, shard-keyed object key
+// Blob bytes are streamed DIRECTLY to their final, UNIT-keyed object key
 // (FinalKey) at upload time - there is no separate staging namespace and no
-// promotion/rename step. The caller knows the slug (hence the owning shard) at
-// upload time, so it writes to blob/<shardKey>/<blobid> straight away, and the
-// binding transaction only commits the small Pointer. Bytes sitting at the
-// final key before the pointer commits are unreachable to any reader (a reader
-// reaches them only via committed metadata -> pointer), so a crash before the
-// bind leaves a SHARD-LOCAL orphan that the age-gated same-shard sweep reclaims
-// via List over FinalPrefixForShard.
+// promotion/rename step. The caller knows the route key (hence the owning
+// storage unit) at upload time, so it writes to blob/<unit>/<blobid> straight
+// away, and the binding transaction only commits the small Pointer. Bytes
+// sitting at the final key before the pointer commits are unreachable to any
+// reader (a reader reaches them only via committed metadata -> pointer), so a
+// crash before the bind leaves a UNIT-LOCAL orphan that the age-gated
+// same-shard sweep reclaims via List over FinalPrefixForUnit. Keying by the
+// unit (a bounded per-node set) rather than the raw shard key (unbounded) is
+// what makes the sweep a finite per-owned-unit prefix scan (section 11.5).
 //
 // # Explicitly DEFERRED to phase 2 (the cluster capability split)
 //

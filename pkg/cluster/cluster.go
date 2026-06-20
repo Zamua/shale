@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
+	"github.com/Zamua/shale/pkg/blob"
 	"github.com/Zamua/shale/pkg/membership"
 	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/reshard"
@@ -142,6 +143,22 @@ type Config struct {
 	// (the decentralized online reshard is R>1 only; the R=1 multi-node path
 	// keeps the coordinated freeze barrier).
 	ConditionalStore storageunit.ConditionalStore
+
+	// BlobStore is the OPTIONAL streaming byte plane (the blob.Store port -
+	// docs/design/blob-values.md). nil leaves the cluster metadata-only; the
+	// plain *KV surface is all that is reachable. When set, NewBlobKV wraps the
+	// cluster in the blob-capable *BlobKV surface (StageBlob / GetBlob /
+	// BindBlob / SweepOrphans). The concrete object-store adapter
+	// (blobstore.MinioBlobStore) is wired at the cmd binary, exactly as the
+	// slate Backend + ConditionalStore are; tests pass an in-memory blob.Store.
+	//
+	// The capability is gated IN THE TYPE, not by this field's nil-ness: New
+	// (the *KV constructor) rejects a non-nil BlobStore (it would be unreachable
+	// through *KV), and NewBlobKV (the *BlobKV constructor) requires it. So a
+	// caller cannot reach a blob method without having configured the store -
+	// the wiring mistake is a constructor error, and the missing method is a
+	// compile error. See kv.go.
+	BlobStore blob.Store
 
 	// BindAddr is the host:port memberlist listens on (UDP + TCP).
 	// Non-empty enables multi-node mode. Format: "host:port" (host

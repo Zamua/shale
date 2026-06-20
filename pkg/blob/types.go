@@ -67,37 +67,49 @@ func DecodePointer(data []byte) (Pointer, error) {
 	return env.Pointer, nil
 }
 
-// Object key layout (design section 5 + section 10.1).
+// Object key layout (design section 5 + sections 10.1 + 11.5).
 //
-// Blob bytes live under the OWNING SHARD's namespace so the owner can enumerate
+// Blob bytes live under the OWNING UNIT's namespace so the owner can enumerate
 // "its" blobs for the same-shard orphan sweep:
 //
-//	blob/<shardKey>/<blobid>
+//	blob/<unit>/<blobid>
+//
+// where <unit> is the routed storage UNIT token (rendered <gen>-<unitID>, e.g.
+// "0-13", or the "legacy" sentinel in non-multi mode). The object key is
+// UNIT-keyed, NOT raw-shard-keyed: a node owns a BOUNDED set of UNITS (N is a
+// fixed power of two), while the app's shard keys are an UNBOUNDED set. Keying
+// objects by the unit gives the orphan sweep one finite prefix per owned unit
+// (blob/<unit>/); keying by the raw shard key would force the sweep to list all
+// of blob/ and recompute ownership per object - a global scan, exactly the
+// cross-shard cost the value-separation design removes (section 11.5).
 //
 // There is NO separate staging namespace: phase 2's StageBlob streams the bytes
-// DIRECTLY to this final, shard-keyed key (the caller knows the slug, hence the
-// shard, at upload time), and the binding transaction only commits the pointer.
-// Bytes sitting here before the pointer commits are unreachable to any reader
-// (a reader reaches them only via the committed metadata -> pointer), so a crash
-// before the bind leaves a SHARD-LOCAL orphan that the age-gated same-shard
-// sweep reclaims. The prefix ends in '/' so a List(prefix) enumerates exactly
-// the shard's namespace.
+// DIRECTLY to this final, unit-keyed key (the caller knows the route key, hence
+// the unit, at upload time), and the binding transaction only commits the
+// pointer. Bytes sitting here before the pointer commits are unreachable to any
+// reader (a reader reaches them only via the committed metadata -> pointer), so
+// a crash before the bind leaves a UNIT-LOCAL orphan that the age-gated
+// same-shard sweep reclaims. The prefix ends in '/' so a List(prefix)
+// enumerates exactly the unit's namespace.
 const (
 	// FinalPrefix is the namespace root for blob bytes.
 	FinalPrefix = "blob/"
 )
 
-// FinalKey builds the object key for a blob owned by shardKey. blobid is
-// shale-internal (a fresh NewBlobID, or the content sha when the app keys by
-// content for within-record dedup).
-func FinalKey(shardKey, blobid string) string {
-	return FinalPrefix + shardKey + "/" + blobid
+// FinalKey builds the object key for a blob owned by unit. unit is the routed
+// storage-unit token (the cluster derives it from the route key at stage time).
+// blobid is shale-internal (a fresh NewBlobID, or the content sha when the app
+// keys by content for within-record dedup).
+func FinalKey(unit, blobid string) string {
+	return FinalPrefix + unit + "/" + blobid
 }
 
-// FinalPrefixForShard builds the List prefix that enumerates every blob object
-// owned by shardKey - the input to the same-shard orphan sweep (phase 2).
-func FinalPrefixForShard(shardKey string) string {
-	return FinalPrefix + shardKey + "/"
+// FinalPrefixForUnit builds the List prefix that enumerates every blob object
+// owned by unit - the input to the same-shard orphan sweep (phase 2). The
+// trailing '/' bounds the prefix to exactly that unit (so "0-1" does not also
+// match "0-13").
+func FinalPrefixForUnit(unit string) string {
+	return FinalPrefix + unit + "/"
 }
 
 // NewBlobID returns a fresh, random, URL-safe blob id (128 bits of crypto/rand

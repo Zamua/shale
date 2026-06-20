@@ -352,3 +352,613 @@ model -> drop the staging-prefix code; 10.3 move the adapter out of core) plus t
 `BlobStore` port, `MinioBlobStore` streaming behavior, `BlobPointer` round-trip,
 `ErrNotFound` mapping, key-layout helpers, and the integration tests are sound and
 carry forward unchanged.
+
+## 11. Phase-2 cluster surface (detailed design)
+
+This section grounds the phase-2 cluster capability split (sections 4 and 10.4)
+in shale's ACTUAL `pkg/cluster` API and pins the exact signatures, flows, and
+internal key rules phase 2 implements. It supersedes the conceptual sketches in
+section 4.2 wherever the real API forced a change; the forced changes and why
+are called out inline and summarized in 11.9.
+
+### 11.0 What the real cluster API forced (read first)
+
+Five facts about the implemented cluster changed the section-4 sketch. None
+change the model (reader-atomic create, atomic delete, shard-local sweep); they
+change the SHAPE the surface bolts onto.
+
+1. **The constructor is `cluster.Open(cfg Config) (*Cluster, error)`, not
+   `New(...)`.** There is one cluster type, `*Cluster`, configured by a `Config`
+   struct (NodeID, Backend/BackendFactory, ShardKeyFn, ReplicationFactor, ...).
+   So `*KV` / `*BlobKV` are NOT alternative return types of two constructors;
+   they are THIN WRAPPERS over a `*Cluster`, and the blob capability is gated by
+   a new optional `Config.BlobStore blob.Store` field plus a blob-aware
+   constructor. The capability-in-the-type property (section 4) is preserved by
+   the wrapper types, not by the cluster itself.
+
+2. **`Transact` is `func(pinKey []byte, fn func(tx backend.Transaction) error)
+   error`** (pkg/cluster/cas.go:408). The transaction handed to `fn` is the
+   `backend.Transaction` INTERFACE (concretely `*clusterTx` in remote.go), not a
+   concrete `*Tx`. So `*BlobTx` wraps a `backend.Transaction`; it does not embed
+   a concrete cluster transaction type (there is no exported one). The shadowing
+   in 4.2 ("`*BlobKV.Transact` yields `*BlobTx`") is implemented by the wrapper's
+   own `Transact` method passing an adapter closure to `*Cluster.Transact`.
+
+3. **The blob object key MUST be UNIT-keyed, not raw-shardKey-keyed.** This is
+   the load-bearing correction. The routing chain is
+   `key -> shardKey (ShardKeyFn) -> ShardHash (xxhash) -> UnitID (hash & (N-1))
+   -> ring owner of the unit` (storageunit/unitmap.go, cluster/multibackend.go).
+   A node owns a BOUNDED set of UNITS (N is a fixed power of two), each holding
+   MANY shard keys; the app's shard key (a hostthis slug / id / subnet) is an
+   UNBOUNDED set. The same-shard sweep must enumerate "blobs this node owns", and
+   what a node owns is UNITS. Keying objects by the raw shard key
+   (`blob/<shardKey>/...`) gives the sweep no finite per-owner prefix: it would
+   have to list ALL of `blob/` and recompute ownership per object - a global
+   scan, exactly the cross-shard cost this whole design removes. Keying objects
+   by the unit (`blob/<unitID>/<blobid>`) makes the sweep list one finite prefix
+   per owned unit. So phase 2 changes the object-key layout from
+   `blob/<shardKey>/<blobid>` (phase-1 `FinalKey`) to a UNIT-derived prefix; see
+   11.5. The phase-1 `FinalKey(shardKey, blobid)` / `FinalPrefixForShard` helpers
+   are re-cut to take a unit token (11.5, 11.9).
+
+4. **`blob.Store.List` yields only keys (`iter.Seq2[string, error]`); the sweep
+   needs each object's `LastModified` for the age-gate (section 10.2).** The port
+   gains a modtime-carrying listing (11.6). This is the GAP called out in the
+   brief.
+
+5. **There is no exported "units this node owns" accessor on `*Cluster`.** The
+   internal `desiredGenUnits()` (multibackend.go:121) computes exactly this set
+   but is unexported and multi-backend-only. The sweep needs a public, mode-aware
+   accessor; phase 2 adds `*Cluster.OwnedUnits()` (11.5, 11.7).
+
+### 11.1 Capability wiring: `Config.BlobStore` + two wrapper types
+
+The blob store is injected at construction via a new optional `Config` field. The
+concrete `*blobstore.MinioBlobStore` is wired at the `cmd/shaled-slate` binary
+(exactly as the slate backend + `ConditionalStore` already are); tests pass an
+in-memory `blob.Store` fake.
+
+```go
+// pkg/cluster/cluster.go - add to Config:
+type Config struct {
+    // ... existing fields ...
+
+    // BlobStore is the OPTIONAL streaming byte plane (blob.Store port). nil
+    // leaves the cluster metadata-only. When set, NewBlobKV exposes the blob
+    // capability; the concrete object-store adapter is wired at the cmd binary.
+    BlobStore blob.Store
+}
+```
+
+`*KV` and `*BlobKV` are wrapper types over `*Cluster`. They exist so the blob
+capability is visible IN THE TYPE (calling a blob op without a configured store
+is a COMPILE error, section 4), which a single `*Cluster` with a nil field could
+not give.
+
+```go
+// pkg/cluster (new file kv.go) - the metadata-only surface.
+type KV struct{ c *Cluster }
+
+// New wraps a metadata-only cluster. cfg.BlobStore MUST be nil (a configured
+// blob store with the plain *KV surface is a wiring mistake: the bytes plane is
+// unreachable). New returns an error if cfg.BlobStore != nil.
+func New(cfg Config) (*KV, error)
+
+func (kv *KV) Get(key []byte) ([]byte, error)
+func (kv *KV) Put(key, value []byte) error
+func (kv *KV) Delete(key []byte) error
+func (kv *KV) Transact(pinKey []byte, fn func(*Tx) error) error
+func (kv *KV) Close() error
+
+// *Tx wraps the cluster transaction (backend.Transaction) with the SAME
+// Get/Put/Delete the cluster transaction exposes. It is the metadata-only
+// transaction; *BlobTx is its blob-capable superset.
+type Tx struct{ tx backend.Transaction }
+
+func (t *Tx) Get(key []byte) ([]byte, error)
+func (t *Tx) Put(key, value []byte) error
+func (t *Tx) Delete(key []byte) error
+```
+
+```go
+// *BlobKV is a SUPERSET of *KV: it embeds *KV (inheriting Get/Put/Delete and
+// the metadata Transact), SHADOWS Transact to yield the richer *BlobTx, and adds
+// the streaming blob ops. Because it embeds *KV, any consumer that needs only
+// metadata accepts a *BlobKV too.
+type BlobKV struct {
+    *KV
+    blobs blob.Store
+}
+
+// NewBlobKV wraps a blob-configured cluster. cfg.BlobStore MUST be non-nil
+// (NewBlobKV returns an error otherwise). This is the ONLY constructor that
+// yields a value with StageBlob/GetBlob/BindBlob, so a caller that did not
+// configure a blob store cannot reach those methods - a compile-time gate.
+func NewBlobKV(cfg Config) (*BlobKV, error)
+
+// Transact SHADOWS *KV.Transact to yield a *BlobTx (which adds BindBlob /
+// UnbindBlob). Same pinKey + retry semantics as *Cluster.Transact.
+func (b *BlobKV) Transact(pinKey []byte, fn func(*BlobTx) error) error
+
+// StageBlob streams r to the FINAL, unit-keyed object key OUTSIDE any
+// transaction (no shard lease held). See 11.2.
+func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, size int64) (BlobRef, error)
+
+// GetBlob resolves the bref for (routeKey, blobid), decodes the pointer, and
+// streams the bytes out. See 11.4.
+func (b *BlobKV) GetBlob(ctx context.Context, routeKey []byte, blobid string) (io.ReadCloser, int64, error)
+
+// SweepOrphans reclaims unreferenced blob objects under the units THIS node
+// owns. See 11.7.
+func (b *BlobKV) SweepOrphans(ctx context.Context, now time.Time, grace time.Duration) error
+```
+
+```go
+// *BlobTx embeds *Tx (Get/Put/Delete) and adds the two blob-binding ops. They
+// are ordinary tx.Put / tx.Delete of the internal bref key, so they co-commit
+// with the app's metadata in the SAME single-shard transaction.
+type BlobTx struct {
+    *Tx
+    kv *BlobKV // for the route-key -> bref-key derivation
+}
+
+func (bt *BlobTx) BindBlob(ref BlobRef) error
+func (bt *BlobTx) UnbindBlob(ref BlobRef) error
+```
+
+**Embed-and-shadow compiles cleanly.** `BlobKV` embeds `*KV`, so `BlobKV` has
+`*KV.Transact` promoted; defining a method `Transact` directly on `*BlobKV` with
+a DIFFERENT signature (`func(*BlobTx)` vs `func(*Tx)`) is allowed in Go - a
+method declared on the outer type shadows the promoted one (there is no
+overloading conflict because the promoted method is only a candidate when the
+outer type declares none). `BlobTx` embeds `*Tx` identically. Confirmed against
+the Go embedding rules; no generic-method or interface-satisfaction subtlety
+applies (these are concrete types, and `*BlobKV` does NOT need to satisfy a `*KV`
+interface - it embeds the concrete `*KV`, so the "narrower Transact" concern in
+open question 8 is a non-issue: a shadowed concrete method does not have to keep
+the embedded method's signature).
+
+### 11.2 StageBlob (the slow streaming, outside any transaction)
+
+```go
+func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, size int64) (BlobRef, error)
+```
+
+Mechanics, grounded in the cluster:
+
+1. `unit := b.c.OwnedUnitToken(routeKey)` - derive the UNIT TOKEN the bytes are
+   keyed under. This is `genUnitForKey(routeKey)` rendered as a stable string
+   (11.5). It uses the SAME `ShardKeyFn` + hash + mask the routed write uses, so
+   the blob object lands under the same unit the pointer (and the app's metadata)
+   route to. Note: this is a PURE function of `routeKey` + the current
+   generation/count - no network, no lease.
+2. `blobid, _ := blob.NewBlobID()` - fresh random id (or the app passes a
+   content-sha-keyed id later for within-record dedup; out of phase-2 scope).
+3. `objkey := blob.FinalKey(unit, blobid)` - `blob/<unit>/<blobid>` (11.5).
+4. `err := b.blobs.PutStream(ctx, objkey, r, size)` - streams the SLOW bytes
+   straight to the object store. **This goes node -> object store directly; it
+   does NOT route through the ring and never crosses a gRPC boundary** (confirmed
+   below). No shard lease is held for the multi-second upload.
+5. Returns `BlobRef{Unit: unit, BlobID: blobid, Size: size, ContentHash: ...}`.
+
+After StageBlob returns, the bytes are durable at `blob/<unit>/<blobid>` but
+UNREFERENCED (no bref points at them). They are invisible to every reader (a
+reader reaches bytes only via a committed pointer). A crash here leaves a
+shard-local orphan the age-gated sweep reclaims (11.7).
+
+**Confirmed: StageBlob's byte stream never crosses nodes.** `blob.Store`
+(MinioBlobStore) is a plain object-store client constructed from endpoint +
+creds (backends/slate/blobstore/minio.go); it has NO reference to the ring,
+membership, or any peer client. `PutStream` calls `minio.PutObject` directly.
+The only thing that routes through the cluster is the small POINTER, via the
+existing `Transact` -> `commitCAS` path (remote.go:217), which forwards a tiny
+`CommitCASRequest` to the unit owner over gRPC. The multi-megabyte plane is
+entirely off the RPC path, exactly as section 2.1 requires.
+
+### 11.3 BindBlob / UnbindBlob (the fast transaction, co-committed)
+
+```go
+func (bt *BlobTx) BindBlob(ref BlobRef) error {
+    ptr := blob.Pointer{ObjKey: blob.FinalKey(ref.Unit, ref.BlobID), Size: ref.Size, ContentHash: ref.ContentHash}
+    enc, err := ptr.Encode()
+    if err != nil { return err }
+    return bt.Put(brefKey(ref.Unit, ref.BlobID), enc) // an ordinary tx.Put
+}
+
+func (bt *BlobTx) UnbindBlob(ref BlobRef) error {
+    return bt.Delete(brefKey(ref.Unit, ref.BlobID))   // an ordinary tx.Delete
+}
+```
+
+`BindBlob` is `tx.Put(brefKey, pointer.Encode())`. Because it is a plain
+`tx.Put` on the cluster transaction, it buffers into the SAME write-set as the
+app's metadata `tx.Put`s and is shipped in ONE `commitCAS` to the unit owner
+(remote.go:457/504/217). The cluster's existing single-shard multi-key atomicity
+is the vehicle - no new commit path. The cross-shard guard
+(`guardShard`, remote.go:372) enforces that the bref key and the app's metadata
+keys all route to the SAME unit; the bref key is constructed (11.5) so they do
+(the bref's shard key IS the unit, and the metadata's shard key hashes INTO that
+unit). See 11.5 for the precise rule and 11.8 for the one subtlety this raises.
+
+**Reader-atomic create:** the bref key becomes visible only at the transaction's
+commit. `GetBlob` resolves through the bref, so it cannot see the blob until the
+bind commits, even though the bytes have sat at the final key since StageBlob.
+
+**Atomic delete:** `UnbindBlob` (or an ordinary `tx.Delete(brefKey)`) removes the
+pointer in the same transaction that removes the app's metadata. The bytes are
+now unreferenced and reclaimed by the sweep. `UnbindBlob` is a convenience over
+`tx.Delete(brefKey(...))`; both work because deleting the pointer key is an
+ordinary KV delete (section 4.2).
+
+### 11.4 GetBlob (resolve pointer, stream out)
+
+```go
+func (b *BlobKV) GetBlob(ctx context.Context, routeKey []byte, blobid string) (io.ReadCloser, int64, error) {
+    unit := b.c.OwnedUnitToken(routeKey)
+    enc, err := b.c.Get(brefKey(unit, blobid))   // routed read to the unit owner
+    if errors.Is(err, backend.ErrNotFound) { return nil, 0, blob.ErrNotFound }
+    if err != nil { return nil, 0, err }
+    ptr, err := blob.DecodePointer(enc)
+    if err != nil { return nil, 0, err }
+    return b.blobs.GetStream(ctx, ptr.ObjKey)     // node -> object store directly
+}
+```
+
+The pointer read is a normal routed `Cluster.Get` (small value, goes to the unit
+owner). The byte stream is a direct object-store `GetStream`, off the RPC path.
+
+**ctx lifetime (carry the phase-1 warning forward):** the returned reader streams
+lazily; `ctx` MUST outlive the reader (the whole duration the caller pipes the
+bytes downstream), not just the `GetBlob` call - minio-go's GetObject binds a
+reader goroutine to `ctx` and `Close` cancels it (blobstore/minio.go:86 LIFETIME
+note). A caller that scopes `ctx` to "assemble the response" truncates a large
+stream mid-flight. The caller MUST `Close` the returned reader.
+
+### 11.5 Object-key layout + the bref shard-key rule (the load-bearing change)
+
+Two internal namespaces, both UNIT-keyed so both are shard-local to the owner:
+
+- **Blob bytes** (object store): `blob/<unit>/<blobid>`
+- **Blob pointer** (slatedb value, an internal key on the unit's shard):
+  `bref/{<unit>}/<blobid>`
+
+where `<unit>` is a STABLE STRING RENDERING of the routed unit (see below), and
+the `{...}` braces around it in the bref key are the Redis-style hash-tag the
+default `ring.ShardKey` honors (ring.go:260).
+
+**Why the unit is the object-key prefix (not the raw shard key):** restated from
+11.0 item 3 - the node owns units, the sweep enumerates units, the raw shard key
+is unbounded. `blob/<unit>/` is a finite per-owned-unit prefix the sweep can list.
+
+**The unit token.** `<unit>` must:
+- be derivable from the route key alone, purely (no network), at stage time;
+- be stable for the life of the blob (so the pointer's ObjKey and the sweep's
+  prefix agree);
+- survive a reshard the way the pointer does (11.8).
+
+The natural token is the GenUnit `genUnitForKey(routeKey)` rendered as
+`<gen>-<unitID>` (decimal), e.g. `0-13`. It is computed via the SAME
+`shardKey` + `HashShardKey` + `resolveGenUnit` the routed write uses
+(multibackend.go:161), so the blob's unit and the metadata's unit are identical
+by construction. In LEGACY (non-multi) mode there are no units; the token is a
+fixed sentinel (e.g. `legacy`) since the single backend owns the whole keyspace
+- the sweep there enumerates the one prefix `blob/legacy/` (11.7).
+
+**The bref shard-key rule (so the pointer co-routes with the metadata).** The
+bref key is `bref/{<unit>}/<blobid>`. We need `ShardKeyFn(brefKey)` to extract a
+shard key that hashes into THE SAME unit `<unit>` denotes - so the bref's
+`tx.Put` lands on the same shard as the app's metadata and the cross-shard guard
+admits them into one transaction. Two ways, and we pick the robust one:
+
+- The brittle way (rejected): make the bref's shard key a string that
+  `HashShardKey` happens to mask back to `<unit>`. There is no such string
+  in general (the mask is many-to-one; you cannot invert it), so this does not
+  work - you cannot synthesize a shard key that lands on a CHOSEN unit without a
+  search. This is why the object key uses the unit directly and the pointer needs
+  a different mechanism.
+
+- **The chosen rule: route the bref by the ROUTE KEY's shard, via the app's
+  ShardKeyFn, NOT by the literal bref bytes.** Phase 2 makes the bref key carry
+  the original route key inside the hash tag, so the SAME `ShardKeyFn` the app
+  configured extracts the SAME shard key it extracts for the app's metadata. The
+  bref key is `bref/{<routeShardKey>}/<unit>/<blobid>` where `<routeShardKey> =
+  ShardKeyFn(routeKey)`. The default `ring.ShardKey` returns the hash-tagged
+  portion `<routeShardKey>` (ring.go:277), which hashes to the same unit the
+  metadata does. For an app with a CUSTOM ShardKeyFn (hostthis), the app's
+  ShardKeyFn must also extract `<routeShardKey>` from a `bref/` key - so phase 2
+  REQUIRES one new `ShardKeyFn` case in the app, analogous to its existing
+  `pastes/` / `versions/` cases: `bref/{<shardKey>}/...` -> the hash-tagged
+  segment. To avoid imposing parsing on every app, phase 2 instead makes shale
+  build the bref key with a hash tag AND ships the rule centrally: the cluster's
+  `brefKey` is `bref/{` + `<routeShardKey>` + `}/<unit>/<blobid>`, and shale
+  documents that an app's ShardKeyFn MUST honor hash tags for `bref/` keys (the
+  default `ring.ShardKey` already does; a custom ShardKeyFn adds a leading
+  `if HasPrefix(key, "bref/") { return ring.ShardKey(key) }` guard - one line).
+  The brace content is `ShardKeyFn(routeKey)`, the EXACT bytes the metadata
+  shards on, so they co-route by construction.
+
+  Concretely:
+
+  ```go
+  // brefKey builds the internal pointer key for (routeKey, unit, blobid). The
+  // hash-tag {sk} carries the ROUTE KEY's shard key so the pointer co-routes
+  // with the app's metadata under the SAME unit, and the <unit>/<blobid> tail
+  // disambiguates within the shard. sk = the cluster's ShardKeyFn(routeKey).
+  func (b *BlobKV) brefKeyFor(routeKey []byte, unit, blobid string) []byte {
+      sk := b.c.shardKey(routeKey) // exported-for-blob accessor; same fn metadata uses
+      return []byte("bref/{" + string(sk) + "}/" + unit + "/" + blobid)
+  }
+  ```
+
+  Note BlobRef carries `Unit`, but the bref key needs the route shard key too, so
+  BindBlob/UnbindBlob take the route key OR BlobRef carries it. To keep the app
+  API (section 6) unchanged (`tx.BindBlob(ref)`), BlobRef carries the route shard
+  key it was staged with (11.6); `brefKey` is then a pure function of BlobRef.
+
+This rule means: object bytes keyed by `<unit>` (finite sweep prefix), pointer
+keyed by the route shard key inside a hash tag (co-routes with metadata). The two
+keys carry DIFFERENT prefixes on purpose - the byte plane needs unit-granular
+enumeration, the pointer needs metadata co-location, and a single key shape
+cannot give both.
+
+```go
+// pkg/blob (re-cut helpers; replaces the phase-1 shardKey-taking versions):
+const FinalPrefix = "blob/"
+func FinalKey(unit, blobid string) string      { return FinalPrefix + unit + "/" + blobid }
+func FinalPrefixForUnit(unit string) string    { return FinalPrefix + unit + "/" }
+```
+
+### 11.6 BlobRef + the Store-port modtime extension
+
+```go
+// pkg/cluster - BlobRef is the opaque token StageBlob returns and Bind/Unbind/
+// Get consume. It carries everything brefKey + the pointer need, so the app
+// never sees objkeys or the pointer record. It is NOT persisted; the persisted
+// reference is the blob.Pointer the bref holds.
+type BlobRef struct {
+    Unit        string // the routed unit token <gen>-<unitID> (or "legacy")
+    RouteShard  []byte // ShardKeyFn(routeKey) at stage time - drives brefKey co-routing
+    BlobID      string // the blob.NewBlobID minted at stage time
+    Size        int64  // the stored (possibly compressed) byte length
+    ContentHash string // OPTIONAL app-supplied hash of the original bytes; carried into Pointer
+}
+```
+
+**Store-port extension for the sweep's age-gate (the GAP).** The phase-1 `List`
+yields only keys; the sweep (section 10.2) needs each object's `LastModified` to
+age-gate. The cleaner of the two options in the brief is to make List carry the
+modtime (one round of listing already returns it from S3/MinIO's `ListObjects`,
+so no extra round-trips - a separate `Stat` per object would be N extra HEADs).
+Phase 2 changes `List` to yield a small struct:
+
+```go
+// pkg/blob - replaces List(ctx, prefix) iter.Seq2[string, error]:
+type ObjectInfo struct {
+    Key      string
+    Size     int64
+    ModTime  time.Time // the object store's LastModified - the age-gate signal
+}
+
+// List yields every object under prefix with its size + modtime. iter.Seq2 so a
+// listing error surfaces per-item and the caller can stop early.
+List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error]
+```
+
+The MinioBlobStore adapter already iterates `minio.ListObjects`, whose
+`ObjectInfo` carries `Key`, `Size`, and `LastModified` - the adapter maps those
+three fields (a near-zero change to blobstore/minio.go:136). `Stat(objkey) ->
+(size, modtime, err)` is the rejected alternative: it would force one HEAD per
+listed object in the sweep, turning an O(objects) listing into O(objects)
+network HEADs. List-carries-modtime is strictly cheaper and is the canonical
+sweep input.
+
+### 11.7 SweepOrphans (age-gated, unit-local, owner-only)
+
+```go
+func (b *BlobKV) SweepOrphans(ctx context.Context, now time.Time, grace time.Duration) error {
+    for _, unit := range b.c.OwnedUnits() {            // bounded set; new accessor (11.0 item 5)
+        prefix := blob.FinalPrefixForUnit(unit)        // blob/<unit>/
+        for obj, err := range b.blobs.List(ctx, prefix) {
+            if err != nil { return err }
+            blobid := path.Base(obj.Key)               // strip blob/<unit>/
+            // Is there a live pointer? LocalGet, not routed Get: this node OWNS
+            // the unit, so the bref lives locally; a routed Get would needlessly
+            // round-trip and, mid-reshard, could chase the moved owner.
+            _, gerr := b.c.LocalGet(b.brefKeyForUnit(unit, blobid))
+            if gerr == nil { continue }                // referenced -> keep
+            if !errors.Is(gerr, backend.ErrNotFound) { return gerr }
+            // Unreferenced. Age-gate: only reclaim if the OBJECT is older than
+            // grace, so a just-staged-not-yet-bound blob is never swept (10.2).
+            if now.Sub(obj.ModTime) < grace { continue }
+            if derr := b.blobs.Delete(ctx, obj.Key); derr != nil { return derr }
+        }
+    }
+    return nil
+}
+```
+
+Key points, grounded:
+
+- **`OwnedUnits()` is the new public accessor** (11.0 item 5). It returns the
+  string unit tokens this node currently owns: in multi-backend mode it wraps
+  `desiredGenUnits()` rendered as `<gen>-<unitID>`; in legacy mode it returns the
+  single sentinel `["legacy"]` (the node owns the whole keyspace, so the one
+  `blob/legacy/` prefix). This makes the sweep mode-agnostic.
+- **The bref existence check is `LocalGet`, not routed `Get`** (cluster.go:1018).
+  The sweep runs ON the owner of the unit, so the bref - if it exists - is in
+  this node's local backend. `LocalGet` reads it directly, bypassing ring
+  routing, which is both faster and correct during a reshard window (a routed Get
+  would chase the new owner of a unit mid-handoff and could see a transient
+  not-found that the age-gate already protects against anyway).
+- **Age-gate via `obj.ModTime`** (section 10.2): a pointer-less object younger
+  than `grace` (default ~1h) is a possible in-flight stage; older is a genuine
+  orphan. The object store's `LastModified` is durable + survives restarts, so no
+  in-memory debounce is needed.
+- **`Delete` is idempotent** (blob.go Delete contract): a double-sweep or a race
+  with a concurrent unbind+manual-delete is harmless.
+- **Cadence + cost** (open question 3): the caller (a background loop in the
+  shaled run-loop, or an explicit admin trigger) sets the cadence; each pass is
+  bounded by the owned-unit count times the per-unit object count. Phase 2 ships
+  `SweepOrphans` as a single callable pass; the scheduling loop is a thin wrapper
+  the cmd binary owns (deferred to the integration, like the cmd-side wiring).
+
+### 11.8 Reshard interaction (pointer moves with the unit; bytes stay put)
+
+When a shard (unit) moves to a new owner, two things must remain consistent: the
+pointer and the bytes.
+
+- **The pointer (`bref/{<routeShard>}/<unit>/<blobid>`) moves with the slatedb
+  unit** via the existing rebalance/handoff machinery (pkg/rebalance,
+  multibackend handoff). It is an ordinary slatedb value on the unit's shard, so
+  it is carried in the unit's key range exactly like the app's metadata. No blob-
+  specific reshard code.
+
+- **The bytes (`blob/<unit>/<blobid>`) do NOT move.** They sit in SHARED object
+  storage under a unit-derived prefix, reachable from every node. After the unit
+  moves, the NEW owner's `OwnedUnits()` now includes `<unit>`, so the NEW owner's
+  `SweepOrphans` enumerates `blob/<unit>/` and the NEW owner's `LocalGet` resolves
+  the (now-local) bref - ownership of the byte sweep transfers automatically
+  because the prefix is UNIT-derived, not node-derived. This is exactly the
+  property section 5 + open question 7 require, and the unit-keyed object layout
+  (11.5) is what makes it hold: a node-keyed or raw-shardKey-keyed object prefix
+  would NOT transfer cleanly.
+
+- **The reshard EDGE CASE - unit doubling (split).** Shale's only growth op is
+  unit doubling (`UnitForHash` doubling-compatible, unitmap.go:40): unit `u` under
+  count N splits into two children under 2N, and the GenUnit token changes
+  (`<gen>-<u>` at gen g becomes `<g+1>-<low>` / `<g+1>-<high>`). Existing bytes
+  were staged under `blob/<g>-<u>/...` (the OLD token), but the pointer (carrying
+  `Pointer.ObjKey`) ALSO holds the old token verbatim, so `GetBlob` still resolves
+  the bytes at their old key after the split - the ObjKey in the pointer is the
+  ground truth, the recomputed token is only used at STAGE time. The SWEEP,
+  however, recomputes the CURRENT token from `OwnedUnits()` and would enumerate
+  `blob/<g+1>-<low>/`, MISSING the pre-split `blob/<g>-<u>/` objects. Phase 2
+  handles this by having `OwnedUnits()` return BOTH the current-generation tokens
+  AND the still-referenced ancestor tokens whose key range this node now owns
+  (the same union `desiredGenUnits` already computes across the cut-over - it
+  returns the gen-(g+1) children for cut-over units; phase 2 extends the SWEEP's
+  unit set to also include the parent token while any object remains under it).
+  The simplest correct rule: the sweep enumerates, for each owned current unit,
+  BOTH `blob/<currentToken>/` and the chain of ancestor tokens that mask into it,
+  until a pass finds an ancestor prefix empty. This is bounded (the doubling chain
+  is short) and is the ONLY reshard-specific blob code. Flagged as the one
+  non-trivial reshard interaction; see 11.10 open questions.
+
+### 11.9 What changed from the section-4 / phase-1 decisions, and why
+
+| Decision (section 4 / phase 1) | Phase-2 reality | Why |
+| --- | --- | --- |
+| `New(meta)` / `NewWithBlobs(meta, b)` | `Open(cfg)` exists; add `Config.BlobStore` + `New(cfg) *KV` / `NewBlobKV(cfg) *BlobKV` wrappers | The real constructor is `Open(Config)`; there is one `*Cluster`. Wrappers carry the capability-in-the-type. |
+| `Transact(shardKey, func(*Tx))` | `Transact(pinKey []byte, func(tx backend.Transaction))`; wrappers re-expose `func(*Tx)` / `func(*BlobTx)` | The cluster's `Transact` hands the `backend.Transaction` interface; the concrete tx type is unexported. |
+| object key `blob/<shardKey>/<blobid>`; `FinalKey(shardKey, blobid)`; `FinalPrefixForShard(shardKey)` | object key `blob/<unit>/<blobid>`; `FinalKey(unit, blobid)`; `FinalPrefixForUnit(unit)` | The node owns UNITS (bounded), not raw shard keys (unbounded). The sweep needs a finite per-owner prefix. THE load-bearing change. |
+| pointer key `bref/<shardKey>/<blobid>`, "routed by the same ShardKeyFn" | pointer key `bref/{<routeShardKey>}/<unit>/<blobid>`, route shard key in a hash tag | You cannot synthesize a shard key that masks back to a chosen unit; instead carry the route key's shard key in a hash tag so the SAME ShardKeyFn co-routes the pointer with the metadata. Apps with a custom ShardKeyFn add one `bref/` -> hash-tag case. |
+| `List(prefix) iter.Seq2[string, error]` | `List(prefix) iter.Seq2[ObjectInfo, error]` (Key+Size+ModTime) | The sweep age-gate needs `LastModified`; carrying it in the listing avoids a HEAD per object. |
+| (implicit) some way to enumerate owned shards | new `*Cluster.OwnedUnits()` accessor | No exported owned-unit accessor exists; `desiredGenUnits()` is internal + multi-only. |
+| `BlobHandle` (opaque token, section 4) | `BlobRef{Unit, RouteShard, BlobID, Size, ContentHash}` | Section 10.1 already collapsed BlobHandle into the pointer; the staged ref must additionally carry the unit + route shard for brefKey + sweep. Still opaque to the app. |
+
+### 11.10 Phase 2 vs phase 3 (hostthis) split
+
+**Phase 2 IMPLEMENTS (this design, in shale):**
+- `Config.BlobStore` field + the `New(cfg) *KV` / `NewBlobKV(cfg) *BlobKV`
+  constructors and the `*KV` / `*Tx` / `*BlobKV` / `*BlobTx` wrapper types.
+- `StageBlob` / `GetBlob` / `BindBlob` / `UnbindBlob` and `BlobRef`.
+- The unit-keyed object layout (`FinalKey(unit, ...)` / `FinalPrefixForUnit`),
+  the `brefKey` rule, and `*Cluster.OwnedUnits()` / `OwnedUnitToken()` /
+  exported `shardKey` accessor.
+- The `blob.Store.List` modtime extension (`ObjectInfo`) and its MinioBlobStore
+  mapping.
+- `SweepOrphans` as a single callable pass, including the reshard ancestor-prefix
+  union (11.8).
+- Tests: reader-atomic-create (bytes staged, bref not yet committed -> GetBlob
+  is not-found; after commit -> resolves), atomic-delete (unbind + metadata
+  delete in one tx -> bref gone, sweep reclaims bytes), crash-injection (stage
+  then no bind -> sweep reclaims after grace, not before), the embed-and-shadow
+  compile + dispatch, and a multi-node integration test that StageBlob on one
+  node, binds the pointer that routes to ANOTHER node, and GetBlobs from a third
+  - proving the byte plane stays off the RPC path while the pointer routes. A
+  memory `blob.Store` fake (with a settable per-object modtime) backs the unit
+  tests; the MinIO integration test reuses the phase-1 harness.
+
+**Phase 2 DEFERS to phase 3 (hostthis integration):**
+- The cmd-side wiring of the concrete `MinioBlobStore` into
+  `cmd/shaled-slate` + the sweep scheduling loop in the shaled run-loop (phase 2
+  ships `SweepOrphans` callable; the cadence/loop is operator wiring).
+- hostthis rewriting its blob path to stream through `*BlobKV`, adding the one
+  `bref/` -> hash-tag case to `shaleShardKey`, and retiring its detached S3 blob
+  store + the crash-orphan reconcile + the site reservation (section 7).
+- Within-record dedup (StageBlob skipped when `Has(content-keyed objkey)`):
+  needs the app to key a blob by content sha (section 6.2); phase 2 leaves
+  `NewBlobID`-keyed blobs only.
+- Streaming compression / the tee (section 6): an app concern; `BlobRef`
+  already carries the optional `ContentHash` slot for the app's sha.
+- The one-time migration of existing bucket blobs into shale-managed
+  objects+pointers (section 9 phase 4).
+
+### 11.11 Open questions phase 2 could not fully close from the code
+
+1. **Reshard ancestor-prefix sweep bound (11.8).** The union of current + ancestor
+   unit prefixes the sweep must enumerate across a doubling is correct in
+   principle, but the EXACT termination rule ("until an ancestor prefix lists
+   empty") needs a test against a real mid-reshard cluster to confirm there is no
+   window where a parent prefix is non-empty yet unowned by this node. The
+   `desiredGenUnits` union already models the ownership side; the byte-prefix side
+   is new. Recommend a dedicated reshard+blob integration test in phase 2 and, if
+   it proves fiddly, deferring blob-during-reshard to a follow-up (steady-state
+   blobs are the common case; a reshard is an explicit, rare op).
+
+2. **`OwnedUnits()` during the handoff window.** `desiredGenUnits()` returns what
+   this node SHOULD own; mid-handoff the physical mount may lag. For the SWEEP
+   this is safe (a not-yet-mounted unit's `LocalGet` returns not-found, and the
+   age-gate prevents premature deletion), but it is worth a test that a unit
+   mid-acquire does not get its just-arrived-but-not-yet-bound blobs swept. The
+   age-gate should cover it; confirm.
+
+3. **Empty-value constraint on the pointer.** `Cluster.Put` rejects an empty
+   value (`ErrEmptyValue`, cluster.go:1424). `Pointer.Encode()` always produces a
+   non-empty JSON envelope, so BindBlob is safe, but this should be pinned by a
+   test (a zero-value Pointer must still encode to non-empty bytes) so a future
+   pointer-schema change cannot accidentally produce an empty value that the
+   commit silently rejects.
+
+4. **Legacy-mode unit sentinel collision.** Using `"legacy"` as the single unit
+   token assumes no app ships a real unit token literally named `legacy`; since
+   tokens are `<gen>-<unitID>` (always containing a `-`), `legacy` cannot collide.
+   Confirmed safe by construction, but noted so the rendering rule
+   (`<gen>-<unitID>`, never a bare word) is treated as load-bearing.
+
+### 11.12 Implementation deltas (phase-2 build + P0 review fix)
+
+The build diverged from the section-11 sketch in a few grounded ways; the code is
+the source of truth, these are the notable ones:
+
+- **The sweep enumerates MOUNTED units, not desired units.** The original sketch
+  had `SweepOrphans` iterate `OwnedUnits()` (desired-from-ring) while the
+  referenced-pointer set (`referencedObjKeys`) scans `LocalScanPrefix("bref/")`
+  (MOUNTED backends only). An adversarial review found that mismatch is a P0
+  data-loss path: a desired-but-not-yet-mounted unit (cold boot, or the
+  rebalance-acquire window) has its blob objects listable from shared storage but
+  its pointers NOT locally visible, so its already-bound blobs look unreferenced
+  and age past the grace and get deleted. Fix: the sweep now uses
+  `Cluster.MountedUnits()` (derived from the mount map), so the object-list loop
+  and the pointer scan read the SAME ownership view. A desired-but-unmounted unit
+  is simply skipped this pass (a missed sweep is a storage leak, never data loss,
+  since `GetBlob` still resolves via the stored pointer's `ObjKey`). Pinned by
+  `TestSweepOrphans_OnlySweepsMountedUnits` (an object under a non-mounted unit is
+  never reclaimed even when old + unreferenced).
+- **The reshard-ancestor machinery (`OwnedUnits` + `ancestorUnitTokens`) was
+  removed**, not shipped: it was unexercised, and reshard-era reclamation of
+  pre-split objects under old-gen prefixes is a documented leak-only follow-up,
+  not a data-loss path. (Mid-reshard `GetBlob` still resolves via the pointer.)
+- **`OwnedUnitToken` -> `RoutedUnitToken`** (it returns the routed token for any
+  key with no ownership check; the old name implied a check that does not happen).
+- **The referenced-set sweep is more robust to reshard than the 11.7 per-object
+  `LocalGet` sketch**: it compares each listed object key byte-exactly against the
+  set of `ptr.ObjKey` from the local bref scan (the pointer is ground truth), so a
+  token change from a doubling never causes a bound object to be swept.
+- **`BlobRef.RouteShard` is `[]byte`** (not the sketch's `string`): `ShardKeyFn`
+  returns `[]byte` cluster-wide, so `brefKey` builds the hash tag byte-exact with
+  no conversion. `brefKey` contract: `RouteShard` must not contain a `}` byte
+  (`ring.ShardKey` stops at the first `}`); benign for slug/id route keys.
+- **The in-memory `blob.Store` fake lives at `pkg/blob/blobmem`** (exported, not
+  `internal/`), so an app's tests (hostthis, phase 3) can use it to unit-test blob
+  paths without standing up MinIO.

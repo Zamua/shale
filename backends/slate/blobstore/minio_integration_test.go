@@ -105,7 +105,7 @@ func TestMinioBlobStore_PutGetSmallRoundTrip(t *testing.T) {
 	ctx := itestCtx(t)
 
 	want := []byte("the quick brown fox jumps over the lazy dog")
-	key := blob.FinalKey("shard-0", mustBlobID(t))
+	key := blob.FinalKey("0-0", mustBlobID(t))
 	if err := s.PutStream(ctx, key, strings.NewReader(string(want)), int64(len(want))); err != nil {
 		t.Fatalf("PutStream: %v", err)
 	}
@@ -145,7 +145,7 @@ func TestMinioBlobStore_LargeStreamingRoundTrip(t *testing.T) {
 	// deterministic bytes so we can recompute the expected hash on GET.
 	putHash := sha256.New()
 	gen := io.TeeReader(newPatternReader(size), putHash)
-	key := blob.FinalKey("shard-9", mustBlobID(t))
+	key := blob.FinalKey("0-9", mustBlobID(t))
 	if err := s.PutStream(ctx, key, gen, int64(size)); err != nil {
 		t.Fatalf("PutStream (20MB): %v", err)
 	}
@@ -189,7 +189,7 @@ func TestMinioBlobStore_GetStreamMissingIsErrNotFound(t *testing.T) {
 	s := newBlobStore(t)
 	ctx := itestCtx(t)
 
-	_, _, err := s.GetStream(ctx, blob.FinalKey("shard-0", "does-not-exist"))
+	_, _, err := s.GetStream(ctx, blob.FinalKey("0-0", "does-not-exist"))
 	if !errors.Is(err, blob.ErrNotFound) {
 		t.Fatalf("GetStream(missing) = %v, want blob.ErrNotFound", err)
 	}
@@ -203,11 +203,11 @@ func TestMinioBlobStore_DeleteIdempotent(t *testing.T) {
 	ctx := itestCtx(t)
 
 	// Delete of a never-written object: no error.
-	if err := s.Delete(ctx, blob.FinalKey("shard-0", "never-existed")); err != nil {
+	if err := s.Delete(ctx, blob.FinalKey("0-0", "never-existed")); err != nil {
 		t.Fatalf("Delete(missing) = %v, want nil (idempotent)", err)
 	}
 
-	key := blob.FinalKey("shard-0", mustBlobID(t))
+	key := blob.FinalKey("0-0", mustBlobID(t))
 	if err := s.PutStream(ctx, key, strings.NewReader("payload"), int64(len("payload"))); err != nil {
 		t.Fatalf("PutStream: %v", err)
 	}
@@ -233,7 +233,7 @@ func TestMinioBlobStore_Has(t *testing.T) {
 	s := newBlobStore(t)
 	ctx := itestCtx(t)
 
-	key := blob.FinalKey("shard-3", mustBlobID(t))
+	key := blob.FinalKey("0-3", mustBlobID(t))
 	ok, err := s.Has(ctx, key)
 	if err != nil {
 		t.Fatalf("Has(missing): %v", err)
@@ -253,58 +253,70 @@ func TestMinioBlobStore_Has(t *testing.T) {
 	}
 }
 
-// TestMinioBlobStore_ListUnderPrefix pins that List yields exactly the keys under
-// a prefix - the input to the phase-2 same-shard orphan sweep - and that the
-// store's internal KeyPrefix is stripped so callers see the same key space they
-// pass to the other methods (a key out of List feeds straight back into Has).
+// TestMinioBlobStore_ListUnderPrefix pins that List yields exactly the objects
+// under a prefix - the input to the same-shard orphan sweep - that each yielded
+// ObjectInfo carries the Key, the correct Size, and a non-zero ModTime (the
+// LastModified the sweep age-gates on), and that the store's internal KeyPrefix
+// is stripped so callers see the same key space they pass to the other methods
+// (a key out of List feeds straight back into Has).
 func TestMinioBlobStore_ListUnderPrefix(t *testing.T) {
 	s := newBlobStore(t)
 	ctx := itestCtx(t)
 
-	// Write three blobs under shard-A and one under shard-B.
-	shardA := "shard-A"
-	shardB := "shard-B"
+	// Write three blobs under unit A and one under unit B.
+	unitA := "0-A"
+	unitB := "0-B"
+	const payloadA = "aaa" // a known size to assert ObjectInfo.Size
 	wantA := map[string]bool{}
 	for i := 0; i < 3; i++ {
 		id := mustBlobID(t)
-		key := blob.FinalKey(shardA, id)
+		key := blob.FinalKey(unitA, id)
 		wantA[key] = true
-		if err := s.PutStream(ctx, key, strings.NewReader("a"), 1); err != nil {
+		if err := s.PutStream(ctx, key, strings.NewReader(payloadA), int64(len(payloadA))); err != nil {
 			t.Fatalf("PutStream A%d: %v", i, err)
 		}
 	}
-	keyB := blob.FinalKey(shardB, mustBlobID(t))
+	keyB := blob.FinalKey(unitB, mustBlobID(t))
 	if err := s.PutStream(ctx, keyB, strings.NewReader("b"), 1); err != nil {
 		t.Fatalf("PutStream B: %v", err)
 	}
 
-	gotA := map[string]bool{}
-	for key, err := range s.List(ctx, blob.FinalPrefixForShard(shardA)) {
+	gotA := map[string]blob.ObjectInfo{}
+	for info, err := range s.List(ctx, blob.FinalPrefixForUnit(unitA)) {
 		if err != nil {
 			t.Fatalf("List error: %v", err)
 		}
-		gotA[key] = true
+		gotA[info.Key] = info
 	}
 	if len(gotA) != len(wantA) {
-		t.Fatalf("List(%s) returned %d keys, want %d: %v", blob.FinalPrefixForShard(shardA), len(gotA), len(wantA), gotA)
+		t.Fatalf("List(%s) returned %d objects, want %d: %v", blob.FinalPrefixForUnit(unitA), len(gotA), len(wantA), gotA)
 	}
 	for k := range wantA {
-		if !gotA[k] {
+		info, ok := gotA[k]
+		if !ok {
 			t.Fatalf("List missing key %q (got %v)", k, gotA)
+		}
+		// Size + ModTime are the sweep's inputs: Size is the footprint, ModTime
+		// is the age-gate signal. Pin both.
+		if info.Size != int64(len(payloadA)) {
+			t.Fatalf("List ObjectInfo.Size for %q = %d, want %d", k, info.Size, len(payloadA))
+		}
+		if info.ModTime.IsZero() {
+			t.Fatalf("List ObjectInfo.ModTime for %q is zero; the orphan sweep age-gate needs a real LastModified", k)
 		}
 		// Round-trip the listed key back through Has: confirms the KeyPrefix was
 		// stripped so List output is in the same key space as the inputs.
-		ok, err := s.Has(ctx, k)
+		hok, err := s.Has(ctx, k)
 		if err != nil {
 			t.Fatalf("Has(listed key %q): %v", k, err)
 		}
-		if !ok {
+		if !hok {
 			t.Fatalf("Has(listed key %q) = false; List returned a key the other methods cannot resolve (KeyPrefix not stripped consistently)", k)
 		}
 	}
-	// shard-B's key must NOT appear under shard-A's prefix.
-	if gotA[keyB] {
-		t.Fatalf("List(%s) leaked a key from %s: %q", blob.FinalPrefixForShard(shardA), shardB, keyB)
+	// unit-B's key must NOT appear under unit-A's prefix.
+	if _, leaked := gotA[keyB]; leaked {
+		t.Fatalf("List(%s) leaked a key from %s: %q", blob.FinalPrefixForUnit(unitA), unitB, keyB)
 	}
 }
 

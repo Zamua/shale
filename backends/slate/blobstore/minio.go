@@ -130,21 +130,30 @@ func (s *MinioBlobStore) Has(ctx context.Context, objkey string) (bool, error) {
 	return true, nil
 }
 
-// List yields every object key under prefix (with this store's KeyPrefix
-// stripped back off, so callers see the same key space they pass to the other
-// methods). It is the input to the phase-2 same-shard orphan-bytes sweep.
-func (s *MinioBlobStore) List(ctx context.Context, prefix string) iter.Seq2[string, error] {
-	return func(yield func(string, error) bool) {
+// List yields every object under prefix as a blob.ObjectInfo (Key + Size +
+// ModTime, with this store's KeyPrefix stripped off the Key so callers see the
+// same key space they pass to the other methods). It is the input to the
+// same-shard orphan-bytes sweep, whose age-gate needs the per-object
+// LastModified - minio's ListObjects already returns Key, Size, and
+// LastModified in the listing record, so mapping all three adds no round-trip
+// (a separate Stat per object would be one HEAD each; section 11.6).
+func (s *MinioBlobStore) List(ctx context.Context, prefix string) iter.Seq2[blob.ObjectInfo, error] {
+	return func(yield func(blob.ObjectInfo, error) bool) {
 		opts := minio.ListObjectsOptions{Prefix: s.keyFor(prefix), Recursive: true}
 		for obj := range s.client.ListObjects(ctx, s.bucket, opts) {
 			if obj.Err != nil {
-				yield("", fmt.Errorf("blobstore: List %s: %w", prefix, obj.Err))
+				yield(blob.ObjectInfo{}, fmt.Errorf("blobstore: List %s: %w", prefix, obj.Err))
 				return
 			}
 			// TrimPrefix fails safe: every listed key starts with s.prefix
 			// (ListObjects was given keyFor(prefix)), and if one ever did not it
 			// is returned unchanged rather than blindly length-sliced.
-			if !yield(strings.TrimPrefix(obj.Key, s.prefix), nil) {
+			info := blob.ObjectInfo{
+				Key:     strings.TrimPrefix(obj.Key, s.prefix),
+				Size:    obj.Size,
+				ModTime: obj.LastModified,
+			}
+			if !yield(info, nil) {
 				return
 			}
 		}
