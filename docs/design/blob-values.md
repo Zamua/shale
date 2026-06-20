@@ -270,3 +270,85 @@ blobKV.Transact(slug, func(tx *BlobTx) error {
 
 Each phase is its own spec-first change with its own tests; this doc is the
 umbrella design.
+
+## 10. Phase-1 review resolutions (2026-06-19)
+
+Phase 1 (the `pkg/blob` BlobStore port + minio adapter + types) is built and
+green (streaming proven on a 20 MB round-trip against real MinIO). The phase-1
+workflow's adversarial review surfaced two foundation decisions to resolve here
+before phase 2 builds on them, plus minor hygiene. Resolutions:
+
+### 10.1 Promotion model: STAGE-TO-FINAL-KEY, no copy (resolves review P1-2)
+
+The design above left "how a staged object becomes the bound final object"
+implicit, and phase 1 guessed a flat `blobstaging/<id>` prefix + a copy-on-bind.
+Reject that: a flat staging prefix is NOT shard-keyed, so a crash between stage
+and bind leaves a staged orphan that only a CROSS-shard sweep could find -
+reintroducing exactly the cross-shard concern this whole design removes.
+
+Resolution: `StageBlob` streams the bytes DIRECTLY to the final, shard-keyed key
+`blob/<shardKey>/<blobid>`. The caller (hostthis) knows the slug at upload time,
+so `*BlobKV.StageBlob` derives the shardKey from it (`ShardKeyFn`) and mints the
+blobid before streaming. `BindBlob` then only writes the small `BlobPointer`
+(referencing that already-final key) and co-commits it with the metadata in the
+per-shard transaction. NO copy, no separate staging namespace.
+
+This is reader-safe: bytes sitting at the final key before the pointer commits
+are unreachable to any reader (a reader reaches bytes only via the committed
+metadata -> pointer), so writing them "early" is invisible. A crash before the
+bind commit leaves `blob/<shardKey>/<blobid>` with no pointer - a SHARD-LOCAL
+orphan, reclaimed by the same-shard sweep. The phase-1 `Stage` helper +
+`StagingKey`/`IsStagingKey` + the staging-prefix concept are SUPERSEDED and to be
+removed; the phase-2 `StageBlob` is `PutStream` to the final key. `BlobHandle`
+collapses into `BlobPointer` (the staged object's final key + size + optional
+content hash fully determine the pointer), so the app sees only that.
+
+### 10.2 Orphan-bytes sweep age-gates via object `LastModified`
+
+Because bytes now land at the final key BEFORE the pointer commits, the orphan
+sweep must not reclaim a blob whose bind transaction simply has not committed
+yet (the same in-flight race the hostthis site-reservation hit). Resolution: the
+sweep reclaims a pointer-less blob object only if its object-store `LastModified`
+is older than a grace (default ~1 h, far beyond any bind window). The object's
+timestamp is a DURABLE, per-object signal from the store itself - no in-memory
+debounce, survives restarts, and is naturally shard-local (the sweep already
+enumerates `blob/<shardKey>/` on the owning node). A just-staged blob is recent
+and kept; a genuine crash-orphan ages out and is reclaimed.
+
+### 10.3 Module placement: port in core, minio adapter in a backend module
+
+Per shale's architecture (CLAUDE.md: the core module stays light, "no heavy
+storage deps"; `cmd/shaled` is memory-only; object-store deps live in backend
+modules), the minio-go dependency must NOT sit in the core module. Resolution:
+`pkg/blob` (core) holds ONLY the `BlobStore` port + the pure domain types
+(`BlobPointer`, the `FinalKey`/`FinalPrefixForShard` helpers, `NewBlobID`,
+`ErrNotFound`); the concrete `MinioBlobStore` adapter moves to a backend module
+(it reuses the exact minio client pattern already in `backends/slate/condstore.go`;
+whether it lives in `backends/slate` or its own `backends/blobstore` module is a
+follow-up call - own-module is cleaner since the blob byte-plane is independent
+of the metadata backend). The cluster (`pkg/cluster`, core, phase 2) depends only
+on the `blob.BlobStore` interface; the concrete adapter is wired at the
+`cmd/shaled-*` binary, exactly as backends already are. Phase-1 code currently
+has the adapter in core; to be moved before phase-1 commit.
+
+### 10.4 Minor hygiene (from the review)
+
+- Add `goleak.VerifyTestMain` to `pkg/blob` (repo precedent) - minio-go's
+  `GetObject` spawns a ctx-bound reader goroutine, so a missed `Close` leaks
+  silently; document on `GetStream` (and future `GetBlob`) that the passed `ctx`
+  must OUTLIVE the returned reader, not just the call (else a phase-2 caller that
+  scopes ctx to "assemble the response" truncates a large stream mid-flight).
+- `List` should strip the prefix with `strings.TrimPrefix` (fail-safe), not a
+  blind length-slice.
+- Update section 4.1's interface sketch to the implemented signatures (methods
+  take `context.Context`; `PutStream(ctx, objkey, r, size) error`; `GetStream`
+  returns `(ReadCloser, size, error)`; `Has` added).
+
+### 10.5 Phase-1 status
+
+Built + reviewed; NOT yet committed. The structural refinements above (10.1 stage
+model -> drop the staging-prefix code; 10.3 move the adapter out of core) plus the
+10.4 hygiene are the immediate next step, after which phase 1 commits clean. The
+`BlobStore` port, `MinioBlobStore` streaming behavior, `BlobPointer` round-trip,
+`ErrNotFound` mapping, key-layout helpers, and the integration tests are sound and
+carry forward unchanged.
