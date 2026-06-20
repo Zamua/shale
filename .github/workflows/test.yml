@@ -56,8 +56,18 @@ jobs:
       - name: go test (no race, workspace, all modules)
         run: |
           set -euo pipefail
-          MODULES=(. backends/pebble backends/slate)
-          for m in "${MODULES[@]}"; do
+          # Root module: fast packages at 300s; the integration suite at 600s.
+          # Its graceful-leave / overlap gates use multi-second artificial mounts
+          # whose FIXED delays remain even without -race, so the package runs
+          # >300s (300s is too tight - it timed out there); the slow runtime is
+          # the floor, not waste. pkg/cluster is fast without -race (no shards).
+          echo "::group::go test root (excl integration, no -race)"
+          go test $(go list ./... | grep -v '/tests/integration$') -timeout 300s -p 1 -parallel 1
+          echo "::endgroup::"
+          echo "::group::go test ./tests/integration (no -race, slow gates)"
+          go test ./tests/integration -timeout 600s -p 1 -parallel 1
+          echo "::endgroup::"
+          for m in backends/pebble backends/slate; do
             echo "::group::go test $m (no -race)"
             (cd "$m" && go test ./... -timeout 300s -p 1 -parallel 1)
             echo "::endgroup::"
