@@ -8,6 +8,7 @@ require (
 	github.com/Zamua/shale v0.7.0
 	github.com/minio/minio-go/v7 v7.2.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
+	go.uber.org/goleak v1.3.0
 	slatedb.io/slatedb-go v0.13.1
 )
 
