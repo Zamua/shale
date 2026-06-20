@@ -96,11 +96,16 @@ jobs:
           # / SIGTERM at ~588s with NO go-test-timeout dump - a silent OOM, not a
           # clean timeout; raising the budget just let it run longer until it died).
           # Shard it into 3 alphabetical slices run as SEPARATE processes so memory
-          # is released between them; each slice is ~1/3 the tests, well under its
-          # own timeout and well under the memory ceiling. The slices partition the
-          # whole package (A-G | H-O | P-Z+rest via -skip catch-all). Follow-up:
-          # profile + shrink the slow overlap/reshard fixtures, then fold back.
-          CLUSTER_SHARD_TIMEOUT=400s
+          # is released between them; each slice is ~1/3 the tests, well under the
+          # memory ceiling (sharding alone fixed the OOM - each 60-72 test slice now
+          # times out CLEANLY rather than getting SIGTERM'd). The slices partition
+          # the whole package (A-G | H-O | P-Z+rest via -skip catch-all). NB the
+          # slices are balanced by COUNT not TIME: the P-Z slice carries the slow
+          # reshard/replication convergence gates (multi-second artificial mounts),
+          # so it needs the full budget while A-G (~157s) and H-O (~21s) finish
+          # fast. Follow-up: profile + shrink the slow reshard fixtures, then a
+          # tighter per-slice budget can return.
+          CLUSTER_SHARD_TIMEOUT=600s
           echo "::group::go test ./pkg/cluster -race (shard 1/3: Test[A-G])"
           go test ./pkg/cluster -race -run '^Test[A-G]' -timeout "$CLUSTER_SHARD_TIMEOUT" -p 1 -parallel 1
           echo "::endgroup::"
