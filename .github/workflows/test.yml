@@ -89,14 +89,26 @@ jobs:
           go test $(go list ./... | grep -vE '/tests/integration$|/pkg/cluster$') \
             -race -timeout "$FAST_TIMEOUT" -p 1 -parallel 1
           echo "::endgroup::"
-          # pkg/cluster now carries the overlap-handoff + decentralized-reshard
-          # convergence gates (deliberately multi-second artificial mounts/drains),
-          # so under -race it earns the larger budget like ./tests/integration - NOT
-          # the tight fast budget. The genuinely-fast packages stay on FAST_TIMEOUT
-          # so a fixture perf regression there still trips CI. Follow-up: profile +
-          # shorten the slow pkg/cluster overlap/reshard fixtures, then fold back.
-          echo "::group::go test ./pkg/cluster (overlap/reshard convergence gates)"
-          go test ./pkg/cluster -race -timeout "$SLOW_TIMEOUT" -p 1 -parallel 1
+          # pkg/cluster (194 tests, incl. the overlap-handoff + decentralized-
+          # reshard convergence gates) is the heaviest package under -race. Run as
+          # ONE process it both exceeds a single 360s budget AND OOMs the runner as
+          # -race shadow memory accumulates across the whole run (observed: exit 143
+          # / SIGTERM at ~588s with NO go-test-timeout dump - a silent OOM, not a
+          # clean timeout; raising the budget just let it run longer until it died).
+          # Shard it into 3 alphabetical slices run as SEPARATE processes so memory
+          # is released between them; each slice is ~1/3 the tests, well under its
+          # own timeout and well under the memory ceiling. The slices partition the
+          # whole package (A-G | H-O | P-Z+rest via -skip catch-all). Follow-up:
+          # profile + shrink the slow overlap/reshard fixtures, then fold back.
+          CLUSTER_SHARD_TIMEOUT=400s
+          echo "::group::go test ./pkg/cluster -race (shard 1/3: Test[A-G])"
+          go test ./pkg/cluster -race -run '^Test[A-G]' -timeout "$CLUSTER_SHARD_TIMEOUT" -p 1 -parallel 1
+          echo "::endgroup::"
+          echo "::group::go test ./pkg/cluster -race (shard 2/3: Test[H-O])"
+          go test ./pkg/cluster -race -run '^Test[H-O]' -timeout "$CLUSTER_SHARD_TIMEOUT" -p 1 -parallel 1
+          echo "::endgroup::"
+          echo "::group::go test ./pkg/cluster -race (shard 3/3: Test[P-Z] + any non-letter)"
+          go test ./pkg/cluster -race -skip '^Test[A-O]' -timeout "$CLUSTER_SHARD_TIMEOUT" -p 1 -parallel 1
           echo "::endgroup::"
           echo "::group::go test ./tests/integration (slow gates)"
           go test ./tests/integration -race -timeout "$SLOW_TIMEOUT" -p 1 -parallel 1
