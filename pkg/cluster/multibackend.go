@@ -24,6 +24,7 @@ package cluster
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
@@ -243,6 +244,14 @@ func (c *Cluster) initMultiBackend() error {
 	// replicated write/read paths key off the unit's replica set instead of a
 	// single owner. STATIC topology: the replica set is fixed at Open (no
 	// membership-change handoff at R>1 yet - a later phase).
+	// Debug/repro hook: simulate a slow cold-start unit mount (a loaded object
+	// store). Because the caller starts this node's gRPC server only AFTER Open
+	// returns, delaying the mount also delays when this node SERVES gRPC - so a
+	// founder with this set reproduces the window where a joiner's GenState dial
+	// times out, exercising the patient learnGenerationFromSeed. No-op unless set.
+	if d := c.cfg.TestingMountDelay; d > 0 {
+		time.Sleep(d)
+	}
 	c.initReplicatedFactory()
 	// Decentralized reshard agreement (v0.9): construct + seed the Arbiter when
 	// opted in (ConditionalStore set) on an R>1 cluster. No-op otherwise. Done

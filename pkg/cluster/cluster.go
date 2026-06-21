@@ -278,6 +278,21 @@ type Config struct {
 	// so a healthy fan-out pays ~nothing).
 	PeerConnectTimeout time.Duration
 
+	// GenLearnBudget bounds the total wall-clock a JOINER spends re-sweeping its
+	// seeds for the cluster generation at Open (learnGenerationFromSeed) before
+	// failing closed. This is the cold-start SIBLING of PeerConnectTimeout: a
+	// seed that is itself cold-starting has bound its gRPC port but does not
+	// begin SERVING it until after its own Open returns (i.e. after it has
+	// mounted every replicated unit, an object-storage-bound step that on a
+	// loaded backend takes tens of seconds). During that window the joiner's
+	// GenState dial times out; a single attempt that fails closed becomes a
+	// CRASH-LOOP under a supervisor. Re-sweeping for this budget WAITS the seed
+	// out instead. Bounded (not infinite) so a joiner whose seeds are truly dead
+	// still fails Open for a supervised restart. Zero falls back to
+	// defaultGenLearnBudget (180s). The caller env-plumbs this for deployments
+	// whose mounts run longer (and tests set it tiny to assert fail-closed fast).
+	GenLearnBudget time.Duration
+
 	// TestingBlockPeerDials, when true, refuses every clientFor call
 	// from the moment Open returns. Must be set at construction time
 	// (not after) because the bootstrap Evaluate runs synchronously
@@ -290,6 +305,17 @@ type Config struct {
 	// ack the destination cannot deliver). Test-only; no production
 	// code path reads this.
 	TestingBlockPeerDials bool
+
+	// TestingMountDelay, when >0, sleeps for that long inside Open right before
+	// the unit mount, SIMULATING a slow cold-start mount (a loaded object store
+	// taking tens of seconds). Because the caller starts this node's gRPC server
+	// only after Open returns, the delay also delays when this node begins
+	// SERVING gRPC - so a founder with this set reproduces the window in which a
+	// joiner's GenState dial times out, exercising the patient learnGenerationFromSeed.
+	// A debug/repro lever (env-plumbed as SHALE_DEBUG_MOUNT_DELAY); no production
+	// path sets it. Named Testing* for the Config convention; it is also used to
+	// reproduce the cold-start failure on a real staging cluster.
+	TestingMountDelay time.Duration
 
 	// TestingForceCleanCut, when true, BREAKS the Option B overlap handoff
 	// back to the pre-2e clean-cut RELEASE-then-ACQUIRE on the R>1 reconcile

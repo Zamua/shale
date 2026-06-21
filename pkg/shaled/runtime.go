@@ -442,6 +442,19 @@ func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 		GracefulLeaveDrainTimeout: cfg.Std.GracefulLeaveDrainTimeout,
 		WriteTimeout:              cfg.Std.WriteTimeout, // 0 -> cluster default (5s)
 	}
+	// GenLearnBudget: a joiner's total seed-generation re-sweep budget. 0 ->
+	// cluster default (defaultGenLearnBudget, 180s). Overridable for a backend
+	// whose cold-start mount runs longer than the default (and, with a small
+	// value, to reproduce the pre-fix single-shot crash-loop on a real cluster).
+	if d := envDur("SHALE_GEN_LEARN_BUDGET"); d > 0 {
+		clusterCfg.GenLearnBudget = d
+	}
+	// SHALE_DEBUG_MOUNT_DELAY: a debug/repro lever that sleeps before this node's
+	// unit mount (delaying when it begins serving gRPC), to reproduce the
+	// cold-start window a joiner's gen query must ride out. No-op unless set.
+	if d := envDur("SHALE_DEBUG_MOUNT_DELAY"); d > 0 {
+		clusterCfg.TestingMountDelay = d
+	}
 	if cfg.BackendFactory != nil {
 		clusterCfg.BackendFactory = cfg.BackendFactory
 		clusterCfg.UnitCount = cfg.Std.UnitCount
@@ -512,6 +525,17 @@ func envOrInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// envDur parses a Go duration (e.g. "180s", "40s") from env; returns 0 when the
+// key is unset, empty, or unparseable, so callers fall back to their default.
+func envDur(key string) time.Duration {
+	if v, ok := os.LookupEnv(key); ok && strings.TrimSpace(v) != "" {
+		if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil {
+			return d
+		}
+	}
+	return 0
 }
 
 func closeBackendQuiet(fn func() error) error {
