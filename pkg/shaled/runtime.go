@@ -64,6 +64,7 @@ import (
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // StdConfig holds the standard cluster/node flags every shaled-*
@@ -317,7 +318,22 @@ func Run(cfg RunConfig) error {
 		}()
 	}
 
-	grpcServer := grpc.NewServer()
+	// Keepalive enforcement MUST permit the peer client's keepalive (set in
+	// cluster.peerDialOptions: ClientParameters{Time: 30s, PermitWithoutStream:
+	// true}). gRPC's DEFAULT server enforcement is MinTime 5m + no pings without
+	// an active stream, so it answers a client that pings a (legitimately) idle
+	// cross-node connection every 30s with GoAway "too_many_pings"
+	// (ENHANCE_YOUR_CALM), tearing the connection down. That churned the
+	// cross-node gen-learning + cross-shard scan on a slow cold-start (a peer
+	// whose mount takes minutes keeps the connection idle long enough for the
+	// keepalive to fire). MinTime 10s (< the client's 30s) + PermitWithoutStream
+	// accepts the client's pings so the connection stays up.
+	grpcServer := grpc.NewServer(
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 	rpc.NewServer(c).Register(grpcServer)
 
 	logger.Printf("shaled: node=%s grpc=%s backend=%s",
