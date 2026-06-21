@@ -3,19 +3,58 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"sort"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/backoff"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"google.golang.org/grpc/status"
 )
+
+// peerDialOptions are the shared dial options for the cluster-internal peer
+// gRPC client (and mirrored by pkg/rpc.Client). They harden the connection
+// against the cold-start fail-fast trap (see Config.PeerConnectTimeout):
+//   - a FAST reconnect backoff so a CACHED ClientConn that misses its first
+//     connect (peer's gRPC momentarily not-ready) recovers in seconds, not the
+//     gRPC default's 120s ceiling that wedges every later RPC on that client;
+//   - keepalive so an idle cached connection stays warm and a half-open one is
+//     detected and replaced rather than silently failing the next RPC.
+//
+// NOTE: these do NOT set WaitForReady - single-key Get/Put stay FAIL-FAST so a
+// momentarily-unreachable replica fails over to another replica immediately
+// rather than blocking the hot path. The cross-shard scan path instead waits
+// EXPLICITLY (peerClient.waitReady, bounded by PeerConnectTimeout) before it
+// opens its stream.
+func peerDialOptions() []grpc.DialOption {
+	return []grpc.DialOption{
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithConnectParams(grpc.ConnectParams{
+			Backoff: backoff.Config{
+				BaseDelay:  200 * time.Millisecond,
+				Multiplier: 1.6,
+				Jitter:     0.2,
+				MaxDelay:   3 * time.Second,
+			},
+			MinConnectTimeout: 5 * time.Second,
+		}),
+		grpc.WithKeepaliveParams(keepalive.ClientParameters{
+			Time:                30 * time.Second,
+			Timeout:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	}
+}
 
 // peerClient is the cluster-internal gRPC client used for inter-node
 // forwarding. It is a deliberate mirror of pkg/rpc.Client (which the
@@ -29,11 +68,37 @@ type peerClient struct {
 }
 
 func newPeerClient(addr string) (*peerClient, error) {
-	conn, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	conn, err := grpc.NewClient(addr, peerDialOptions()...)
 	if err != nil {
 		return nil, err
 	}
 	return &peerClient{conn: conn, api: pb.NewShaleNodeClient(conn)}, nil
+}
+
+// waitReady blocks until this peer's gRPC ClientConn reaches READY or the
+// context is done. grpc.NewClient is LAZY (it does not connect until the first
+// RPC) and FAIL-FAST (a not-yet-ready connection fails an RPC immediately), so
+// the cross-shard scan path (snapshotPeer) calls waitReady FIRST to absorb a
+// peer that is momentarily not-serving-gRPC at cold-start: it nudges the
+// connection out of IDLE (Connect) and waits for the connectivity state to
+// climb to READY (the fast peerDialOptions backoff makes that quick once the
+// peer is up). On ctx expiry it returns an error so the caller records the
+// peer's AggregateResult.Err instead of blocking the whole fan-out forever.
+func (c *peerClient) waitReady(ctx context.Context) error {
+	if c.conn == nil {
+		return errors.New("cluster: peer client closed")
+	}
+	c.conn.Connect() // nudge out of IDLE; no-op if already connecting/ready
+	for {
+		s := c.conn.GetState()
+		if s == connectivity.Ready {
+			return nil
+		}
+		if !c.conn.WaitForStateChange(ctx, s) {
+			// ctx done before the state changed.
+			return fmt.Errorf("cluster: peer connection not ready (state %s): %w", s, ctx.Err())
+		}
+	}
 }
 
 func (c *peerClient) Close() error {

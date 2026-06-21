@@ -260,6 +260,24 @@ type Config struct {
 	// Zero falls back to 5s.
 	ReadTimeout time.Duration
 
+	// PeerConnectTimeout bounds how long a cross-shard Aggregate (the
+	// snapshotPeer fan-out) waits for a peer's gRPC connection to reach
+	// READY before recording that peer's AggregateResult.Err. The peer
+	// gRPC client is FAIL-FAST by default (gRPC's WaitForReady=false): if
+	// a peer's gRPC server is momentarily not-ready at first-connect (a
+	// heavy cold-start where the process is busy mounting units), the
+	// CACHED ClientConn enters TRANSIENT_FAILURE + backoff and every
+	// subsequent fan-out RPC on that cached client fails INSTANTLY with
+	// "error reading server preface: use of closed network connection"
+	// for the whole backoff window. To absorb that transient, snapshotPeer
+	// explicitly waits (up to this bound) for the connection to become
+	// READY before opening the scan stream, so a peer that comes up within
+	// the window is scanned instead of spuriously erroring. Zero falls
+	// back to 30s (generous: a cold-starting peer can take tens of seconds
+	// to begin serving gRPC; the wait returns AS SOON AS the peer is ready,
+	// so a healthy fan-out pays ~nothing).
+	PeerConnectTimeout time.Duration
+
 	// TestingBlockPeerDials, when true, refuses every clientFor call
 	// from the moment Open returns. Must be set at construction time
 	// (not after) because the bootstrap Evaluate runs synchronously
@@ -398,6 +416,9 @@ func normalizeConfig(cfg *Config) {
 	}
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = 5 * time.Second
+	}
+	if cfg.PeerConnectTimeout <= 0 {
+		cfg.PeerConnectTimeout = 30 * time.Second
 	}
 }
 
@@ -1845,6 +1866,19 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 // message is replayed by the view's initial full-keyspace ScanPrefix.
 func (c *Cluster) snapshotPeer(addr string) (backend.Backend, error) {
 	cli, err := c.clientFor(addr)
+	if err != nil {
+		return nil, err
+	}
+	// Wait (bounded by PeerConnectTimeout) for the peer's gRPC connection to be
+	// READY before opening the scan stream. The peer client is lazy + fail-fast,
+	// so without this a peer momentarily not-serving-gRPC at cold-start would
+	// fail-fast the stream's first Recv AND leave this CACHED client in backoff,
+	// poisoning every later fan-out RPC for the whole backoff window. Waiting
+	// here absorbs that transient; the long-lived stream below then opens over an
+	// already-READY connection, so its (unbounded) ctx cannot hang on connect.
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), c.cfg.PeerConnectTimeout)
+	err = cli.waitReady(readyCtx)
+	readyCancel()
 	if err != nil {
 		return nil, err
 	}
