@@ -329,3 +329,62 @@ func TestMinIO_WriterEpochFencing(t *testing.T) {
 		t.Fatalf("w2 should observe its own value; got %q", got)
 	}
 }
+
+// TestMinIO_ScanFencedHandle is the READ-side sibling of
+// TestMinIO_WriterEpochFencing and the real-slatedb half of the #443 fix: once a
+// higher-epoch writer supersedes a Slate, a SCAN through the now-stale handle
+// must FAIL (production slatedb CLOSES the fenced handle, unlike the in-memory
+// test double which lets fenced reads pass - the exact divergence that hid this
+// bug), AND that failure must be tagged backend.ErrFenced so the cluster's
+// cross-shard scan path recognizes it via errors.Is and recodes+evicts instead
+// of failing the whole aggregate with the raw fence. Covers the gap that the
+// non-transactional (*Slate).ScanPrefix / iterator.Next previously omitted
+// fenceTag while the transactional ScanPrefix had it.
+func TestMinIO_ScanFencedHandle(t *testing.T) {
+	fx := startMinIO(t)
+
+	const db = "fenced-scan"
+
+	// Writer 1 opens + writes a handful of keys it could later scan.
+	w1 := openSlate(t, fx, db)
+	for i := 0; i < 8; i++ {
+		if err := w1.Put([]byte(fmt.Sprintf("k%02d", i)), []byte("v")); err != nil {
+			t.Fatalf("w1 put %d: %v", i, err)
+		}
+	}
+
+	// Writer 2 opens the SAME (bucket, dbName), bumping the manifest writer-epoch
+	// and fencing w1.
+	_ = openSlate(t, fx, db)
+
+	// w1's subsequent SCAN must fail. The fence can surface either at ScanPrefix
+	// (cursor open) or the iterator's first Next, and slatedb's background writer
+	// poll lands it on the next op, so poll a bounded window (same shape as the
+	// WriterEpochFencing Put loop).
+	deadline := time.Now().Add(30 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		it, err := w1.ScanPrefix(nil)
+		if err != nil {
+			lastErr = err
+		} else {
+			_, _, nerr := it.Next()
+			_ = it.Close()
+			lastErr = nerr
+		}
+		if lastErr != nil {
+			break
+		}
+		time.Sleep(250 * time.Millisecond)
+	}
+	if lastErr == nil {
+		t.Fatalf("expected w1.ScanPrefix/Next to fail after w2 fenced it; got nil over 30s")
+	}
+	t.Logf("w1 scan fenced as expected: %v", lastErr)
+	if !slate.IsFenced(lastErr) {
+		t.Fatalf("a fenced scan error must be IsFenced; got %v", lastErr)
+	}
+	if !errors.Is(lastErr, backend.ErrFenced) {
+		t.Fatalf("a fenced scan error must be tagged backend.ErrFenced so the cluster recodes it via errors.Is; got %v", lastErr)
+	}
+}

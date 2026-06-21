@@ -408,7 +408,16 @@ func (c *Cluster) localMountedBackendForKey(key []byte) (backend.Backend, bool) 
 // its gen-(g+1) children (until the old unit is retired); the admin scan
 // counting a key in both is acceptable for the non-routed keysHeld view.
 // Multi-backend mode only.
-func (c *Cluster) mountedBackends() []backend.Backend {
+// mountedUnit pairs a mounted ReplicaUnit with its live backend handle. The
+// scan paths carry the ru alongside the backend so a scan that hits a FENCED
+// handle can evict the RIGHT mount (the cross-shard scan fence self-heal needs
+// the ru, which a bare []backend.Backend loses).
+type mountedUnit struct {
+	ru storageunit.ReplicaUnit
+	b  backend.Backend
+}
+
+func (c *Cluster) mountedUnits() []mountedUnit {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
 	ids := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
@@ -416,9 +425,9 @@ func (c *Cluster) mountedBackends() []backend.Backend {
 		ids = append(ids, ru)
 	}
 	sortReplicaUnits(ids)
-	out := make([]backend.Backend, 0, len(ids))
+	out := make([]mountedUnit, 0, len(ids))
 	for _, ru := range ids {
-		out = append(out, c.mountMap[ru])
+		out = append(out, mountedUnit{ru: ru, b: c.mountMap[ru]})
 	}
 	return out
 }
@@ -431,37 +440,56 @@ func (c *Cluster) mountedBackends() []backend.Backend {
 // open iterator is closed when its turn ends (or on the chain's Close).
 // Multi-backend mode only.
 func (c *Cluster) localScanMounted(prefix []byte) (backend.Iterator, error) {
-	return &mountedIterator{backends: c.mountedBackends(), prefix: prefix}, nil
+	return &mountedIterator{c: c, units: c.mountedUnits(), prefix: prefix}, nil
 }
 
 // mountedIterator chains the per-unit iterators of a multi-backend node
 // into one backend.Iterator. It opens each unit's iterator lazily as the
 // prior one exhausts, so at most one unit iterator is live at a time.
+//
+// A FENCED mounted handle (a higher-epoch owner superseded this node's mount
+// during a membership change) makes the underlying ScanPrefix / Next fail with
+// backend.ErrFenced in production. The iterator recodes that exactly as the
+// write path does (fenceToTransient: EVICT the stale mount + surface the
+// retryable acquiring-window error) so the cross-shard scan that drives this
+// (Aggregate / LocalScan) re-runs and heals once the reconcile re-acquires,
+// instead of failing the whole aggregate with the raw fence. A non-fence error
+// passes through unchanged. Carries (c, ru) per unit so the eviction hits the
+// right mount. The caller MUST stop on a non-nil Next error (every in-repo
+// caller does: the LocalScan handler + localMountedSnapshot both return on the
+// first error); the iterator does not resume cleanly past a fence (the fenced
+// unit has already been consumed from its work list).
 type mountedIterator struct {
-	backends []backend.Backend
-	prefix   []byte
-	idx      int
-	cur      backend.Iterator
+	c      *Cluster
+	units  []mountedUnit
+	prefix []byte
+	idx    int
+	cur    backend.Iterator
+	curRU  storageunit.ReplicaUnit // the unit `cur` belongs to (for fence eviction)
+	curB   backend.Backend
 }
 
 func (it *mountedIterator) Next() (key, value []byte, err error) {
 	for {
 		if it.cur == nil {
-			if it.idx >= len(it.backends) {
+			if it.idx >= len(it.units) {
 				return nil, nil, nil
 			}
-			cur, err := it.backends[it.idx].ScanPrefix(it.prefix)
+			mu := it.units[it.idx]
+			it.idx++
+			cur, err := mu.b.ScanPrefix(it.prefix)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, it.c.fenceToTransient(mu.ru, mu.b, "LocalScan", err)
 			}
 			it.cur = cur
-			it.idx++
+			it.curRU = mu.ru
+			it.curB = mu.b
 		}
 		k, v, err := it.cur.Next()
 		if err != nil {
 			_ = it.cur.Close()
 			it.cur = nil
-			return nil, nil, err
+			return nil, nil, it.c.fenceToTransient(it.curRU, it.curB, "LocalScan", err)
 		}
 		if k == nil {
 			// This unit exhausted; move to the next.
@@ -489,16 +517,21 @@ func (it *mountedIterator) Close() error {
 // snapshotBackend. Multi-backend mode only.
 func (c *Cluster) localMountedSnapshot() (backend.Backend, error) {
 	snap := newSnapshotBackend()
-	for _, b := range c.mountedBackends() {
-		it, err := b.ScanPrefix(nil)
+	for _, mu := range c.mountedUnits() {
+		it, err := mu.b.ScanPrefix(nil)
 		if err != nil {
-			return nil, err
+			// A FENCED mount (superseded by a higher-epoch owner mid-convergence)
+			// is recoded EXACTLY as the write path does: evict the stale mount +
+			// surface the retryable acquiring-window error, so Aggregate's caller
+			// re-runs the scan and heals once the reconcile re-acquires, instead of
+			// failing the aggregate with the raw fence. Non-fence errors pass through.
+			return nil, c.fenceToTransient(mu.ru, mu.b, "aggregate scan", err)
 		}
 		for {
 			k, v, err := it.Next()
 			if err != nil {
 				_ = it.Close()
-				return nil, err
+				return nil, c.fenceToTransient(mu.ru, mu.b, "aggregate scan", err)
 			}
 			if k == nil {
 				break

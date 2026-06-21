@@ -328,12 +328,12 @@ func (s *Slate) Put(key, value []byte) error {
 	}
 	if s.writeOpts != nil {
 		if _, err := s.db.PutWithOptions(key, value, defaultPutOptions(), *s.writeOpts); err != nil {
-			return fmt.Errorf("slate: put: %w", err)
+			return fenceTag("slate: put", err)
 		}
 		return nil
 	}
 	if _, err := s.db.Put(key, value); err != nil {
-		return fmt.Errorf("slate: put: %w", err)
+		return fenceTag("slate: put", err)
 	}
 	return nil
 }
@@ -347,7 +347,7 @@ func (s *Slate) Get(key []byte) ([]byte, error) {
 	}
 	raw, err := s.db.Get(key)
 	if err != nil {
-		return nil, fmt.Errorf("slate: get: %w", err)
+		return nil, fenceTag("slate: get", err)
 	}
 	if raw == nil {
 		return nil, backend.ErrNotFound
@@ -364,12 +364,12 @@ func (s *Slate) Delete(key []byte) error {
 	}
 	if s.writeOpts != nil {
 		if _, err := s.db.DeleteWithOptions(key, *s.writeOpts); err != nil {
-			return fmt.Errorf("slate: delete: %w", err)
+			return fenceTag("slate: delete", err)
 		}
 		return nil
 	}
 	if _, err := s.db.Delete(key); err != nil {
-		return fmt.Errorf("slate: delete: %w", err)
+		return fenceTag("slate: delete", err)
 	}
 	return nil
 }
@@ -383,7 +383,7 @@ func (s *Slate) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	}
 	it, err := s.db.ScanPrefix(prefix)
 	if err != nil {
-		return nil, fmt.Errorf("slate: scan prefix: %w", err)
+		return nil, fenceTag("slate: scan prefix", err)
 	}
 	return &iterator{it: it}, nil
 }
@@ -465,11 +465,14 @@ func IsFenced(err error) bool {
 // writer-epoch fence, ADDITIONALLY tags it with backend.ErrFenced (multi-%w) so
 // the cluster layer recognizes the fence backend-agnostically (errors.Is(err,
 // backend.ErrFenced)) and recodes the leg to the TRANSIENT acquiring-window
-// error instead of hard-failing the write. EVERY write/read op of a transaction
-// routes through here, NOT just Commit: the writer-epoch fence can surface at
-// whichever op (Get/Put/Delete/Commit/ScanPrefix) runs first against a now-stale
+// error instead of hard-failing the write OR the cross-shard scan. EVERY op
+// routes through here - the NON-transactional backend Put/Get/Delete/ScanPrefix
+// and the iterator's Next (the path the cross-shard Aggregate / LocalScan reads
+// a MOUNTED unit through), AND every transactional op, NOT just Commit: the
+// writer-epoch fence can surface at whichever op runs first against a now-stale
 // writer (slatedb's background manifest-epoch poll lands it on the next op), so
-// the apply sequence Begin->Get->Put->Commit could fence at any step. errors.As
+// the apply sequence Begin->Get->Put->Commit, or a bare ScanPrefix on a
+// superseded mount, could fence at any step. errors.As
 // against *ErrorClosed still resolves through the multi-wrap, so IsFenced and the
 // rendered slatedb reason are both preserved. A non-fence error keeps the plain
 // %w wrap.
@@ -494,7 +497,7 @@ func (i *iterator) Next() ([]byte, []byte, error) {
 	}
 	kv, err := i.it.Next()
 	if err != nil {
-		return nil, nil, fmt.Errorf("slate: scan next: %w", err)
+		return nil, nil, fenceTag("slate: scan next", err)
 	}
 	if kv == nil {
 		return nil, nil, nil
