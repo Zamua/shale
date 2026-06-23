@@ -95,11 +95,59 @@ func (c *Cluster) bootstrapViaMarker() (gen storageunit.Generation, count storag
 	}
 }
 
-// NOTE (follow-up, #459): advancing the marker's durable {gen, count} on a
-// reshard - so a full-cluster restart of a RESHARDED homogeneous cluster
-// resumes the new generation rather than the founding gen 0 - is a separate,
-// contained change (a CompareAndSet from the reshard commit path). It is not
-// exercised yet (prod is gen 0, never resharded; the existing reshard tests use
-// the legacy seed-RPC path), so it is deliberately deferred until after the
-// bootstrap lands + validates. A homogeneous cluster MUST NOT reshard until it
-// is wired.
+// advanceClusterInitMarker advances the __cluster/init marker's durable
+// {gen, count} to (newGen, newCount) when the marker is BEHIND it, so a full-
+// cluster restart of a RESHARDED homogeneous cluster resumes the finalized
+// generation instead of re-forming the founding gen 0 (#460). It is the reshard-
+// side counterpart to bootstrapViaMarker: the founder writes {gen:0, count:N},
+// each reshard finalize advances it, and a boot reads it.
+//
+// Tracks the FINALIZED generation, NOT the reshard arbiter's epoch. The arbiter
+// (__reshard/epoch) advances its epoch to the next TARGET step BEFORE any node
+// finalizes (it is the agreement that DRIVES the split/merge), so it runs ahead
+// of durability; resuming it could mount children that are not yet caught up. The
+// caller advances this marker only at finalizeReshard, where the live generation
+// itself advances (gated on allCutOver: every cut-over marker present => the
+// children are durable), so the marker is the restart-safe generation.
+//
+// Monotone + idempotent: it reads the marker and returns success WITHOUT writing
+// if the marker is already at or beyond newGen (a concurrent finalizer, or a
+// re-run, never double-advances or regresses); on a CAS precondition failure it
+// re-reads and re-evaluates (a concurrent advance is observed, not fought). No-op
+// (nil) when no ConditionalStore is wired, or when no marker exists (a legacy
+// seed-RPC cluster that never founded via the marker - the advance only updates
+// an EXISTING marker; creation stays the founder's job in bootstrapViaMarker).
+func (c *Cluster) advanceClusterInitMarker(newGen storageunit.Generation, newCount storageunit.UnitCount) error {
+	cs := c.cfg.ConditionalStore
+	if cs == nil {
+		return nil
+	}
+	for {
+		data, version, getErr := cs.Get(clusterInitMarkerKey)
+		if errors.Is(getErr, storageunit.ErrCondNotFound) {
+			return nil // no marker to advance (legacy founding): not this path's job to create it
+		}
+		if getErr != nil {
+			return fmt.Errorf("cluster: read %s for advance: %w", clusterInitMarkerKey, getErr)
+		}
+		rec, decErr := decodeClusterInit(data)
+		if decErr != nil {
+			return fmt.Errorf("cluster: corrupt %s marker on advance: %w", clusterInitMarkerKey, decErr)
+		}
+		if rec.Gen >= uint64(newGen) {
+			return nil // already at or beyond the target generation: monotone + idempotent
+		}
+		payload, encErr := encodeClusterInit(clusterInitRecord{Gen: uint64(newGen), Count: newCount.N()})
+		if encErr != nil {
+			return encErr
+		}
+		_, casErr := cs.CompareAndSet(clusterInitMarkerKey, payload, version)
+		if casErr == nil {
+			return nil // advanced
+		}
+		if errors.Is(casErr, storageunit.ErrPrecondition) {
+			continue // a concurrent writer advanced it between our Get and CAS: re-read
+		}
+		return fmt.Errorf("cluster: advance %s: %w", clusterInitMarkerKey, casErr)
+	}
+}

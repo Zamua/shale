@@ -199,6 +199,18 @@ func (c *Cluster) observeCutoverMarkers(gs genState) {
 // split's children (a merge's survivors are already at their ring home). A unit
 // whose final copy is not strict this tick defers finalize to the next.
 func (c *Cluster) finalizeReshard(gs genState) {
+	// Advance the durable __cluster/init generation marker to gen+1 BEFORE
+	// retiring any parent (#460), so a full-cluster restart of the homogeneous
+	// deployment resumes the finalized generation and never a stale, about-to-be-
+	// retired parent (post-cut-over writes live in the children). allCutOver holds
+	// here (the caller's gate), so the gen-(g+1) children are durable and resuming
+	// gen+1 loses nothing. If the marker write FAILS, DEFER the retire: leaving
+	// the parents mounted keeps gen-g safely resumable, and this finalize re-runs
+	// next reconcile tick. No-op when no ConditionalStore / no marker (legacy
+	// paths unchanged).
+	if err := c.advanceClusterInitMarker(gs.gen+1, gs.nextCount); err != nil {
+		return
+	}
 	for _, ru := range c.ownedParentSlots(gs) {
 		if !c.finalizeParent(ru, gs) {
 			return // not safe to retire this unit yet; retry next tick

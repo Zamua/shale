@@ -1,6 +1,9 @@
 # Homogeneous bootstrap: runtime try-join-else-form
 
-Status: DESIGN (spec-first; no code yet)
+Status: IMPLEMENTED. The runtime try-join-else-form bootstrap (#459) is
+staging-validated (2026-06-23: concurrent first boot -> single founder, restart
+rejoins, full-cluster restart adopts the marker). The reshard-finalize marker
+advance (#460, section 4) tracks the durable generation through a split/merge.
 
 ## Problem
 
@@ -100,11 +103,53 @@ not bake the bug in.)
 So this design ADDS the missing persistence, folded into the same marker: the
 `cluster-init` CAS marker carries `{generation, unit-count}` as its VALUE. It is
 the durable source of truth. Write/update rules:
-- FORM (marker absent) -> `PutIfAbsent(initKey, {gen:0, count:N})`.
-- Reshard -> `CompareAndSet(initKey, {gen:bumped, count:2N}, expectedVersion)`
-  so the durable record advances in lockstep with the in-memory `genState`.
+- FORM (marker absent) -> `PutIfAbsent(initKey, {gen:0, count:N})` (the founder;
+  implemented #459 as `bootstrapViaMarker`).
+- Reshard finalize -> advance the marker to `{gen+1, nextCount}` via a monotone,
+  idempotent `CompareAndSet`, so the durable record tracks the FINALIZED in-memory
+  generation (implemented #460; details below).
 - RESUME / any boot -> read the marker to get the current `{gen, count}` instead
-  of trusting `initGenState`'s gen-0.
+  of trusting `initGenState`'s gen-0 (implemented #459: `bootstrapViaMarker`
+  adopts the marker's `{gen, count}` instead of re-forming gen 0).
+
+**Reshard-finalize advance (#460).** The marker advances inside the DECENTRALIZED
+reshard's `finalizeReshard` - the step that advances the live in-memory generation
+once `allCutOver` holds (every old unit's durable cut-over marker is present, i.e.
+the gen-(g+1) children provably hold every acked write). Three properties make it
+correct:
+
+- **Track the FINALIZED generation, not the arbiter epoch.** The reshard arbiter
+  (`__reshard/epoch`) also persists `{epoch, count}`, but its epoch advances to the
+  next TARGET step BEFORE any node finalizes (it is the agreement that DRIVES the
+  reshard), so it runs AHEAD of durability: a restart resuming the arbiter epoch
+  could mount children that are not yet caught up. The `cluster-init` marker tracks
+  the local `genState.gen`, which advances ONLY at `finalizeReshard` (gated on
+  `allCutOver`), so it is the durable, restart-safe generation.
+- **Advance the marker BEFORE retiring parents.** `finalizeReshard` writes the
+  marker to `{gen+1, nextCount}` as its FIRST step, before retiring any parent.
+  This closes the window in which a crash/restart between "parents retired (the
+  gen-g bytes are now stale - post-cut-over writes went to the children)" and
+  "marker advanced" would resume the OLD generation and serve a stale parent.
+  `allCutOver` guarantees the children are durable, so resuming gen+1 at this point
+  loses nothing; and if the marker advance FAILS, the parents are NOT retired (the
+  retire is gated on the advance), so a restart still safely resumes gen-g.
+- **Idempotent + monotone + self-healing.** The advance reads the marker and
+  no-ops if it is already at or beyond the target generation (a concurrent
+  finalizer, or a re-run, never double-advances or regresses); on a CAS
+  precondition failure it re-reads and re-evaluates (a concurrent advance is
+  observed, not fought). If the store write FAILS, `finalizeReshard` DEFERS
+  (returns without retiring parents); the existing finalize-retry loop re-runs it
+  next reconcile tick (`allCutOver` still holds, the generation has not advanced),
+  so it self-heals with no separate poller. A merge advances identically
+  (`{gen+1, nextCount}` with the halved count). A cluster with no `cluster-init`
+  marker (legacy seed-RPC founding, no homogeneous bootstrap) is a no-op: the
+  advance only updates an EXISTING marker; creation stays the founder's job.
+
+Scope: the decentralized R>1 reshard path - the homogeneous deployment's path (a
+homogeneous deployment is R>1, arbiter-wired). The R=1 barrier and single-node
+imperative reshard paths are not wired (they are not the homogeneous target);
+folding them in is a contained follow-up if a homogeneous R=1 / single-node cluster
+ever ships.
 
 On boot, BEFORE deciding form-vs-join, every node reads the marker from shared
 storage:
@@ -164,9 +209,12 @@ full-restart -> resumes-generation, concurrent-boot -> single founder).
 
 ## Open questions
 
-- Where exactly the generation record lives relative to the `cluster-init`
-  marker (one object vs marker + separate gen record), and whether the existing
-  joiner generation-learning (`multibackend.go`) reads it directly.
+- RESOLVED (#459/#460): the generation record is ONE object - the `cluster-init`
+  marker's value carries `{gen, count}`. The founder writes `{gen:0, count:N}`, a
+  reshard finalize advances it via monotone CAS, and `bootstrapViaMarker` reads it
+  on boot. There is no separate gen record. The legacy joiner generation-learning
+  (`learnGenerationFromSeed`) stays the fallback for a cluster without a
+  ConditionalStore (it reads a live peer's `genState`, not the marker).
 - The `BootstrapJoinTimeout` value: long enough that a slow-starting peer is
   discovered before a node decides to contend-to-form, short enough that a
   genuine fresh cluster founds promptly.
