@@ -5,6 +5,10 @@
 *.out
 .DS_Store
 *.log
+# native slatedb libs (libslatedb_uniffi.{so,dylib}) - built in-container for the
+# image, or symlinked locally for -tags slatedb tests; never committed.
+*.so
+*.dylib
 /dist/
 /coverage.*
 /shale
