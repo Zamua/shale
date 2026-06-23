@@ -161,12 +161,24 @@ func run(argv []string, stderr *os.File) error {
 		if err != nil {
 			return err
 		}
+		// The shared CAS arbiter over the same bucket drives the homogeneous
+		// try-join-else-form bootstrap (the __cluster/init form-lock + durable
+		// generation) so every pod runs one identical config in a single
+		// StatefulSet, no seed wart. nil would fall back to the legacy
+		// seed-RPC bootstrap.
+		condStore, err := openSlateCondStore(cfg)
+		if err != nil {
+			return err
+		}
+		logger.Printf("shaled-slate: homogeneous bootstrap armed (conditional store over bucket=%s key-prefix=%q)",
+			cfg.Bucket, cfg.KeyPrefix)
 		return shaled.Run(shaled.RunConfig{
-			Std:            *std,
-			BackendLabel:   "slate-multi",
-			BackendFactory: factory,
-			CloseFactory:   closeFactory,
-			Logger:         logger,
+			Std:              *std,
+			BackendLabel:     "slate-multi",
+			BackendFactory:   factory,
+			CloseFactory:     closeFactory,
+			ConditionalStore: condStore,
+			Logger:           logger,
 		})
 	}
 

@@ -11,6 +11,7 @@ package main
 import (
 	"fmt"
 	"log"
+	"strings"
 
 	"github.com/Zamua/shale/backends/slate"
 	"github.com/Zamua/shale/pkg/backend"
@@ -78,4 +79,26 @@ func openSlateFactory(cfg slateConfig, logger *log.Logger) (storageunit.BackendF
 	// tracks; Handle.Close is the backing-level safety net (best-effort
 	// flush + shutdown of anything left).
 	return handle, handle.Close, nil
+}
+
+// openSlateCondStore builds the shared CAS arbiter over the same bucket the
+// multi-backend factory uses. It backs the homogeneous try-join-else-form
+// bootstrap (the __cluster/init form-lock + durable generation marker) and the
+// decentralized reshard arbiter. NewBacking takes the endpoint WITH its scheme;
+// the minio client behind the conditional store wants a bare host:port, so the
+// scheme is stripped here (UseSSL already carries the transport choice).
+func openSlateCondStore(cfg slateConfig) (storageunit.ConditionalStore, error) {
+	host := strings.TrimPrefix(strings.TrimPrefix(cfg.Endpoint, "https://"), "http://")
+	cs, err := slate.NewMinioConditionalStore(slate.MinioConditionalStoreConfig{
+		EndpointHost: host,
+		AccessKey:    cfg.AccessKey,
+		SecretKey:    cfg.SecretKey,
+		UseSSL:       cfg.UseSSL,
+		Bucket:       cfg.Bucket,
+		KeyPrefix:    cfg.KeyPrefix,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("open slate conditional store: %w", err)
+	}
+	return cs, nil
 }

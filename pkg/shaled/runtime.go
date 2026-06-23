@@ -246,6 +246,13 @@ type RunConfig struct {
 	// backing-level teardown the cluster does not own.
 	CloseFactory func() error
 
+	// ConditionalStore, when set (multi-backend mode), enables the homogeneous
+	// runtime try-join-else-form bootstrap: the cluster's form-vs-join decision
+	// + durable generation live in the shared CAS store's __cluster/init marker
+	// instead of the empty-seeds-means-founder config split. It also backs the
+	// decentralized reshard arbiter. nil keeps the legacy seed-RPC bootstrap.
+	ConditionalStore storageunit.ConditionalStore
+
 	// Logger is where startup + shutdown lines are written. Required.
 	Logger *log.Logger
 }
@@ -461,6 +468,7 @@ func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 	} else {
 		clusterCfg.Backend = cfg.Backend
 	}
+	clusterCfg.ConditionalStore = cfg.ConditionalStore
 	return clusterCfg
 }
 
