@@ -106,9 +106,12 @@ func (c *Cluster) bootstrapViaMarker() (gen storageunit.Generation, count storag
 // (__reshard/epoch) advances its epoch to the next TARGET step BEFORE any node
 // finalizes (it is the agreement that DRIVES the split/merge), so it runs ahead
 // of durability; resuming it could mount children that are not yet caught up. The
-// caller advances this marker only at finalizeReshard, where the live generation
-// itself advances (gated on allCutOver: every cut-over marker present => the
-// children are durable), so the marker is the restart-safe generation.
+// caller advances this marker only at finalizeReshard, where this node's live
+// generation advances. Once the reshard COMPLETES cluster-wide the marker is the
+// restart-safe generation; a full-cluster crash DURING an active reshard is the
+// separate, not-yet-lossless resume-mid-reshard case (#461) - see finalizeReshard
+// for the full reasoning. This advance is the steady-state mechanism, not a
+// mid-reshard-crash guarantee.
 //
 // Monotone + idempotent: it reads the marker and returns success WITHOUT writing
 // if the marker is already at or beyond newGen (a concurrent finalizer, or a

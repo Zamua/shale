@@ -113,26 +113,44 @@ the durable source of truth. Write/update rules:
   adopts the marker's `{gen, count}` instead of re-forming gen 0).
 
 **Reshard-finalize advance (#460).** The marker advances inside the DECENTRALIZED
-reshard's `finalizeReshard` - the step that advances the live in-memory generation
-once `allCutOver` holds (every old unit's durable cut-over marker is present, i.e.
-the gen-(g+1) children provably hold every acked write). Three properties make it
-correct:
+reshard's `finalizeReshard` - the step that advances this node's live in-memory
+generation once its LOCAL `allCutOver` holds (every old unit's durable cut-over
+marker has been observed by this node). The STEADY-STATE guarantee: once a reshard
+COMPLETES cluster-wide, the marker is at gen+1, so a full-cluster restart resumes
+the finalized generation losslessly (all data is in the children). Properties:
 
 - **Track the FINALIZED generation, not the arbiter epoch.** The reshard arbiter
   (`__reshard/epoch`) also persists `{epoch, count}`, but its epoch advances to the
   next TARGET step BEFORE any node finalizes (it is the agreement that DRIVES the
   reshard), so it runs AHEAD of durability: a restart resuming the arbiter epoch
   could mount children that are not yet caught up. The `cluster-init` marker tracks
-  the local `genState.gen`, which advances ONLY at `finalizeReshard` (gated on
-  `allCutOver`), so it is the durable, restart-safe generation.
+  the local `genState.gen`, which advances ONLY at `finalizeReshard`, so it is the
+  restart-safe generation for a COMPLETED reshard.
 - **Advance the marker BEFORE retiring parents.** `finalizeReshard` writes the
   marker to `{gen+1, nextCount}` as its FIRST step, before retiring any parent.
   This closes the window in which a crash/restart between "parents retired (the
   gen-g bytes are now stale - post-cut-over writes went to the children)" and
-  "marker advanced" would resume the OLD generation and serve a stale parent.
-  `allCutOver` guarantees the children are durable, so resuming gen+1 at this point
-  loses nothing; and if the marker advance FAILS, the parents are NOT retired (the
-  retire is gated on the advance), so a restart still safely resumes gen-g.
+  "marker advanced" would resume the OLD generation and serve a stale parent. And
+  if the marker advance FAILS, the parents are NOT retired (the retire is gated on
+  the advance), so a restart still safely resumes gen-g.
+- **NOT lossless for a full-cluster crash DURING an active reshard.** `allCutOver`
+  is LOCAL (this node's observed cut-over markers), and `finalizeReshard` runs
+  per-node, so the FIRST node to reach `allCutOver` advances the SHARED marker to
+  gen+1 while a lagging peer that has not yet flipped is still acking writes on its
+  PARENT legs and has not yet drained those stragglers into the children (its drain
+  runs in ITS own `finalizeReshard`, possibly later). Mid-reshard, acked writes are
+  split across gen-g parents (lagging units) and gen-(g+1) children (flipped units);
+  a full-cluster crash + single-generation resume (what `bootstrapViaMarker` does)
+  cannot hold both, so it loses the writes homed in the other generation. This is
+  fundamental to a generation-collapsed resume, not a flaw in the marker timing
+  (resuming gen-g would symmetrically lose already-flipped child writes). The marker
+  advance STRICTLY NARROWS the pre-#460 behavior (a mid-reshard full restart reset
+  everyone to gen 0, losing everything past gen 0) and fully fixes the COMPLETED-
+  reshard resume; making a mid-reshard full crash lossless needs resume-time reshard
+  re-drain (re-mount the still-durable gen-g parents from object storage and re-run
+  the strict drain into the children before serving) - a contained follow-up (#461).
+  Operationally: do not full-restart a homogeneous cluster during an active reshard
+  until #461 lands; a reshard is a short, operator-initiated window.
 - **Idempotent + monotone + self-healing.** The advance reads the marker and
   no-ops if it is already at or beyond the target generation (a concurrent
   finalizer, or a re-run, never double-advances or regresses); on a CAS

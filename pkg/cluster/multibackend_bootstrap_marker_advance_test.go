@@ -244,6 +244,65 @@ func TestFinalizeReshard_DefersWhenMarkerAdvanceFails(t *testing.T) {
 	}
 }
 
+// flakyCondStore wraps a ConditionalStore and fails the first failGets Get calls
+// with a transient error, to exercise the self-healing retry after a TRANSIENT
+// (not permanent) marker-read failure - the recover-then-succeed half the corrupt-
+// marker defer test cannot reach.
+type flakyCondStore struct {
+	storageunit.ConditionalStore
+	failGets int
+}
+
+func (f *flakyCondStore) Get(key string) ([]byte, string, error) {
+	if f.failGets > 0 {
+		f.failGets--
+		return nil, "", errors.New("transient store error")
+	}
+	return f.ConditionalStore.Get(key)
+}
+
+// TestFinalizeReshard_SelfHealsAfterTransientMarkerFailure pins the self-healing
+// the docs promise: a TRANSIENT marker-write failure defers the finalize (tick 1),
+// and a later tick (the store having recovered) advances the marker AND commits
+// the generation (tick 2). This is the recover-then-succeed transition that the
+// permanently-corrupt-marker defer test cannot exercise.
+func TestFinalizeReshard_SelfHealsAfterTransientMarkerFailure(t *testing.T) {
+	mem := storageunit.NewMemConditionalStore()
+	seedMarker(t, mem, 0, 4)
+	flaky := &flakyCondStore{ConditionalStore: mem, failGets: 1}
+
+	c := &Cluster{unitCount: storageunit.MustUnitCount(4)}
+	c.cfg.ConditionalStore = flaky
+	cutOver := make(map[storageunit.UnitID]struct{})
+	for _, k := range storageunit.MustUnitCount(4).IDs() {
+		cutOver[k] = struct{}{}
+	}
+	c.commitGenState(genState{
+		gen:       0,
+		count:     storageunit.MustUnitCount(4),
+		nextCount: storageunit.MustUnitCount(8),
+		cutOver:   cutOver,
+	})
+
+	// Tick 1: the marker read fails transiently -> finalize defers; nothing moves.
+	c.finalizeReshard(c.genSnapshot())
+	if gs := c.genSnapshot(); gs.gen != 0 || gs.nextCount.IsZero() {
+		t.Fatalf("tick 1 must defer: got {gen:%d,nextCount:%d}", gs.gen, gs.nextCount.N())
+	}
+	if rec := readMarker(t, mem); rec.Gen != 0 {
+		t.Fatalf("tick 1 must not advance the marker: got gen %d", rec.Gen)
+	}
+
+	// Tick 2: the store has recovered -> finalize advances the marker + commits gen+1.
+	c.finalizeReshard(c.genSnapshot())
+	if rec := readMarker(t, mem); rec.Gen != 1 || rec.Count != 8 {
+		t.Fatalf("tick 2 must advance: got {gen:%d,count:%d}", rec.Gen, rec.Count)
+	}
+	if gs := c.genSnapshot(); gs.gen != 1 || !gs.nextCount.IsZero() {
+		t.Fatalf("tick 2 must finalize: got {gen:%d,nextCount:%d}", gs.gen, gs.nextCount.N())
+	}
+}
+
 // TestFinalizeSplit_AdvancesMarkerWithRealParents is the end-to-end proof that the
 // marker advance coexists with the REAL parent retire: a replicated cluster mid-
 // split, with a founded marker, finalizes - advancing the durable marker to the
