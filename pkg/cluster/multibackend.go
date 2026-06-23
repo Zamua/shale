@@ -214,16 +214,38 @@ func (c *Cluster) initMultiBackend() error {
 	}
 	c.initGenState()
 
-	// Generation propagation (join-after-reshard fix): a JOINER (multi-backend
-	// Open WITH seeds) must learn the cluster's LIVE {generation, unit-count}
-	// BEFORE it derives or mounts any unit below, or it routes / owns keys at
-	// gen 0 and orphans acked writes after the cluster has resharded. Query a
-	// seed and commit the live generation here, ahead of the mount loop, so
-	// there is NO window in which this node serves at gen 0. The founder /
-	// single-node / legacy paths have no seeds and keep initGenState's gen-0
-	// default. Fail closed: a seed that cannot be reached fails Open rather
-	// than leaving the joiner at the wrong generation.
-	if len(c.cfg.Seeds) > 0 {
+	// Bootstrap the generation BEFORE deriving or mounting any unit below, or
+	// this node routes / owns keys at gen 0 and orphans acked writes after the
+	// cluster has resharded.
+	//
+	// When a shared ConditionalStore is configured, the __cluster/init marker is
+	// the authority (homogeneous runtime try-join-else-form; see
+	// multibackend_bootstrap_marker.go): every node runs the SAME path, the
+	// single PutIfAbsent winner founds at gen 0, and everyone else adopts the
+	// marker's durable {gen, count}. This is what lets a restart REJOIN at the
+	// live generation instead of re-forming gen 0, and a full-cluster restart
+	// resume the live generation with no live peer to ask.
+	//
+	// Without a ConditionalStore, fall back to the legacy config-driven path: a
+	// JOINER (Open WITH seeds) learns the live generation from a seed RPC, while
+	// the founder / single-node paths keep initGenState's gen-0 default. Fail
+	// closed in both: a marker read / seed query that cannot complete fails Open
+	// rather than leaving this node at the wrong generation.
+	if c.cfg.ConditionalStore != nil {
+		gen, count, founded, err := c.bootstrapViaMarker()
+		if err != nil {
+			return err
+		}
+		if !founded {
+			// Adopt the marker's durable {gen, count}. (A founder wrote
+			// {gen:0, count:N}; initGenState already seeded that, nothing to do.)
+			c.commitGenState(genState{
+				gen:     gen,
+				count:   count,
+				cutOver: make(map[storageunit.UnitID]struct{}),
+			})
+		}
+	} else if len(c.cfg.Seeds) > 0 {
 		if err := c.learnGenerationFromSeed(); err != nil {
 			return err
 		}

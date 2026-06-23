@@ -794,6 +794,13 @@ func Open(cfg Config) (*Cluster, error) {
 		// founder (no seeds) and in-process tests that pass no seeds run no
 		// loop. See membership.Config.RejoinInterval.
 		RejoinInterval: membership.DefaultRejoinInterval,
+		// Homogeneous bootstrap: when a shared ConditionalStore is wired, every
+		// node carries the SAME seed list (a headless Service) and the first one
+		// up reaches no peer. AllowSoloStart lets it come up solo and contend to
+		// form via the __cluster/init marker, instead of failing Open. Without a
+		// ConditionalStore (no durable form-lock) keep the strict behavior: a
+		// joiner with unreachable seeds fails rather than silently fork.
+		AllowSoloStart: cfg.ConditionalStore != nil,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cluster: membership: %w", err)
