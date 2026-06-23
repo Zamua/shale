@@ -365,7 +365,21 @@ func (b *BlobKV) referencedObjKeys() (map[string]struct{}, error) {
 		if k == nil {
 			break
 		}
-		ptr, derr := blob.DecodePointer(v)
+		// LocalScanPrefix hands back the RAW stored value. At R>1 that is the
+		// LWW Envelope (Stamp + payload); at R=1 it is the bare payload. Decode
+		// strips the envelope and passes a raw value through unchanged (its v0.3
+		// compat path), so this is correct at every replication factor. WITHOUT
+		// this strip the sweep fed the envelope's binary header into
+		// DecodePointer and fail-closed on the FIRST enveloped bref - so the
+		// blob GC never ran at R>1.
+		env, derr := Decode(v)
+		if derr != nil {
+			return nil, derr // a present-but-corrupt envelope header: fail closed
+		}
+		if len(env.Payload) == 0 {
+			continue // a delete tombstone (the bref was unbound) references nothing
+		}
+		ptr, derr := blob.DecodePointer(env.Payload)
 		if derr != nil {
 			return nil, derr // fail-closed: an undecodable pointer aborts the scan
 		}

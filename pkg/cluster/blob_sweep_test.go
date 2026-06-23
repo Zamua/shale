@@ -69,6 +69,86 @@ func TestSweepOrphans_KeepsReferenced(t *testing.T) {
 	_ = rc.Close()
 }
 
+// TestSweepOrphans_DecodesEnvelopedPointer pins the R>1 path. At R>1 a bound
+// blob's bref is stored as an LWW Envelope (Stamp + payload) - the shape the
+// replicated write produces and the live prod cluster holds. The orphan sweep's
+// referenced-set scan reads brefs RAW via LocalScanPrefix, so it must Decode the
+// envelope before DecodePointer. Without that strip it fed the envelope's binary
+// header into the JSON decoder, fail-closed on the FIRST enveloped bref, and the
+// GC never ran (the prod #427 bug: "decode pointer: invalid character").
+//
+// This test FAILS against the pre-fix code: SweepOrphans returns the decode
+// error, so the aged orphan is never reclaimed.
+func TestSweepOrphans_DecodesEnvelopedPointer(t *testing.T) {
+	store := blobmem.New()
+	mem := memory.New()
+	bkv, err := cluster.NewBlobKV(cluster.Config{NodeID: "n1", Backend: mem, BlobStore: store})
+	if err != nil {
+		t.Fatalf("NewBlobKV: %v", err)
+	}
+	t.Cleanup(func() { _ = bkv.Close() })
+	ctx := context.Background()
+
+	// A referenced blob: stage + bind (BindBlob writes a RAW bref at R=1).
+	ref, err := bkv.StageBlob(ctx, []byte("slug-ref"), bytes.NewReader([]byte("kept bytes")), 10)
+	if err != nil {
+		t.Fatalf("StageBlob ref: %v", err)
+	}
+	if err := bkv.Transact([]byte("slug-ref"), func(tx *cluster.BlobTx) error { return tx.BindBlob(ref) }); err != nil {
+		t.Fatalf("bind: %v", err)
+	}
+
+	// Re-stamp every bref as an LWW Envelope, the shape a replicated R>1 write
+	// produces. This is exactly what the referenced-set scan must strip.
+	it, err := mem.ScanPrefix([]byte("bref/"))
+	if err != nil {
+		t.Fatalf("scan bref/: %v", err)
+	}
+	type kvp struct{ k, v []byte }
+	var brefs []kvp
+	for {
+		k, v, ierr := it.Next()
+		if ierr != nil {
+			t.Fatalf("iter: %v", ierr)
+		}
+		if k == nil {
+			break
+		}
+		brefs = append(brefs, kvp{append([]byte(nil), k...), append([]byte(nil), v...)})
+	}
+	_ = it.Close()
+	if len(brefs) == 0 {
+		t.Fatal("bind wrote no bref")
+	}
+	for _, b := range brefs {
+		env := cluster.Encode(cluster.Envelope{Stamp: cluster.Stamp{TimestampNanos: 1, NodeID: "n1"}, Payload: b.v})
+		if err := mem.Put(b.k, env); err != nil {
+			t.Fatalf("re-stamp bref: %v", err)
+		}
+	}
+
+	// An aged orphan (staged, never bound). The sweep reaches it ONLY if the
+	// referenced-set scan did not fail-close on the enveloped bref above.
+	orphan, err := bkv.StageBlob(ctx, []byte("slug-orphan"), bytes.NewReader([]byte("orphan bytes")), 12)
+	if err != nil {
+		t.Fatalf("StageBlob orphan: %v", err)
+	}
+	store.SetModTime(blob.FinalKey(orphan.Unit, orphan.BlobID), time.Unix(0, 0))
+	store.SetModTime(blob.FinalKey(ref.Unit, ref.BlobID), time.Unix(0, 0)) // age the referenced too
+
+	if err := bkv.SweepOrphans(ctx, time.Now(), time.Hour); err != nil {
+		t.Fatalf("SweepOrphans fail-closed on an enveloped bref (the #427 bug): %v", err)
+	}
+	// Referenced object survives (its ObjKey was decoded from the envelope).
+	if has, _ := store.Has(ctx, blob.FinalKey(ref.Unit, ref.BlobID)); !has {
+		t.Fatal("referenced blob was wrongly swept - the enveloped bref's ObjKey was not decoded")
+	}
+	// Orphan is reclaimed (the GC actually ran).
+	if has, _ := store.Has(ctx, blob.FinalKey(orphan.Unit, orphan.BlobID)); has {
+		t.Fatal("aged orphan was not reclaimed - the referenced-set scan did not complete")
+	}
+}
+
 // TestSweepOrphans_ReclaimsAgedOrphan is the crash-injection case: stage with NO
 // bind (the process "died" before the binding commit), age the object past the
 // grace, and assert the sweep reclaims it.
