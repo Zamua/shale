@@ -169,6 +169,17 @@ type Config struct {
 	// itself). Zero DISABLES the loop (the default for in-process tests that
 	// do not churn addresses); production sets a non-zero interval.
 	RejoinInterval time.Duration
+
+	// AllowSoloStart controls what happens when Seeds is non-empty but NONE of
+	// them is reachable at Open. By default (false) that is a hard error: a
+	// joiner with dead seeds must not silently fork a new cluster. When true,
+	// Open instead comes up SOLO (a 1-node memberlist) and returns success, and
+	// the CALLER owns the form-vs-join decision (e.g. a durable CAS form-lock).
+	// This is what lets a homogeneous fleet - every pod configured with the SAME
+	// seed list (a headless Service), no dedicated seed pod - boot from cold:
+	// the first pod up reaches no peer, starts solo, and contends to form;
+	// later pods reach it and join.
+	AllowSoloStart bool
 }
 
 // DefaultRejoinInterval is the production re-Join cadence used when a
@@ -447,13 +458,22 @@ func Open(cfg Config) (*Membership, error) {
 
 	if len(cfg.Seeds) > 0 {
 		contacted, err := ml.Join(cfg.Seeds)
-		if err != nil {
-			_ = ml.Shutdown()
-			return nil, fmt.Errorf("membership: join: %w", err)
-		}
-		if contacted == 0 {
-			_ = ml.Shutdown()
-			return nil, fmt.Errorf("membership: join: no seeds reachable (seeds=%v)", cfg.Seeds)
+		// AllowSoloStart (homogeneous bootstrap): unreachable seeds are EXPECTED.
+		// The headless Service lists peers that may be down, and the first pod up
+		// reaches none - memberlist.Join then returns contacted==0 AND a dial err.
+		// Under the flag both are non-fatal: contacted==0 means "start solo" (the
+		// caller contends to form via a durable CAS form-lock), contacted>0 means
+		// "joined". Without the flag, either is a hard failure (a joiner with dead
+		// seeds must not silently fork a new cluster).
+		if !cfg.AllowSoloStart {
+			if err != nil {
+				_ = ml.Shutdown()
+				return nil, fmt.Errorf("membership: join: %w", err)
+			}
+			if contacted == 0 {
+				_ = ml.Shutdown()
+				return nil, fmt.Errorf("membership: join: no seeds reachable (seeds=%v)", cfg.Seeds)
+			}
 		}
 	}
 	m.ml = ml

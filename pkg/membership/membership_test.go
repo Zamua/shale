@@ -83,6 +83,32 @@ func TestOpenWithUnreachableSeedsFails(t *testing.T) {
 	}
 }
 
+func TestOpenSoloStartWhenSeedsUnreachable(t *testing.T) {
+	port := ephemeralPort(t)
+	dead := ephemeralPort(t)
+
+	// AllowSoloStart: unreachable seeds is NOT fatal; the node comes up solo.
+	// This is the homogeneous-bootstrap path - every pod carries the same seed
+	// list (a headless Service), and the first one up reaches no peer, starts
+	// solo, then contends to form via the caller's durable CAS form-lock.
+	m, err := Open(Config{
+		NodeID:         "solo",
+		BindAddr:       bindAddr(port),
+		GRPCAddr:       "127.0.0.1:1",
+		Seeds:          []string{bindAddr(dead)},
+		LogOutput:      io.Discard,
+		AllowSoloStart: true,
+	})
+	if err != nil {
+		t.Fatalf("AllowSoloStart: want solo start when seeds unreachable, got error: %v", err)
+	}
+	defer func() { _ = m.Close() }()
+
+	if got := m.Members(); len(got) != 1 {
+		t.Fatalf("solo node should see exactly itself, got %d members: %v", len(got), got)
+	}
+}
+
 func TestThreeNodesConverge(t *testing.T) {
 	n1Port := ephemeralPort(t)
 	n2Port := ephemeralPort(t)
