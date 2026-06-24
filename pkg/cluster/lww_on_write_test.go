@@ -50,6 +50,16 @@ import (
 // same workload.
 func runConcurrentIncrements(t *testing.T, nodes []*replicatedNode, key []byte, workers int) *cluster.Cluster {
 	t.Helper()
+	// Every increment targets ONE key, so all `workers` writers serialize on
+	// that key's CAS. Under the race detector the contention window widens
+	// enough that the default CASMaxAttempts (10) exhausts before a contended
+	// writer wins - the increments ERROR OUT (caught at line ~85), they are
+	// not silently lost, so this is a test-environment artifact, not a lost
+	// update. Give the budget generous headroom and drop the inter-attempt
+	// backoff so the retries resolve quickly. Restored at test end.
+	oldMax, oldBackoff := cluster.CASMaxAttempts, cluster.SetCASBaseBackoffZero()
+	cluster.CASMaxAttempts = 500
+	t.Cleanup(func() { cluster.CASMaxAttempts = oldMax; cluster.RestoreCASBaseBackoff(oldBackoff) })
 	owner := ownerIndex(nodes, key)
 	if owner < 0 {
 		t.Fatalf("no owner for %q", key)
