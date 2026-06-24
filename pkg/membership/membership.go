@@ -478,25 +478,23 @@ func Open(cfg Config) (*Membership, error) {
 	}
 	m.ml = ml
 
-	// Belt-and-suspenders cache seed. The NotifyJoin path SHOULD have
-	// inserted every currently-known node already (memberlist fires
-	// it during Create + Join for the local node and each peer), but
-	// pulling from memberlist.Members() once here covers the
-	// theoretical window between Join returning and the final
-	// NotifyJoin draining through. This is the ONE call site outside
-	// the event callbacks that reads Node fields directly: it is
-	// safe only because no other Membership consumer has a handle
-	// yet (Open has not returned), so memberlist's gossip goroutines
-	// are the only writers and their NotifyJoin/Leave is what we are
-	// reconciling against.
-	for _, n := range ml.Members() {
-		mem := nodeToMember(n)
-		m.cacheMu.Lock()
-		if _, ok := m.cache[mem.ID]; !ok {
-			m.cache[mem.ID] = mem
-		}
-		m.cacheMu.Unlock()
+	// Belt-and-suspenders cache seed for the LOCAL node only, built from our
+	// OWN config (id + GRPCAddr; not draining at Open) - never read from a
+	// live memberlist Node. NotifyJoin already upserts the local node (and
+	// every peer) synchronously during Create/Join, so this only guarantees
+	// self is present the instant Open returns. We must NOT iterate
+	// ml.Members() and nodeToMember() it here: that reads Node.Meta outside
+	// any memberlist lock and RACES memberlist's gossip goroutines
+	// (packetHandler -> aliveNode concurrently mutates Node.Meta - confirmed
+	// by -race, see nodeToMember's contract). Peers are reconciled solely via
+	// the memberlist-serialized NotifyJoin/Leave/Update callbacks, the only
+	// safe place to read a Node's fields.
+	self := Member{ID: cfg.NodeID, Addr: cfg.GRPCAddr}
+	m.cacheMu.Lock()
+	if _, ok := m.cache[self.ID]; !ok {
+		m.cache[self.ID] = self
 	}
+	m.cacheMu.Unlock()
 
 	// Start the periodic seed re-Join (anti-entropy that heals a
 	// post-startup gossip split, e.g. after a mass rolling restart). Only
