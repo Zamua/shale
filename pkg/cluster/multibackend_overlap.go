@@ -550,7 +550,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		// The phase entry is gone or not Acquiring (a concurrent reconcile already
 		// flipped or dropped it). Still install the mount (it is the authoritative
 		// durable owner) and drop any stale phase entry.
-		c.mountMap[ru] = b
+		c.storeMount(ru, b)
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
 		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
@@ -560,13 +560,13 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	if err != nil {
 		// Illegal edge should not happen (cur is Acquiring); install the mount and
 		// drop the phase to converge to Owned regardless.
-		c.mountMap[ru] = b
+		c.storeMount(ru, b)
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
 		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
 		return
 	}
-	c.mountMap[ru] = b
+	c.storeMount(ru, b)
 	// Ready is transient: once the mount entry is present the node serves locally,
 	// so the steady state is Owned (no phase entry). Drop the entry rather than
 	// parking in Ready - Owned = mounted + no phase, per the FSM's steady-state

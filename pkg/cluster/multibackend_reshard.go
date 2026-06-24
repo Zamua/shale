@@ -446,8 +446,8 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
 	c.mountMu.Lock()
-	c.mountMap[replica0(lowGU)] = lowBE
-	c.mountMap[replica0(highGU)] = highBE
+	c.storeMount(replica0(lowGU), lowBE)
+	c.storeMount(replica0(highGU), highBE)
 	c.mountMu.Unlock()
 
 	// The source backend (old gen-g unit K), which keeps serving throughout.

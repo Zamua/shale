@@ -250,7 +250,7 @@ func (c *Cluster) mountReplicaUnits() error {
 			c.lastAcquireErr.Delete(ru)
 			c.myOpenEpoch.Store(ru, openedEpoch) // this node's exact open epoch (drain gate)
 			c.mountMu.Lock()
-			c.mountMap[ru] = b
+			c.storeMount(ru, b)
 			c.mountMu.Unlock()
 			mounted.Add(1)
 			return nil
@@ -413,7 +413,7 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 		_ = c.replicaFactory.CloseReplicaUnit(ru)
 		return
 	}
-	c.mountMap[ru] = b
+	c.storeMount(ru, b)
 	c.mountMu.Unlock()
 
 	// Write the durable serving marker AFTER the mount (outside the lock: shared
@@ -709,21 +709,14 @@ func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Membe
 		// mid-mount has no mounted position and returns the transient
 		// errUnitAcquiring, which the read fan-out skips while another union member
 		// (the still-mounted current owner) answers.
-		b, ru, ok := c.localBackendAndRUForKey(key)
+		b, ok := c.localBackendForKey(key)
 		if !ok {
 			return nil, errUnitAcquiring("Get")
 		}
-		v, err := b.Get(key)
-		if err != nil {
-			// A FENCED owner-local read (a higher-epoch owner superseded this
-			// mount) must recode to the transient acquiring-window error AND evict
-			// the stale mount, EXACTLY as the write + scan paths do - otherwise the
-			// fence re-surfaces on every read forever and reconcile never re-acquires
-			// (it sees the position still mounted). A non-fence error passes through.
-			// See docs/SPEC.md "Fenced owner-local read self-heals".
-			return nil, c.fenceToTransient(ru, b, "Get", err)
-		}
-		return v, nil
+		// b is the fence-self-healing mount (storeMount): a fenced read recodes to
+		// the transient acquiring-window error + evicts the stale mount here, so a
+		// fenced GET self-heals instead of returning the raw fence forever (#433).
+		return b.Get(key)
 	}
 	cli, err := c.clientFor(replica.Addr)
 	if err != nil {

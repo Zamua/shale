@@ -300,7 +300,7 @@ func (c *Cluster) initMultiBackend() error {
 			_ = c.closeMountedUnits()
 			return fmt.Errorf("cluster: open unit %s: %w", gu, err)
 		}
-		c.mountMap[replica0(gu)] = b
+		c.storeMount(replica0(gu), b)
 	}
 	return nil
 }
@@ -382,27 +382,15 @@ func (c *Cluster) unitOwnerOf(key []byte) (owner ring.Member, isLocal bool) {
 // guard) treat ok=false as "this node does not own the unit": refuse, do
 // NOT re-forward. Multi-backend mode only.
 func (c *Cluster) localBackendForKey(key []byte) (backend.Backend, bool) {
-	b, _, ok := c.localBackendAndRUForKey(key)
-	return b, ok
-}
-
-// localBackendAndRUForKey is localBackendForKey plus the resolved ReplicaUnit,
-// for read paths that must EVICT a fenced mount via fenceToTransient (which needs
-// the ru to evict the right position). The owner-local read paths use it so a
-// fenced owner-local Get / scan self-heals the same way the write path does,
-// instead of returning the raw fence forever (docs/SPEC.md "Fenced owner-local
-// read self-heals"). Multi-backend mode only.
-func (c *Cluster) localBackendAndRUForKey(key []byte) (backend.Backend, storageunit.ReplicaUnit, bool) {
 	gu := c.genUnitForKey(key)
 	pos, ok := c.localReplicaPos(gu)
 	if !ok {
-		return nil, storageunit.ReplicaUnit{}, false
+		return nil, false
 	}
-	ru := storageunit.NewReplicaUnit(gu, pos)
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
-	b, ok := c.mountMap[ru]
-	return b, ru, ok
+	b, ok := c.mountMap[storageunit.NewReplicaUnit(gu, pos)]
+	return b, ok
 }
 
 // localBackendForReplicaUnit resolves the mounted backend for an EXPLICIT
@@ -432,24 +420,15 @@ func (c *Cluster) localBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backen
 // the drain window, instead of refusing them via the loop-guard. Returns the
 // first mounted backend whose ReplicaUnit is for the key's GenUnit.
 func (c *Cluster) localMountedBackendForKey(key []byte) (backend.Backend, bool) {
-	b, _, ok := c.localMountedBackendAndRUForKey(key)
-	return b, ok
-}
-
-// localMountedBackendAndRUForKey is localMountedBackendForKey plus the resolved
-// ReplicaUnit, so the forwarded-read handler (LocalGet) can EVICT a fenced mount
-// via fenceToTransient (which needs the ru). Same physical-mount resolution (any
-// replica index), used so a fenced forwarded read self-heals like the write path.
-func (c *Cluster) localMountedBackendAndRUForKey(key []byte) (backend.Backend, storageunit.ReplicaUnit, bool) {
 	gu := c.genUnitForKey(key)
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
 	for ru, b := range c.mountMap {
 		if ru.Unit == gu {
-			return b, ru, true
+			return b, true
 		}
 	}
-	return nil, storageunit.ReplicaUnit{}, false
+	return nil, false
 }
 
 // mountedBackends returns a snapshot of every backend this node currently

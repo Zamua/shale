@@ -218,9 +218,13 @@ func TestAcquireFencesPriorOwner(t *testing.T) {
 		t.Fatalf("B.Get acked after handoff: got=%q err=%v (acked write lost)", got, err)
 	}
 
-	// A is fenced: A's still-held backend cannot write U anymore.
-	if err := abk.Put([]byte("stale"), []byte("x")); !errors.Is(err, sharedfactory.ErrFenced) {
-		t.Fatalf("A write after B acquired: got %v, want ErrFenced", err)
+	// A is fenced: B acquired U at a higher epoch, so A's stale mount cannot
+	// write U anymore. Via the fence-self-healing decorator (storeMount) the
+	// fenced write does NOT surface the raw fence - it recodes to the TRANSIENT
+	// acquiring-window error AND evicts A's stale mount, so a retry re-routes to
+	// the new owner instead of wedging on the dead handle (#433).
+	if err := abk.Put([]byte("stale"), []byte("x")); !errors.Is(err, errAcquiringSentinel) {
+		t.Fatalf("A write after B acquired: got %v, want the transient acquiring error", err)
 	}
 
 	// Now A reconciles (it lost U): it releases U cleanly.
