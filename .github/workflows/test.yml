@@ -6,160 +6,105 @@ on:
   pull_request:
 
 jobs:
-  # BLOCKING gate: vet + build + NON-race tests across every go.work module
-  # (core + backends/pebble + backends/slate). This is the required signal.
-  # The race-detector pass runs in the separate, currently NON-blocking
-  # `test-race` job below - see its comment for why.
-  test:
-    name: vet + build + tests
+  # Fast compile gate: vet + build across every go.work module, plus the
+  # per-module GOWORK=off build that proves each published module graph is
+  # self-consistent. No tests run here - every test runs under the race
+  # detector in the `race` matrix below, which IS the behavior gate (a -race
+  # run exercises strictly more than a plain run, so a separate non-race test
+  # pass would only duplicate coverage and double the wall-clock).
+  build:
+    name: vet + build
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
           check-latest: true
           cache: true
-
-      # `go test ./...` only walks the current module, so each go.work member
-      # needs its own invocation. MODULES is the canonical list; append a new
-      # backend here (and in test-race) when it lands.
-      - name: go vet (workspace, all modules)
+      - name: go vet + build (workspace, all modules)
         run: |
           set -euo pipefail
           MODULES=(. backends/pebble backends/slate)
           for m in "${MODULES[@]}"; do
-            echo "::group::go vet $m"
-            (cd "$m" && go vet ./...)
-            echo "::endgroup::"
+            echo "::group::go vet $m"; (cd "$m" && go vet ./...); echo "::endgroup::"
+            echo "::group::go build $m"; (cd "$m" && go build ./...); echo "::endgroup::"
           done
-
-      - name: go build (workspace, all modules)
-        run: |
-          set -euo pipefail
-          MODULES=(. backends/pebble backends/slate)
-          for m in "${MODULES[@]}"; do
-            echo "::group::go build $m"
-            (cd "$m" && go build ./...)
-            echo "::endgroup::"
-          done
-
-      # Non-race tests are the blocking behavior gate. Without the race
-      # detector they are fast and memory-light, so pkg/cluster and the
-      # integration suite run whole - no sharding, no OOM. `go vet` above
-      # already compiled every _test.go, so a test-compile break trips there
-      # too. -p 1 -parallel 1 keeps the in-process multi-node fixtures off
-      # each other's ephemeral ports. The race pass lives in test-race.
-      - name: go test (no race, workspace, all modules)
-        run: |
-          set -euo pipefail
-          # Root module: fast packages at 300s; the integration suite at 600s.
-          # Its graceful-leave / overlap gates use multi-second artificial mounts
-          # whose FIXED delays remain even without -race, so the package runs
-          # >300s (300s is too tight - it timed out there); the slow runtime is
-          # the floor, not waste. pkg/cluster is fast without -race (no shards).
-          echo "::group::go test root (excl integration, no -race)"
-          go test $(go list ./... | grep -v '/tests/integration$') -timeout 300s -p 1 -parallel 1
-          echo "::endgroup::"
-          echo "::group::go test ./tests/integration (no -race, slow gates)"
-          go test ./tests/integration -timeout 600s -p 1 -parallel 1
-          echo "::endgroup::"
-          for m in backends/pebble backends/slate; do
-            echo "::group::go test $m (no -race)"
-            (cd "$m" && go test ./... -timeout 300s -p 1 -parallel 1)
-            echo "::endgroup::"
-          done
-
-  # BLOCKING race-detector + module-hygiene pass. The race detector is the
-  # primary defense against the concurrency bugs a gossip-membership +
-  # multi-node-handoff store is prone to, so it gates merges exactly like
-  # `test`. Both passes are SERIALIZED (-p 1 -parallel 1) so the in-process
-  # multi-node fixtures plus race shadow memory fit the runner; pkg/cluster
-  # AND tests/integration are sharded into separate processes so memory is
-  # released between slices and no single slice exceeds its timeout. (History:
-  # this job was non-blocking while a stack of latent findings surfaced at
-  # once - a pkg/membership draining-gossip race, the pkg/cluster -race OOM,
-  # and a stale backends/slate core pin; all are worked off, so it is required
-  # again.)
-  test-race:
-    name: race detector
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.25'
-          check-latest: true
-          cache: true
-
-      # Full suite under the race detector, serialized (-p 1 -parallel 1) so
-      # the 3-node in-process fixtures plus race shadow memory fit the runner.
-      - name: go test (race, workspace, all modules)
-        run: |
-          set -euo pipefail
-          FAST_TIMEOUT=360s
-          SLOW_TIMEOUT=600s
-          echo "::group::go test root fast packages (excl pkg/cluster)"
-          go test $(go list ./... | grep -vE '/tests/integration$|/pkg/cluster$') \
-            -race -timeout "$FAST_TIMEOUT" -p 1 -parallel 1
-          echo "::endgroup::"
-          # pkg/cluster (194 tests, incl. the overlap-handoff + decentralized-
-          # reshard convergence gates) is the heaviest package under -race. Run as
-          # ONE process it both exceeds a single 360s budget AND OOMs the runner as
-          # -race shadow memory accumulates across the whole run (observed: exit 143
-          # / SIGTERM at ~588s with NO go-test-timeout dump - a silent OOM). Shard
-          # it into 3 alphabetical slices run as SEPARATE processes so memory is
-          # released between them (sharding alone fixed the OOM). The slices
-          # partition the whole package (A-G | H-O | P-Z+rest via -skip catch-all);
-          # the P-Z slice carries the slow reshard/replication gates so it needs the
-          # full budget. Follow-up: shrink the slow reshard fixtures, then fold back.
-          CLUSTER_SHARD_TIMEOUT=600s
-          echo "::group::go test ./pkg/cluster -race (shard 1/3: Test[A-G])"
-          go test ./pkg/cluster -race -run '^Test[A-G]' -timeout "$CLUSTER_SHARD_TIMEOUT" -p 1 -parallel 1
-          echo "::endgroup::"
-          echo "::group::go test ./pkg/cluster -race (shard 2/3: Test[H-O])"
-          go test ./pkg/cluster -race -run '^Test[H-O]' -timeout "$CLUSTER_SHARD_TIMEOUT" -p 1 -parallel 1
-          echo "::endgroup::"
-          echo "::group::go test ./pkg/cluster -race (shard 3/3: Test[P-Z] + any non-letter)"
-          go test ./pkg/cluster -race -skip '^Test[A-O]' -timeout "$CLUSTER_SHARD_TIMEOUT" -p 1 -parallel 1
-          echo "::endgroup::"
-          # tests/integration under -race exceeds a single 600s budget (the
-          # non-race suite alone is ~460s; -race's CPU slowdown pushes the whole
-          # package past 600s - it cleanly TIMED OUT, it did NOT OOM). Split it
-          # into two name-sharded processes run separately (A-M | the rest via a
-          # -skip catch-all so coverage is exhaustive, TestMain aside) each with
-          # its own budget, so the slower work fits and memory releases between.
-          INTEG_SHARD_TIMEOUT=900s
-          echo "::group::go test ./tests/integration -race (shard 1/2: Test[A-M])"
-          go test ./tests/integration -race -run '^Test[A-M]' -timeout "$INTEG_SHARD_TIMEOUT" -p 1 -parallel 1
-          echo "::endgroup::"
-          echo "::group::go test ./tests/integration -race (shard 2/2: Test[N-Z] + any non-letter)"
-          go test ./tests/integration -race -skip '^Test[A-M]' -timeout "$INTEG_SHARD_TIMEOUT" -p 1 -parallel 1
-          echo "::endgroup::"
-          for m in backends/pebble backends/slate; do
-            echo "::group::go test $m"
-            (cd "$m" && go test ./... -race -timeout "$SLOW_TIMEOUT" -p 1 -parallel 1)
-            echo "::endgroup::"
-          done
-
-      # Per-module release-validation: each backend must build standalone with
-      # GOWORK=off so the published module graph is self-consistent. Currently
-      # backends/slate FAILS here - its go.mod pins a CORE version older than the
-      # symbols its code uses (the overlap-handoff work added them but never
-      # bumped the pin); fix = bump backends/slate's github.com/Zamua/shale pin.
-      # Non-blocking until then.
       - name: per-module build (GOWORK=off)
         run: |
           set -euo pipefail
-          BACKENDS=(backends/pebble backends/slate)
-          for m in "${BACKENDS[@]}"; do
-            echo "::group::GOWORK=off go build $m"
-            (cd "$m" && GOWORK=off go build ./...)
-            echo "::endgroup::"
+          for m in backends/pebble backends/slate; do
+            echo "::group::GOWORK=off go build $m"; (cd "$m" && GOWORK=off go build ./...); echo "::endgroup::"
           done
+
+  # BLOCKING race-detector gate, fanned out across runners. The race detector
+  # is the primary defense against the concurrency bugs a gossip-membership +
+  # multi-node-handoff store is prone to, so it gates merges.
+  #
+  # Why a matrix and not one job: -race carries heavy CPU+memory overhead, and
+  # on GitHub's 2-vCPU runners a SINGLE serial job starves the in-process
+  # multi-node fixtures - the 3-node convergence goroutines don't get scheduled
+  # promptly, so per-test write-readiness/rebalance-idle budgets blow and the
+  # whole run drags past 20 minutes. Splitting the heavy packages across
+  # independent runners keeps each runner's load light (so convergence stays
+  # fast and the budgets hold) AND makes wall-clock = the slowest slice, not the
+  # sum. The two heavy packages (pkg/cluster, tests/integration) are name-sharded
+  # round-robin over `go test -list` output, so coverage is exhaustive by
+  # construction (every listed test lands in exactly one shard) and the shards
+  # stay balanced as tests are added. Each slice still runs -p 1 -parallel 1 for
+  # memory; the parallelism is across RUNNERS, not within a process.
+  race:
+    name: race ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: fast,      kind: fast }
+          - { name: backends,  kind: backends }
+          - { name: cluster-0, kind: shard, pkg: ./pkg/cluster,       shard: '0', shards: '5' }
+          - { name: cluster-1, kind: shard, pkg: ./pkg/cluster,       shard: '1', shards: '5' }
+          - { name: cluster-2, kind: shard, pkg: ./pkg/cluster,       shard: '2', shards: '5' }
+          - { name: cluster-3, kind: shard, pkg: ./pkg/cluster,       shard: '3', shards: '5' }
+          - { name: cluster-4, kind: shard, pkg: ./pkg/cluster,       shard: '4', shards: '5' }
+          - { name: integ-0,   kind: shard, pkg: ./tests/integration, shard: '0', shards: '5' }
+          - { name: integ-1,   kind: shard, pkg: ./tests/integration, shard: '1', shards: '5' }
+          - { name: integ-2,   kind: shard, pkg: ./tests/integration, shard: '2', shards: '5' }
+          - { name: integ-3,   kind: shard, pkg: ./tests/integration, shard: '3', shards: '5' }
+          - { name: integ-4,   kind: shard, pkg: ./tests/integration, shard: '4', shards: '5' }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+          cache: true
+      - name: go test -race (${{ matrix.name }})
+        run: |
+          set -euo pipefail
+          case "${{ matrix.kind }}" in
+            fast)
+              # Every core-module package EXCEPT the two heavy packages that are
+              # sharded on their own runners below. Light + quick under -race.
+              go test $(go list ./... | grep -vE '/tests/integration$|/pkg/cluster$') \
+                -race -timeout 300s -p 1 -parallel 1
+              ;;
+            backends)
+              for m in backends/pebble backends/slate; do
+                echo "::group::go test $m -race"
+                (cd "$m" && go test ./... -race -timeout 300s -p 1 -parallel 1)
+                echo "::endgroup::"
+              done
+              ;;
+            shard)
+              # Round-robin partition of the package's tests over `go test -list`
+              # output: every test lands in exactly one shard, so the union of all
+              # shards is the whole package with no gaps and no overlap.
+              ALL=$(go test ${{ matrix.pkg }} -list '.*' | grep -E '^Test' | sort)
+              PAT=$(echo "$ALL" | awk 'NR % ${{ matrix.shards }} == ${{ matrix.shard }}' | paste -sd'|' -)
+              if [ -z "$PAT" ]; then echo "shard ${{ matrix.shard }}/${{ matrix.shards }} empty - nothing to run"; exit 0; fi
+              COUNT=$(echo "$ALL" | awk 'NR % ${{ matrix.shards }} == ${{ matrix.shard }}' | wc -l | tr -d ' ')
+              echo "::notice::${{ matrix.pkg }} shard ${{ matrix.shard }}/${{ matrix.shards }}: $COUNT tests"
+              go test ${{ matrix.pkg }} -race -run "^(${PAT})\$" -timeout 360s -p 1 -parallel 1
+              ;;
+          esac
