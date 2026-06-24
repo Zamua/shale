@@ -349,6 +349,18 @@ func TestR2GateCatchesLostWrite(t *testing.T) {
 // is durable on BOTH replica copies of the counter's unit (the per-unit fan-out
 // reached both, via apply-if-newer).
 func TestMultibackendR2_CASPerUnitFanout(t *testing.T) {
+	// The 60 goroutines below all increment ONE counter, so every commit
+	// contends on the same key's CAS. Under the race detector the ~10x
+	// slowdown widens that contention window enough that a writer can lose
+	// the CAS race more than the default CASMaxAttempts (10) times running
+	// and exhaust its budget - a test-environment artifact, not a lost
+	// update. Raise the budget (the var is exported for exactly this, see
+	// cas_test.go) so the no-lost-update assertion is what's under test, not
+	// the retry headroom. Restored on return.
+	oldMax := cluster.CASMaxAttempts
+	cluster.CASMaxAttempts = 500
+	defer func() { cluster.CASMaxAttempts = oldMax }()
+
 	const unitCount, r = 16, 2
 	backing := sharedfactory.NewBacking()
 	nodes := start3NodeR2(t, unitCount, backing)
