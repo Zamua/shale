@@ -709,11 +709,21 @@ func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Membe
 		// mid-mount has no mounted position and returns the transient
 		// errUnitAcquiring, which the read fan-out skips while another union member
 		// (the still-mounted current owner) answers.
-		b, ok := c.localBackendForKey(key)
+		b, ru, ok := c.localBackendAndRUForKey(key)
 		if !ok {
 			return nil, errUnitAcquiring("Get")
 		}
-		return b.Get(key)
+		v, err := b.Get(key)
+		if err != nil {
+			// A FENCED owner-local read (a higher-epoch owner superseded this
+			// mount) must recode to the transient acquiring-window error AND evict
+			// the stale mount, EXACTLY as the write + scan paths do - otherwise the
+			// fence re-surfaces on every read forever and reconcile never re-acquires
+			// (it sees the position still mounted). A non-fence error passes through.
+			// See docs/SPEC.md "Fenced owner-local read self-heals".
+			return nil, c.fenceToTransient(ru, b, "Get", err)
+		}
+		return v, nil
 	}
 	cli, err := c.clientFor(replica.Addr)
 	if err != nil {

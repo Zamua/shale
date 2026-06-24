@@ -1097,11 +1097,21 @@ func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
 		// DRAINING node, which is excluded from the ownership ring but still holds
 		// the unit mounted while it hands off). localBackendForKey would disclaim
 		// it via the ring index; scan the mountMap by unit instead.
-		b, ok := c.localMountedBackendForKey(key)
+		b, ru, ok := c.localMountedBackendAndRUForKey(key)
 		if !ok {
 			return nil, backend.ErrNotFound
 		}
-		return b.Get(key)
+		v, err := b.Get(key)
+		if err != nil {
+			// A fenced owner-local read on a FORWARDED get must recode to transient
+			// + evict the stale mount here (on the node that physically holds it),
+			// same as the local + write + scan paths - so a forwarded read that hits
+			// a fenced mount self-heals instead of returning the raw fence forever.
+			// evictStaleMount is a no-op on a DRAINING mount (its fence is the
+			// expected successor signal), so the handoff path stays correct.
+			return nil, c.fenceToTransient(ru, b, "LocalGet", err)
+		}
+		return v, nil
 	}
 	return c.backend.Get(key)
 }
@@ -1592,13 +1602,19 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 	if c.multi {
 		owner, local := c.ownerOf(key)
 		if local {
-			b, ok := c.localBackendForKey(key)
+			b, ru, ok := c.localBackendAndRUForKey(key)
 			if !ok {
 				// Owner-but-unmounted: handoff landing on us. Retryable
 				// acquiring-window error (never serve a stale result).
 				return nil, errUnitAcquiring("Get")
 			}
-			return b.Get(key)
+			v, err := b.Get(key)
+			if err != nil {
+				// Fenced owner-local read: recode to transient + evict the stale
+				// mount so it self-heals, same as the R>1 + write + scan paths.
+				return nil, c.fenceToTransient(ru, b, "Get", err)
+			}
+			return v, nil
 		}
 		return c.forwardGet(owner.Addr, key)
 	}

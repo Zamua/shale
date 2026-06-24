@@ -39,7 +39,6 @@
 package sharedfactory
 
 import (
-	"errors"
 	"fmt"
 	"sort"
 	"sync"
@@ -51,13 +50,20 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
-// ErrFenced is returned by a write against a unit whose lease has moved: the
+// ErrFenced is returned by an op against a unit whose lease has moved: the
 // shared durable epoch has advanced past the epoch this handle opened the
 // unit at, so a higher-epoch owner has fenced this (now stale) writer. It is
-// the in-test analogue of slatedb's writer-epoch fencing error. A read after
-// fencing still succeeds (the bytes are shared + durable); only WRITES from
-// the fenced handle fail, which is exactly the single-writer guarantee.
-var ErrFenced = errors.New("sharedfactory: writer fenced; unit lease moved to a higher epoch")
+// the in-test analogue of slatedb's writer-epoch fencing error. By default a
+// READ after fencing still succeeds (the bytes are shared + durable) and only
+// WRITES fail; SetStrictReadFencing makes reads fail too, modeling slatedb's
+// closed-handle-on-read.
+//
+// It WRAPS backend.ErrFenced so errors.Is(err, backend.ErrFenced) resolves it -
+// the backend-agnostic contract every real backend honors (pkg/backend:
+// "the writer MUST wrap its native fence error"). Without the wrap the cluster's
+// fence-recode self-heal (fenceToTransient) cannot recognize the test double's
+// fence, so a test would silently NOT exercise the eviction path it means to.
+var ErrFenced = fmt.Errorf("sharedfactory: writer fenced; unit lease moved to a higher epoch: %w", backend.ErrFenced)
 
 // Backing is the shared object-storage analogue: per-unit durable bytes +
 // per-unit durable writer-epoch, referenced by every per-node Handle. One
@@ -90,6 +96,15 @@ type Backing struct {
 	// once the damage is repaired. A sync.Map so it is safe to arm/clear
 	// concurrently with mounts without taking b.mu.
 	openFaults sync.Map
+
+	// strictReadFencing, when true, makes a FENCED handle fail READS (Get +
+	// ScanPrefix) with ErrFenced too, not just writes. Real slatedb CLOSES a
+	// fenced handle, so every op on it (read OR write) errors; the default model
+	// lets reads through to support the overlap-handoff union-read (a draining
+	// owner serves reads while a successor catches up). Opt-in per test so a test
+	// that needs slatedb's close-on-fence semantics (the routed-GET fence
+	// self-heal) gets them without changing the overlap tests' behavior.
+	strictReadFencing atomic.Bool
 
 	// servingMarkers is the durable, poll-observable SERVING MARKER registry
 	// (v0.8 Phase 2e, Option B overlap handoff): per-replica-position, the open
@@ -372,6 +387,11 @@ func (b *Backing) SetOpenReplicaFault(ru storageunit.ReplicaUnit, err error) {
 	b.openFaults.Store(ru, err)
 }
 
+// SetStrictReadFencing toggles whether a fenced handle also fails READS (Get +
+// ScanPrefix) with ErrFenced, modeling real slatedb's close-on-fence. Default
+// false (reads pass through, the overlap-union-read model). Test-only.
+func (b *Backing) SetStrictReadFencing(on bool) { b.strictReadFencing.Store(on) }
+
 // OpenReplicaUnit opens replica position ru.Replica of unit ru.Unit against
 // the per-replica shared backing, fencing any prior writer of the SAME
 // replica position. It returns a fencedReplicaBackend over the SHARED
@@ -647,9 +667,17 @@ func (f *fencedReplicaBackend) Begin(level backend.IsolationLevel) (backend.Tran
 	return f.store.Begin(level)
 }
 
-func (f *fencedReplicaBackend) Get(key []byte) ([]byte, error) { return f.store.Get(key) }
+func (f *fencedReplicaBackend) Get(key []byte) ([]byte, error) {
+	if f.backing.strictReadFencing.Load() && f.fenced() {
+		return nil, ErrFenced
+	}
+	return f.store.Get(key)
+}
 
 func (f *fencedReplicaBackend) ScanPrefix(prefix []byte) (backend.Iterator, error) {
+	if f.backing.strictReadFencing.Load() && f.fenced() {
+		return nil, ErrFenced
+	}
 	return f.store.ScanPrefix(prefix)
 }
 
