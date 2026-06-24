@@ -18,6 +18,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"strings"
 	"testing"
 	"time"
 
@@ -186,8 +187,24 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 		if i > 0 {
 			cfg.Seeds = []string{hostPort(bindPorts[0])}
 		}
-		c, err := cluster.Open(cfg)
-		if err != nil {
+		// Retry the open on a transient port bind-collision: freePort can
+		// hand back a port another node's memberlist grabs in the close-then-
+		// bind window (a TOCTOU surfacing as "address already in use" under CI
+		// load). Re-allocate THIS node's port and retry - for the founder this
+		// runs before any joiner reads bindPorts[0] as a seed, and for a joiner
+		// the seed (node 0's port) is unaffected.
+		var c *cluster.Cluster
+		for attempt := 0; ; attempt++ {
+			var err error
+			c, err = cluster.Open(cfg)
+			if err == nil {
+				break
+			}
+			if attempt < 4 && strings.Contains(err.Error(), "address already in use") {
+				bindPorts[i] = freePort(t)
+				cfg.BindAddr = hostPort(bindPorts[i])
+				continue
+			}
 			for _, stop := range grpcStops {
 				stop()
 			}
@@ -199,7 +216,7 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 
 	// Wait for all rings to converge.
 	for i, c := range clusters {
-		if err := waitForRingSize(c, 3, 5*time.Second); err != nil {
+		if err := waitForRingSize(c, 3, 5*time.Second*convScale); err != nil {
 			t.Fatalf("ring on node %d: %v", i, err)
 		}
 	}
@@ -208,7 +225,7 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 	// startup, but the StateReceiving guard would reject our test
 	// Puts until it clears).
 	for i, c := range clusters {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second*convScale)
 		if err := c.WaitForRebalanceIdle(ctx); err != nil {
 			cancel()
 			t.Fatalf("node %d rebalance idle: %v", i, err)
@@ -224,7 +241,7 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 	// "write needed N acks, got M" flake. The retry here is scoped to
 	// setup only; once this returns the cluster is write-ready and any
 	// later Unavailable in a test body is a real failure.
-	waitForWriteReady(t, clusters, 45*time.Second)
+	waitForWriteReady(t, clusters, 45*time.Second*convScale)
 
 	out := make([]*replicatedNode, 3)
 	for i := range 3 {
