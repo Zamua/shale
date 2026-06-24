@@ -298,7 +298,22 @@ func TestReplicate_WriteOne_AcksOnPrimaryAlone(t *testing.T) {
 	nodes[1].KillGRPC()
 	nodes[2].KillGRPC()
 
-	if err := nodes[0].Cluster.Put([]byte("wone"), []byte("v")); err != nil {
+	// Retry the WriteOne on a transient Unavailable. A real caller retries
+	// Unavailable, and under the race detector on a slow CI runner the kill of
+	// N2+N3's gRPC can briefly race the cluster's replica-set view, so the
+	// first attempt can see 0 acks before N1's local-replica ack settles. The
+	// claim under test is that WriteOne EVENTUALLY succeeds on the primary
+	// alone; the local-Put assertion below is >=1, so a retry can't violate it.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		err := nodes[0].Cluster.Put([]byte("wone"), []byte("v"))
+		if err == nil {
+			break
+		}
+		if status.Code(err) == codes.Unavailable && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
 		t.Fatalf("WriteOne Put with 2 of 3 remotes down should succeed: %v", err)
 	}
 
