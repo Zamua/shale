@@ -73,23 +73,20 @@ jobs:
             echo "::endgroup::"
           done
 
-  # NON-BLOCKING (continue-on-error) race-detector + module-hygiene pass.
-  # INTERIM STATE:
-  # the overlap-handoff prod code reached `main` via a branch reconcile and
-  # had never run in CI under -race, surfacing a stack of latent -race
-  # findings at once (a pkg/membership data race in
-  # TestSetDrainingGossipsToPeer, plus a pkg/cluster -race runner OOM the
-  # sharding below addresses). It also exposed a module-hygiene gap: the
-  # GOWORK=off per-module build (below) fails because backends/slate/go.mod
-  # pins a CORE github.com/Zamua/shale version older than the slate code's own
-  # symbols (storageunit.ReplicaUnit etc. - go.work masked the stale pin). Until
-  # all of these are hardened deliberately (tracked separately), they run HERE
-  # and SURFACE without failing the required `test` gate. Promote back to a
-  # required job once worked off.
+  # BLOCKING race-detector + module-hygiene pass. The race detector is the
+  # primary defense against the concurrency bugs a gossip-membership +
+  # multi-node-handoff store is prone to, so it gates merges exactly like
+  # `test`. Both passes are SERIALIZED (-p 1 -parallel 1) so the in-process
+  # multi-node fixtures plus race shadow memory fit the runner; pkg/cluster
+  # AND tests/integration are sharded into separate processes so memory is
+  # released between slices and no single slice exceeds its timeout. (History:
+  # this job was non-blocking while a stack of latent findings surfaced at
+  # once - a pkg/membership draining-gossip race, the pkg/cluster -race OOM,
+  # and a stale backends/slate core pin; all are worked off, so it is required
+  # again.)
   test-race:
-    name: race detector (non-blocking)
+    name: race detector
     runs-on: ubuntu-latest
-    continue-on-error: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -132,8 +129,18 @@ jobs:
           echo "::group::go test ./pkg/cluster -race (shard 3/3: Test[P-Z] + any non-letter)"
           go test ./pkg/cluster -race -skip '^Test[A-O]' -timeout "$CLUSTER_SHARD_TIMEOUT" -p 1 -parallel 1
           echo "::endgroup::"
-          echo "::group::go test ./tests/integration (slow gates)"
-          go test ./tests/integration -race -timeout "$SLOW_TIMEOUT" -p 1 -parallel 1
+          # tests/integration under -race exceeds a single 600s budget (the
+          # non-race suite alone is ~460s; -race's CPU slowdown pushes the whole
+          # package past 600s - it cleanly TIMED OUT, it did NOT OOM). Split it
+          # into two name-sharded processes run separately (A-M | the rest via a
+          # -skip catch-all so coverage is exhaustive, TestMain aside) each with
+          # its own budget, so the slower work fits and memory releases between.
+          INTEG_SHARD_TIMEOUT=900s
+          echo "::group::go test ./tests/integration -race (shard 1/2: Test[A-M])"
+          go test ./tests/integration -race -run '^Test[A-M]' -timeout "$INTEG_SHARD_TIMEOUT" -p 1 -parallel 1
+          echo "::endgroup::"
+          echo "::group::go test ./tests/integration -race (shard 2/2: Test[N-Z] + any non-letter)"
+          go test ./tests/integration -race -skip '^Test[A-M]' -timeout "$INTEG_SHARD_TIMEOUT" -p 1 -parallel 1
           echo "::endgroup::"
           for m in backends/pebble backends/slate; do
             echo "::group::go test $m"
