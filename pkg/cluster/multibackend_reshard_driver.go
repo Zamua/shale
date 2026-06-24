@@ -199,6 +199,35 @@ func (c *Cluster) observeCutoverMarkers(gs genState) {
 // split's children (a merge's survivors are already at their ring home). A unit
 // whose final copy is not strict this tick defers finalize to the next.
 func (c *Cluster) finalizeReshard(gs genState) {
+	// Advance the durable __cluster/init generation marker to gen+1 BEFORE
+	// retiring any parent (#460). The STEADY-STATE goal: once the whole reshard
+	// COMPLETES (every node has drained + retired), the marker is at gen+1, so a
+	// full-cluster restart resumes the finalized generation losslessly (all data is
+	// in the children) instead of re-forming gen 0 over gen-N data. Advancing
+	// before the retire also closes the narrow window where a restart between
+	// "parents retired" and "marker advanced" would resume a stale, retired-parent
+	// generation.
+	//
+	// NOT lossless for a full-cluster crash DURING an active reshard, and it cannot
+	// be: allCutOver is LOCAL (this node's observed cut-over markers), so a lagging
+	// peer that has not yet flipped still acks writes on its PARENT legs, and its
+	// strict drain of those stragglers into the children runs in ITS own
+	// finalizeReshard - possibly AFTER this node advances the shared marker. A
+	// full-cluster crash in that window resumes a single generation (gen+1) that
+	// does not yet hold the lagging peer's undrained parent stragglers, losing them
+	// (symmetrically, resuming gen-g would lose the already-flipped units' child
+	// writes - no single-generation resume holds both mid-reshard). This STRICTLY
+	// NARROWS the pre-#460 behavior (a mid-reshard full restart reset everyone to
+	// gen 0, losing everything past gen 0) but does not make a mid-reshard full
+	// crash lossless; that needs resume-time reshard re-drain (#461). A homogeneous
+	// cluster should not be full-restarted during an active reshard until #461.
+	//
+	// If the marker write FAILS, DEFER the retire: leaving the parents mounted keeps
+	// gen-g resumable, and this finalize re-runs next reconcile tick (self-healing).
+	// No-op when no ConditionalStore / no marker (legacy paths unchanged).
+	if err := c.advanceClusterInitMarker(gs.gen+1, gs.nextCount); err != nil {
+		return
+	}
 	for _, ru := range c.ownedParentSlots(gs) {
 		if !c.finalizeParent(ru, gs) {
 			return // not safe to retire this unit yet; retry next tick

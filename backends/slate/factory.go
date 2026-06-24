@@ -210,30 +210,55 @@ func (b *Backing) DurableEpoch(gu storageunit.GenUnit) (storageunit.Epoch, error
 // Uses the slatedb Admin surface (NewAdminBuilder + ReadManifest), which
 // reads the manifest object directly. Returns (0, nil) when the db does
 // not yet exist.
+type durableEpochResult struct {
+	epoch storageunit.Epoch
+	err   error
+}
+
+// readDurableEpochBounded reads dbName's durable manifest writer-epoch via the
+// slatedb Admin surface (NewAdminBuilder + ReadManifest), BOUNDED by openTimeout().
+// The admin Build + ReadManifest are un-cancellable cgo calls; without a bound a
+// slow/hung manifest read on a bloated unit wedges the boot-fence path FOREVER
+// (the DB-open path has runWithTimeout, but this durable-epoch read historically
+// did NOT), which is exactly the cold-start mount hang. On timeout we abandon the
+// admin goroutine (same contract as runWithTimeout for the DB open: it keeps
+// running until the cgo returns, then runs its own Destroy()s; the result channel
+// is buffered so the late send never blocks) and return a timeout error so the
+// caller boots DEGRADED instead of hanging. The store is created + destroyed
+// INSIDE the goroutine so a timeout never Destroys a store the abandoned
+// goroutine is still using.
+func (b *Backing) readDurableEpochBounded(dbName string) (storageunit.Epoch, error) {
+	r, timedOut := runWithTimeout(openTimeout(), func() durableEpochResult {
+		store, err := b.resolveStore()
+		if err != nil {
+			return durableEpochResult{err: err}
+		}
+		defer store.Destroy()
+		adminBuilder := slatedb.NewAdminBuilder(dbName, store)
+		defer adminBuilder.Destroy()
+		admin, err := adminBuilder.Build()
+		if err != nil {
+			return durableEpochResult{err: fmt.Errorf("slate: build admin for %s: %w", dbName, err)}
+		}
+		defer admin.Destroy()
+		manifest, err := admin.ReadManifest(nil)
+		if err != nil {
+			return durableEpochResult{err: fmt.Errorf("slate: read manifest for %s: %w", dbName, err)}
+		}
+		if manifest == nil {
+			// Db not yet created: no prior writer, durable epoch 0.
+			return durableEpochResult{epoch: 0}
+		}
+		return durableEpochResult{epoch: storageunit.Epoch(manifest.WriterEpoch)}
+	})
+	if timedOut {
+		return 0, fmt.Errorf("slate: durable-epoch read for %s timed out after %s (un-cancellable slatedb admin read abandoned; boots degraded)", dbName, openTimeout())
+	}
+	return r.epoch, r.err
+}
+
 func (b *Backing) durableEpoch(gu storageunit.GenUnit) (storageunit.Epoch, error) {
-	store, err := b.resolveStore()
-	if err != nil {
-		return 0, err
-	}
-	defer store.Destroy()
-
-	adminBuilder := slatedb.NewAdminBuilder(b.cfg.dbName(gu), store)
-	defer adminBuilder.Destroy()
-	admin, err := adminBuilder.Build()
-	if err != nil {
-		return 0, fmt.Errorf("slate: build admin for %s: %w", gu, err)
-	}
-	defer admin.Destroy()
-
-	manifest, err := admin.ReadManifest(nil)
-	if err != nil {
-		return 0, fmt.Errorf("slate: read manifest for %s: %w", gu, err)
-	}
-	if manifest == nil {
-		// Db not yet created: no prior writer, durable epoch 0.
-		return 0, nil
-	}
-	return storageunit.Epoch(manifest.WriterEpoch), nil
+	return b.readDurableEpochBounded(b.cfg.dbName(gu))
 }
 
 // DurableEpochReplica is the R>1 analogue of DurableEpoch: it reads the
@@ -254,28 +279,7 @@ func (b *Backing) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.E
 // epoch: replica positions fence INDEPENDENTLY. A nil manifest means the
 // position has never been created (durable epoch 0). Mirrors durableEpoch.
 func (b *Backing) durableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Epoch, error) {
-	store, err := b.resolveStore()
-	if err != nil {
-		return 0, err
-	}
-	defer store.Destroy()
-
-	adminBuilder := slatedb.NewAdminBuilder(b.cfg.dbNameReplica(ru), store)
-	defer adminBuilder.Destroy()
-	admin, err := adminBuilder.Build()
-	if err != nil {
-		return 0, fmt.Errorf("slate: build admin for %s: %w", ru, err)
-	}
-	defer admin.Destroy()
-
-	manifest, err := admin.ReadManifest(nil)
-	if err != nil {
-		return 0, fmt.Errorf("slate: read manifest for %s: %w", ru, err)
-	}
-	if manifest == nil {
-		return 0, nil
-	}
-	return storageunit.Epoch(manifest.WriterEpoch), nil
+	return b.readDurableEpochBounded(b.cfg.dbNameReplica(ru))
 }
 
 // minioClient builds a fresh minio S3 client against the configured endpoint +

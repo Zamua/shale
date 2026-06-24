@@ -28,3 +28,7 @@ func openSlateBackend(_ slateConfig, _ *log.Logger) (backend.Backend, func() err
 func openSlateFactory(_ slateConfig, _ *log.Logger) (storageunit.BackendFactory, func() error, error) {
 	return nil, nil, fmt.Errorf("%s", rebuildHint)
 }
+
+func openSlateCondStore(_ slateConfig) (storageunit.ConditionalStore, error) {
+	return nil, fmt.Errorf("%s", rebuildHint)
+}

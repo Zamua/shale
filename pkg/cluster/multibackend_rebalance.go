@@ -303,7 +303,7 @@ func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 		_ = c.factory.CloseUnit(gu)
 		return
 	}
-	c.mountMap[replica0(gu)] = b
+	c.storeMount(replica0(gu), b)
 	c.mountMu.Unlock()
 }
 

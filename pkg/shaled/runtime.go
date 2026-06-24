@@ -64,6 +64,7 @@ import (
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/keepalive"
 )
 
 // StdConfig holds the standard cluster/node flags every shaled-*
@@ -245,6 +246,13 @@ type RunConfig struct {
 	// backing-level teardown the cluster does not own.
 	CloseFactory func() error
 
+	// ConditionalStore, when set (multi-backend mode), enables the homogeneous
+	// runtime try-join-else-form bootstrap: the cluster's form-vs-join decision
+	// + durable generation live in the shared CAS store's __cluster/init marker
+	// instead of the empty-seeds-means-founder config split. It also backs the
+	// decentralized reshard arbiter. nil keeps the legacy seed-RPC bootstrap.
+	ConditionalStore storageunit.ConditionalStore
+
 	// Logger is where startup + shutdown lines are written. Required.
 	Logger *log.Logger
 }
@@ -317,7 +325,22 @@ func Run(cfg RunConfig) error {
 		}()
 	}
 
-	grpcServer := grpc.NewServer()
+	// Keepalive enforcement MUST permit the peer client's keepalive (set in
+	// cluster.peerDialOptions: ClientParameters{Time: 30s, PermitWithoutStream:
+	// true}). gRPC's DEFAULT server enforcement is MinTime 5m + no pings without
+	// an active stream, so it answers a client that pings a (legitimately) idle
+	// cross-node connection every 30s with GoAway "too_many_pings"
+	// (ENHANCE_YOUR_CALM), tearing the connection down. That churned the
+	// cross-node gen-learning + cross-shard scan on a slow cold-start (a peer
+	// whose mount takes minutes keeps the connection idle long enough for the
+	// keepalive to fire). MinTime 10s (< the client's 30s) + PermitWithoutStream
+	// accepts the client's pings so the connection stays up.
+	grpcServer := grpc.NewServer(
+		grpc.KeepaliveEnforcementPolicy(keepalive.EnforcementPolicy{
+			MinTime:             10 * time.Second,
+			PermitWithoutStream: true,
+		}),
+	)
 	rpc.NewServer(c).Register(grpcServer)
 
 	logger.Printf("shaled: node=%s grpc=%s backend=%s",
@@ -426,12 +449,26 @@ func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 		GracefulLeaveDrainTimeout: cfg.Std.GracefulLeaveDrainTimeout,
 		WriteTimeout:              cfg.Std.WriteTimeout, // 0 -> cluster default (5s)
 	}
+	// GenLearnBudget: a joiner's total seed-generation re-sweep budget. 0 ->
+	// cluster default (defaultGenLearnBudget, 180s). Overridable for a backend
+	// whose cold-start mount runs longer than the default (and, with a small
+	// value, to reproduce the pre-fix single-shot crash-loop on a real cluster).
+	if d := envDur("SHALE_GEN_LEARN_BUDGET"); d > 0 {
+		clusterCfg.GenLearnBudget = d
+	}
+	// SHALE_DEBUG_MOUNT_DELAY: a debug/repro lever that sleeps before this node's
+	// unit mount (delaying when it begins serving gRPC), to reproduce the
+	// cold-start window a joiner's gen query must ride out. No-op unless set.
+	if d := envDur("SHALE_DEBUG_MOUNT_DELAY"); d > 0 {
+		clusterCfg.TestingMountDelay = d
+	}
 	if cfg.BackendFactory != nil {
 		clusterCfg.BackendFactory = cfg.BackendFactory
 		clusterCfg.UnitCount = cfg.Std.UnitCount
 	} else {
 		clusterCfg.Backend = cfg.Backend
 	}
+	clusterCfg.ConditionalStore = cfg.ConditionalStore
 	return clusterCfg
 }
 
@@ -496,6 +533,17 @@ func envOrInt(key string, fallback int) int {
 		}
 	}
 	return fallback
+}
+
+// envDur parses a Go duration (e.g. "180s", "40s") from env; returns 0 when the
+// key is unset, empty, or unparseable, so callers fall back to their default.
+func envDur(key string) time.Duration {
+	if v, ok := os.LookupEnv(key); ok && strings.TrimSpace(v) != "" {
+		if d, err := time.ParseDuration(strings.TrimSpace(v)); err == nil {
+			return d
+		}
+	}
+	return 0
 }
 
 func closeBackendQuiet(fn func() error) error {

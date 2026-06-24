@@ -59,10 +59,30 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
-// genQueryTimeout bounds the synchronous seed GenState query made during a
-// joiner's Open. Generous (the seed answers from an in-memory snapshot, no
-// I/O), but bounded so a wedged seed makes Open fail-closed rather than hang.
+// genQueryTimeout bounds ONE synchronous seed GenState query attempt made
+// during a joiner's Open. Generous (the seed answers from an in-memory
+// snapshot, no I/O), but bounded so a wedged seed makes a single attempt
+// fail rather than hang. The joiner re-sweeps its seeds across many such
+// attempts up to GenLearnBudget (see learnGenerationFromSeed).
 const genQueryTimeout = 10 * time.Second
+
+// defaultGenLearnBudget is the total wall-clock a joiner spends RE-SWEEPING its
+// seeds for the cluster generation before failing Open. It must comfortably
+// exceed a worst-case cold-start UNIT MOUNT: a seed binds its gRPC port early
+// but does not begin SERVING it until after its own Open returns (i.e. after it
+// has mounted every replicated unit, an object-storage-bound step that on a
+// loaded backend takes tens of seconds). A single 10s attempt that fails closed
+// turns that transient window into a crash-loop under a supervisor; re-sweeping
+// for this budget WAITS the seed out instead. Bounded (not infinite) so a
+// joiner whose seeds are truly dead still fails Open for a supervised restart.
+// Overridable per-cluster via Config.GenLearnBudget (env-plumbed by the caller).
+const defaultGenLearnBudget = 180 * time.Second
+
+// genLearnBackoff is the pause between seed re-sweeps in learnGenerationFromSeed.
+// Small relative to the budget so the joiner reconnects promptly once the seed
+// begins serving, but not a busy-loop. A var (not const) only so tests can
+// shrink it; production never reassigns it.
+var genLearnBackoff = 2 * time.Second
 
 // GenStateSnapshot returns the local node's live {generation, unit-count} for
 // the cluster-internal GenState RPC. The generation is the uint64 of the
@@ -81,18 +101,59 @@ func (c *Cluster) GenStateSnapshot() (gen uint64, count uint32) {
 // this node has seeds (a joiner), and BEFORE any unit is derived or mounted,
 // so there is no window in which the joiner routes / owns a key at gen 0.
 //
-// Fails closed: a seed that is unreachable or rejects the query makes this
-// (and therefore Open) fail rather than silently leaving the joiner at gen 0.
+// PATIENT: it re-sweeps the visible seeds with backoff for genLearnBudget()
+// before giving up. A seed that is itself cold-starting has bound its gRPC port
+// but does not begin SERVING it until after its own Open (its unit mount)
+// returns; until then the joiner's GenState dial times out with "connections to
+// become ready". A single fail-closed attempt would turn that transient mount
+// window into a CRASH-LOOP under a supervisor; re-sweeping waits the seed out.
+// This is the gen-query sibling of the scan path's PeerConnectTimeout wait.
+//
+// Fails closed: only if EVERY visible seed stays unreachable / rejecting for the
+// WHOLE budget does this (and therefore Open) fail, rather than silently leaving
+// the joiner at gen 0. Bounded so truly-dead seeds still fail Open for a
+// supervised restart rather than hanging forever.
 func (c *Cluster) learnGenerationFromSeed() error {
+	budget := c.genLearnBudget()
+	deadline := time.Now().Add(budget)
+	var lastErr error
+	for attempt := 1; ; attempt++ {
+		committed, err := c.trySeedGenSweep()
+		if committed {
+			return nil
+		}
+		lastErr = err
+		if !time.Now().Before(deadline) {
+			return fmt.Errorf("cluster: could not learn the cluster generation within %s (%d attempt(s)): %w", budget, attempt, lastErr)
+		}
+		time.Sleep(genLearnBackoff)
+	}
+}
+
+// genLearnBudget is the joiner's total seed-gen-query budget: Config.GenLearnBudget
+// when set (>0), else defaultGenLearnBudget.
+func (c *Cluster) genLearnBudget() time.Duration {
+	if c.cfg.GenLearnBudget > 0 {
+		return c.cfg.GenLearnBudget
+	}
+	return defaultGenLearnBudget
+}
+
+// trySeedGenSweep makes ONE pass over the currently-visible seeds, querying each
+// for the cluster generation. Returns (true, nil) the instant a seed answers
+// (the generation is committed as a side effect). Returns (false, lastErr) if no
+// visible seed answered this pass - lastErr says why (no peer visible YET, or
+// the last query error), so the patient caller can retry or surface it. The
+// addr set is re-fetched each pass so a seed that only just joined gossip (or
+// only just began serving gRPC) is picked up on the next sweep.
+func (c *Cluster) trySeedGenSweep() (committed bool, lastErr error) {
 	addrs := c.seedGRPCAddrs()
 	if len(addrs) == 0 {
-		return fmt.Errorf("cluster: no live peer to query for the cluster generation (seeds=%v)", c.cfg.Seeds)
+		return false, fmt.Errorf("cluster: no live peer visible yet to query for the cluster generation (seeds=%v)", c.cfg.Seeds)
 	}
 	// Try each visible peer in turn. A momentarily-unreachable peer must not
-	// fail the join while another healthy seed exists (e.g. a node joins while
-	// one of two existing nodes is briefly down). Fail closed only if EVERY
-	// peer fails: never fall back to gen 0.
-	var lastErr error
+	// end the sweep while another healthy seed exists (e.g. a node joins while
+	// one of two existing nodes is briefly down). Never fall back to gen 0.
 	for _, addr := range addrs {
 		cli, err := c.clientFor(addr)
 		if err != nil {
@@ -122,9 +183,9 @@ func (c *Cluster) learnGenerationFromSeed() error {
 			count:   count,
 			cutOver: make(map[storageunit.UnitID]struct{}),
 		})
-		return nil
+		return true, nil
 	}
-	return fmt.Errorf("cluster: could not learn the cluster generation from any of %d visible peer(s): %w", len(addrs), lastErr)
+	return false, lastErr
 }
 
 // seedGRPCAddrs returns the gRPC addresses of every visible non-self peer, for

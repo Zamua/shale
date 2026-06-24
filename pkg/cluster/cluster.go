@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
+	"github.com/Zamua/shale/pkg/blob"
 	"github.com/Zamua/shale/pkg/membership"
 	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/reshard"
@@ -143,6 +144,22 @@ type Config struct {
 	// keeps the coordinated freeze barrier).
 	ConditionalStore storageunit.ConditionalStore
 
+	// BlobStore is the OPTIONAL streaming byte plane (the blob.Store port -
+	// docs/design/blob-values.md). nil leaves the cluster metadata-only; the
+	// plain *KV surface is all that is reachable. When set, NewBlobKV wraps the
+	// cluster in the blob-capable *BlobKV surface (StageBlob / GetBlob /
+	// BindBlob / SweepOrphans). The concrete object-store adapter
+	// (blobstore.MinioBlobStore) is wired at the cmd binary, exactly as the
+	// slate Backend + ConditionalStore are; tests pass an in-memory blob.Store.
+	//
+	// The capability is gated IN THE TYPE, not by this field's nil-ness: New
+	// (the *KV constructor) rejects a non-nil BlobStore (it would be unreachable
+	// through *KV), and NewBlobKV (the *BlobKV constructor) requires it. So a
+	// caller cannot reach a blob method without having configured the store -
+	// the wiring mistake is a constructor error, and the missing method is a
+	// compile error. See kv.go.
+	BlobStore blob.Store
+
 	// BindAddr is the host:port memberlist listens on (UDP + TCP).
 	// Non-empty enables multi-node mode. Format: "host:port" (host
 	// may be empty for "all interfaces").
@@ -243,6 +260,39 @@ type Config struct {
 	// Zero falls back to 5s.
 	ReadTimeout time.Duration
 
+	// PeerConnectTimeout bounds how long a cross-shard Aggregate (the
+	// snapshotPeer fan-out) waits for a peer's gRPC connection to reach
+	// READY before recording that peer's AggregateResult.Err. The peer
+	// gRPC client is FAIL-FAST by default (gRPC's WaitForReady=false): if
+	// a peer's gRPC server is momentarily not-ready at first-connect (a
+	// heavy cold-start where the process is busy mounting units), the
+	// CACHED ClientConn enters TRANSIENT_FAILURE + backoff and every
+	// subsequent fan-out RPC on that cached client fails INSTANTLY with
+	// "error reading server preface: use of closed network connection"
+	// for the whole backoff window. To absorb that transient, snapshotPeer
+	// explicitly waits (up to this bound) for the connection to become
+	// READY before opening the scan stream, so a peer that comes up within
+	// the window is scanned instead of spuriously erroring. Zero falls
+	// back to 30s (generous: a cold-starting peer can take tens of seconds
+	// to begin serving gRPC; the wait returns AS SOON AS the peer is ready,
+	// so a healthy fan-out pays ~nothing).
+	PeerConnectTimeout time.Duration
+
+	// GenLearnBudget bounds the total wall-clock a JOINER spends re-sweeping its
+	// seeds for the cluster generation at Open (learnGenerationFromSeed) before
+	// failing closed. This is the cold-start SIBLING of PeerConnectTimeout: a
+	// seed that is itself cold-starting has bound its gRPC port but does not
+	// begin SERVING it until after its own Open returns (i.e. after it has
+	// mounted every replicated unit, an object-storage-bound step that on a
+	// loaded backend takes tens of seconds). During that window the joiner's
+	// GenState dial times out; a single attempt that fails closed becomes a
+	// CRASH-LOOP under a supervisor. Re-sweeping for this budget WAITS the seed
+	// out instead. Bounded (not infinite) so a joiner whose seeds are truly dead
+	// still fails Open for a supervised restart. Zero falls back to
+	// defaultGenLearnBudget (180s). The caller env-plumbs this for deployments
+	// whose mounts run longer (and tests set it tiny to assert fail-closed fast).
+	GenLearnBudget time.Duration
+
 	// TestingBlockPeerDials, when true, refuses every clientFor call
 	// from the moment Open returns. Must be set at construction time
 	// (not after) because the bootstrap Evaluate runs synchronously
@@ -255,6 +305,17 @@ type Config struct {
 	// ack the destination cannot deliver). Test-only; no production
 	// code path reads this.
 	TestingBlockPeerDials bool
+
+	// TestingMountDelay, when >0, sleeps for that long inside Open right before
+	// the unit mount, SIMULATING a slow cold-start mount (a loaded object store
+	// taking tens of seconds). Because the caller starts this node's gRPC server
+	// only after Open returns, the delay also delays when this node begins
+	// SERVING gRPC - so a founder with this set reproduces the window in which a
+	// joiner's GenState dial times out, exercising the patient learnGenerationFromSeed.
+	// A debug/repro lever (env-plumbed as SHALE_DEBUG_MOUNT_DELAY); no production
+	// path sets it. Named Testing* for the Config convention; it is also used to
+	// reproduce the cold-start failure on a real staging cluster.
+	TestingMountDelay time.Duration
 
 	// TestingForceCleanCut, when true, BREAKS the Option B overlap handoff
 	// back to the pre-2e clean-cut RELEASE-then-ACQUIRE on the R>1 reconcile
@@ -381,6 +442,9 @@ func normalizeConfig(cfg *Config) {
 	}
 	if cfg.ReadTimeout <= 0 {
 		cfg.ReadTimeout = 5 * time.Second
+	}
+	if cfg.PeerConnectTimeout <= 0 {
+		cfg.PeerConnectTimeout = 30 * time.Second
 	}
 }
 
@@ -730,6 +794,13 @@ func Open(cfg Config) (*Cluster, error) {
 		// founder (no seeds) and in-process tests that pass no seeds run no
 		// loop. See membership.Config.RejoinInterval.
 		RejoinInterval: membership.DefaultRejoinInterval,
+		// Homogeneous bootstrap: when a shared ConditionalStore is wired, every
+		// node carries the SAME seed list (a headless Service) and the first one
+		// up reaches no peer. AllowSoloStart lets it come up solo and contend to
+		// form via the __cluster/init marker, instead of failing Open. Without a
+		// ConditionalStore (no durable form-lock) keep the strict behavior: a
+		// joiner with unreachable seeds fails rather than silently fork.
+		AllowSoloStart: cfg.ConditionalStore != nil,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("cluster: membership: %w", err)
@@ -1030,6 +1101,9 @@ func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
 		if !ok {
 			return nil, backend.ErrNotFound
 		}
+		// b is the fence-self-healing mount (storeMount): a fenced forwarded read
+		// recodes to transient + evicts the stale mount on the node that physically
+		// holds it, so it self-heals instead of returning the raw fence forever.
 		return b.Get(key)
 	}
 	return c.backend.Get(key)
@@ -1527,6 +1601,8 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 				// acquiring-window error (never serve a stale result).
 				return nil, errUnitAcquiring("Get")
 			}
+			// b is the fence-self-healing mount (storeMount): a fenced read
+			// self-heals here, so the simple Get is safe.
 			return b.Get(key)
 		}
 		return c.forwardGet(owner.Addr, key)
@@ -1828,6 +1904,19 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 // message is replayed by the view's initial full-keyspace ScanPrefix.
 func (c *Cluster) snapshotPeer(addr string) (backend.Backend, error) {
 	cli, err := c.clientFor(addr)
+	if err != nil {
+		return nil, err
+	}
+	// Wait (bounded by PeerConnectTimeout) for the peer's gRPC connection to be
+	// READY before opening the scan stream. The peer client is lazy + fail-fast,
+	// so without this a peer momentarily not-serving-gRPC at cold-start would
+	// fail-fast the stream's first Recv AND leave this CACHED client in backoff,
+	// poisoning every later fan-out RPC for the whole backoff window. Waiting
+	// here absorbs that transient; the long-lived stream below then opens over an
+	// already-READY connection, so its (unbounded) ctx cannot hang on connect.
+	readyCtx, readyCancel := context.WithTimeout(context.Background(), c.cfg.PeerConnectTimeout)
+	err = cli.waitReady(readyCtx)
+	readyCancel()
 	if err != nil {
 		return nil, err
 	}

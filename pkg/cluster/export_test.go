@@ -28,3 +28,9 @@ func SetTransactUnavailableTimeout(d time.Duration) time.Duration {
 	transactUnavailableTimeout = d
 	return prev
 }
+
+// BrefKeyForTest exposes the unexported brefKey helper to the external
+// cluster_test package so the co-routing rule (the bref key carries the route
+// shard key in a hash tag, so ring.ShardKey extracts it back) can be pinned by
+// a test without widening the public API.
+func BrefKeyForTest(ref BlobRef) []byte { return brefKey(ref) }

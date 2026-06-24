@@ -24,6 +24,7 @@ package cluster
 import (
 	"encoding/binary"
 	"fmt"
+	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
@@ -213,16 +214,38 @@ func (c *Cluster) initMultiBackend() error {
 	}
 	c.initGenState()
 
-	// Generation propagation (join-after-reshard fix): a JOINER (multi-backend
-	// Open WITH seeds) must learn the cluster's LIVE {generation, unit-count}
-	// BEFORE it derives or mounts any unit below, or it routes / owns keys at
-	// gen 0 and orphans acked writes after the cluster has resharded. Query a
-	// seed and commit the live generation here, ahead of the mount loop, so
-	// there is NO window in which this node serves at gen 0. The founder /
-	// single-node / legacy paths have no seeds and keep initGenState's gen-0
-	// default. Fail closed: a seed that cannot be reached fails Open rather
-	// than leaving the joiner at the wrong generation.
-	if len(c.cfg.Seeds) > 0 {
+	// Bootstrap the generation BEFORE deriving or mounting any unit below, or
+	// this node routes / owns keys at gen 0 and orphans acked writes after the
+	// cluster has resharded.
+	//
+	// When a shared ConditionalStore is configured, the __cluster/init marker is
+	// the authority (homogeneous runtime try-join-else-form; see
+	// multibackend_bootstrap_marker.go): every node runs the SAME path, the
+	// single PutIfAbsent winner founds at gen 0, and everyone else adopts the
+	// marker's durable {gen, count}. This is what lets a restart REJOIN at the
+	// live generation instead of re-forming gen 0, and a full-cluster restart
+	// resume the live generation with no live peer to ask.
+	//
+	// Without a ConditionalStore, fall back to the legacy config-driven path: a
+	// JOINER (Open WITH seeds) learns the live generation from a seed RPC, while
+	// the founder / single-node paths keep initGenState's gen-0 default. Fail
+	// closed in both: a marker read / seed query that cannot complete fails Open
+	// rather than leaving this node at the wrong generation.
+	if c.cfg.ConditionalStore != nil {
+		gen, count, founded, err := c.bootstrapViaMarker()
+		if err != nil {
+			return err
+		}
+		if !founded {
+			// Adopt the marker's durable {gen, count}. (A founder wrote
+			// {gen:0, count:N}; initGenState already seeded that, nothing to do.)
+			c.commitGenState(genState{
+				gen:     gen,
+				count:   count,
+				cutOver: make(map[storageunit.UnitID]struct{}),
+			})
+		}
+	} else if len(c.cfg.Seeds) > 0 {
 		if err := c.learnGenerationFromSeed(); err != nil {
 			return err
 		}
@@ -243,6 +266,14 @@ func (c *Cluster) initMultiBackend() error {
 	// replicated write/read paths key off the unit's replica set instead of a
 	// single owner. STATIC topology: the replica set is fixed at Open (no
 	// membership-change handoff at R>1 yet - a later phase).
+	// Debug/repro hook: simulate a slow cold-start unit mount (a loaded object
+	// store). Because the caller starts this node's gRPC server only AFTER Open
+	// returns, delaying the mount also delays when this node SERVES gRPC - so a
+	// founder with this set reproduces the window where a joiner's GenState dial
+	// times out, exercising the patient learnGenerationFromSeed. No-op unless set.
+	if d := c.cfg.TestingMountDelay; d > 0 {
+		time.Sleep(d)
+	}
 	c.initReplicatedFactory()
 	// Decentralized reshard agreement (v0.9): construct + seed the Arbiter when
 	// opted in (ConditionalStore set) on an R>1 cluster. No-op otherwise. Done
@@ -269,7 +300,7 @@ func (c *Cluster) initMultiBackend() error {
 			_ = c.closeMountedUnits()
 			return fmt.Errorf("cluster: open unit %s: %w", gu, err)
 		}
-		c.mountMap[replica0(gu)] = b
+		c.storeMount(replica0(gu), b)
 	}
 	return nil
 }
@@ -408,7 +439,16 @@ func (c *Cluster) localMountedBackendForKey(key []byte) (backend.Backend, bool) 
 // its gen-(g+1) children (until the old unit is retired); the admin scan
 // counting a key in both is acceptable for the non-routed keysHeld view.
 // Multi-backend mode only.
-func (c *Cluster) mountedBackends() []backend.Backend {
+// mountedUnit pairs a mounted ReplicaUnit with its live backend handle. The
+// scan paths carry the ru alongside the backend so a scan that hits a FENCED
+// handle can evict the RIGHT mount (the cross-shard scan fence self-heal needs
+// the ru, which a bare []backend.Backend loses).
+type mountedUnit struct {
+	ru storageunit.ReplicaUnit
+	b  backend.Backend
+}
+
+func (c *Cluster) mountedUnits() []mountedUnit {
 	c.mountMu.RLock()
 	defer c.mountMu.RUnlock()
 	ids := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
@@ -416,9 +456,9 @@ func (c *Cluster) mountedBackends() []backend.Backend {
 		ids = append(ids, ru)
 	}
 	sortReplicaUnits(ids)
-	out := make([]backend.Backend, 0, len(ids))
+	out := make([]mountedUnit, 0, len(ids))
 	for _, ru := range ids {
-		out = append(out, c.mountMap[ru])
+		out = append(out, mountedUnit{ru: ru, b: c.mountMap[ru]})
 	}
 	return out
 }
@@ -431,37 +471,56 @@ func (c *Cluster) mountedBackends() []backend.Backend {
 // open iterator is closed when its turn ends (or on the chain's Close).
 // Multi-backend mode only.
 func (c *Cluster) localScanMounted(prefix []byte) (backend.Iterator, error) {
-	return &mountedIterator{backends: c.mountedBackends(), prefix: prefix}, nil
+	return &mountedIterator{c: c, units: c.mountedUnits(), prefix: prefix}, nil
 }
 
 // mountedIterator chains the per-unit iterators of a multi-backend node
 // into one backend.Iterator. It opens each unit's iterator lazily as the
 // prior one exhausts, so at most one unit iterator is live at a time.
+//
+// A FENCED mounted handle (a higher-epoch owner superseded this node's mount
+// during a membership change) makes the underlying ScanPrefix / Next fail with
+// backend.ErrFenced in production. The iterator recodes that exactly as the
+// write path does (fenceToTransient: EVICT the stale mount + surface the
+// retryable acquiring-window error) so the cross-shard scan that drives this
+// (Aggregate / LocalScan) re-runs and heals once the reconcile re-acquires,
+// instead of failing the whole aggregate with the raw fence. A non-fence error
+// passes through unchanged. Carries (c, ru) per unit so the eviction hits the
+// right mount. The caller MUST stop on a non-nil Next error (every in-repo
+// caller does: the LocalScan handler + localMountedSnapshot both return on the
+// first error); the iterator does not resume cleanly past a fence (the fenced
+// unit has already been consumed from its work list).
 type mountedIterator struct {
-	backends []backend.Backend
-	prefix   []byte
-	idx      int
-	cur      backend.Iterator
+	c      *Cluster
+	units  []mountedUnit
+	prefix []byte
+	idx    int
+	cur    backend.Iterator
+	curRU  storageunit.ReplicaUnit // the unit `cur` belongs to (for fence eviction)
+	curB   backend.Backend
 }
 
 func (it *mountedIterator) Next() (key, value []byte, err error) {
 	for {
 		if it.cur == nil {
-			if it.idx >= len(it.backends) {
+			if it.idx >= len(it.units) {
 				return nil, nil, nil
 			}
-			cur, err := it.backends[it.idx].ScanPrefix(it.prefix)
+			mu := it.units[it.idx]
+			it.idx++
+			cur, err := mu.b.ScanPrefix(it.prefix)
 			if err != nil {
-				return nil, nil, err
+				return nil, nil, it.c.fenceToTransient(mu.ru, mu.b, "LocalScan", err)
 			}
 			it.cur = cur
-			it.idx++
+			it.curRU = mu.ru
+			it.curB = mu.b
 		}
 		k, v, err := it.cur.Next()
 		if err != nil {
 			_ = it.cur.Close()
 			it.cur = nil
-			return nil, nil, err
+			return nil, nil, it.c.fenceToTransient(it.curRU, it.curB, "LocalScan", err)
 		}
 		if k == nil {
 			// This unit exhausted; move to the next.
@@ -489,16 +548,21 @@ func (it *mountedIterator) Close() error {
 // snapshotBackend. Multi-backend mode only.
 func (c *Cluster) localMountedSnapshot() (backend.Backend, error) {
 	snap := newSnapshotBackend()
-	for _, b := range c.mountedBackends() {
-		it, err := b.ScanPrefix(nil)
+	for _, mu := range c.mountedUnits() {
+		it, err := mu.b.ScanPrefix(nil)
 		if err != nil {
-			return nil, err
+			// A FENCED mount (superseded by a higher-epoch owner mid-convergence)
+			// is recoded EXACTLY as the write path does: evict the stale mount +
+			// surface the retryable acquiring-window error, so Aggregate's caller
+			// re-runs the scan and heals once the reconcile re-acquires, instead of
+			// failing the aggregate with the raw fence. Non-fence errors pass through.
+			return nil, c.fenceToTransient(mu.ru, mu.b, "aggregate scan", err)
 		}
 		for {
 			k, v, err := it.Next()
 			if err != nil {
 				_ = it.Close()
-				return nil, err
+				return nil, c.fenceToTransient(mu.ru, mu.b, "aggregate scan", err)
 			}
 			if k == nil {
 				break

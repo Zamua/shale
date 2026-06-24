@@ -250,7 +250,7 @@ func (c *Cluster) mountReplicaUnits() error {
 			c.lastAcquireErr.Delete(ru)
 			c.myOpenEpoch.Store(ru, openedEpoch) // this node's exact open epoch (drain gate)
 			c.mountMu.Lock()
-			c.mountMap[ru] = b
+			c.storeMount(ru, b)
 			c.mountMu.Unlock()
 			mounted.Add(1)
 			return nil
@@ -413,7 +413,7 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 		_ = c.replicaFactory.CloseReplicaUnit(ru)
 		return
 	}
-	c.mountMap[ru] = b
+	c.storeMount(ru, b)
 	c.mountMu.Unlock()
 
 	// Write the durable serving marker AFTER the mount (outside the lock: shared
@@ -713,6 +713,9 @@ func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Membe
 		if !ok {
 			return nil, errUnitAcquiring("Get")
 		}
+		// b is the fence-self-healing mount (storeMount): a fenced read recodes to
+		// the transient acquiring-window error + evicts the stale mount here, so a
+		// fenced GET self-heals instead of returning the raw fence forever (#433).
 		return b.Get(key)
 	}
 	cli, err := c.clientFor(replica.Addr)
