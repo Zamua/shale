@@ -421,14 +421,29 @@ func TestTxDelete_BrefKeyEquivalentToUnbind(t *testing.T) {
 
 // --- brefKey co-routing rule (design section 11.5) ---
 
-// TestBrefKey_Shape pins the literal bref key layout
-// bref/{<routeShard>}/<unit>/<blobid>.
+// TestBrefKey_Shape pins the literal TOKEN-FREE bref key layout
+// bref/{<routeShard>}/<blobid> (design section 12): the unit token is NOT a key
+// segment, so the key is identical before and after a reshard (#471). Unit is
+// set on the ref but must NOT appear in the key.
 func TestBrefKey_Shape(t *testing.T) {
 	ref := cluster.BlobRef{Unit: "0-13", RouteShard: []byte("slug-7"), BlobID: "deadbeef"}
 	got := cluster.BrefKeyForTest(ref)
-	want := []byte("bref/{slug-7}/0-13/deadbeef")
+	want := []byte("bref/{slug-7}/deadbeef")
 	if !bytes.Equal(got, want) {
 		t.Fatalf("brefKey = %q, want %q", got, want)
+	}
+}
+
+// TestBrefKey_TokenFree pins the load-bearing reshard-transparency property: two
+// refs that differ ONLY in Unit (the routed token, which a reshard changes)
+// produce the IDENTICAL bref key. This is what makes a post-reshard read
+// reconstruct the same key the pre-reshard bind wrote (#471).
+func TestBrefKey_TokenFree(t *testing.T) {
+	gen0 := cluster.BlobRef{Unit: "0-13", RouteShard: []byte("slug-7"), BlobID: "deadbeef"}
+	gen1 := cluster.BlobRef{Unit: "1-5", RouteShard: []byte("slug-7"), BlobID: "deadbeef"}
+	if !bytes.Equal(cluster.BrefKeyForTest(gen0), cluster.BrefKeyForTest(gen1)) {
+		t.Fatalf("brefKey is NOT token-free: gen0=%q gen1=%q (a reshard would make the read miss)",
+			cluster.BrefKeyForTest(gen0), cluster.BrefKeyForTest(gen1))
 	}
 }
 

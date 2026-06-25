@@ -165,12 +165,14 @@ type BlobTx struct {
 //
 // It is an ordinary tx.Put of the bref key, so it buffers into the SAME
 // write-set as the app's metadata Puts and ships in one commit to the unit
-// owner. The bref key derives from ref via brefKey, whose hash tag carries the
-// route shard key, so the pointer routes to the SAME unit as the metadata and
-// the cluster's cross-shard guard admits them into one transaction (the caller
-// MUST pin the Transact on a key that routes to that same unit). ref MUST come
-// from StageBlob (which populates Unit + RouteShard); a zero-value ref produces
-// a malformed bref key.
+// owner. The bref key derives from ref via brefKey (token-free, section 12),
+// whose hash tag carries the route shard key, so the pointer routes to the SAME
+// unit as the metadata and the cluster's cross-shard guard admits them into one
+// transaction (the caller MUST pin the Transact on a key that routes to that
+// same unit). ref MUST come from StageBlob (which populates Unit + RouteShard);
+// the OBJECT key the Pointer carries uses ref.Unit + ref.BlobID, and the bref
+// key uses ref.RouteShard + ref.BlobID, so a zero-value ref produces a malformed
+// pointer.
 func (bt *BlobTx) BindBlob(ref BlobRef) error {
 	ptr := blob.Pointer{
 		ObjKey:      blob.FinalKey(ref.Unit, ref.BlobID),
@@ -190,7 +192,9 @@ func (bt *BlobTx) BindBlob(ref BlobRef) error {
 // the app's metadata (atomic delete, design section 11.3). The now-unreferenced
 // bytes are reclaimed by the same-shard orphan sweep. It is a convenience over
 // tx.Delete(brefKey(ref)); both work because deleting the pointer key is an
-// ordinary KV delete.
+// ordinary KV delete. The deleted (token-free, section 12) key is the SAME one
+// GetBlob and a later reshard reconstruct, so the tombstone is reshard-
+// transparent: a delete issued before a reshard stays deleted after it (#471).
 func (bt *BlobTx) UnbindBlob(ref BlobRef) error {
 	return bt.Delete(brefKey(ref))
 }
@@ -246,6 +250,15 @@ func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, si
 // blob.ErrNotFound, the same not-found shape the caller already handles for a
 // missing object.
 //
+// RESHARD-TRANSPARENT (design section 12): the bref key is TOKEN-FREE
+// (bref/{<routeShard>}/<blobid>), so GetBlob does NOT recompute the routed unit
+// token - it reconstructs the SAME key from the route shard + blob id regardless
+// of how many reshards have advanced the generation since the bind. The byte
+// LOCATION is owned solely by the decoded Pointer's ObjKey (the verbatim
+// stage-time object key, including the stage-time token); GetBlob streams
+// ptr.ObjKey verbatim, so bytes staged under an old-token prefix are still found
+// after a reshard. The recomputed token is used ONLY at stage time, never here.
+//
 // ctx LIFETIME: the returned reader streams lazily, so ctx MUST outlive the
 // reader (the whole duration the caller pipes the bytes downstream), not just
 // the GetBlob call - the object-store adapter binds a reader goroutine to ctx
@@ -253,8 +266,10 @@ func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, si
 // truncates a large stream mid-flight (design section 11.4, blobstore/minio.go
 // LIFETIME note). The caller MUST Close the returned reader.
 func (b *BlobKV) GetBlob(ctx context.Context, routeKey []byte, blobid string) (io.ReadCloser, int64, error) {
-	unit := b.c.RoutedUnitToken(routeKey)
-	ref := BlobRef{Unit: unit, RouteShard: b.c.shardKey(routeKey), BlobID: blobid}
+	// Token-free bref key (section 12): the lookup is a pure function of the route
+	// shard + blob id, so it does NOT recompute the routed unit token (which would
+	// return the CURRENT generation's token and miss a pre-reshard pointer - #471).
+	ref := BlobRef{RouteShard: b.c.shardKey(routeKey), BlobID: blobid}
 	enc, err := b.c.Get(brefKey(ref))
 	if errors.Is(err, backend.ErrNotFound) {
 		return nil, 0, blob.ErrNotFound
@@ -417,17 +432,23 @@ type BlobRef struct {
 
 // brefKey builds the internal pointer key for ref:
 //
-//	bref/{<routeShard>}/<unit>/<blobid>
+//	bref/{<routeShard>}/<blobid>
 //
-// The hash tag {<routeShard>} carries the ROUTE KEY's shard key so the default
-// ring.ShardKey (and an app's ShardKeyFn that honors hash tags for bref/ keys)
-// extracts the SAME shard key it extracts for the app's metadata - so the
-// pointer co-routes with the metadata under the same unit and the cross-shard
-// guard admits them into one transaction. The <unit>/<blobid> tail
-// disambiguates within the shard (design section 11.5).
+// The key is TOKEN-FREE (design section 12): the routed unit token is NOT a key
+// segment. The hash tag {<routeShard>} carries the ROUTE KEY's shard key so the
+// default ring.ShardKey (and an app's ShardKeyFn that honors hash tags for bref/
+// keys) extracts the SAME shard key it extracts for the app's metadata - so the
+// pointer co-routes with the metadata under the same unit AND the byte-verbatim
+// reshard copy carries it to the same survivor / child. <blobid> disambiguates
+// within the shard. Because neither {routeShard} nor <blobid> changes across a
+// reshard, BindBlob / UnbindBlob / GetBlob build the IDENTICAL key before and
+// after a generation bump - so reads and deletes are reshard-transparent (#471).
+// The earlier <unit> tail segment coupled the key to the generation and made a
+// post-reshard read miss; it is gone (section 12.1 / 12.2).
 //
-// It is a pure function of the BlobRef (which carries both RouteShard and Unit),
-// so BindBlob / UnbindBlob / GetBlob derive the key without re-resolving routing.
+// It is a pure function of the BlobRef's RouteShard + BlobID (BlobRef.Unit is
+// NOT read here; StageBlob still uses it for the OBJECT key), so BindBlob /
+// UnbindBlob / GetBlob derive the key without re-resolving routing.
 //
 // CONTRACT: ref.RouteShard MUST NOT contain a '}' byte. The default
 // ring.ShardKey reads the hash tag up to the FIRST '}', so an embedded '}' in the
@@ -435,13 +456,11 @@ type BlobRef struct {
 // from the app's metadata shard. This is benign for slug / id route keys (no
 // '}'); no validation is enforced here, this is the documented caller contract.
 func brefKey(ref BlobRef) []byte {
-	out := make([]byte, 0, len(brefPrefix)+len(ref.RouteShard)+len(ref.Unit)+len(ref.BlobID)+4)
+	out := make([]byte, 0, len(brefPrefix)+len(ref.RouteShard)+len(ref.BlobID)+3)
 	out = append(out, brefPrefix...)
 	out = append(out, '{')
 	out = append(out, ref.RouteShard...)
 	out = append(out, '}', '/')
-	out = append(out, ref.Unit...)
-	out = append(out, '/')
 	out = append(out, ref.BlobID...)
 	return out
 }

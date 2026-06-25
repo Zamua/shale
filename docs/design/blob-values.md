@@ -620,7 +620,9 @@ Two internal namespaces, both UNIT-keyed so both are shard-local to the owner:
 
 - **Blob bytes** (object store): `blob/<unit>/<blobid>`
 - **Blob pointer** (slatedb value, an internal key on the unit's shard):
-  `bref/{<unit>}/<blobid>`
+  `bref/{<unit>}/<blobid>` (SUPERSEDED by section 12: the pointer key is now
+  TOKEN-FREE, `bref/{<routeShard>}/<blobid>`, so reads survive a reshard; the
+  object key below is unchanged)
 
 where `<unit>` is a STABLE STRING RENDERING of the routed unit (see below), and
 the `{...}` braces around it in the bref key are the Redis-style hash-tag the
@@ -823,7 +825,16 @@ pointer and the bytes.
   (11.5) is what makes it hold: a node-keyed or raw-shardKey-keyed object prefix
   would NOT transfer cleanly.
 
-- **The reshard EDGE CASE - unit doubling (split).** Shale's only growth op is
+- **The reshard EDGE CASE - unit doubling (split). SUPERSEDED by section 12 for
+  the READ PATH.** The "ancestor-prefix union" sketched below was a SWEEP-side
+  patch and was never shipped (11.12); it does not address the read-path miss
+  (#471) where `GetBlob` recomputed a NEW-generation token and missed the bref
+  written under the old token. Section 12 fixes that at the root by making the
+  pointer key TOKEN-FREE (`bref/{<routeShard>}/<blobid>`), so the recomputed
+  lookup key is reshard-invariant. The description below is retained for the
+  OBJECT-key half (the bytes stay under their old-token prefix and are resolved
+  via the verbatim `Pointer.ObjKey`, which section 12 preserves) and as the
+  historical record of the bug.
   unit doubling (`UnitForHash` doubling-compatible, unitmap.go:40): unit `u` under
   count N splits into two children under 2N, and the GenUnit token changes
   (`<gen>-<u>` at gen g becomes `<g+1>-<low>` / `<g+1>-<high>`). Existing bytes
@@ -962,3 +973,125 @@ the source of truth, these are the notable ones:
 - **The in-memory `blob.Store` fake lives at `pkg/blob/blobmem`** (exported, not
   `internal/`), so an app's tests (hostthis, phase 3) can use it to unit-test blob
   paths without standing up MinIO.
+
+## 12. Token-free bref key (reshard-transparent pointer, #471)
+
+### 12.1 The bug the section-11 bref shape caused
+
+Section 11.5 keyed the blob POINTER as `bref/{<routeShard>}/<unit>/<blobid>`,
+embedding the routed unit token (`<gen>-<unitID>`, e.g. `0-13`) as a tail
+segment. That token segment couples the pointer key to the CURRENT generation,
+which breaks reads across a reshard:
+
+1. `BindBlob` writes the bref at `bref/{<routeShard>}/<old-token>/<blobid>` where
+   `<old-token>` is `RoutedUnitToken(routeKey)` at bind time (e.g. `0-13` in a
+   16-unit gen-0 cluster).
+2. A reshard (split `N -> 2N` or merge `2N -> N`) copies the unit's keyspace to
+   its child / survivor BYTE-VERBATIM: `ScanPrefix(nil)` over every parent key,
+   `tx.Put` each key UNCHANGED (the live overlap dual-write and the finalize
+   copy both do this). The `{<routeShard>}` hash tag routes the bref to the
+   correct child / survivor, so the pointer arrives intact - but still keyed with
+   the OLD token.
+3. `finalizeReshard` advances the cluster generation to `{gen+1, nextCount}`. Now
+   `RoutedUnitToken(routeKey)` returns the NEW token (e.g. `1-5`).
+4. `GetBlob` rebuilds the lookup key as `bref/{<routeShard>}/<new-token>/<blobid>`
+   -> MISS -> `blob.ErrNotFound`. The pointer is present (under the old-token key)
+   and the bytes never moved (they are at `blob/<old-token>/<blobid>`, found via
+   the stored `Pointer.ObjKey`), but the bref KEY the reader reconstructs is
+   unreachable. The app metadata survives because its key (`pastes/<slug>`)
+   carries no token.
+
+This is the same generation-coupling section 11.8 flagged as "the one
+non-trivial reshard interaction" and 11.12 deferred as a leak-only follow-up for
+the SWEEP. For the SWEEP it is leak-only (the stored ObjKey is ground truth); for
+the READ PATH it is a hard miss (the lookup key is recomputed from the live
+generation, not read from the pointer). The section-11.8 "ancestor-prefix union"
+idea was the SWEEP-side patch; it does NOT help the read path and the
+ancestor machinery was removed (11.12). The clean fix is to remove the coupling
+at its root: drop the token from the pointer KEY.
+
+### 12.2 The fix: the bref key is token-free
+
+The pointer key becomes:
+
+```
+bref/{<routeShard>}/<blobid>
+```
+
+The `<unit-token>` tail segment is GONE. The `{<routeShard>}` hash tag already
+routes the pointer to the SAME survivor / child the metadata routes to (the byte-
+verbatim copy carries it there), and `<blobid>` already disambiguates within the
+shard, so the unit token was redundant disambiguation that only coupled the key
+to the generation. With it removed, `BindBlob`, `UnbindBlob`, and `GetBlob` build
+the IDENTICAL key before and after any reshard (the key is a pure function of the
+route shard + blob id, neither of which a reshard changes), so reads and deletes
+are reshard-transparent.
+
+`BlobRef.RouteShard` and `BlobRef.BlobID` are all `brefKey` consumes; the
+`BlobRef.Unit` field stays (StageBlob still needs it for the OBJECT key, below)
+but is no longer part of the pointer key.
+
+### 12.3 What does NOT change (the byte location is owned solely by the Pointer)
+
+- **The OBJECT key keeps the token: `blob/<unit-token>/<blobid>`.** `StageBlob`
+  is UNCHANGED. The bytes still live under a unit-token prefix so the orphan sweep
+  has one finite prefix per MOUNTED unit to enumerate (11.7); a token-free object
+  key would force the sweep back to a global `blob/` scan. The byte LOCATION is
+  owned SOLELY by the persisted `Pointer.ObjKey` (which carries the verbatim
+  object key the bytes were staged under, including the stage-time token), NOT by
+  any recomputation: `GetBlob` reads the token-free bref, decodes the Pointer, and
+  streams `ptr.ObjKey` verbatim. So bytes staged at `blob/<old-token>/<blobid>`
+  before a reshard are still found after it - the recomputed token is used ONLY at
+  STAGE time, never at read time. This is the same ObjKey-is-ground-truth property
+  11.12 already relies on for the sweep, now also the read path's invariant.
+- **The reshard COPY stays byte-verbatim.** Do NOT re-key the bref inside the
+  split / merge copy. The copy runs WITHOUT a write-freeze while live
+  `BindBlob` / `UnbindBlob` dual-writes flow to both generations keyed verbatim;
+  re-keying a bref in the copy would split one logical pointer across two keys, so
+  apply-if-newer (LWW) could not order a create against a concurrent delete - a
+  resurrected or lost delete. The fix is the KEY SHAPE only: a token-free key is
+  carried correctly by the existing byte-verbatim copy with ZERO copy-path
+  changes. This is why the fix lives in the key derivation, not the copy.
+- **Delete safety.** An `UnbindBlob` tombstone is itself written at the token-free
+  key, so it is reshard-transparent identically to a create: a delete issued
+  before a reshard, or a read issued after one, both resolve the same key. A
+  delete-after-reshard stays deleted under standard apply-if-newer LWW (token-free
+  reads see the token-free tombstone). This holds for BOTH split (`N -> 2N`) and
+  merge (`2N -> N`).
+
+### 12.4 NO in-code fallback; legacy data needs an offline migration (deploy precondition)
+
+The running code understands ONLY token-free brefs. There is deliberately NO
+read-fallback to the old token-ful key, no parent-token walk, no
+migrate-forward-on-read, no dual-format decode. A fallback would re-introduce the
+generation coupling the fix removes (the fallback key still embeds a token to
+guess) and would have to guess across the doubling chain.
+
+Consequence: a cluster that already holds POINTERS in the legacy token-ful
+format (`bref/{<routeShard>}/<unit>/<blobid>`, e.g. prod gen-0 data written by
+the section-11 code) cannot serve them after deploying this code - the new
+`GetBlob` looks under the token-free key and misses. Converting that data is a
+ONE-TIME, OFFLINE MIGRATION the OPERATOR runs as a DEPLOY PRECONDITION:
+
+1. Scale the app down (no live writers, so no dual-write races the migration).
+2. Re-key every `bref/{<routeShard>}/<unit>/<blobid>` entry to
+   `bref/{<routeShard>}/<blobid>` (strip the `<unit>` segment; the value - the
+   encoded Pointer, carrying the verbatim ObjKey - is unchanged, so the bytes
+   stay where they are).
+3. Bring the app up on this code.
+
+That migration is an OPERATOR-SIDE deliverable; it lives in the private infra
+repo (a one-off `down` / `migrate` / `up` runbook + tooling), NOT in shale. shale
+ships only the token-free product code + tests; it does not carry migration code,
+a legacy-format reader, or any operator runbook. A deployment that skips the
+offline migration will 404 its pre-existing blobs (the bytes and pointers are
+intact, only the lookup key shape differs) until the re-key is run; a deployment
+with no pre-existing token-ful brefs (a fresh cluster) needs no migration.
+
+### 12.5 Supersedes
+
+This section supersedes the bref KEY SHAPE in 11.5 / 11.9 (`bref/{<routeShard>}/
+<unit>/<blobid>` -> `bref/{<routeShard>}/<blobid>`) and resolves the read-path
+half of the reshard interaction 11.8 / 11.11 flagged. The OBJECT key shape
+(`blob/<unit-token>/<blobid>`, 11.5) and the sweep's mounted-unit enumeration
+(11.7 / 11.12) are UNCHANGED.
