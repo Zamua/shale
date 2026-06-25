@@ -277,6 +277,20 @@ const DefaultMetaRefreshInterval = 10 * time.Second
 // alone cannot clear the address gate).
 const deadNodeReclaimTime = 30 * time.Second
 
+// metaUpdateTimeout bounds how long a single meta-refresh tick waits inside
+// memberlist.UpdateNode for the queued alive broadcast to flush. It must be
+// NON-ZERO: memberlist treats a 0 timeout as "wait forever" (not "do not
+// wait"), and with a live peer UpdateNode blocks on the broadcast's notify
+// channel - which never fires if the next tick's re-broadcast SUPERSEDES this
+// one before it transmits (memberlist's TransmitLimitedQueue invalidates the
+// older same-node broadcast, and an invalidated broadcast does not signal its
+// notify). A 0 timeout therefore wedges the loop's goroutine permanently on the
+// first superseded tick. A small bounded timeout makes a tick that cannot flush
+// promptly return; the next tick retries with a still-higher incarnation. Kept
+// well under DefaultMetaRefreshInterval so a slow tick never overruns into the
+// next one.
+const metaUpdateTimeout = 2 * time.Second
+
 // Membership is the running gossip layer for one node. All exported
 // methods are safe for concurrent use.
 type Membership struct {
@@ -718,13 +732,17 @@ func (m *Membership) metaRefreshLoop(interval time.Duration) {
 				continue
 			}
 			// UpdateNode re-reads NodeMeta (unchanged on a steady node) and
-			// re-broadcasts it with a bumped incarnation. The 0 timeout means
-			// "do not block waiting for the broadcast to flush"; it propagates
-			// via the normal gossip loop. A best-effort error (e.g. a racing
-			// shutdown) is ignored; the next tick retries.
-			if err := m.ml.UpdateNode(0); err != nil {
-				continue
-			}
+			// re-broadcasts it with a bumped incarnation. The timeout is BOUNDED
+			// and non-zero on purpose: memberlist reads 0 as "wait forever" (NOT
+			// "do not wait"), and with a live peer UpdateNode blocks on the
+			// broadcast's notify channel, which never fires if the next tick
+			// supersedes this broadcast before it transmits - a 0 timeout would
+			// wedge this goroutine permanently. metaUpdateTimeout caps the wait;
+			// a tick that times out (or hits a racing-shutdown error) still
+			// re-broadcast via normal gossip and is a best-effort no-op, so it
+			// counts as an attempt and the next tick retries with a higher
+			// incarnation. See metaUpdateTimeout.
+			_ = m.ml.UpdateNode(metaUpdateTimeout)
 			m.metaRefreshAttempts.Add(1)
 		}
 	}
