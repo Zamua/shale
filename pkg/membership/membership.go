@@ -89,6 +89,15 @@ type Member struct {
 	// consistent-hash ownership ring so its positions redistribute to
 	// non-draining members. Decoded from the peer's Meta payload.
 	Draining bool
+	// DeclaredUnitCount is the node's STANDING declared shard (unit) count -
+	// the value the operator configured for it (SHALE_UNIT_COUNT). It is
+	// gossiped in the Meta payload so the cluster can detect cluster-wide
+	// AGREEMENT on a desired count and drive a declarative reshard toward it
+	// (see the cluster's observeDeclaredReshardTarget). 0 means UNKNOWN /
+	// absent (a legacy node that does not gossip it, or a non-multi-backend
+	// node); an unknown count breaks unanimity and defers any auto-reshard,
+	// the fail-safe. Static for the node's lifetime.
+	DeclaredUnitCount uint32
 }
 
 // metaSep separates the address head from the optional draining marker
@@ -100,32 +109,52 @@ const metaSep = '\x00'
 // metaDrainingMarker is the trailing segment that flags a draining node.
 const metaDrainingMarker = "D"
 
-// encodeMeta builds the Meta payload for the local node. A non-draining
-// node encodes exactly its address (legacy-identical). A draining node
-// appends metaSep + the draining marker.
-func encodeMeta(addr string, draining bool) []byte {
-	if !draining {
-		return []byte(addr)
+// metaUnitCountPrefix tags the trailing segment carrying a node's standing
+// DECLARED unit count, e.g. "U16". It is its own NUL-delimited segment after
+// the optional draining marker, so it composes with draining and is ignored
+// by any decoder that does not understand it (forward-compatible). A NUL
+// never appears in the decimal count, so the segment is unambiguous.
+const metaUnitCountPrefix = "U"
+
+// encodeMeta builds the Meta payload for the local node. The head is the
+// address (legacy-identical bare-address form when there is nothing else to
+// carry). A draining node appends metaSep + the draining marker; a node with
+// a known declared unit count (> 0) appends metaSep + "U<count>". Segments are
+// independent, so the payload may carry neither, either, or both.
+func encodeMeta(addr string, draining bool, declaredUnitCount uint32) []byte {
+	s := addr
+	if draining {
+		s += string(metaSep) + metaDrainingMarker
 	}
-	return []byte(addr + string(metaSep) + metaDrainingMarker)
+	if declaredUnitCount > 0 {
+		s += string(metaSep) + metaUnitCountPrefix + strconv.FormatUint(uint64(declaredUnitCount), 10)
+	}
+	return []byte(s)
 }
 
-// decodeMeta parses a Meta payload back into the address + draining bit.
-// The head (up to the first metaSep, or the whole payload if none) is
-// always the address; a trailing metaDrainingMarker segment sets
-// draining. Unknown trailing segments are ignored (forward-compatible).
-func decodeMeta(meta []byte) (addr string, draining bool) {
+// decodeMeta parses a Meta payload back into the address, draining bit, and
+// declared unit count. The head (up to the first metaSep, or the whole payload
+// if none) is always the address; a trailing metaDrainingMarker segment sets
+// draining, a trailing "U<count>" segment sets the declared unit count.
+// Unknown / unparseable trailing segments are ignored (forward-compatible);
+// an absent count segment yields 0 (UNKNOWN).
+func decodeMeta(meta []byte) (addr string, draining bool, declaredUnitCount uint32) {
 	s := string(meta)
 	head, rest, found := strings.Cut(s, string(metaSep))
 	if !found {
-		return s, false
+		return s, false, 0
 	}
 	for _, seg := range strings.Split(rest, string(metaSep)) {
-		if seg == metaDrainingMarker {
+		switch {
+		case seg == metaDrainingMarker:
 			draining = true
+		case strings.HasPrefix(seg, metaUnitCountPrefix):
+			if n, err := strconv.ParseUint(seg[len(metaUnitCountPrefix):], 10, 32); err == nil {
+				declaredUnitCount = uint32(n)
+			}
 		}
 	}
-	return head, draining
+	return head, draining, declaredUnitCount
 }
 
 // Event is one membership change notification.
@@ -150,6 +179,13 @@ type Config struct {
 	// to peers as the node's Meta payload so they can forward
 	// requests here. Format: "host:port".
 	GRPCAddr string
+	// DeclaredUnitCount is the node's standing declared shard (unit) count,
+	// broadcast in the Meta payload (the declarative-reshard signal; see
+	// Member.DeclaredUnitCount). 0 (the default) means "do not advertise a
+	// count" - the node is non-multi-backend or pre-feature, and peers see it
+	// as UNKNOWN. The cluster passes its configured SHALE_UNIT_COUNT here in
+	// multi-backend mode.
+	DeclaredUnitCount uint32
 	// LogOutput is where memberlist's internal logger writes. nil
 	// means stderr (memberlist's default). Tests pass io.Discard to
 	// stay quiet.
@@ -249,11 +285,16 @@ type metaDelegate struct {
 	mu       sync.Mutex
 	addr     string
 	draining bool
+	// declaredUnitCount is the node's standing declared shard count. Unlike
+	// draining it is fixed for the node's lifetime (set at construction from
+	// Config.DeclaredUnitCount); it is read under mu only to share the lock
+	// with the draining read in NodeMeta.
+	declaredUnitCount uint32
 }
 
 func (d *metaDelegate) NodeMeta(limit int) []byte {
 	d.mu.Lock()
-	meta := encodeMeta(d.addr, d.draining)
+	meta := encodeMeta(d.addr, d.draining, d.declaredUnitCount)
 	d.mu.Unlock()
 	if len(meta) > limit {
 		return meta[:limit]
@@ -319,11 +360,12 @@ type eventDelegate struct {
 func nodeToMember(n *memberlist.Node) Member {
 	name := strings.Clone(n.Name)
 	meta := append([]byte(nil), n.Meta...)
-	addr, draining := decodeMeta(meta)
+	addr, draining, declaredUnitCount := decodeMeta(meta)
 	return Member{
-		ID:       name,
-		Addr:     addr,
-		Draining: draining,
+		ID:                name,
+		Addr:              addr,
+		Draining:          draining,
+		DeclaredUnitCount: declaredUnitCount,
 	}
 }
 
@@ -443,7 +485,7 @@ func Open(cfg Config) (*Membership, error) {
 	}
 	mlCfg.BindPort = bindPort
 	mlCfg.AdvertisePort = bindPort
-	meta := &metaDelegate{addr: cfg.GRPCAddr}
+	meta := &metaDelegate{addr: cfg.GRPCAddr, declaredUnitCount: cfg.DeclaredUnitCount}
 	m.meta = meta
 	mlCfg.Delegate = meta
 	mlCfg.Events = events
@@ -489,7 +531,7 @@ func Open(cfg Config) (*Membership, error) {
 	// by -race, see nodeToMember's contract). Peers are reconciled solely via
 	// the memberlist-serialized NotifyJoin/Leave/Update callbacks, the only
 	// safe place to read a Node's fields.
-	self := Member{ID: cfg.NodeID, Addr: cfg.GRPCAddr}
+	self := Member{ID: cfg.NodeID, Addr: cfg.GRPCAddr, DeclaredUnitCount: cfg.DeclaredUnitCount}
 	m.cacheMu.Lock()
 	if _, ok := m.cache[self.ID]; !ok {
 		m.cache[self.ID] = self

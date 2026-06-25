@@ -459,34 +459,59 @@ func waitForDraining(m *Membership, id string, want bool, wantAddr string, timeo
 }
 
 // TestEncodeDecodeMetaRoundTrip pins the backward-shaped Meta wire
-// format: the non-draining payload is byte-identical to the bare-address
-// legacy format, and the draining bit round-trips while the address
-// still decodes cleanly.
+// format: the bare (no draining, no declared count) payload is
+// byte-identical to the bare-address legacy format, and the draining bit +
+// declared unit count round-trip while the address still decodes cleanly.
 func TestEncodeDecodeMetaRoundTrip(t *testing.T) {
 	const addr = "127.0.0.1:7001"
 
-	// Non-draining encodes to exactly the bare address (legacy-shaped).
-	meta := encodeMeta(addr, false)
+	// Bare (non-draining, no declared count) encodes to exactly the bare
+	// address (legacy-shaped).
+	meta := encodeMeta(addr, false, 0)
 	if string(meta) != addr {
-		t.Fatalf("non-draining meta = %q, want bare addr %q", meta, addr)
+		t.Fatalf("bare meta = %q, want bare addr %q", meta, addr)
 	}
-	gotAddr, draining := decodeMeta(meta)
-	if gotAddr != addr || draining {
-		t.Fatalf("decode(non-draining) = (%q, %v), want (%q, false)", gotAddr, draining, addr)
+	gotAddr, draining, count := decodeMeta(meta)
+	if gotAddr != addr || draining || count != 0 {
+		t.Fatalf("decode(bare) = (%q, %v, %d), want (%q, false, 0)", gotAddr, draining, count, addr)
 	}
 
 	// Draining round-trips the bit while keeping the address.
-	meta = encodeMeta(addr, true)
-	gotAddr, draining = decodeMeta(meta)
-	if gotAddr != addr || !draining {
-		t.Fatalf("decode(draining) = (%q, %v), want (%q, true)", gotAddr, draining, addr)
+	meta = encodeMeta(addr, true, 0)
+	gotAddr, draining, count = decodeMeta(meta)
+	if gotAddr != addr || !draining || count != 0 {
+		t.Fatalf("decode(draining) = (%q, %v, %d), want (%q, true, 0)", gotAddr, draining, count, addr)
+	}
+
+	// A declared unit count round-trips while keeping the address (and not
+	// draining).
+	meta = encodeMeta(addr, false, 16)
+	gotAddr, draining, count = decodeMeta(meta)
+	if gotAddr != addr || draining || count != 16 {
+		t.Fatalf("decode(count=16) = (%q, %v, %d), want (%q, false, 16)", gotAddr, draining, count, addr)
+	}
+
+	// Draining AND a declared count compose: both round-trip together, the
+	// address intact, regardless of segment order.
+	meta = encodeMeta(addr, true, 8)
+	gotAddr, draining, count = decodeMeta(meta)
+	if gotAddr != addr || !draining || count != 8 {
+		t.Fatalf("decode(draining+count=8) = (%q, %v, %d), want (%q, true, 8)", gotAddr, draining, count, addr)
 	}
 
 	// A legacy bare-address payload (no separator, written by an older
-	// node) decodes as not-draining with the address intact.
-	gotAddr, draining = decodeMeta([]byte(addr))
-	if gotAddr != addr || draining {
-		t.Fatalf("decode(legacy) = (%q, %v), want (%q, false)", gotAddr, draining, addr)
+	// node) decodes as not-draining, unknown count (0), address intact.
+	gotAddr, draining, count = decodeMeta([]byte(addr))
+	if gotAddr != addr || draining || count != 0 {
+		t.Fatalf("decode(legacy) = (%q, %v, %d), want (%q, false, 0)", gotAddr, draining, count, addr)
+	}
+
+	// A legacy draining-only payload (addr\x00D, written by a node that
+	// gossips draining but not the count) decodes draining with unknown
+	// count - the forward-compat path that keeps the count fail-safe.
+	gotAddr, draining, count = decodeMeta([]byte(addr + string(metaSep) + metaDrainingMarker))
+	if gotAddr != addr || !draining || count != 0 {
+		t.Fatalf("decode(legacy draining) = (%q, %v, %d), want (%q, true, 0)", gotAddr, draining, count, addr)
 	}
 }
 

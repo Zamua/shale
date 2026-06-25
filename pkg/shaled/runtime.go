@@ -469,6 +469,13 @@ func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 		clusterCfg.Backend = cfg.Backend
 	}
 	clusterCfg.ConditionalStore = cfg.ConditionalStore
+	// The homogeneous deployment (a ConditionalStore-backed multi-backend
+	// node) drives its shard count declaratively: the operator changes
+	// SHALE_UNIT_COUNT in the deployment and applies it, and the cluster
+	// reshards to match once every node agrees. Enable it whenever the arbiter
+	// is wired in multi-backend mode; without an arbiter or in single-backend
+	// mode it is inert.
+	clusterCfg.DeclarativeReshard = cfg.ConditionalStore != nil && cfg.BackendFactory != nil
 	return clusterCfg
 }
 

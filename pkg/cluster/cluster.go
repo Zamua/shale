@@ -144,6 +144,23 @@ type Config struct {
 	// keeps the coordinated freeze barrier).
 	ConditionalStore storageunit.ConditionalStore
 
+	// DeclarativeReshard makes the cluster DRIVE the arbiter target from the
+	// cluster-wide gossiped DECLARED unit count (UnitCount, advertised in
+	// membership metadata): on every reconcile tick, when the cluster is steady
+	// AND every live member agrees on the same declared count, the cluster
+	// CAS-retargets the arbiter to it and the decentralized driver converges
+	// online. This is the "declare SHALE_UNIT_COUNT in the deployment and
+	// apply" operator surface for the homogeneous deployment (see
+	// observeDeclaredReshardTarget + docs/SPEC.md "Declarative reshard").
+	//
+	// Default false: the arbiter target is then set ONLY externally (the
+	// imperative Reshard path, or a test driving reshard.Arbiter.Retarget
+	// directly), and the gossiped declared count is informational. Tests that
+	// drive a reshard imperatively (the lossless split/merge gate) MUST leave
+	// this false so their target is not reconciled back to the founded count.
+	// Requires ConditionalStore (an arbiter); a no-op without one.
+	DeclarativeReshard bool
+
 	// BlobStore is the OPTIONAL streaming byte plane (the blob.Store port -
 	// docs/design/blob-values.md). nil leaves the cluster metadata-only; the
 	// plain *KV surface is all that is reachable. When set, NewBlobKV wraps the
@@ -788,6 +805,13 @@ func Open(cfg Config) (*Cluster, error) {
 		GRPCAddr:  cfg.GRPCAddr,
 		Seeds:     cfg.Seeds,
 		LogOutput: cfg.LogOutput,
+		// Gossip this node's standing declared shard count (SHALE_UNIT_COUNT)
+		// so the cluster can detect cluster-wide AGREEMENT on a desired count
+		// and drive a declarative reshard toward it (observeDeclaredReshardTarget).
+		// A zero UnitCount (legacy / non-multi-backend mode) yields 0 = "do not
+		// advertise", so peers treat this node as UNKNOWN and never auto-reshard
+		// on its account.
+		DeclaredUnitCount: cfg.UnitCount.N(),
 		// Periodic seed re-Join heals a post-startup gossip split (e.g. a
 		// mass rolling restart fragmenting the ring). Wired with the
 		// production default; only active when Seeds is non-empty, so a
