@@ -85,7 +85,13 @@ const (
 // Addr is the gRPC host:port the node listens on - decoded from the
 // memberlist Meta payload.
 type Member struct {
-	// ID is the unique node identifier (matches Config.NodeID).
+	// ID is the STABLE shale node identity (Config.NodeID). It is decoded
+	// from the peer's Meta payload (the "I<id>" segment), falling back to the
+	// memberlist node name for a legacy peer that does not publish it (whose
+	// memberlist name still IS its stable id). NOT the memberlist node name,
+	// which is per-process-unique (NodeID#bootEpoch) so a restart never
+	// collides with its own prior incarnation; see Open + the SPEC subsection
+	// "Stable node identity vs memberlist node name".
 	ID string
 	// Addr is the node's gRPC host:port, as broadcast via Config.GRPCAddr.
 	Addr string
@@ -321,13 +327,16 @@ const DefaultMetaRefreshInterval = 10 * time.Second
 // peer reaped as dead (a hard kill where the graceful Leave did not reach
 // that peer) has its fresh Meta rejected at the conflicting-address gate
 // FOREVER, before the incarnation is even examined. A bounded reclaim window
-// lets that peer accept the new IP once the old entry has been dead this long
-// - exactly the rolling-restart case (the old pod is gone for good; the new
-// pod legitimately owns the name). Safe because the name is the stable NodeID
-// and the StatefulSet identity model (one pod per ordinal) means two LIVE
-// pods never genuinely share a name. Set on the gossip config in Open; it is
-// the companion the periodic Meta re-broadcast needs (the incarnation bump
-// alone cannot clear the address gate).
+// lets that peer accept the new IP once the old entry has been dead this long.
+//
+// NO LONGER LOAD-BEARING FOR RESTARTS as of the identity decouple (#473): the
+// memberlist node name is now per-process-unique (NodeID#bootEpoch), so a
+// restarted pod is a brand-new memberlist node that never shares a name with
+// its dead prior incarnation - the conflicting-address gate this window
+// mitigated is simply never reached for a restart. Retained (harmless) as a
+// belt-and-suspenders reclaim window for any residual same-name/new-address
+// case and to avoid a behavior change; see the SPEC subsection "Stable node
+// identity vs memberlist node name".
 const deadNodeReclaimTime = 30 * time.Second
 
 // metaUpdateTimeout bounds how long a single meta-refresh tick waits inside
