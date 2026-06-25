@@ -20,6 +20,7 @@ package ring
 import (
 	"sort"
 	"sync"
+	"sync/atomic"
 
 	"github.com/buraksezer/consistent"
 	"github.com/cespare/xxhash/v2"
@@ -61,6 +62,23 @@ type Ring struct {
 	mu      sync.RWMutex
 	hash    *consistent.Consistent
 	members map[string]Member // id -> Member (for Addr lookup + snapshot)
+
+	// rebuildPanics counts how many times rebuildHashLocked recovered a
+	// panic out of the consistent-hash library (see rebuildHashLocked).
+	// Observability only; a nonzero value means a membership change was
+	// momentarily not reflected in routing (the prior ring was kept).
+	rebuildPanics atomic.Uint64
+}
+
+// ringCfg is the consistent-hash configuration, shared by New + every
+// rebuild so the ownership map is identical however the ring was built.
+func ringCfg() consistent.Config {
+	return consistent.Config{
+		PartitionCount:    partitionCount,
+		ReplicationFactor: replicationFactor,
+		Load:              loadFactor,
+		Hasher:            xxhasher{},
+	}
 }
 
 // New returns an empty Ring. Add Members before calling LocateKey;
@@ -68,28 +86,53 @@ type Ring struct {
 // callers should guard with Empty().
 func New() *Ring {
 	return &Ring{
-		hash: consistent.New(nil, consistent.Config{
-			PartitionCount:    partitionCount,
-			ReplicationFactor: replicationFactor,
-			Load:              loadFactor,
-			Hasher:            xxhasher{},
-		}),
+		hash:    consistent.New(nil, ringCfg()),
 		members: make(map[string]Member),
 	}
 }
 
-// Add inserts m into the ring, or replaces the existing entry with
-// the same ID (e.g. when a node's gRPC Addr changes after restart).
-// Replacement is a Remove + Add at the consistent layer so ownership
-// is recomputed.
+// rebuildHashLocked rebuilds the consistent hash FROM SCRATCH out of the
+// authoritative member set (r.members). It deliberately does NOT use the
+// library's incremental Remove: that path corrupts the library's internal
+// ring/sortedSet under churn at higher member counts, leaving a sortedSet
+// hash whose ring entry is nil so distributeWithLoad nil-derefs and crash-
+// loops the whole process (#466: panic at consistent.go:194, observed at 12
+// members). Building a fresh Consistent from the full member set never calls
+// the buggy Remove, so the corruption cannot arise. A recover guards the
+// build: if the library still panics on a pathological input, we KEEP THE
+// PRIOR ring (the assignment below never ran) and let the next membership
+// change retry, so a library bug degrades into brief routing staleness
+// instead of a process crash. Caller holds r.mu.
+func (r *Ring) rebuildHashLocked() {
+	if len(r.members) == 0 {
+		// consistent.New(nil, ...) is the known-safe empty ring; building
+		// from an empty slice can fault inside the library.
+		r.hash = consistent.New(nil, ringCfg())
+		return
+	}
+	members := make([]consistent.Member, 0, len(r.members))
+	for _, m := range r.members {
+		members = append(members, m)
+	}
+	defer func() {
+		if rec := recover(); rec != nil {
+			// r.hash retains its prior (valid) value; r.members is already
+			// correct, so the next Add/Remove re-attempts the rebuild.
+			r.rebuildPanics.Add(1)
+		}
+	}()
+	r.hash = consistent.New(members, ringCfg())
+}
+
+// Add inserts m into the ring, or replaces the existing entry with the same
+// ID (e.g. when a node's gRPC Addr changes after restart). The ring is then
+// rebuilt from the full member set (see rebuildHashLocked) so ownership is
+// recomputed without touching the library's buggy incremental Remove.
 func (r *Ring) Add(m Member) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.members[m.ID]; ok {
-		r.hash.Remove(m.ID)
-	}
 	r.members[m.ID] = m
-	r.hash.Add(m)
+	r.rebuildHashLocked()
 }
 
 // Remove deletes the Member with the given ID. No-op if absent.
@@ -100,8 +143,12 @@ func (r *Ring) Remove(id string) {
 		return
 	}
 	delete(r.members, id)
-	r.hash.Remove(id)
+	r.rebuildHashLocked()
 }
+
+// RebuildPanics returns the cumulative count of consistent-hash library
+// panics recovered during ring rebuilds. Zero in healthy operation.
+func (r *Ring) RebuildPanics() uint64 { return r.rebuildPanics.Load() }
 
 // Members returns a snapshot of the current Members, sorted by ID for
 // stable iteration (callers often log or diff this).

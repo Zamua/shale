@@ -364,3 +364,73 @@ func TestLocateKeyN_NonPositiveN(t *testing.T) {
 		t.Errorf("LocateKeyN(_, -1) should return empty, got %v", got)
 	}
 }
+
+// TestRing_DenseChurnNoPanic_466 pins the #466 fix: a dense membership churn
+// (well past the 12-member count that crash-looped prod-staging) including the
+// re-add path (Add of an already-present ID) must NOT panic out of the
+// consistent-hash library, and must leave the ring consistent. Before the fix
+// (incremental hash.Remove on re-add) this nil-deref'd in distributeWithLoad at
+// ~12 members; the rebuild-from-member-set fix makes it safe.
+func TestRing_DenseChurnNoPanic_466(t *testing.T) {
+	r := ring.New()
+	const N = 16
+	add := func(i int) {
+		r.Add(ring.Member{ID: fmt.Sprintf("n%02d", i), Addr: fmt.Sprintf("10.0.0.%d:7946", i)})
+	}
+	// scale up to N (past 12)
+	for i := 0; i < N; i++ {
+		add(i)
+	}
+	if got := len(r.Members()); got != N {
+		t.Fatalf("after scale-up want %d members, got %d", N, got)
+	}
+	// re-add every member (the path that triggered #466) + a churn of
+	// remove/re-add while the cluster is dense.
+	for round := 0; round < 5; round++ {
+		for i := 0; i < N; i++ {
+			add(i) // re-add (existing ID)
+		}
+		r.Remove("n07")
+		add(7) // re-add after remove
+		r.Remove("n11")
+		r.Remove("n12")
+		add(11)
+		add(12)
+	}
+	// the ring must still resolve keys to a live member and stay whole.
+	if got := len(r.Members()); got != N {
+		t.Fatalf("after churn want %d members, got %d", N, got)
+	}
+	if m := r.LocateKey([]byte("some-key")); m.ID == "" {
+		t.Fatalf("LocateKey returned empty member after churn")
+	}
+	if p := r.RebuildPanics(); p != 0 {
+		t.Fatalf("rebuild panicked %d times at N=%d (the library still faults); fix insufficient", p, N)
+	}
+}
+
+// TestRing_RebuildOwnershipDeterministic pins that building the ring from the
+// SAME member set in different insertion orders yields the SAME ownership (the
+// rebuild-from-truth fix must not change which node owns a key vs the prior
+// incremental build, or peers would disagree on routing).
+func TestRing_RebuildOwnershipDeterministic(t *testing.T) {
+	ids := []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"}
+	mk := func(order []string) *ring.Ring {
+		r := ring.New()
+		for _, id := range order {
+			r.Add(ring.Member{ID: id, Addr: "h:" + id})
+		}
+		return r
+	}
+	forward := mk(ids)
+	rev := make([]string, len(ids))
+	for i, id := range ids {
+		rev[len(ids)-1-i] = id
+	}
+	reverse := mk(rev)
+	for _, key := range []string{"k1", "k2", "alpha", "{tag}/x", "zzz", "0xdead"} {
+		if a, b := forward.LocateKey([]byte(key)), reverse.LocateKey([]byte(key)); a.ID != b.ID {
+			t.Fatalf("ownership of %q differs by insertion order: %s vs %s", key, a.ID, b.ID)
+		}
+	}
+}
