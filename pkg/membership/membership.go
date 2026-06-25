@@ -18,7 +18,14 @@
 // a trailing "D" segment means Draining=true. Absence of any NUL means
 // not draining. So the common (non-draining) case is the legacy format,
 // and the draining bit rides alongside the address in the SAME Meta
-// payload that the graceful-leave path uses.
+// payload that the graceful-leave path uses. Two further trailing
+// segments carry the standing declared unit count ("U<count>") and the
+// node's STABLE identity + boot epoch ("I<nodeID>" and "E<epoch>") - the
+// last two decouple the memberlist node NAME (which is per-process unique,
+// so a restart is a clean new-node join) from the stable shale node id
+// (which rides in Meta and survives restarts). All segments are
+// order-independent and any decoder ignores a prefix it does not know
+// (forward-compatible), so an OLD peer still parses addr/draining/count.
 package membership
 
 import (
@@ -98,6 +105,16 @@ type Member struct {
 	// node); an unknown count breaks unanimity and defers any auto-reshard,
 	// the fail-safe. Static for the node's lifetime.
 	DeclaredUnitCount uint32
+
+	// epoch is the UNEXPORTED per-process boot token (time.Now().UnixNano()
+	// captured at Open) decoded from the Meta "E<epoch>" segment, 0 when a
+	// peer's Meta carries none (a legacy node). It exists ONLY to break the
+	// dedup tie when two memberlist names momentarily share one stable ID
+	// during a restart (old process name A, new process name B, both id S):
+	// Members()/Snapshot() project the per-name cache to one Member per ID,
+	// keeping the HIGHEST epoch (the newest process). It is NOT part of the
+	// public surface the ring or cluster consumes.
+	epoch uint64
 }
 
 // metaSep separates the address head from the optional draining marker
@@ -116,12 +133,34 @@ const metaDrainingMarker = "D"
 // never appears in the decimal count, so the segment is unambiguous.
 const metaUnitCountPrefix = "U"
 
+// metaStableIDPrefix tags the trailing segment carrying the node's STABLE
+// shale identity (Config.NodeID), e.g. "Ishaled-homog-0". It decouples the
+// stable id from the per-process-unique memberlist node NAME: peers recover
+// the stable id from Meta rather than from the name, so a restart (which gets
+// a fresh name) keeps the same logical id. Its own NUL-delimited segment, so
+// it composes with draining + count in any order and is ignored by a decoder
+// that does not understand it (forward-compatible). A NodeID may hold any
+// bytes except NUL (the segment separator, which never appears in a pod name),
+// so the segment is unambiguous.
+const metaStableIDPrefix = "I"
+
+// metaEpochPrefix tags the trailing segment carrying the node's per-PROCESS
+// boot epoch (a monotonic token captured at Open), e.g. "E1718000000000000000".
+// It is the dedup tie-break when two memberlist names momentarily share one
+// stable id during a restart (highest epoch wins = newest process). Its own
+// NUL-delimited segment, decimal uint64, ignored by an unaware decoder
+// (forward-compatible).
+const metaEpochPrefix = "E"
+
 // encodeMeta builds the Meta payload for the local node. The head is the
-// address (legacy-identical bare-address form when there is nothing else to
-// carry). A draining node appends metaSep + the draining marker; a node with
-// a known declared unit count (> 0) appends metaSep + "U<count>". Segments are
-// independent, so the payload may carry neither, either, or both.
-func encodeMeta(addr string, draining bool, declaredUnitCount uint32) []byte {
+// address (legacy-identical bare-address form). A draining node appends
+// metaSep + the draining marker; a node with a known declared unit count (> 0)
+// appends metaSep + "U<count>"; a node with a stable id appends metaSep +
+// "I<id>" and metaSep + "E<epoch>". Segments are independent + order does not
+// matter to the decoder, so the payload may carry any subset. The stable-id +
+// epoch segments are always emitted by a node that knows them (epoch is the
+// per-process Open token, always nonzero in production).
+func encodeMeta(addr string, draining bool, declaredUnitCount uint32, stableID string, epoch uint64) []byte {
 	s := addr
 	if draining {
 		s += string(metaSep) + metaDrainingMarker
@@ -129,20 +168,28 @@ func encodeMeta(addr string, draining bool, declaredUnitCount uint32) []byte {
 	if declaredUnitCount > 0 {
 		s += string(metaSep) + metaUnitCountPrefix + strconv.FormatUint(uint64(declaredUnitCount), 10)
 	}
+	if stableID != "" {
+		s += string(metaSep) + metaStableIDPrefix + stableID
+	}
+	if epoch > 0 {
+		s += string(metaSep) + metaEpochPrefix + strconv.FormatUint(epoch, 10)
+	}
 	return []byte(s)
 }
 
-// decodeMeta parses a Meta payload back into the address, draining bit, and
-// declared unit count. The head (up to the first metaSep, or the whole payload
-// if none) is always the address; a trailing metaDrainingMarker segment sets
-// draining, a trailing "U<count>" segment sets the declared unit count.
-// Unknown / unparseable trailing segments are ignored (forward-compatible);
-// an absent count segment yields 0 (UNKNOWN).
-func decodeMeta(meta []byte) (addr string, draining bool, declaredUnitCount uint32) {
+// decodeMeta parses a Meta payload back into the address, draining bit,
+// declared unit count, stable id, and boot epoch. The head (up to the first
+// metaSep, or the whole payload if none) is always the address; a trailing
+// metaDrainingMarker segment sets draining, "U<count>" sets the declared unit
+// count, "I<id>" sets the stable id, "E<epoch>" sets the boot epoch. Unknown /
+// unparseable trailing segments are ignored (forward-compatible); an absent
+// count yields 0 (UNKNOWN), an absent stable id yields "" (the caller falls
+// back to the memberlist name), an absent epoch yields 0.
+func decodeMeta(meta []byte) (addr string, draining bool, declaredUnitCount uint32, stableID string, epoch uint64) {
 	s := string(meta)
 	head, rest, found := strings.Cut(s, string(metaSep))
 	if !found {
-		return s, false, 0
+		return s, false, 0, "", 0
 	}
 	for _, seg := range strings.Split(rest, string(metaSep)) {
 		switch {
@@ -152,9 +199,15 @@ func decodeMeta(meta []byte) (addr string, draining bool, declaredUnitCount uint
 			if n, err := strconv.ParseUint(seg[len(metaUnitCountPrefix):], 10, 32); err == nil {
 				declaredUnitCount = uint32(n)
 			}
+		case strings.HasPrefix(seg, metaStableIDPrefix):
+			stableID = seg[len(metaStableIDPrefix):]
+		case strings.HasPrefix(seg, metaEpochPrefix):
+			if n, err := strconv.ParseUint(seg[len(metaEpochPrefix):], 10, 64); err == nil {
+				epoch = n
+			}
 		}
 	}
-	return head, draining, declaredUnitCount
+	return head, draining, declaredUnitCount, stableID, epoch
 }
 
 // Event is one membership change notification.
@@ -338,15 +391,25 @@ type Membership struct {
 	metaRefreshAttempts atomic.Uint64
 	metaRefreshSkips    atomic.Uint64
 
-	// cache holds the authoritative Member snapshot keyed by node ID.
-	// Reads (Members, Snapshot) consult this map under cacheMu instead
-	// of dereferencing memberlist.Node pointers, whose Name + Meta
-	// fields memberlist mutates from its own goroutines without a
-	// per-Node lock. The cache is populated from inside memberlist's
-	// NotifyJoin / NotifyLeave / NotifyUpdate callbacks (which run
-	// serialized vs the alive/dead transitions, so reading Node fields
-	// THERE is safe), plus a single seeding pass at Open time before
-	// any external goroutine can observe Membership.
+	// mlName is THIS node's unique memberlist node name (Config.NodeID +
+	// "#" + bootEpoch), the cache key for the local node's own entry. It is
+	// distinct from cfg.NodeID (the stable id): the local self-seed and the
+	// SetDraining self-update both key the cache by mlName, while the projected
+	// Member.ID stays the stable id. Set once in Open before any goroutine can
+	// observe Membership, then read-only.
+	mlName string
+
+	// cache holds the authoritative Member snapshot keyed by the UNIQUE
+	// memberlist node name (NOT the stable Member.ID). Reads (Members,
+	// Snapshot) consult this map under cacheMu - then PROJECT it to one Member
+	// per stable id (highest epoch wins) - instead of dereferencing
+	// memberlist.Node pointers, whose Name + Meta fields memberlist mutates
+	// from its own goroutines without a per-Node lock. The cache is populated
+	// from inside memberlist's NotifyJoin / NotifyLeave / NotifyUpdate
+	// callbacks (which run serialized vs the alive/dead transitions, so reading
+	// Node fields THERE is safe), plus a single seeding pass at Open time before
+	// any external goroutine can observe Membership. Keying by name keeps a
+	// restarting node's old + new entries distinct (see upsertCache).
 	cacheMu sync.RWMutex
 	cache   map[string]Member
 }
@@ -370,11 +433,18 @@ type metaDelegate struct {
 	// Config.DeclaredUnitCount); it is read under mu only to share the lock
 	// with the draining read in NodeMeta.
 	declaredUnitCount uint32
+	// stableID is the node's stable shale identity (Config.NodeID), published
+	// in Meta so peers recover it independently of the per-process memberlist
+	// name. epoch is the per-process boot token captured at Open. Both are
+	// fixed for the node's lifetime; they are read under mu only to share the
+	// lock with the draining read in NodeMeta.
+	stableID string
+	epoch    uint64
 }
 
 func (d *metaDelegate) NodeMeta(limit int) []byte {
 	d.mu.Lock()
-	meta := encodeMeta(d.addr, d.draining, d.declaredUnitCount)
+	meta := encodeMeta(d.addr, d.draining, d.declaredUnitCount, d.stableID, d.epoch)
 	d.mu.Unlock()
 	if len(meta) > limit {
 		return meta[:limit]
@@ -429,7 +499,15 @@ type eventDelegate struct {
 	parent *Membership
 }
 
-// nodeToMember derives our Member value object from a memberlist.Node.
+// nodeToMember derives our Member value object from a memberlist.Node,
+// returning BOTH the unique memberlist node name (the cache key) and the
+// Member (whose ID is the STABLE shale id). Member.ID is the stable id
+// decoded from the node's Meta, FALLING BACK to the memberlist name when the
+// Meta carries no stable-id segment - the backward-compat path for a legacy
+// peer whose memberlist name still IS its stable id during a rolling upgrade.
+// Member.epoch is the decoded boot epoch (0 when absent), used only for the
+// per-id dedup tie-break in Members()/Snapshot().
+//
 // MUST ONLY be called either (a) at Open() during the single-writer
 // seeding window before goroutines spawn, or (b) inside a memberlist
 // event callback (NotifyJoin/Leave/Update), where memberlist serializes
@@ -437,44 +515,56 @@ type eventDelegate struct {
 // mutation. Calling this from a reconcile / Members / Snapshot path
 // races with memberlist's internal aliveNode writes; the cache exists
 // precisely to avoid that.
-func nodeToMember(n *memberlist.Node) Member {
-	name := strings.Clone(n.Name)
+func nodeToMember(n *memberlist.Node) (name string, m Member) {
+	name = strings.Clone(n.Name)
 	meta := append([]byte(nil), n.Meta...)
-	addr, draining, declaredUnitCount := decodeMeta(meta)
-	return Member{
-		ID:                name,
+	addr, draining, declaredUnitCount, stableID, epoch := decodeMeta(meta)
+	id := stableID
+	if id == "" {
+		// Legacy peer (no stable-id segment): its memberlist name IS its
+		// stable id, so fall back to the name.
+		id = name
+	}
+	return name, Member{
+		ID:                id,
 		Addr:              addr,
 		Draining:          draining,
 		DeclaredUnitCount: declaredUnitCount,
+		epoch:             epoch,
 	}
 }
 
 func (e *eventDelegate) NotifyJoin(n *memberlist.Node) {
-	m := nodeToMember(n)
-	e.upsertCache(m)
+	name, m := nodeToMember(n)
+	e.upsertCache(name, m)
 	e.send(EventJoin, m)
 }
 
 func (e *eventDelegate) NotifyLeave(n *memberlist.Node) {
-	m := nodeToMember(n)
-	e.removeCache(m.ID)
+	name, m := nodeToMember(n)
+	e.removeCache(name)
 	e.send(EventLeave, m)
 }
 
 func (e *eventDelegate) NotifyUpdate(n *memberlist.Node) {
 	// Treat metadata updates as a join refresh: the addressing info
 	// for the node may have changed (e.g. GRPCAddr migrated).
-	m := nodeToMember(n)
-	e.upsertCache(m)
+	name, m := nodeToMember(n)
+	e.upsertCache(name, m)
 	e.send(EventJoin, m)
 }
 
-// upsertCache writes the given Member into the parent Membership's
-// cache. No-op if no parent is attached (the synthetic-delegate test
-// path). Late stray callbacks after Close are harmless: Members()
-// already returns nil once the parent's closed flag is set, so the
-// post-Close cache state is unobservable.
-func (e *eventDelegate) upsertCache(m Member) {
+// upsertCache writes the given Member into the parent Membership's cache,
+// keyed by the UNIQUE memberlist node name (NOT the stable Member.ID). Keying
+// by name is load-bearing for the restart leave-hazard: during a restart both
+// the old process (name A, stable id S) and the new process (name B, stable id
+// S) are briefly present; keying by name keeps them as distinct entries so the
+// old NotifyLeave(A) drops only A. Members()/Snapshot() project per-name
+// entries down to one Member per stable id. No-op if no parent is attached
+// (the synthetic-delegate test path). Late stray callbacks after Close are
+// harmless: Members() already returns nil once the parent's closed flag is set,
+// so the post-Close cache state is unobservable.
+func (e *eventDelegate) upsertCache(name string, m Member) {
 	if e.parent == nil {
 		return
 	}
@@ -482,19 +572,20 @@ func (e *eventDelegate) upsertCache(m Member) {
 	if e.parent.cache == nil {
 		e.parent.cache = make(map[string]Member, 4)
 	}
-	e.parent.cache[m.ID] = m
+	e.parent.cache[name] = m
 	e.parent.cacheMu.Unlock()
 }
 
-// removeCache deletes the given ID from the parent Membership's cache.
-// No-op if no parent is attached. See upsertCache for the post-Close
-// rationale.
-func (e *eventDelegate) removeCache(id string) {
+// removeCache deletes the given memberlist NAME from the parent Membership's
+// cache. No-op if no parent is attached. See upsertCache for the keyed-by-name
+// rationale (it keeps a restarting node's old + new entries distinct) and the
+// post-Close rationale.
+func (e *eventDelegate) removeCache(name string) {
 	if e.parent == nil {
 		return
 	}
 	e.parent.cacheMu.Lock()
-	delete(e.parent.cache, id)
+	delete(e.parent.cache, name)
 	e.parent.cacheMu.Unlock()
 }
 
@@ -557,8 +648,19 @@ func Open(cfg Config) (*Membership, error) {
 	}
 	events.parent = m
 
+	// Each PROCESS gets a UNIQUE memberlist node name = stable id + "#" +
+	// bootEpoch, so a restart is a brand-new memberlist node: the old process
+	// dies a normal death (different name, no same-name/new-address conflict to
+	// reject) and the new one joins cleanly. The stable id rides in Meta (see
+	// metaStableIDPrefix) so peers recover the logical identity independently of
+	// this per-process name. bootEpoch is a per-process monotonic token; using
+	// time.Now in production code is fine (only the workflow SCRIPT layer cannot).
+	bootEpoch := uint64(time.Now().UnixNano())
+	mlName := fmt.Sprintf("%s#%d", cfg.NodeID, bootEpoch)
+	m.mlName = mlName
+
 	mlCfg := gossipConfig()
-	mlCfg.Name = cfg.NodeID
+	mlCfg.Name = mlName
 	if bindHost != "" {
 		mlCfg.BindAddr = bindHost
 		mlCfg.AdvertiseAddr = bindHost
@@ -574,7 +676,7 @@ func Open(cfg Config) (*Membership, error) {
 	// (the incarnation bump alone cannot clear the address gate). See
 	// deadNodeReclaimTime.
 	mlCfg.DeadNodeReclaimTime = deadNodeReclaimTime
-	meta := &metaDelegate{addr: cfg.GRPCAddr, declaredUnitCount: cfg.DeclaredUnitCount}
+	meta := &metaDelegate{addr: cfg.GRPCAddr, declaredUnitCount: cfg.DeclaredUnitCount, stableID: cfg.NodeID, epoch: bootEpoch}
 	m.meta = meta
 	mlCfg.Delegate = meta
 	mlCfg.Events = events
@@ -620,10 +722,13 @@ func Open(cfg Config) (*Membership, error) {
 	// by -race, see nodeToMember's contract). Peers are reconciled solely via
 	// the memberlist-serialized NotifyJoin/Leave/Update callbacks, the only
 	// safe place to read a Node's fields.
-	self := Member{ID: cfg.NodeID, Addr: cfg.GRPCAddr, DeclaredUnitCount: cfg.DeclaredUnitCount}
+	// Keyed by the UNIQUE memberlist name (mlName), not the stable id, so it
+	// matches the eventDelegate's keying; the projected Member carries the
+	// stable id (cfg.NodeID) and this process's boot epoch.
+	self := Member{ID: cfg.NodeID, Addr: cfg.GRPCAddr, DeclaredUnitCount: cfg.DeclaredUnitCount, epoch: bootEpoch}
 	m.cacheMu.Lock()
-	if _, ok := m.cache[self.ID]; !ok {
-		m.cache[self.ID] = self
+	if _, ok := m.cache[mlName]; !ok {
+		m.cache[mlName] = self
 	}
 	m.cacheMu.Unlock()
 
@@ -770,6 +875,14 @@ func (m *Membership) MetaRefreshSkips() uint64 { return m.metaRefreshSkips.Load(
 // detector catches. The event callbacks are serialized vs those
 // internal mutations, so the cache is consistent with the
 // authoritative view memberlist publishes via events.
+//
+// The cache is keyed by the unique memberlist node NAME; this PROJECTS it to
+// one Member per STABLE id so the ring (which keys on Member.ID) sees exactly
+// one entry per logical node. When two memberlist names momentarily share a
+// stable id (the restart window: old process + new process), the projection
+// keeps the entry with the HIGHEST epoch (the newest process), so consumers
+// observe the restarted node's fresh address + declared count rather than the
+// dead instance's stale view.
 func (m *Membership) Members() []Member {
 	m.mu.Lock()
 	if m.closed {
@@ -778,11 +891,17 @@ func (m *Membership) Members() []Member {
 	}
 	m.mu.Unlock()
 	m.cacheMu.RLock()
-	out := make([]Member, 0, len(m.cache))
+	byID := make(map[string]Member, len(m.cache))
 	for _, mem := range m.cache {
-		out = append(out, mem)
+		if cur, ok := byID[mem.ID]; !ok || mem.epoch > cur.epoch {
+			byID[mem.ID] = mem
+		}
 	}
 	m.cacheMu.RUnlock()
+	out := make([]Member, 0, len(byID))
+	for _, mem := range byID {
+		out = append(out, mem)
+	}
 	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
 	return out
 }
@@ -844,9 +963,12 @@ func (m *Membership) SetDraining(draining bool) error {
 	// owning the positions it is trying to yield.
 	m.cacheMu.Lock()
 	if m.cache != nil {
-		if cur, ok := m.cache[m.cfg.NodeID]; ok {
+		// Keyed by THIS node's unique memberlist name (mlName), matching the
+		// self-seed + eventDelegate keying; the entry's Member.ID stays the
+		// stable id.
+		if cur, ok := m.cache[m.mlName]; ok {
 			cur.Draining = draining
-			m.cache[m.cfg.NodeID] = cur
+			m.cache[m.mlName] = cur
 		}
 	}
 	m.cacheMu.Unlock()
