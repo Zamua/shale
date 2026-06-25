@@ -196,6 +196,16 @@ func (c *Cluster) reconcileUnits() {
 		// unchanged. Run before the overlap reconcile so a just-entered split's
 		// children are in the desired set this same pass, and a just-finalized
 		// generation's redistribution runs against the advanced generation.
+		//
+		// First, reconcile the agreed target toward the cluster-wide DECLARED
+		// unit count (the operator's SHALE_UNIT_COUNT, gossiped in membership
+		// metadata): when the cluster is steady AND every live member agrees on
+		// the same declared count, CAS the arbiter target to it. observeReshard
+		// below then picks the new target up THIS SAME tick and enters the
+		// split/merge. No-op without an arbiter, or until the live set is
+		// unanimous (the rolling-deploy flap guard). See
+		// multibackend_reshard_declared.go.
+		c.observeDeclaredReshardTarget()
 		c.observeReshard()
 		// R>1 (replicated multi-backend, v0.8 Phase 2b): the desired set is the
 		// replica-set membership, not single ownership. This runs on the INITIAL
