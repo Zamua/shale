@@ -206,6 +206,32 @@ type Config struct {
 	// do not churn addresses); production sets a non-zero interval.
 	RejoinInterval time.Duration
 
+	// MetaRefreshInterval is how often a background goroutine re-broadcasts
+	// THIS node's own Meta payload (gRPC address + draining bit + declared
+	// unit count) via memberlist.UpdateNode. It is a DISTINCT concern from
+	// RejoinInterval: rejoin re-bridges a gossip SPLIT (re-Join the seeds);
+	// meta-refresh re-publishes the local node's metadata to NON-split-but-
+	// STALE peers. After a STAGGERED rolling restart a restarted pod keeps
+	// its stable node NAME but RESETS its memberlist incarnation to 0, so a
+	// peer that still remembers the OLD process's higher incarnation REJECTS
+	// the new pod's fresh Meta as stale (memberlist's aliveNode incarnation
+	// guard) - leaving peers with a per-peer-divergent view of one member's
+	// declared count that does NOT self-heal, which turns any unanimity gate
+	// (the declarative-reshard driver) into a RACE. UpdateNode re-reads
+	// NodeMeta and broadcasts with a BUMPED (process-local) incarnation each
+	// call, so repeated ticks monotonically climb the local incarnation and
+	// within a bounded number of rounds overtake the stale remembered value,
+	// clearing the rejection. The loop runs only on a non-zero interval,
+	// stops on Close, and SKIPS once the node is leaving (a departing node
+	// must not re-advertise itself - identical guard to the rejoin loop).
+	// Zero DISABLES the loop (the default for in-process tests that do not
+	// churn addresses); production sets a non-zero interval. NB the
+	// incarnation bump alone is insufficient when a peer holds the old entry
+	// as StateDead with the old IP - the address-reclaim gate rejects the
+	// new IP first; DeadNodeReclaimTime (set on the gossip config in Open)
+	// opens that window so the re-broadcast can land.
+	MetaRefreshInterval time.Duration
+
 	// AllowSoloStart controls what happens when Seeds is non-empty but NONE of
 	// them is reachable at Open. By default (false) that is a hard error: a
 	// joiner with dead seeds must not silently fork a new cluster. When true,
@@ -225,6 +251,31 @@ type Config struct {
 // gossip rounds, infrequent enough that the idempotent no-op Join on a
 // healthy cluster is negligible overhead.
 const DefaultRejoinInterval = 30 * time.Second
+
+// DefaultMetaRefreshInterval is the production cadence for the local-Meta
+// re-broadcast loop. 10s is small enough that a peer holding a STALE Meta
+// view of this node (the reset-incarnation case after a staggered rolling
+// restart) self-heals within a couple of refresh rounds - bounding the
+// window the declarative-reshard unanimity gate can be stuck racing - yet
+// large enough that the re-broadcast (a single small UpdateNode alive
+// message on an unchanged Meta) adds negligible gossip load.
+const DefaultMetaRefreshInterval = 10 * time.Second
+
+// deadNodeReclaimTime is the bounded window after which a peer may reclaim a
+// DEAD node's NAME for a NEW address. memberlist defaults DeadNodeReclaimTime
+// to 0, which means a StateDead entry's name can NEVER be reclaimed by a
+// different IP - so a restarted pod (same stable NodeID, new pod IP) that a
+// peer reaped as dead (a hard kill where the graceful Leave did not reach
+// that peer) has its fresh Meta rejected at the conflicting-address gate
+// FOREVER, before the incarnation is even examined. A bounded reclaim window
+// lets that peer accept the new IP once the old entry has been dead this long
+// - exactly the rolling-restart case (the old pod is gone for good; the new
+// pod legitimately owns the name). Safe because the name is the stable NodeID
+// and the StatefulSet identity model (one pod per ordinal) means two LIVE
+// pods never genuinely share a name. Set on the gossip config in Open; it is
+// the companion the periodic Meta re-broadcast needs (the incarnation bump
+// alone cannot clear the address gate).
+const deadNodeReclaimTime = 30 * time.Second
 
 // Membership is the running gossip layer for one node. All exported
 // methods are safe for concurrent use.
@@ -257,6 +308,21 @@ type Membership struct {
 	// observability hooks, surfaced for tests + debugging.
 	rejoinAttempts atomic.Uint64
 	rejoinSkips    atomic.Uint64
+
+	// metaRefreshDone is closed by Close to stop the periodic Meta
+	// re-broadcast goroutine. nil when no refresh loop is running
+	// (MetaRefreshInterval == 0). It is a SEPARATE lifecycle from the
+	// rejoin loop: it heals a stale-Meta peer view, not a gossip split.
+	metaRefreshDone chan struct{}
+	// metaRefreshWG tracks the meta-refresh goroutine so Close can wait for
+	// it to exit cleanly before tearing the transport down.
+	metaRefreshWG sync.WaitGroup
+	// metaRefreshAttempts counts how many times the loop actually called
+	// ml.UpdateNode (alive + not leaving). metaRefreshSkips counts ticks the
+	// loop skipped because the node was leaving or closing. Observability
+	// hooks, surfaced for tests + debugging.
+	metaRefreshAttempts atomic.Uint64
+	metaRefreshSkips    atomic.Uint64
 
 	// cache holds the authoritative Member snapshot keyed by node ID.
 	// Reads (Members, Snapshot) consult this map under cacheMu instead
@@ -485,6 +551,15 @@ func Open(cfg Config) (*Membership, error) {
 	}
 	mlCfg.BindPort = bindPort
 	mlCfg.AdvertisePort = bindPort
+	// Bounded dead-node address reclaim. memberlist defaults this to 0,
+	// which makes a StateDead entry's NAME un-reclaimable by a NEW IP - so a
+	// restarted pod (same NodeID, new pod IP) that a peer reaped as dead has
+	// its fresh Meta rejected at the conflicting-address gate forever. A
+	// bounded window lets that peer accept the new IP after the old entry has
+	// been dead this long, the companion the periodic Meta re-broadcast needs
+	// (the incarnation bump alone cannot clear the address gate). See
+	// deadNodeReclaimTime.
+	mlCfg.DeadNodeReclaimTime = deadNodeReclaimTime
 	meta := &metaDelegate{addr: cfg.GRPCAddr, declaredUnitCount: cfg.DeclaredUnitCount}
 	m.meta = meta
 	mlCfg.Delegate = meta
@@ -549,6 +624,17 @@ func Open(cfg Config) (*Membership, error) {
 		go m.rejoinLoop(cfg.Seeds, cfg.RejoinInterval)
 	}
 
+	// Start the periodic local-Meta re-broadcast (heals a stale-Meta peer
+	// view after a staggered rolling restart - the reset-incarnation case).
+	// Unlike rejoin it does NOT require seeds (a node re-publishes its OWN
+	// metadata to whatever peers it is already connected to), only a non-zero
+	// interval; in-process tests that do not churn addresses leave it 0.
+	if cfg.MetaRefreshInterval > 0 {
+		m.metaRefreshDone = make(chan struct{})
+		m.metaRefreshWG.Add(1)
+		go m.metaRefreshLoop(cfg.MetaRefreshInterval)
+	}
+
 	return m, nil
 }
 
@@ -601,6 +687,58 @@ func (m *Membership) RejoinAttempts() uint64 { return m.rejoinAttempts.Load() }
 // RejoinSkips returns how many rejoin ticks were skipped because the node
 // was leaving or closing. Observability hook for tests + debugging.
 func (m *Membership) RejoinSkips() uint64 { return m.rejoinSkips.Load() }
+
+// metaRefreshLoop periodically re-broadcasts THIS node's own Meta payload via
+// memberlist.UpdateNode, so a peer holding a STALE view of this node's Meta
+// (the reset-incarnation case after a staggered rolling restart) self-heals on
+// a bounded interval. UpdateNode re-reads the local NodeMeta and broadcasts a
+// fresh alive message with a BUMPED process-local incarnation each call, so
+// repeated ticks monotonically climb the incarnation and within a bounded
+// number of rounds overtake whatever stale value a peer remembered for this
+// name - clearing memberlist's incarnation-staleness rejection. The local
+// node's own cache is already authoritative for its Meta, so this changes
+// nothing locally; it only re-publishes. The loop exits when metaRefreshDone
+// is closed (by Close) and SKIPS the broadcast while the node is leaving or
+// closed (a departing node must not re-advertise itself - the same guard the
+// rejoin loop applies).
+func (m *Membership) metaRefreshLoop(interval time.Duration) {
+	defer m.metaRefreshWG.Done()
+	t := time.NewTicker(interval)
+	defer t.Stop()
+	for {
+		select {
+		case <-m.metaRefreshDone:
+			return
+		case <-t.C:
+			m.mu.Lock()
+			skip := m.closed || m.leaving
+			m.mu.Unlock()
+			if skip {
+				m.metaRefreshSkips.Add(1)
+				continue
+			}
+			// UpdateNode re-reads NodeMeta (unchanged on a steady node) and
+			// re-broadcasts it with a bumped incarnation. The 0 timeout means
+			// "do not block waiting for the broadcast to flush"; it propagates
+			// via the normal gossip loop. A best-effort error (e.g. a racing
+			// shutdown) is ignored; the next tick retries.
+			if err := m.ml.UpdateNode(0); err != nil {
+				continue
+			}
+			m.metaRefreshAttempts.Add(1)
+		}
+	}
+}
+
+// MetaRefreshAttempts returns how many times the periodic meta-refresh loop
+// has actually called memberlist.UpdateNode (the node was alive + not
+// leaving). Observability hook for tests + debugging; 0 when no refresh loop
+// runs.
+func (m *Membership) MetaRefreshAttempts() uint64 { return m.metaRefreshAttempts.Load() }
+
+// MetaRefreshSkips returns how many meta-refresh ticks were skipped because
+// the node was leaving or closing. Observability hook for tests + debugging.
+func (m *Membership) MetaRefreshSkips() uint64 { return m.metaRefreshSkips.Load() }
 
 // Members returns a snapshot of currently known cluster members,
 // sorted by ID for deterministic iteration. Returns nil if the
@@ -749,15 +887,21 @@ func (m *Membership) Close() error {
 	}
 	m.closed = true
 	rejoinDone := m.rejoinDone
+	metaRefreshDone := m.metaRefreshDone
 	m.mu.Unlock()
 
-	// Stop the periodic rejoin goroutine and wait for it to exit BEFORE
-	// tearing the transport down, so it can never call ml.Join on a
-	// shut-down memberlist. closed=true (set above) already makes any
-	// in-flight tick skip; closing the channel wakes a blocked select.
+	// Stop the periodic background goroutines and wait for them to exit
+	// BEFORE tearing the transport down, so neither can call ml.Join /
+	// ml.UpdateNode on a shut-down memberlist. closed=true (set above)
+	// already makes any in-flight tick skip; closing the channel wakes a
+	// blocked select.
 	if rejoinDone != nil {
 		close(rejoinDone)
 		m.rejoinWG.Wait()
+	}
+	if metaRefreshDone != nil {
+		close(metaRefreshDone)
+		m.metaRefreshWG.Wait()
 	}
 
 	// Best-effort graceful leave; ignore errors so Shutdown still runs.

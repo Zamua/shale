@@ -818,6 +818,15 @@ func Open(cfg Config) (*Cluster, error) {
 		// founder (no seeds) and in-process tests that pass no seeds run no
 		// loop. See membership.Config.RejoinInterval.
 		RejoinInterval: membership.DefaultRejoinInterval,
+		// Periodic local-Meta re-broadcast heals a STALE-Meta peer view after
+		// a STAGGERED rolling restart (a restarted pod resets its memberlist
+		// incarnation, so peers reject its fresh declared count as stale until
+		// the bumped-incarnation re-broadcast overtakes the remembered value).
+		// Wired with the production default; the gossiped declared count is
+		// what the declarative-reshard unanimity gate reads, so it must
+		// converge deterministically rather than race. See
+		// membership.Config.MetaRefreshInterval.
+		MetaRefreshInterval: membership.DefaultMetaRefreshInterval,
 		// Homogeneous bootstrap: when a shared ConditionalStore is wired, every
 		// node carries the SAME seed list (a headless Service) and the first one
 		// up reaches no peer. AllowSoloStart lets it come up solo and contend to
