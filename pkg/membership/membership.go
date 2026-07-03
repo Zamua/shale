@@ -301,6 +301,16 @@ type Config struct {
 	// the first pod up reaches no peer, starts solo, and contends to form;
 	// later pods reach it and join.
 	AllowSoloStart bool
+
+	// TestingStableMemberlistName forces the memberlist node NAME to be the bare
+	// stable NodeID (the PRE-#473 behavior) instead of the per-process-unique
+	// NodeID#bootEpoch. TEST-ONLY: it exists purely so a test can demonstrate the
+	// dead-node-reclaim / conflicting-address failure that #473 fixed - a restart
+	// that reuses its name presents a same-name/new-address alive message, which
+	// memberlist's aliveNode gates behind DeadNodeReclaimTime. Production must
+	// leave this false (the default), so a restart is always a fresh unique-named
+	// node and the reclaim gate is never reached. Named Testing* per convention.
+	TestingStableMemberlistName bool
 }
 
 // DefaultRejoinInterval is the production re-Join cadence used when a
@@ -666,6 +676,14 @@ func Open(cfg Config) (*Membership, error) {
 	// time.Now in production code is fine (only the workflow SCRIPT layer cannot).
 	bootEpoch := uint64(time.Now().UnixNano())
 	mlName := fmt.Sprintf("%s#%d", cfg.NodeID, bootEpoch)
+	if cfg.TestingStableMemberlistName {
+		// PRE-#473 behavior (test-only): reuse the bare stable id as the memberlist
+		// name, so a restart collides with its own dead prior incarnation and hits
+		// the conflicting-address / DeadNodeReclaimTime gate. The stable id still
+		// rides in Meta + the boot epoch still climbs, so only the NAME reuse (the
+		// exact pre-fix condition) is reintroduced.
+		mlName = cfg.NodeID
+	}
 	m.mlName = mlName
 
 	mlCfg := gossipConfig()
