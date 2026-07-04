@@ -371,6 +371,11 @@ type Handle struct {
 	mu          sync.Mutex
 	open        map[storageunit.GenUnit]storageunit.Epoch     // units THIS handle has open + at what epoch (R=1)
 	openReplica map[storageunit.ReplicaUnit]storageunit.Epoch // replicas THIS handle has open + at what epoch (R>1)
+
+	// openSpans records every OpenReplicaUnit call's (position, start, end)
+	// in completion order (guarded by mu; read via OpenTimeline). Test
+	// support for the handoff-cycle latency pins. Test-only.
+	openSpans []OpenSpan
 }
 
 // Handle returns a fresh per-node handle over this backing. Each node in a
@@ -395,6 +400,31 @@ func (h *Handle) SetAcquireDelay(d time.Duration) {
 // bounded-concurrency boot-mount gate (assert the mount opened positions in
 // parallel up to, and never beyond, the configured bound).
 func (h *Handle) MaxConcurrentOpens() int64 { return h.openMaxInFlight.Load() }
+
+// OpenSpan is one recorded OpenReplicaUnit call on a handle: the position and
+// the wall-clock start/end of the call. Test support for the handoff-cycle
+// latency pins (assert queued opens CHAIN event-driven - the next open starts
+// the moment the previous finishes - rather than waiting a reconcile tick).
+type OpenSpan struct {
+	RU    storageunit.ReplicaUnit
+	Start time.Time
+	End   time.Time
+}
+
+// OpenTimeline returns a copy of every OpenReplicaUnit span recorded on this
+// handle, in completion order.
+func (h *Handle) OpenTimeline() []OpenSpan {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]OpenSpan(nil), h.openSpans...)
+}
+
+// recordOpenSpan appends one completed open to the handle's timeline.
+func (h *Handle) recordOpenSpan(ru storageunit.ReplicaUnit, start time.Time) {
+	h.mu.Lock()
+	h.openSpans = append(h.openSpans, OpenSpan{RU: ru, Start: start, End: time.Now()})
+	h.mu.Unlock()
+}
 
 // SetOpenReplicaFault arms (err != nil) or clears (err == nil) an injected
 // OpenReplicaUnit failure for replica position ru on the SHARED backing, so
@@ -429,6 +459,10 @@ func (b *Backing) SetEagerFence(on bool) { b.eagerFence.Store(on) }
 // owner of the same position acquires it. Distinct replica positions are
 // independent stores: opening replica 1 never touches replica 0.
 func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	// Timeline recording (test-only): every call's (start, end) span, so the
+	// handoff-cycle latency pins can assert queued opens chain event-driven.
+	openStart := time.Now()
+	defer h.recordOpenSpan(ru, openStart)
 	// Concurrency high-water tracking (test-only, Phase 2g): record the peak
 	// number of simultaneously in-flight opens so a test can assert the boot
 	// mount runs them in parallel up to its bound. Wraps the whole call (defer)

@@ -18,6 +18,20 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
+// shutdownReplicatedFixture registers a cleanup that terminates the fixture
+// cluster's background goroutines (the fast drain poller a never-resolving
+// test drain leaves running, stray acquire goroutines) so goleak sees a
+// clean exit. The white-box fixture has no full Close path; this is the
+// minimal teardown its loopWG goroutines all honor.
+func shutdownReplicatedFixture(t *testing.T, c *Cluster) {
+	t.Helper()
+	t.Cleanup(func() {
+		c.closed.Store(true)
+		c.closeOnce.Do(func() { close(c.closeCh) })
+		c.loopWG.Wait()
+	})
+}
+
 // waitReplicaFlushCount polls the backing until ru's flush count reaches want
 // (the displacement flush runs in a background goroutine) or the deadline
 // fires. It then holds the assertion through a short grace window so a LATE
@@ -54,6 +68,7 @@ func waitReplicaFlushCount(t *testing.T, b *sharedfactory.Backing, ru storageuni
 func TestOverlap_DisplacementFlush_FiresExactlyOncePerTransition(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+	shutdownReplicatedFixture(t, c)
 	target := ru(0, 0, 0)
 
 	// 1) Mount through the real flip: storeMount wraps the factory backend in
@@ -75,11 +90,14 @@ func TestOverlap_DisplacementFlush_FiresExactlyOncePerTransition(t *testing.T) {
 
 	// 3) Re-entrant edges while already Draining are no-ops: beginDrain
 	// returns on the phase guard before the flush; drainCheck (no successor
-	// marker yet, so the position stays Draining) never flushes.
+	// marker yet, so the position stays Draining) never flushes. NB a bare
+	// loopWG.Wait would block here: beginDrain also armed the fast drain
+	// poller, which stays alive while this (never-resolving) drain persists.
+	// Settle any (buggy) stray flush goroutine with a bounded grace window.
 	c.beginDrain(target)
 	c.beginDrain(target)
 	c.drainCheck(target)
-	c.loopWG.Wait() // settle any (buggy) stray flush goroutine before asserting
+	time.Sleep(150 * time.Millisecond)
 	if got := backing.ReplicaFlushCount(target); got != 1 {
 		t.Fatalf("re-entrant drain ticks flushed again: count = %d, want 1", got)
 	}
@@ -103,6 +121,7 @@ func TestOverlap_DisplacementFlush_FiresExactlyOncePerTransition(t *testing.T) {
 func TestOverlap_DisplacementFlush_SkipsBackendWithoutCapability(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+	shutdownReplicatedFixture(t, c)
 	target := ru(0, 1, 0)
 
 	c.mountMu.Lock()
@@ -114,7 +133,9 @@ func TestOverlap_DisplacementFlush_SkipsBackendWithoutCapability(t *testing.T) {
 	if st := c.handoffPhaseOf(target); st.Phase != storageunit.PhaseDraining {
 		t.Fatalf("drain edge should arm normally for a non-Flusher backend, got %v", st.Phase)
 	}
-	c.loopWG.Wait()
+	// Bounded grace window (a bare loopWG.Wait would block on the fast drain
+	// poller beginDrain armed, since this drain never resolves).
+	time.Sleep(150 * time.Millisecond)
 	if got := backing.ReplicaFlushCount(target); got != 0 {
 		t.Fatalf("a non-Flusher backend should record no flushes, got %d", got)
 	}

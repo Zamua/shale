@@ -55,6 +55,15 @@ import (
 // object-storage acquire window a live join hits.
 func startReplicatedNodeSlowAcquire(t *testing.T, id, seedAddr string, unitCount, rf int, backing *sharedfactory.Backing, delay time.Duration, writeTimeout time.Duration) *sharedNode {
 	t.Helper()
+	return startReplicatedNodeSlowAcquireCfg(t, id, seedAddr, unitCount, rf, backing, delay, writeTimeout, nil)
+}
+
+// startReplicatedNodeSlowAcquireCfg is startReplicatedNodeSlowAcquire with a
+// final config mutate hook, applied AFTER the defaults below - so a test can
+// override OpenConcurrency (e.g. the handoff-cycle latency pin runs the
+// production default bound of 1 instead of the gates' 8).
+func startReplicatedNodeSlowAcquireCfg(t *testing.T, id, seedAddr string, unitCount, rf int, backing *sharedfactory.Backing, delay time.Duration, writeTimeout time.Duration, mutate func(*cluster.Config)) *sharedNode {
+	t.Helper()
 	h := backing.Handle()
 	h.SetAcquireDelay(delay) // armed BEFORE Open
 
@@ -86,6 +95,9 @@ func startReplicatedNodeSlowAcquire(t *testing.T, id, seedAddr string, unitCount
 	}
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}
+	}
+	if mutate != nil {
+		mutate(&cfg)
 	}
 	c, bindAddr := openClusterRetryBind(t, cfg)
 	rpc.NewServer(c).Register(grpcSrv)

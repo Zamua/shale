@@ -576,6 +576,13 @@ type Cluster struct {
 	// first acquire (mirrors mountReplicaUnits sizing its pool at call time).
 	openSem chan struct{}
 
+	// drainPollerActive guards the at-most-one background fast drain poller
+	// (ensureDrainPoller): while any position is Draining the poller re-runs
+	// the release checks every displacedDrainPollInterval so a displaced
+	// owner releases within ~half a second of its successor's serving marker
+	// instead of waiting for the periodic reconcile tick.
+	drainPollerActive atomic.Bool
+
 	// draining is a TEST-ONLY override for the gossiped Draining set: when
 	// non-nil, drainingIDs returns it directly instead of reading the membership
 	// snapshot. It lets the white-box pending-ranges tests inject a transition

@@ -39,6 +39,8 @@
 package cluster
 
 import (
+	"time"
+
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -448,6 +450,98 @@ func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	// replays a minimal WAL tail instead of the whole unflushed tail. A reclaim
 	// + re-drain is a NEW edge and flushes again by design.
 	c.flushDisplaced(b)
+
+	// FAST DRAIN POLL (docs/SPEC.md "Displacement flush" sibling change): while
+	// any position is Draining, poll the release gate on the short
+	// displacedDrainPollInterval cadence instead of waiting for the periodic
+	// reconcile tick, so the displaced owner releases (close + cleanup) within
+	// ~half a second of the successor's serving marker landing rather than up
+	// to a full reconcileInterval later. Poll-only is preserved: this is a
+	// LOCAL cadence change, no push RPC. The leaver's own DrainForLeave already
+	// fast-polls; this covers the JOIN direction's displaced owner.
+	c.ensureDrainPoller()
+}
+
+// displacedDrainPollInterval is the short cadence a displaced owner polls its
+// Draining positions' release gate at (drainCheck: one serving-marker read per
+// draining position per poll). Coarser than DrainForLeave's drainPollInterval
+// because the displaced owner is not blocking a process exit; fine enough that
+// release cleanup follows the successor's marker within ~half a second.
+const displacedDrainPollInterval = 500 * time.Millisecond
+
+// drainPollerMaxLife caps one fast-poller run. The fast cadence exists for
+// the NORMAL case (the successor's marker lands within seconds of the drain
+// edge); a drain still unresolved after this long is stuck on a slow or
+// failed successor, and burning a marker read every half second at the store
+// indefinitely buys nothing - the poller exits and the periodic reconcile's
+// tick-cadence drainCheck remains the backstop, exactly the pre-poller
+// behavior. A NEW Owned -> Draining edge arms a fresh poller.
+const drainPollerMaxLife = 30 * time.Second
+
+// ensureDrainPoller starts, at most one at a time, a background poller that
+// re-runs the drain release checks every displacedDrainPollInterval while ANY
+// loser-phase (Draining) position exists, for at most drainPollerMaxLife,
+// then exits. Armed from beginDrain (the Owned -> Draining edge). The
+// periodic reconcile keeps running the same checks as the backstop;
+// drainCheck's mountMap CAS-delete keeps the release exactly-once regardless
+// of how many pollers observe the marker.
+func (c *Cluster) ensureDrainPoller() {
+	if !c.drainPollerActive.CompareAndSwap(false, true) {
+		return // a poller is already running.
+	}
+	c.loopWG.Add(1)
+	go func() {
+		defer c.loopWG.Done()
+		expired := false
+		defer func() {
+			c.drainPollerActive.Store(false)
+			// Close the exit-vs-new-drain race: a beginDrain that ran after
+			// this poller's final "no losers left" check but before the
+			// Store(false) above found drainPollerActive still true and did
+			// not start a poller. Re-check and re-arm so that drain is not
+			// left to the slow tick. NEVER re-arm on expiry: a stuck drain
+			// would otherwise re-spawn the poller forever, defeating the cap.
+			if !expired && !c.closed.Load() && c.hasLoserPhase() {
+				c.ensureDrainPoller()
+			}
+		}()
+		t := time.NewTicker(displacedDrainPollInterval)
+		defer t.Stop()
+		expiry := time.NewTimer(drainPollerMaxLife)
+		defer expiry.Stop()
+		for {
+			select {
+			case <-c.closeCh:
+				return
+			case <-expiry.C:
+				expired = true
+				return // stuck drain: hand back to the tick backstop.
+			case <-t.C:
+				if c.closed.Load() {
+					return
+				}
+				c.reconcileMu.Lock()
+				c.runDrainChecks()
+				c.reconcileMu.Unlock()
+				if !c.hasLoserPhase() {
+					return // every drain resolved; the next edge re-arms.
+				}
+			}
+		}
+	}()
+}
+
+// hasLoserPhase reports whether any position is currently in a loser
+// (Draining) phase. Reads under mountMu.
+func (c *Cluster) hasLoserPhase() bool {
+	c.mountMu.RLock()
+	defer c.mountMu.RUnlock()
+	for _, st := range c.handoffPhase {
+		if st.Phase.IsLoser() {
+			return true
+		}
+	}
+	return false
 }
 
 // flushDisplaced asks a displaced (newly-Draining) position's backend to make
@@ -575,24 +669,68 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 			delete(c.acquireInFlight, ru)
 			c.mountMu.Unlock()
 		}()
-		// NODE-WIDE OPEN BOUND: take a permit before the slow open, so a node
-		// gaining many positions at once runs at most Config.OpenConcurrency
-		// (default 1) real-data FFI opens concurrently - the SAME knob the boot
-		// mount pool enforces, because concurrent real-data opens are the
-		// documented "empty SSTable" corruption trigger in the shipped binding
-		// (see defaultOpenConcurrency). While queued the position simply stays
-		// PhaseAcquiring and the union keeps covering it via the still-mounted
-		// current owner, so the bound sequences the opens without any
-		// availability cost. The acquireInFlight entry is held across the queue
-		// wait, so a reconcile re-drive never spawns a duplicate waiter.
-		release := c.acquireOpenPermit()
-		defer release()
-		if c.closed.Load() {
-			return // Close ran while queued; nothing to open.
+		// NODE-WIDE OPEN BOUND: take a permit around each open attempt, so a
+		// node gaining many positions at once runs at most
+		// Config.OpenConcurrency (default 1) real-data FFI opens concurrently -
+		// the SAME knob the boot mount pool enforces, because concurrent
+		// real-data opens are the documented "empty SSTable" corruption trigger
+		// in the shipped binding (see defaultOpenConcurrency). While queued the
+		// position simply stays PhaseAcquiring and the union keeps covering it
+		// via the still-mounted current owner, so the bound sequences the opens
+		// without any availability cost. Queued goroutines block on the permit
+		// channel, so when one open finishes the next queued open starts
+		// IMMEDIATELY (event-driven chaining, never a reconcile-tick wait). The
+		// acquireInFlight entry is held across the whole loop, so a reconcile
+		// re-drive never spawns a duplicate waiter.
+		//
+		// FAILURE RE-DRIVE (handoff-cycle latency): a FAILED open used to
+		// strand the position as Acquiring until the NEXT periodic reconcile
+		// re-drove it - quantizing every transient open failure to a full
+		// reconcileInterval. Retry here instead on a short jittered backoff,
+		// RELEASING the permit between attempts so a failing position never
+		// starves the queued positions behind it. Bounded: once the backoff
+		// exceeds acquireRedriveCap the goroutine exits and the periodic
+		// reconcile remains the backstop (identical to the pre-fix behavior
+		// from that point on). Success/failure is read off lastAcquireErr,
+		// the same signal the reconcile re-drive path uses.
+		backoff := acquireRedriveBase
+		for {
+			if c.closed.Load() {
+				return
+			}
+			release := c.acquireOpenPermit()
+			if c.closed.Load() {
+				release()
+				return // Close ran while queued; nothing to open.
+			}
+			c.acquireReplicaUnitOverlapBlocking(ru)
+			release()
+			if _, failed := c.lastAcquireErr.Load(ru); !failed {
+				return // mounted (or superseded); done.
+			}
+			if backoff > acquireRedriveCap {
+				return // hand the retry back to the periodic reconcile backstop.
+			}
+			select {
+			case <-c.closeCh:
+				return
+			case <-time.After(jitteredBackoff(backoff)):
+			}
+			backoff *= 2
 		}
-		c.acquireReplicaUnitOverlapBlocking(ru)
 	}()
 }
+
+// acquireRedriveBase / acquireRedriveCap bound the in-goroutine retry of a
+// FAILED overlap open: attempts after ~250ms, 500ms, 1s, 2s (jittered), then
+// the periodic reconcile takes over. Short enough that a transient open
+// failure costs sub-second latency instead of a full reconcileInterval;
+// bounded so a permanently failing position degrades to exactly the old
+// tick-driven retry cadence.
+const (
+	acquireRedriveBase = 250 * time.Millisecond
+	acquireRedriveCap  = 2 * time.Second
+)
 
 // acquireReplicaUnitOverlapBlocking performs the GAINER's slow mount + flip
 // synchronously. It is run from acquireReplicaUnitOverlap's background goroutine
