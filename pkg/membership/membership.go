@@ -102,6 +102,19 @@ type Member struct {
 	// consistent-hash ownership ring so its positions redistribute to
 	// non-draining members. Decoded from the peer's Meta payload.
 	Draining bool
+	// Joining is true when the node is WARMING UP into the ring: it booted
+	// with one or more DEFERRED positions (owned-but-not-yet-mounted, because a
+	// peer's serving marker was present so the node did not fence the live peer)
+	// and has not yet mounted every position it owns. It is the entry-side mirror
+	// of Draining: while a node is Joining, every node's per-op current/pending
+	// split EXCLUDES it from the CURRENT set (subject to a quorum floor), so the
+	// still-mounted DISPLACED owner stays the stable holder and the newcomer
+	// acquires the position via the background pending-owner path (serving-marking
+	// it, which gates the displaced owner's drain). Cleared once the node has
+	// mounted every position it owns. Decoded from the peer's Meta payload. A
+	// cold start (no serving markers anywhere) defers nothing and never sets it,
+	// so first-cluster convergence is unchanged.
+	Joining bool
 	// DeclaredUnitCount is the node's STANDING declared shard (unit) count -
 	// the value the operator configured for it (SHALE_UNIT_COUNT). It is
 	// gossiped in the Meta payload so the cluster can detect cluster-wide
@@ -131,6 +144,12 @@ const metaSep = '\x00'
 
 // metaDrainingMarker is the trailing segment that flags a draining node.
 const metaDrainingMarker = "D"
+
+// metaJoiningMarker is the trailing segment that flags a JOINING (warming) node.
+// It is the entry-side mirror of metaDrainingMarker: its own NUL-delimited "J"
+// segment, order-independent, ignored by any decoder that does not understand it
+// (forward-compatible), so an old peer still parses addr/draining/count.
+const metaJoiningMarker = "J"
 
 // metaUnitCountPrefix tags the trailing segment carrying a node's standing
 // DECLARED unit count, e.g. "U16". It is its own NUL-delimited segment after
@@ -166,10 +185,13 @@ const metaEpochPrefix = "E"
 // matter to the decoder, so the payload may carry any subset. The stable-id +
 // epoch segments are always emitted by a node that knows them (epoch is the
 // per-process Open token, always nonzero in production).
-func encodeMeta(addr string, draining bool, declaredUnitCount uint32, stableID string, epoch uint64) []byte {
+func encodeMeta(addr string, draining, joining bool, declaredUnitCount uint32, stableID string, epoch uint64) []byte {
 	s := addr
 	if draining {
 		s += string(metaSep) + metaDrainingMarker
+	}
+	if joining {
+		s += string(metaSep) + metaJoiningMarker
 	}
 	if declaredUnitCount > 0 {
 		s += string(metaSep) + metaUnitCountPrefix + strconv.FormatUint(uint64(declaredUnitCount), 10)
@@ -191,16 +213,18 @@ func encodeMeta(addr string, draining bool, declaredUnitCount uint32, stableID s
 // unparseable trailing segments are ignored (forward-compatible); an absent
 // count yields 0 (UNKNOWN), an absent stable id yields "" (the caller falls
 // back to the memberlist name), an absent epoch yields 0.
-func decodeMeta(meta []byte) (addr string, draining bool, declaredUnitCount uint32, stableID string, epoch uint64) {
+func decodeMeta(meta []byte) (addr string, draining, joining bool, declaredUnitCount uint32, stableID string, epoch uint64) {
 	s := string(meta)
 	head, rest, found := strings.Cut(s, string(metaSep))
 	if !found {
-		return s, false, 0, "", 0
+		return s, false, false, 0, "", 0
 	}
 	for _, seg := range strings.Split(rest, string(metaSep)) {
 		switch {
 		case seg == metaDrainingMarker:
 			draining = true
+		case seg == metaJoiningMarker:
+			joining = true
 		case strings.HasPrefix(seg, metaUnitCountPrefix):
 			if n, err := strconv.ParseUint(seg[len(metaUnitCountPrefix):], 10, 32); err == nil {
 				declaredUnitCount = uint32(n)
@@ -213,7 +237,7 @@ func decodeMeta(meta []byte) (addr string, draining bool, declaredUnitCount uint
 			}
 		}
 	}
-	return head, draining, declaredUnitCount, stableID, epoch
+	return head, draining, joining, declaredUnitCount, stableID, epoch
 }
 
 // Event is one membership change notification.
@@ -245,6 +269,19 @@ type Config struct {
 	// as UNKNOWN. The cluster passes its configured SHALE_UNIT_COUNT here in
 	// multi-backend mode.
 	DeclaredUnitCount uint32
+	// Joining seeds the INITIAL value of this node's gossiped Joining bit, so it
+	// is present in the VERY FIRST Meta payload memberlist broadcasts (atomically
+	// with the node's ring presence). This closes a race the entry-side
+	// write-transparency needs: if a newcomer advertised Joining only AFTER its
+	// address had already gossiped, a peer could learn the newcomer is a member
+	// (and clean-cut RELEASE the position the newcomer displaces) BEFORE it learns
+	// the newcomer is Joining (which would have told it to HOLD + drain instead).
+	// Because the bit rides in the SAME Meta payload as the address, seeding it
+	// true here makes presence and Joining atomic. The cluster sets it true for a
+	// node JOINING an existing replicated cluster (has seeds, R>1); the reconcile
+	// clears it once the node has mounted every position it owns. A founder (no
+	// seeds) leaves it false, so cold first-cluster formation is unchanged.
+	Joining bool
 	// LogOutput is where memberlist's internal logger writes. nil
 	// means stderr (memberlist's default). Tests pass io.Discard to
 	// stay quiet.
@@ -447,6 +484,10 @@ type metaDelegate struct {
 	mu       sync.Mutex
 	addr     string
 	draining bool
+	// joining flips true while the node is WARMING (booted with deferred
+	// positions) and false once it has mounted every position it owns. Read
+	// under mu in NodeMeta alongside draining; mirrors the draining lifecycle.
+	joining bool
 	// declaredUnitCount is the node's standing declared shard count. Unlike
 	// draining it is fixed for the node's lifetime (set at construction from
 	// Config.DeclaredUnitCount); it is read under mu only to share the lock
@@ -463,7 +504,7 @@ type metaDelegate struct {
 
 func (d *metaDelegate) NodeMeta(limit int) []byte {
 	d.mu.Lock()
-	meta := encodeMeta(d.addr, d.draining, d.declaredUnitCount, d.stableID, d.epoch)
+	meta := encodeMeta(d.addr, d.draining, d.joining, d.declaredUnitCount, d.stableID, d.epoch)
 	d.mu.Unlock()
 	if len(meta) > limit {
 		return meta[:limit]
@@ -481,6 +522,19 @@ func (d *metaDelegate) setDraining(draining bool) bool {
 		return false
 	}
 	d.draining = draining
+	return true
+}
+
+// setJoining updates the local joining flag. Returns true if the value changed
+// (so the caller knows whether a gossip refresh is worth triggering). Mirror of
+// setDraining.
+func (d *metaDelegate) setJoining(joining bool) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	if d.joining == joining {
+		return false
+	}
+	d.joining = joining
 	return true
 }
 
@@ -537,7 +591,7 @@ type eventDelegate struct {
 func nodeToMember(n *memberlist.Node) (name string, m Member) {
 	name = strings.Clone(n.Name)
 	meta := append([]byte(nil), n.Meta...)
-	addr, draining, declaredUnitCount, stableID, epoch := decodeMeta(meta)
+	addr, draining, joining, declaredUnitCount, stableID, epoch := decodeMeta(meta)
 	id := stableID
 	if id == "" {
 		// Legacy peer (no stable-id segment): its memberlist name IS its
@@ -548,6 +602,7 @@ func nodeToMember(n *memberlist.Node) (name string, m Member) {
 		ID:                id,
 		Addr:              addr,
 		Draining:          draining,
+		Joining:           joining,
 		DeclaredUnitCount: declaredUnitCount,
 		epoch:             epoch,
 	}
@@ -703,7 +758,7 @@ func Open(cfg Config) (*Membership, error) {
 	// (the incarnation bump alone cannot clear the address gate). See
 	// deadNodeReclaimTime.
 	mlCfg.DeadNodeReclaimTime = deadNodeReclaimTime
-	meta := &metaDelegate{addr: cfg.GRPCAddr, declaredUnitCount: cfg.DeclaredUnitCount, stableID: cfg.NodeID, epoch: bootEpoch}
+	meta := &metaDelegate{addr: cfg.GRPCAddr, draining: false, joining: cfg.Joining, declaredUnitCount: cfg.DeclaredUnitCount, stableID: cfg.NodeID, epoch: bootEpoch}
 	m.meta = meta
 	mlCfg.Delegate = meta
 	mlCfg.Events = events
@@ -752,7 +807,7 @@ func Open(cfg Config) (*Membership, error) {
 	// Keyed by the UNIQUE memberlist name (mlName), not the stable id, so it
 	// matches the eventDelegate's keying; the projected Member carries the
 	// stable id (cfg.NodeID) and this process's boot epoch.
-	self := Member{ID: cfg.NodeID, Addr: cfg.GRPCAddr, DeclaredUnitCount: cfg.DeclaredUnitCount, epoch: bootEpoch}
+	self := Member{ID: cfg.NodeID, Addr: cfg.GRPCAddr, Joining: cfg.Joining, DeclaredUnitCount: cfg.DeclaredUnitCount, epoch: bootEpoch}
 	m.cacheMu.Lock()
 	if _, ok := m.cache[mlName]; !ok {
 		m.cache[mlName] = self
@@ -1002,6 +1057,46 @@ func (m *Membership) SetDraining(draining bool) error {
 	// UpdateNode re-reads NodeMeta (now reflecting the flag) and gossips
 	// it. The 0 timeout means "do not block waiting for the broadcast to
 	// flush"; the change still propagates via the normal gossip loop.
+	return m.ml.UpdateNode(0)
+}
+
+// SetJoining flips the LOCAL node's joining bit and gossips the change to peers.
+// A joining node is WARMING: it stays a full, alive, addressable member and a
+// real (pending) OWNER of the positions it is mounting, but advertises that it
+// has not yet mounted every position it owns, so every node's per-op current /
+// pending split EXCLUDES it from the CURRENT set (subject to a quorum floor) -
+// the still-mounted displaced owner stays the stable holder and this node
+// acquires its positions via the background pending-owner path. It is the
+// entry-side mirror of SetDraining; like SetDraining it does NOT leave the
+// cluster (the transport stays up and the node is not marked closed).
+//
+// The flag rides in the same Meta payload that already carries the gRPC address
+// and the draining bit. SetJoining updates the local metaDelegate then calls
+// memberlist.UpdateNode so memberlist re-reads NodeMeta + gossips the new
+// payload. If the value is unchanged, it is a no-op (no gossip churn). No-op
+// (returns nil) once the Membership is Closed.
+func (m *Membership) SetJoining(joining bool) error {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil
+	}
+	m.mu.Unlock()
+	if !m.meta.setJoining(joining) {
+		return nil
+	}
+	// Update THIS node's OWN cache entry directly so the local Snapshot reflects
+	// the new joining bit immediately (the same reason SetDraining does: memberlist
+	// does not reliably fire a local NotifyUpdate for the node itself, so without
+	// this the node's own ring reconcile would never observe its own joining state).
+	m.cacheMu.Lock()
+	if m.cache != nil {
+		if cur, ok := m.cache[m.mlName]; ok {
+			cur.Joining = joining
+			m.cache[m.mlName] = cur
+		}
+	}
+	m.cacheMu.Unlock()
 	return m.ml.UpdateNode(0)
 }
 

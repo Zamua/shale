@@ -562,6 +562,21 @@ type Cluster struct {
 	// without a memberlist. Nil in production (the snapshot is authoritative).
 	draining map[string]struct{}
 
+	// joining is a TEST-ONLY override for the gossiped Joining set: when non-nil,
+	// joiningIDs returns it directly instead of reading the membership snapshot.
+	// It lets the white-box pending-ranges tests inject a JOIN transition (and
+	// exercise the quorum floor) without a memberlist. Nil in production (the
+	// snapshot is authoritative). The entry-side mirror of draining above.
+	joining map[string]struct{}
+
+	// selfJoining tracks whether THIS node currently advertises the Joining bit.
+	// Set true at boot when mountReplicaUnits boot-defers one or more owned
+	// positions (a peer is serving them); cleared by the reconcile once every
+	// owned position is mounted. Kept as a local atomic so the reconcile's
+	// clear-decision does not race a self-snapshot; the authoritative gossiped bit
+	// is driven through membership.SetJoining alongside this flag.
+	selfJoining atomic.Bool
+
 	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
 	// capability view of factory: non-nil iff the factory implements
 	// ReplicaBackendFactory AND R>1. The replicated paths open each owned unit
@@ -799,11 +814,23 @@ func Open(cfg Config) (*Cluster, error) {
 		return nil, errors.New("cluster: GRPCAddr is required in multi-node mode")
 	}
 
+	// JOIN write-transparency (v0.8 Phase 2e, entry side): a node JOINING an
+	// existing REPLICATED cluster (it has seeds, and R>1) advertises the Joining
+	// bit in its VERY FIRST gossip Meta - atomically with its ring presence - so a
+	// peer never learns the newcomer is a member (and clean-cut releases a position
+	// it displaces) BEFORE it learns the newcomer is Joining (which tells it to HOLD
+	// + drain instead). A founder (no seeds) or an R=1 node leaves it false, so cold
+	// first-cluster formation and the single-replica path are unchanged. The
+	// reconcile clears the bit once this node has mounted every position it owns.
+	startJoining := multi && cfg.ReplicationFactor > 1 && len(cfg.Seeds) > 0
+	c.selfJoining.Store(startJoining)
+
 	mem, err := membership.Open(membership.Config{
 		NodeID:    cfg.NodeID,
 		BindAddr:  cfg.BindAddr,
 		GRPCAddr:  cfg.GRPCAddr,
 		Seeds:     cfg.Seeds,
+		Joining:   startJoining,
 		LogOutput: cfg.LogOutput,
 		// Gossip this node's standing declared shard count (SHALE_UNIT_COUNT)
 		// so the cluster can detect cluster-wide AGREEMENT on a desired count

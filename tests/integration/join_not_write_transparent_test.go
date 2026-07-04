@@ -1,34 +1,36 @@
 package integration
 
-// JOIN IS NOT WRITE-TRANSPARENT (the mirror gap of the graceful-leave path).
+// JOIN IS WRITE-TRANSPARENT (the quorum-floor-guarded MIRROR of graceful leave).
 //
-// shale keeps writes AVAILABLE through a graceful LEAVE: the leaving node sets
-// its Draining bit, stays a CURRENT owner in the ring, and the write fan-out
-// dual-writes to the routed UNION (current-ring + pending-ring), so a node that
-// physically holds the data is always in the write set until the successor
-// mounts (graceful_leave_test.go + overlap_handoff_test.go pin this). That whole
-// mechanism is GATED on the Draining bit (drainingIDs() -> the current/pending
-// union). A plain membership ADD (a new node joins and the ring reassigns a
-// replica slot from an existing node to the newcomer) sets NO Draining bit, so:
+// shale keeps writes AVAILABLE through a graceful LEAVE: the leaving node sets its
+// Draining bit, stays a CURRENT owner in the ring, and the write fan-out dual-
+// writes to the routed UNION, so a node that physically holds the data is always
+// in the write set until the successor mounts. v0.8 Phase 2e now makes a JOIN the
+// exact mirror via a gossiped Joining bit and the UNIFIED SPLIT: current = ring
+// EXCLUDING joining (quorum-floored); pending = ring EXCLUDING draining. A node
+// that boots into a live cluster with DEFERRED positions advertises Joining, so:
 //
-//   - routedReplicasWithUnit / routedReplicasForKey take the len(draining)==0
-//     fast path and return ONLY the NEW ring's replica set - which INCLUDES the
-//     mid-acquire newcomer and EXCLUDES the displaced old replica (which still
-//     physically holds the data). (pkg/cluster/multibackend_pending_route.go)
-//   - the newcomer mounts the moving unit via the CLEAN-CUT acquireReplicaUnit
-//     (no handoffPhase, no predecessor forward, synchronous open), and a routed
-//     op to a not-yet-mounted position returns errUnitAcquiring with NO forward
-//     (resolveAndApplyReplicaPut). (pkg/cluster/multibackend_replicated.go +
-//     multibackend_reshard_route.go)
+//   - it is EXCLUDED from the CURRENT set (currentUnitReplicas), so the still-
+//     mounted DISPLACED old replica stays a current owner and keeps serving; the
+//     newcomer is a PENDING owner that acquires via the background overlap path
+//     (acquireReplicaUnitOverlap) and serving-marks on mount-complete, which gates
+//     the displaced owner's drain. (pkg/cluster/multibackend_overlap*.go)
+//   - routedReplicasWithUnit forms the current/pending UNION with stableR held at
+//     R: a moving-shard write dual-writes [displaced-owner (mounted), survivor
+//     (mounted), newcomer (mid-acquire)] and acks over the two MOUNTED holders,
+//     so it stays available for the whole slow mount. (multibackend_pending_route.go)
+//   - THE QUORUM FLOOR keeps current from shrinking below R: if 2+ of a unit's
+//     replicas warm at once (mass boot) current reverts to the full ring, the SAFE
+//     wedge (never acks below R durable copies) - covered by the mass-boot gate.
 //
-// Net: a write to a MOVING shard routes to [newcomer(mid-acquire), survivor] and
-// collects only ONE ack -> "write needed 2 acks, got 1 (replicas mid-acquire)"
-// for the whole acquire window. With a real slow (object-storage) mount and many
-// moving units the window is minutes - the live 3->4 wedge.
+// BEFORE the fix a plain ADD set no bit, so routing returned only the NEW ring
+// (newcomer mid-acquire IN, displaced owner OUT) and a moving-shard write collected
+// only ONE ack -> "needed 2 acks, got 1 (replicas mid-acquire)" for the whole
+// window (the live 3->4 wedge: this test previously measured 24/24 moving-shard
+// writes WEDGED). It now measures those same moving shards staying AVAILABLE.
 //
-// This file reproduces that deterministically and pins the asymmetry: the JOIN
-// wedges the moving shards while non-moving shards stay available (this test),
-// and a graceful LEAVE keeps the moving shards available (the companion below).
+// This file pins the SYMMETRY: the JOIN keeps the moving shards available (this
+// test), exactly as a graceful LEAVE does (the companion below).
 
 import (
 	"fmt"
@@ -124,10 +126,14 @@ func probeClass(entry *cluster.Cluster, uk map[storageunit.UnitID]string, units 
 	return
 }
 
-// TestJoinNotWriteTransparent_MovingShardsWedge is the deterministic JOIN repro:
-// adding a 4th node with a slow mount wedges writes to every shard that moves
-// ONTO it (mid-acquire), while non-moving shards stay available.
-func TestJoinNotWriteTransparent_MovingShardsWedge(t *testing.T) {
+// TestJoinIsWriteTransparent_MovingShardsStayAvailable is the deterministic JOIN
+// transparency gate (the FIXED behavior; this test previously asserted the wedge
+// and measured 24/24 moving-shard writes WEDGED). Adding a 4th node with a slow
+// mount now keeps writes to every shard that moves ONTO it AVAILABLE throughout
+// the mount: the newcomer advertises the Joining bit, so the still-mounted
+// displaced replica stays a CURRENT owner and the union write acks over the two
+// mounted holders while the newcomer mounts in the background.
+func TestJoinIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
 	// Short WriteTimeout so each probe returns fast (its internal retry cannot mask
@@ -144,10 +150,10 @@ func TestJoinNotWriteTransparent_MovingShardsWedge(t *testing.T) {
 
 	uk := oneKeyPerUnit(t, n1.Cluster, uc)
 	// Plant a serving marker for every position so the JOINING node BOOT-DEFERS its
-	// owned positions at Open (a live long-running cluster has markers everywhere)
-	// and then re-acquires them via the reconcile - the path the slow acquire delay
-	// governs. Without this the joiner mounts everything instantly at Open and the
-	// acquire window (hence the wedge) never opens in-process.
+	// owned positions at Open (a live long-running cluster has markers everywhere),
+	// advertises the Joining bit, and then re-acquires them SLOWLY via the reconcile
+	// overlap path - the path the slow acquire delay governs. Without this the joiner
+	// mounts everything instantly at Open and never advertises Joining.
 	plantAllServingMarkers(t, n1.Handle, uc, rf)
 
 	// Classify units by whether the 4th node ("jn-d") becomes a replica: a MOVING
@@ -170,11 +176,13 @@ func TestJoinNotWriteTransparent_MovingShardsWedge(t *testing.T) {
 	}
 	t.Logf("of %d units: %d MOVE onto jn-d, %d stay put", uc, len(moving), len(stable))
 
-	// Join the 4th node with the acquire delay armed BEFORE Open: it boot-defers
-	// its owned positions (markers planted) then re-acquires them SLOWLY via the
-	// reconcile, so every moving shard sits owned-but-unmounted on jn-d for the
-	// window - the real object-storage join wedge.
-	const mountDelay = 12 * time.Second
+	// Join the 4th node with the acquire delay armed BEFORE Open: it boot-defers its
+	// owned positions (markers planted) -> advertises Joining -> re-acquires them
+	// SLOWLY via the overlap reconcile, so every moving shard sits owned-but-unmounted
+	// on jn-d for the window while the DISPLACED owner keeps serving it via the union.
+	// A long mount so jn-d is provably still warming through the whole measurement,
+	// with generous headroom for the slower convergence under `-race`.
+	const mountDelay = 25 * time.Second
 	n4 := startReplicatedNodeSlowAcquire(t, "jn-d", n1.BindAddr, uc, rf, backing, mountDelay, 300*time.Millisecond)
 	cs4 := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
 	if err := waitForMembersAll(cs4, 4, 30*time.Second); err != nil {
@@ -185,12 +193,51 @@ func TestJoinNotWriteTransparent_MovingShardsWedge(t *testing.T) {
 		t.Fatalf("entry node not converged to 4 members")
 	}
 
-	// PROBE while jn-d is mid-acquire (12s window). Aggregate over a few rounds so
-	// the signal is robust. The entry is n1 (fully converged, routes to the new
-	// replica set that includes the mid-acquire jn-d for moving units).
+	// TRANSPARENCY-ENGAGED GATE: poll until a moving-shard write SUCCEEDS through n1
+	// (proving n1 observed jn-d's Joining bit and formed the union), REQUIRING that
+	// jn-d is still mid-mount at that instant (it still has owned-but-unmounted
+	// positions). Keying on jn-d's ACTUAL mount progress (desiredButUnmounted), not
+	// wall-clock, makes this robust under -race: if the write is available while
+	// jn-d has not finished mounting, that is transparency DURING the mount, not the
+	// wedge healing at mount-end.
+	probeUnit := moving[0]
+	engaged := false
+	var lastErr error
+	engageDeadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(engageDeadline) {
+		if desiredButUnmounted(n4.Cluster) == 0 {
+			break // jn-d finished mounting before we could observe the transition (see below)
+		}
+		err := n1.Cluster.Put([]byte(uk[probeUnit]), []byte("engage"))
+		if err == nil {
+			engaged = true
+			break
+		}
+		lastErr = err
+		time.Sleep(100 * time.Millisecond)
+	}
+	unmountedAtEngage := desiredButUnmounted(n4.Cluster)
+	if !engaged {
+		t.Logf("DIAG: engage never succeeded; lastErr=%v jn-d desired-but-unmounted=%d", lastErr, unmountedAtEngage)
+		t.Logf("DIAG probeUnit=%d old-replicas=%v new-replicas=%v", probeUnit,
+			replicaIDsForMembers(old3, probeUnit, rf), replicaIDsForMembers(new4, probeUnit, rf))
+		for _, n := range []*sharedNode{n1, n2, n3, n4} {
+			t.Logf("DIAG node %s state:\n%s", n.ID, n.Cluster.DebugState())
+		}
+		t.Fatalf("moving-shard write never became available while jn-d was mid-mount - the JOIN did not become " +
+			"write-transparent (the union did not form / Joining bit did not engage)")
+	}
+	if unmountedAtEngage == 0 {
+		t.Fatalf("jn-d finished mounting before the transition could be observed - raise mountDelay for headroom")
+	}
+	t.Logf("transparency ENGAGED while jn-d still has %d owned-but-unmounted moving positions - provably mid-mount", unmountedAtEngage)
+
+	// MEASURE while jn-d is still mid-acquire (still has owned-but-unmounted
+	// positions), so this is a during-mount measurement, not the post-mount steady
+	// state. Gate every round on jn-d's mount progress rather than wall-clock.
 	var movOK, movMid, movOther, stOK, stMid, stOther int
-	const rounds = 3
-	for r := 0; r < rounds; r++ {
+	rounds := 0
+	for r := 0; r < 4 && desiredButUnmounted(n4.Cluster) > 0; r++ {
 		o, m, x := probeClass(n1.Cluster, uk, moving)
 		movOK += o
 		movMid += m
@@ -199,10 +246,15 @@ func TestJoinNotWriteTransparent_MovingShardsWedge(t *testing.T) {
 		stOK += o
 		stMid += m
 		stOther += x
-		time.Sleep(1 * time.Second)
+		rounds++
+		time.Sleep(400 * time.Millisecond)
 	}
 	movTotal := movOK + movMid + movOther
 	stTotal := stOK + stMid + stOther
+	if rounds == 0 || movTotal == 0 {
+		t.Fatalf("no during-mount moving-shard probes ran (jn-d mounted too fast; raise mountDelay)")
+	}
+	t.Logf("measured %d rounds while jn-d mid-mount", rounds)
 	t.Logf("MOVING-shard writes during acquire: ok=%d midAcquire=%d other=%d (total=%d)", movOK, movMid, movOther, movTotal)
 	t.Logf("STABLE-shard writes during acquire: ok=%d midAcquire=%d other=%d (total=%d)", stOK, stMid, stOther, stTotal)
 
@@ -211,24 +263,25 @@ func TestJoinNotWriteTransparent_MovingShardsWedge(t *testing.T) {
 		n.Handle.SetAcquireDelay(0)
 	}
 
-	// ASSERTIONS (the deterministic JOIN wedge):
-	// 1. Moving shards WEDGE: mid-acquire dominates their writes.
-	if movMid == 0 {
-		t.Fatalf("expected moving-shard writes to WEDGE with 'replicas mid-acquire' during the join acquire, saw none "+
-			"(ok=%d other=%d) - the join may have become write-transparent (hypothesis refuted)", movOK, movOther)
+	// ASSERTIONS (the JOIN is now write-transparent, the mirror of the leave gate):
+	// 1. Moving shards stay AVAILABLE through the slow mount (the inverse of the old
+	//    24/24 wedge): the union acks over the displaced owner + survivor.
+	if movTotal == 0 {
+		t.Fatalf("no moving-shard probes ran")
 	}
-	if rate := float64(movMid) / float64(movTotal); rate < 0.6 {
-		t.Fatalf("join wedge not dominant: only %.0f%% of moving-shard writes were mid-acquire (want >=60%%); "+
-			"ok=%d mid=%d other=%d", rate*100, movOK, movMid, movOther)
+	if rate := float64(movOK) / float64(movTotal); rate < 0.9 {
+		t.Fatalf("JOIN not write-transparent: only %.0f%% of moving-shard writes acked during jn-d's slow mount "+
+			"(want >=90%%); ok=%d mid=%d other=%d - the displaced owner is not being kept in the write set via the "+
+			"Joining-bit union", rate*100, movOK, movMid, movOther)
 	}
-	// 2. Stable shards stay AVAILABLE: zero mid-acquire (they never route to jn-d).
+	// 2. Stable shards stay AVAILABLE too (they never route to jn-d): zero mid-acquire.
 	if stMid > 0 {
-		t.Fatalf("unexpected: %d STABLE-shard writes wedged mid-acquire (only MOVING shards should wedge on a join)", stMid)
+		t.Fatalf("unexpected: %d STABLE-shard writes wedged mid-acquire (stable shards must never wedge)", stMid)
 	}
-	t.Logf("CONFIRMED: JOIN is NOT write-transparent - %d/%d moving-shard writes wedged 'needed 2 acks, got 1 "+
-		"(replicas mid-acquire)' during jn-d's acquire, while stable shards stayed 100%% available (%d/%d ok). "+
-		"The displaced replica is dropped from routing (no Draining bit -> no current/pending union) and the "+
-		"newcomer refuses (mid-acquire, no forward) until it mounts.", movMid, movTotal, stOK, stTotal)
+	t.Logf("CONFIRMED: JOIN is WRITE-TRANSPARENT - %d/%d moving-shard writes ACKED during jn-d's slow mount "+
+		"(before the fix this measured 24/24 WEDGED), and stable shards stayed available (%d/%d ok). The newcomer's "+
+		"Joining bit keeps the displaced replica a CURRENT owner so the union always has a mounted holder in the "+
+		"write set - the exact mirror of the graceful-leave path.", movOK, movTotal, stOK, stTotal)
 }
 
 // TestLeaveIsWriteTransparent_MovingShardsStayAvailable is the COMPANION that
@@ -330,8 +383,9 @@ func TestLeaveIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 			rate*100, ok, mid, other)
 	}
 	_ = survivors
-	t.Logf("CONFIRMED (asymmetry): a graceful LEAVE keeps the moving shards AVAILABLE (%d/%d acked through the "+
+	t.Logf("CONFIRMED (symmetry): a graceful LEAVE keeps the moving shards AVAILABLE (%d/%d acked through the "+
 		"successor's slow mount) - the Draining bit engages the current/pending union so a mounted holder is always "+
-		"in the write set. The JOIN has no such coverage (see TestJoinNotWriteTransparent_MovingShardsWedge): "+
-		"same slow mount, but the moving shards WEDGE because a plain ADD sets no Draining bit.", ok, total)
+		"in the write set. The JOIN now has the mirror coverage (see TestJoinIsWriteTransparent_MovingShardsStayAvailable): "+
+		"same slow mount, the moving shards stay available because the Joining bit keeps the displaced owner a current "+
+		"owner - the exact entry-side mirror of this leave path.", ok, total)
 }

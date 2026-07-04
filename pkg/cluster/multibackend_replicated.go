@@ -267,6 +267,19 @@ func (c *Cluster) mountReplicaUnits() error {
 			"(a peer is already serving - NOT fenced; reconcile hands off after convergence); see /debug/shale/state",
 			mounted.Load(), skipped.Load(), deferred.Load())
 	}
+	// JOIN write-transparency (v0.8 Phase 2e, entry side): if this node BOOT-DEFERRED
+	// one or more owned positions (a peer is serving them, so we did not fence it),
+	// it is WARMING into the ring - advertise the Joining bit so every node excludes
+	// it from the CURRENT set (quorum-floored) until it has mounted every position
+	// it owns. That keeps the still-mounted displaced peer the stable holder and
+	// routes this node's positions through the pending-owner acquire path (which
+	// serving-marks them, gating the displaced peer's drain), the exact mirror of a
+	// graceful leave. The reconcile clears the bit once every owned position is
+	// mounted (maintainJoiningState). A cold start defers nothing, so the bit is
+	// never set and first-cluster convergence is unchanged.
+	if deferred.Load() > 0 {
+		c.setSelfJoining(true)
+	}
 	return nil
 }
 

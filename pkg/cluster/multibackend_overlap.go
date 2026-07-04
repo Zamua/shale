@@ -59,12 +59,17 @@ import (
 //
 // Caller MUST hold reconcileMu; mount + phase mutations take mountMu.
 func (c *Cluster) reconcileReplicaUnitsOverlap() {
-	draining := c.drainingIDs()
+	joining, draining := c.transitionSets()
 
-	// current = positions the LIVE ring (including draining members) assigns this
-	// node. desired = current here: the set this node owns + must keep mounted
-	// (current owners stay mounted throughout a transition).
-	current := c.desiredReplicaUnits()
+	// current = positions this node owns under the CURRENT view (the ring
+	// EXCLUDING joining members, quorum-floored, draining members INCLUDED): the
+	// set it holds + must keep mounted as a stable current owner throughout a
+	// transition. With no joining members this is desiredReplicaUnits (the full
+	// ring), so the leave path is unchanged. Excluding a JOINING newcomer here is
+	// what routes a moving position's DRAIN half onto the still-mounted displaced
+	// owner (it stays in current-not-pending) and the ACQUIRE half onto the
+	// newcomer (it is pending-not-current), the exact mirror of a leave.
+	current := c.desiredCurrentReplicaUnits(joining)
 	currentSet := make(map[storageunit.ReplicaUnit]struct{}, len(current))
 	for _, ru := range current {
 		currentSet[ru] = struct{}{}
@@ -314,6 +319,31 @@ func (c *Cluster) desiredPendingReplicaUnits(draining map[string]struct{}) []sto
 	}
 	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []ring.Member {
 		return c.pendingUnitReplicas(gu, draining)
+	})
+}
+
+// desiredCurrentReplicaUnits returns the positions this node owns under the
+// CURRENT view (the ring EXCLUDING joining members, quorum-floored): the slots it
+// holds + must keep mounted RIGHT NOW as a stable current owner. It is the
+// entry-side mirror of desiredPendingReplicaUnits and the reconcile's current
+// input. With no joining members it is identical to desiredReplicaUnits (steady
+// state), so the transition halves of the reconcile are empty.
+//
+// It mirrors desiredReplicaUnits exactly (including the v0.9 gen-(g+1) split
+// children) but supplies the JOINING-EXCLUDED-with-floor replica lookup
+// (currentUnitReplicas) as replicaAt, sharing the core desiredReplicaUnitsVia -
+// exactly as desiredPendingReplicaUnits supplies the draining-excluded lookup.
+// Keeping current + pending as thin calls over the shared core guarantees they
+// stay in lockstep (the reconcile treats any spurious divergence as a transition).
+func (c *Cluster) desiredCurrentReplicaUnits(joining map[string]struct{}) []storageunit.ReplicaUnit {
+	if len(joining) == 0 {
+		return c.desiredReplicaUnits()
+	}
+	// Build the reduced (joining-excluded) ring ONCE and reuse it across every
+	// unit's replica lookup, rather than rebuilding per unit inside currentUnitReplicas.
+	reduced := c.buildReducedRing(joining)
+	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []ring.Member {
+		return c.currentReplicasFromReduced(reduced, gu)
 	})
 }
 

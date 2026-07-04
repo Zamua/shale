@@ -465,61 +465,68 @@ func waitForDraining(m *Membership, id string, want bool, wantAddr string, timeo
 func TestEncodeDecodeMetaRoundTrip(t *testing.T) {
 	const addr = "127.0.0.1:7001"
 
-	// Bare (non-draining, no declared count, no stable id/epoch) encodes to
-	// exactly the bare address (legacy-shaped).
-	meta := encodeMeta(addr, false, 0, "", 0)
+	// Bare (non-draining, non-joining, no declared count, no stable id/epoch)
+	// encodes to exactly the bare address (legacy-shaped).
+	meta := encodeMeta(addr, false, false, 0, "", 0)
 	if string(meta) != addr {
 		t.Fatalf("bare meta = %q, want bare addr %q", meta, addr)
 	}
-	gotAddr, draining, count, id, epoch := decodeMeta(meta)
-	if gotAddr != addr || draining || count != 0 || id != "" || epoch != 0 {
-		t.Fatalf("decode(bare) = (%q, %v, %d, %q, %d), want (%q, false, 0, \"\", 0)", gotAddr, draining, count, id, epoch, addr)
+	gotAddr, draining, joining, count, id, epoch := decodeMeta(meta)
+	if gotAddr != addr || draining || joining || count != 0 || id != "" || epoch != 0 {
+		t.Fatalf("decode(bare) = (%q, %v, %v, %d, %q, %d), want (%q, false, false, 0, \"\", 0)", gotAddr, draining, joining, count, id, epoch, addr)
 	}
 
 	// Draining round-trips the bit while keeping the address.
-	meta = encodeMeta(addr, true, 0, "", 0)
-	gotAddr, draining, count, _, _ = decodeMeta(meta)
-	if gotAddr != addr || !draining || count != 0 {
-		t.Fatalf("decode(draining) = (%q, %v, %d), want (%q, true, 0)", gotAddr, draining, count, addr)
+	meta = encodeMeta(addr, true, false, 0, "", 0)
+	gotAddr, draining, joining, count, _, _ = decodeMeta(meta)
+	if gotAddr != addr || !draining || joining || count != 0 {
+		t.Fatalf("decode(draining) = (%q, %v, %v, %d), want (%q, true, false, 0)", gotAddr, draining, joining, count, addr)
 	}
 
-	// A declared unit count round-trips while keeping the address (and not
-	// draining).
-	meta = encodeMeta(addr, false, 16, "", 0)
-	gotAddr, draining, count, _, _ = decodeMeta(meta)
-	if gotAddr != addr || draining || count != 16 {
-		t.Fatalf("decode(count=16) = (%q, %v, %d), want (%q, false, 16)", gotAddr, draining, count, addr)
+	// Joining round-trips the bit while keeping the address (and not draining).
+	meta = encodeMeta(addr, false, true, 0, "", 0)
+	gotAddr, draining, joining, count, _, _ = decodeMeta(meta)
+	if gotAddr != addr || draining || !joining || count != 0 {
+		t.Fatalf("decode(joining) = (%q, %v, %v, %d), want (%q, false, true, 0)", gotAddr, draining, joining, count, addr)
 	}
 
-	// Draining AND a declared count compose: both round-trip together, the
-	// address intact, regardless of segment order.
-	meta = encodeMeta(addr, true, 8, "", 0)
-	gotAddr, draining, count, _, _ = decodeMeta(meta)
-	if gotAddr != addr || !draining || count != 8 {
-		t.Fatalf("decode(draining+count=8) = (%q, %v, %d), want (%q, true, 8)", gotAddr, draining, count, addr)
+	// A declared unit count round-trips while keeping the address (and neither
+	// draining nor joining).
+	meta = encodeMeta(addr, false, false, 16, "", 0)
+	gotAddr, draining, joining, count, _, _ = decodeMeta(meta)
+	if gotAddr != addr || draining || joining || count != 16 {
+		t.Fatalf("decode(count=16) = (%q, %v, %v, %d), want (%q, false, false, 16)", gotAddr, draining, joining, count, addr)
+	}
+
+	// Draining AND joining AND a declared count compose: all round-trip together,
+	// the address intact, regardless of segment order.
+	meta = encodeMeta(addr, true, true, 8, "", 0)
+	gotAddr, draining, joining, count, _, _ = decodeMeta(meta)
+	if gotAddr != addr || !draining || !joining || count != 8 {
+		t.Fatalf("decode(draining+joining+count=8) = (%q, %v, %v, %d), want (%q, true, true, 8)", gotAddr, draining, joining, count, addr)
 	}
 
 	// Stable id + epoch round-trip alongside draining + count, address intact.
-	meta = encodeMeta(addr, true, 8, "shaled-homog-0", 1718000000000000000)
-	gotAddr, draining, count, id, epoch = decodeMeta(meta)
-	if gotAddr != addr || !draining || count != 8 || id != "shaled-homog-0" || epoch != 1718000000000000000 {
-		t.Fatalf("decode(full) = (%q, %v, %d, %q, %d), want (%q, true, 8, %q, %d)", gotAddr, draining, count, id, epoch, addr, "shaled-homog-0", uint64(1718000000000000000))
+	meta = encodeMeta(addr, true, false, 8, "shaled-homog-0", 1718000000000000000)
+	gotAddr, draining, joining, count, id, epoch = decodeMeta(meta)
+	if gotAddr != addr || !draining || joining || count != 8 || id != "shaled-homog-0" || epoch != 1718000000000000000 {
+		t.Fatalf("decode(full) = (%q, %v, %v, %d, %q, %d), want (%q, true, false, 8, %q, %d)", gotAddr, draining, joining, count, id, epoch, addr, "shaled-homog-0", uint64(1718000000000000000))
 	}
 
 	// A legacy bare-address payload (no separator, written by an older
-	// node) decodes as not-draining, unknown count (0), no stable id/epoch,
-	// address intact.
-	gotAddr, draining, count, id, epoch = decodeMeta([]byte(addr))
-	if gotAddr != addr || draining || count != 0 || id != "" || epoch != 0 {
-		t.Fatalf("decode(legacy) = (%q, %v, %d, %q, %d), want (%q, false, 0, \"\", 0)", gotAddr, draining, count, id, epoch, addr)
+	// node) decodes as not-draining, not-joining, unknown count (0), no stable
+	// id/epoch, address intact.
+	gotAddr, draining, joining, count, id, epoch = decodeMeta([]byte(addr))
+	if gotAddr != addr || draining || joining || count != 0 || id != "" || epoch != 0 {
+		t.Fatalf("decode(legacy) = (%q, %v, %v, %d, %q, %d), want (%q, false, false, 0, \"\", 0)", gotAddr, draining, joining, count, id, epoch, addr)
 	}
 
 	// A legacy draining-only payload (addr\x00D, written by a node that
 	// gossips draining but not the count) decodes draining with unknown
 	// count - the forward-compat path that keeps the count fail-safe.
-	gotAddr, draining, count, _, _ = decodeMeta([]byte(addr + string(metaSep) + metaDrainingMarker))
-	if gotAddr != addr || !draining || count != 0 {
-		t.Fatalf("decode(legacy draining) = (%q, %v, %d), want (%q, true, 0)", gotAddr, draining, count, addr)
+	gotAddr, draining, joining, count, _, _ = decodeMeta([]byte(addr + string(metaSep) + metaDrainingMarker))
+	if gotAddr != addr || !draining || joining || count != 0 {
+		t.Fatalf("decode(legacy draining) = (%q, %v, %v, %d), want (%q, true, false, 0)", gotAddr, draining, joining, count, addr)
 	}
 }
 

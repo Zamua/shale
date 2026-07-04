@@ -232,6 +232,9 @@ func (c *Cluster) reconcileUnits() {
 		}
 		c.reconcileReplicaUnitsOverlap()
 		c.runDrainChecks()
+		// JOIN write-transparency (entry side): clear this node's Joining bit once
+		// it has mounted every position it owns (a no-op unless it is warming).
+		c.maintainJoiningState()
 		return
 	}
 	desired := c.desiredGenUnits()
