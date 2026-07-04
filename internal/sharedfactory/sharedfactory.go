@@ -119,6 +119,13 @@ type Backing struct {
 	// existing availability tests keep their fence-at-completion timing.
 	eagerFence atomic.Bool
 
+	// replicaFlushes counts backend.Flusher.Flush calls per replica position
+	// across every handle's backends (test observability for the cluster's
+	// DISPLACEMENT FLUSH, v0.8 Phase 2e: the Owned -> Draining edge flushes the
+	// displaced owner's backend exactly once). Guarded by mu; read via
+	// ReplicaFlushCount.
+	replicaFlushes map[storageunit.ReplicaUnit]int
+
 	// servingMarkers is the durable, poll-observable SERVING MARKER registry
 	// (v0.8 Phase 2e, Option B overlap handoff): per-replica-position, the open
 	// epoch of the latest live owner that reached Ready. It is the in-memory
@@ -140,6 +147,7 @@ func NewBacking() *Backing {
 		epochs:         make(map[storageunit.GenUnit]storageunit.Epoch),
 		replicaStores:  make(map[storageunit.ReplicaUnit]*memory.Memory),
 		replicaEpochs:  make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		replicaFlushes: make(map[storageunit.ReplicaUnit]int),
 		servingMarkers: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 	}
 }
@@ -721,3 +729,35 @@ func (f *fencedReplicaBackend) ScanPrefix(prefix []byte) (backend.Iterator, erro
 }
 
 func (f *fencedReplicaBackend) Close() error { return nil }
+
+// Flush implements the OPTIONAL backend.Flusher capability (the cluster's
+// displacement flush, v0.8 Phase 2e). The double has no memtable to make
+// durable - the shared *memory.Memory IS the durable bytes - so the flush is
+// a semantic no-op; it COUNTS the call on the shared backing (test
+// observability: the pin test asserts exactly one flush per Owned -> Draining
+// edge) and mirrors the real backend's contract by failing once fenced (a
+// higher-epoch owner took the database over; the caller treats it as a
+// best-effort miss).
+func (f *fencedReplicaBackend) Flush() error {
+	f.backing.countReplicaFlush(f.unit)
+	if f.fenced() {
+		return ErrFenced
+	}
+	return nil
+}
+
+// countReplicaFlush records one Flush call against ru (under mu).
+func (b *Backing) countReplicaFlush(ru storageunit.ReplicaUnit) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.replicaFlushes[ru]++
+}
+
+// ReplicaFlushCount reports how many times ru's backends were asked to
+// Flush, across every handle. Test observability for the displacement
+// flush's exactly-once-per-transition guarantee.
+func (b *Backing) ReplicaFlushCount(ru storageunit.ReplicaUnit) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.replicaFlushes[ru]
+}

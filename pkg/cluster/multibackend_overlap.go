@@ -39,6 +39,7 @@
 package cluster
 
 import (
+	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -420,7 +421,8 @@ func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	// corrected next poll), never release early.
 	open := c.ownOpenEpoch(ru)
 	c.mountMu.Lock()
-	if _, mounted := c.mountMap[ru]; !mounted {
+	b, mounted := c.mountMap[ru]
+	if !mounted {
 		// Lost the mount under us (a concurrent evict); nothing to drain.
 		c.mountMu.Unlock()
 		return
@@ -437,6 +439,48 @@ func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	next.OpenEpoch = open
 	c.handoffPhase[ru] = next
 	c.mountMu.Unlock()
+
+	// DISPLACEMENT FLUSH (docs/SPEC.md "Displacement flush"): this call is the
+	// Owned -> Draining edge - reached ONLY when the phase was just armed above
+	// (the phase!=0 return keeps re-entrant drain ticks out), so the flush fires
+	// EXACTLY ONCE per displacement transition. Flushing the displaced owner's
+	// memtable NOW means the successor's fencing open (already racing this)
+	// replays a minimal WAL tail instead of the whole unflushed tail. A reclaim
+	// + re-drain is a NEW edge and flushes again by design.
+	c.flushDisplaced(b)
+}
+
+// flushDisplaced asks a displaced (newly-Draining) position's backend to make
+// its in-memory write state durable, best-effort. It never creates an error
+// path: a backend without the OPTIONAL backend.Flusher capability is skipped,
+// and a flush failure is discarded (the only failure modes are benign - the
+// successor's open already fenced this owner, which is exactly the pre-flush
+// behavior, or the backend is closing). The flush runs in a background
+// goroutine because it is backing-store I/O and the caller holds reconcileMu
+// (a slow flush must never stall the reconcile tick or routed ops); loopWG
+// tracks it so Close awaits it.
+func (c *Cluster) flushDisplaced(b backend.Backend) {
+	fl, ok := flushableBackend(b)
+	if !ok || c.closed.Load() {
+		return
+	}
+	c.loopWG.Add(1)
+	go func() {
+		defer c.loopWG.Done()
+		_ = fl.Flush()
+	}()
+}
+
+// flushableBackend reports whether b (a mountMap entry) supports the OPTIONAL
+// Flusher capability, unwrapping the fencedSelfHealing decorator storeMount
+// wraps every mounted backend in. The unwrap keeps the capability honest: the
+// decorator itself must not advertise Flush for an inner backend that cannot.
+func flushableBackend(b backend.Backend) (backend.Flusher, bool) {
+	if fsh, ok := b.(*fencedSelfHealing); ok {
+		b = fsh.inner
+	}
+	fl, ok := b.(backend.Flusher)
+	return fl, ok
 }
 
 // beginAcquire records PhaseAcquiring for a pending position MOVING IN. There is

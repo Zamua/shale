@@ -374,6 +374,28 @@ func (s *Slate) Delete(key []byte) error {
 	return nil
 }
 
+// Flush forces the active memtable (and any immutable memtables) durable
+// to L0 SSTs in the object store WITHOUT closing the backend, so a
+// subsequent open of this database recovers a minimal WAL tail. It
+// implements the OPTIONAL backend.Flusher capability the cluster's
+// displacement flush uses at handoff edges (docs/SPEC.md "Displacement
+// flush"). Once a higher-epoch writer has fenced this instance the flush
+// fails with the fence error; callers treat that as a best-effort miss
+// (the successor already owns the database), never as data loss.
+func (s *Slate) Flush() error {
+	if s.db == nil {
+		return backend.ErrClosed
+	}
+	if err := s.db.FlushWithOptions(slatedb.FlushOptions{FlushType: slatedb.FlushTypeMemTable}); err != nil {
+		return fenceTag("slate: flush", err)
+	}
+	return nil
+}
+
+// Compile-time capability assertion: the slate backend supports the
+// cluster's displacement flush.
+var _ backend.Flusher = (*Slate)(nil)
+
 // ScanPrefix returns an iterator over all keys starting with prefix,
 // in key-ascending order. Caller MUST Close the iterator to release
 // the underlying SlateDB cursor.

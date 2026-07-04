@@ -429,14 +429,15 @@ func seedSequential(t *testing.T, be backend.Backend, start, n int) {
 
 // flushMemtable is the L2 lever primitive: force the owner's memtable
 // (and immutable memtables) to L0 SSTs, leaving a minimal WAL tail for
-// the next opener to replay. Exercises Db.FlushWithOptions(MemTable),
-// which the v0.13.1 binding DOES expose (feasibility datum for the
-// checkpoint-before-handoff design).
+// the next opener to replay. It calls the PRODUCTION flush surface -
+// (*Slate).Flush, the backend.Flusher capability the cluster's
+// displacement flush uses - so the ownerFlush timings measure exactly
+// what production pays.
 func flushMemtable(t *testing.T, be backend.Backend) time.Duration {
 	t.Helper()
-	s := be.(*Slate)
+	fl := be.(backend.Flusher)
 	t0 := time.Now()
-	if err := s.db.FlushWithOptions(slatedb.FlushOptions{FlushType: slatedb.FlushTypeMemTable}); err != nil {
+	if err := fl.Flush(); err != nil {
 		t.Fatalf("openbench: memtable flush: %v", err)
 	}
 	return time.Since(t0)
