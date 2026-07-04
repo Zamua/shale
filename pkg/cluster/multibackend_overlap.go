@@ -39,6 +39,7 @@
 package cluster
 
 import (
+	"sync"
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
@@ -255,6 +256,46 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		}
 		c.acquireReplicaUnit(ru)
 	}
+
+	c.logAcquireQueueSummary()
+}
+
+// logAcquireQueueSummary emits ONE line per reconcile pass while any gainer
+// position is unmounted: mounted count, acquiring count, permits held and the
+// oldest holder's tenure. Low-noise (silent in steady state) and exactly the
+// datum a wedged-open pipeline stall hides: a single line naming which
+// position has held the open permit for how long.
+func (c *Cluster) logAcquireQueueSummary() {
+	c.mountMu.RLock()
+	inFlight := len(c.acquireInFlight)
+	gainers := 0
+	for _, st := range c.handoffPhase {
+		if st.Phase.IsGainer() {
+			gainers++
+		}
+	}
+	mounted := len(c.mountMap)
+	c.mountMu.RUnlock()
+	if gainers == 0 && inFlight == 0 {
+		return // steady state: no line.
+	}
+	holders := 0
+	var oldestRU storageunit.ReplicaUnit
+	var oldest time.Time
+	c.permitHolders.Range(func(k, v any) bool {
+		holders++
+		if ts := v.(time.Time); oldest.IsZero() || ts.Before(oldest) {
+			oldest, oldestRU = ts, k.(storageunit.ReplicaUnit)
+		}
+		return true
+	})
+	if holders > 0 {
+		c.logf("shale: acquire queue: %d mounted, %d acquiring, %d in flight, %d holding an open permit (oldest %s held %s)",
+			mounted, gainers, inFlight, holders, oldestRU, time.Since(oldest).Round(time.Second))
+		return
+	}
+	c.logf("shale: acquire queue: %d mounted, %d acquiring, %d in flight, 0 holding an open permit",
+		mounted, gainers, inFlight)
 }
 
 // finishStuckFlipIfNeeded completes a handoff flip that the background acquire
@@ -693,24 +734,63 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 		// reconcile remains the backstop (identical to the pre-fix behavior
 		// from that point on). Success/failure is read off lastAcquireErr,
 		// the same signal the reconcile re-drive path uses.
+		spawned := time.Now()
 		backoff := acquireRedriveBase
+		attempt := 0
 		for {
 			if c.closed.Load() {
 				return
 			}
-			release := c.acquireOpenPermit()
+			permitRelease := c.acquireOpenPermit()
+			// Exactly-once permit release shared by the normal path and the
+			// watchdog, plus holder bookkeeping for the queue summary line.
+			var relOnce sync.Once
+			rel := func() {
+				relOnce.Do(func() {
+					c.permitHolders.Delete(ru)
+					permitRelease()
+				})
+			}
+			c.permitHolders.Store(ru, time.Now())
 			if c.closed.Load() {
-				release()
+				rel()
 				return // Close ran while queued; nothing to open.
 			}
+			attempt++
+			if attempt == 1 {
+				c.logf("shale: acquire start %s: waited %s for the open permit",
+					ru, time.Since(spawned).Round(time.Millisecond))
+			}
+			// PERMIT WATCHDOG (docs/SPEC.md "v0.8 Phase 2e", the permit
+			// watchdog): a slow/hung open must not starve the queue. After
+			// OpenPermitTimeout release the PERMIT ONLY - queued positions
+			// proceed; this position's open keeps running (un-cancellable FFI)
+			// and stays the only open for ru (acquireInFlight dedupes), so the
+			// watchdog can never double-open a position. The overlap this
+			// creates with the next queued open is the accepted, detected-and-
+			// retried degraded mode argued in the spec.
+			wd := time.AfterFunc(c.openPermitTimeout(), func() {
+				c.logf("shale: acquire %s: open still running after %s; releasing the open permit so queued positions proceed (the open continues; this position stays deduped)",
+					ru, c.openPermitTimeout())
+				rel()
+			})
+			attemptStart := time.Now()
 			c.acquireReplicaUnitOverlapBlocking(ru)
-			release()
-			if _, failed := c.lastAcquireErr.Load(ru); !failed {
+			wd.Stop()
+			rel()
+			errVal, failed := c.lastAcquireErr.Load(ru)
+			if !failed {
+				c.logf("shale: acquire done %s: attempt %d took %s, %s total since armed",
+					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), time.Since(spawned).Round(time.Millisecond))
 				return // mounted (or superseded); done.
 			}
 			if backoff > acquireRedriveCap {
+				c.logf("shale: acquire failed %s: attempt %d after %s (%v); backoff budget exhausted, periodic reconcile is the backstop",
+					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), errVal)
 				return // hand the retry back to the periodic reconcile backstop.
 			}
+			c.logf("shale: acquire failed %s: attempt %d after %s (%v); retrying in ~%s",
+				ru, attempt, time.Since(attemptStart).Round(time.Millisecond), errVal, backoff)
 			select {
 			case <-c.closeCh:
 				return
@@ -738,6 +818,7 @@ const (
 // deterministic blocking behavior. It must NOT be called while holding mountMu
 // (it takes mountMu for the flip).
 func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) {
+	openStart := time.Now()
 	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 	if err != nil {
 		// SELF-HEAL the same factory/cluster desync as the clean-cut path (#408):
@@ -805,7 +886,10 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	// Write the serving marker EXACTLY ONCE, AFTER the mount flip (outside the
 	// lock: it is shared-storage I/O). This is the durable, poll-observable release
 	// signal the old owner's drainCheck polls. No RPC is sent.
+	markStart := time.Now()
 	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	c.logf("shale: mounted %s at epoch %d: open %s, serving-mark %s",
+		ru, openedEpoch, markStart.Sub(openStart).Round(time.Millisecond), time.Since(markStart).Round(time.Millisecond))
 }
 
 // drainCheck is the OLD owner's POLL-ONLY release-check for a Draining position,

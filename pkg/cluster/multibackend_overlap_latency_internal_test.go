@@ -119,3 +119,96 @@ func TestOverlap_DrainPoller_ReleasesOnMarker_WithoutReconcileTick(t *testing.T)
 	}
 	t.Fatalf("Draining position was never released by the fast poller (marker %d > gate; no reconcile loop in this fixture)", succEpoch)
 }
+
+// TestOverlapAcquire_SlowOpenReleasesPermit_QueueUnstarved pins the PERMIT
+// WATCHDOG (docs/SPEC.md "v0.8 Phase 2e", the permit watchdog): a slow/hung
+// open releases the node-wide open PERMIT after OpenPermitTimeout so queued
+// positions proceed, while the stuck position's own open keeps running and
+// is NEVER double-opened. This is the jwt-shaped failure the watchdog
+// exists for: pre-fix, one open wedged mid-FFI at bound=1 held the permit
+// forever and every queued position starved indefinitely.
+func TestOverlapAcquire_SlowOpenReleasesPermit_QueueUnstarved(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 16, 2, backing, "n1")
+	shutdownReplicatedFixture(t, c)
+	// Fast watchdog for the test; the bound stays the production default (1).
+	c.cfg.OpenPermitTimeout = 300 * time.Millisecond
+
+	targets := c.desiredReplicaUnits()
+	if len(targets) < 4 {
+		t.Fatalf("need >=4 positions, got %d", len(targets))
+	}
+	targets = targets[:4]
+	stuck := targets[0]
+
+	release := backing.HangOpenReplica(stuck)
+	released := false
+	defer func() {
+		if !released {
+			release()
+		}
+	}()
+
+	start := time.Now()
+	for _, ru := range targets {
+		c.beginAcquire(ru)
+		c.acquireReplicaUnitOverlap(ru)
+	}
+
+	// The three queued positions must mount DESPITE the stuck head-of-line
+	// open: the watchdog frees the permit at ~300ms and they chain through.
+	// Pre-fix this loop times out (permanent starvation).
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		mountedAll := true
+		for _, ru := range targets[1:] {
+			if _, ok := c.localBackendForReplicaUnit(ru); !ok {
+				mountedAll = false
+				break
+			}
+		}
+		if mountedAll {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("queued positions starved behind the stuck open: the permit watchdog did not release")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if e := time.Since(start); e >= reconcileInterval {
+		t.Fatalf("queued positions mounted only after %v (>= reconcileInterval %v): unstarving is tick-driven, not the watchdog", e, reconcileInterval)
+	}
+
+	// The stuck position: exactly ONE open started, still unmounted, still
+	// deduped as in flight (so reconcile re-drives cannot double-open it).
+	if got := backing.OpenReplicaStartCount(stuck); got != 1 {
+		t.Fatalf("stuck position opened %d times while hung, want exactly 1 (double-open)", got)
+	}
+	if _, ok := c.localBackendForReplicaUnit(stuck); ok {
+		t.Fatalf("stuck position reported mounted while its open is hung")
+	}
+	c.mountMu.Lock()
+	_, inFlight := c.acquireInFlight[stuck]
+	c.mountMu.Unlock()
+	if !inFlight {
+		t.Fatalf("stuck position lost its acquireInFlight dedup entry while its open is still running")
+	}
+
+	// Release the hang: the stuck open completes and mounts through the
+	// NORMAL path - and it is still the ONLY open that ever ran for it.
+	release()
+	released = true
+	deadline = time.Now().Add(5 * time.Second)
+	for {
+		if _, ok := c.localBackendForReplicaUnit(stuck); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("stuck position never mounted after the hang released")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := backing.OpenReplicaStartCount(stuck); got != 1 {
+		t.Fatalf("stuck position opened %d times in total, want exactly 1 (the watchdog must never re-drive a live open)", got)
+	}
+}

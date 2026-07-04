@@ -255,6 +255,18 @@ type Config struct {
 	// via this one knob. Only consulted in multi-backend R>1 mode.
 	OpenConcurrency int
 
+	// OpenPermitTimeout bounds how long ONE background overlap acquire may
+	// hold the node-wide open permit before the permit watchdog releases
+	// the PERMIT ONLY, so queued positions proceed while the slow/hung open
+	// keeps running to completion (the FFI open is not cancellable; the
+	// position stays deduped by acquireInFlight, so no double-open). This
+	// converts a wedged open from a total acquire-pipeline stall into one
+	// stuck position. See docs/SPEC.md "v0.8 Phase 2e" (the permit
+	// watchdog) for the overlap-risk reasoning. Zero (or negative) is
+	// normalized to defaultOpenPermitTimeout (60s). Only consulted in
+	// multi-backend R>1 mode.
+	OpenPermitTimeout time.Duration
+
 	// WriteConsistency picks how many replica acks a Put / Delete
 	// waits for. Zero is normalized to WriteQuorum by Open (the v0.4
 	// default). See WriteConsistency for the per-value semantics.
@@ -582,6 +594,12 @@ type Cluster struct {
 	// owner releases within ~half a second of its successor's serving marker
 	// instead of waiting for the periodic reconcile tick.
 	drainPollerActive atomic.Bool
+
+	// permitHolders tracks which positions currently hold a node-wide open
+	// permit and since when (ru -> time.Time). Observability only: the
+	// per-tick acquire-queue summary line names the oldest holder, which is
+	// exactly the datum a wedged-open pipeline stall hides without it.
+	permitHolders sync.Map
 
 	// draining is a TEST-ONLY override for the gossiped Draining set: when
 	// non-nil, drainingIDs returns it directly instead of reading the membership

@@ -119,6 +119,20 @@ type Backing struct {
 	// existing availability tests keep their fence-at-completion timing.
 	eagerFence atomic.Bool
 
+	// openHangs holds, per replica position, a channel OpenReplicaUnit blocks
+	// on at entry until the test releases it (HangOpenReplica) - modeling an
+	// open WEDGED mid-FFI against a degraded store, the permit-watchdog pin's
+	// scenario. Distinct from acquireDelayNanos (a bounded latency) and
+	// openFaults (an immediate error). A sync.Map (arm/release without mu).
+	openHangs sync.Map
+
+	// openReplicaStarts counts OpenReplicaUnit ENTRIES per position across
+	// every handle (guarded by mu). The permit-watchdog pin asserts a stuck
+	// position is opened EXACTLY ONCE (no double-open) even after the permit
+	// is released around it. The OpenTimeline records only COMPLETED opens,
+	// so a hung open is visible here and nowhere else.
+	openReplicaStarts map[storageunit.ReplicaUnit]int
+
 	// replicaFlushes counts backend.Flusher.Flush calls per replica position
 	// across every handle's backends (test observability for the cluster's
 	// DISPLACEMENT FLUSH, v0.8 Phase 2e: the Owned -> Draining edge flushes the
@@ -143,12 +157,13 @@ type Backing struct {
 // NewBacking returns an empty shared backing (no units written yet).
 func NewBacking() *Backing {
 	return &Backing{
-		stores:         make(map[storageunit.GenUnit]*memory.Memory),
-		epochs:         make(map[storageunit.GenUnit]storageunit.Epoch),
-		replicaStores:  make(map[storageunit.ReplicaUnit]*memory.Memory),
-		replicaEpochs:  make(map[storageunit.ReplicaUnit]storageunit.Epoch),
-		replicaFlushes: make(map[storageunit.ReplicaUnit]int),
-		servingMarkers: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		stores:            make(map[storageunit.GenUnit]*memory.Memory),
+		epochs:            make(map[storageunit.GenUnit]storageunit.Epoch),
+		replicaStores:     make(map[storageunit.ReplicaUnit]*memory.Memory),
+		replicaEpochs:     make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		replicaFlushes:    make(map[storageunit.ReplicaUnit]int),
+		openReplicaStarts: make(map[storageunit.ReplicaUnit]int),
+		servingMarkers:    make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 	}
 }
 
@@ -438,6 +453,37 @@ func (b *Backing) SetOpenReplicaFault(ru storageunit.ReplicaUnit, err error) {
 	b.openFaults.Store(ru, err)
 }
 
+// HangOpenReplica arms a HANG on every subsequent OpenReplicaUnit of ru: the
+// open blocks at entry until the returned release func is called (idempotent).
+// Models an open wedged mid-FFI against a degraded store. Test-only; the
+// caller MUST release before test end or the blocked goroutine leaks.
+func (b *Backing) HangOpenReplica(ru storageunit.ReplicaUnit) (release func()) {
+	ch := make(chan struct{})
+	b.openHangs.Store(ru, ch)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.openHangs.Delete(ru)
+			close(ch)
+		})
+	}
+}
+
+// OpenReplicaStartCount reports how many OpenReplicaUnit calls for ru have
+// STARTED across every handle (completed or still in flight). Test-only.
+func (b *Backing) OpenReplicaStartCount(ru storageunit.ReplicaUnit) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.openReplicaStarts[ru]
+}
+
+// countOpenReplicaStart records one OpenReplicaUnit entry for ru.
+func (b *Backing) countOpenReplicaStart(ru storageunit.ReplicaUnit) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.openReplicaStarts[ru]++
+}
+
 // SetStrictReadFencing toggles whether a fenced handle also fails READS (Get +
 // ScanPrefix) with ErrFenced, modeling real slatedb's close-on-fence. Default
 // false (reads pass through, the overlap-union-read model). Test-only.
@@ -463,6 +509,13 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	// handoff-cycle latency pins can assert queued opens chain event-driven.
 	openStart := time.Now()
 	defer h.recordOpenSpan(ru, openStart)
+	h.backing.countOpenReplicaStart(ru)
+	// Injected hang (test-only): block at entry until released, modeling an
+	// open wedged mid-FFI. Before the fault check so a hang + fault compose
+	// as hang-then-fail.
+	if ch, ok := h.backing.openHangs.Load(ru); ok {
+		<-ch.(chan struct{})
+	}
 	// Concurrency high-water tracking (test-only, Phase 2g): record the peak
 	// number of simultaneously in-flight opens so a test can assert the boot
 	// mount runs them in parallel up to its bound. Wraps the whole call (defer)

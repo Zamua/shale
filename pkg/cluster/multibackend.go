@@ -91,6 +91,21 @@ func (c *Cluster) openConcurrency() int {
 	return conc
 }
 
+// defaultOpenPermitTimeout is the permit watchdog bound when
+// Config.OpenPermitTimeout is unset: how long one overlap acquire may hold
+// the node-wide open permit before the permit is released to unstarve the
+// queue (the open itself keeps running). Roughly 2x a worst-case clean open
+// against a loaded object store.
+const defaultOpenPermitTimeout = 60 * time.Second
+
+// openPermitTimeout returns the normalized permit watchdog bound.
+func (c *Cluster) openPermitTimeout() time.Duration {
+	if d := c.cfg.OpenPermitTimeout; d > 0 {
+		return d
+	}
+	return defaultOpenPermitTimeout
+}
+
 // acquireOpenPermit blocks until a node-wide open permit is available and
 // returns the release func. The permit gate (openSem) is created lazily
 // under mountMu on first use, sized by openConcurrency() at that moment.

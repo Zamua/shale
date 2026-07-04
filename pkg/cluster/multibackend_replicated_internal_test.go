@@ -9,6 +9,7 @@ package cluster
 
 import (
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -31,7 +32,10 @@ func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfa
 		rg.Add(ring.Member{ID: id, Addr: id + ":0"})
 	}
 	c := &Cluster{
-		cfg:             Config{NodeID: self, ReplicationFactor: r},
+		// LogOutput io.Discard: the acquire/mount transition logging added for
+		// the handoff observability would otherwise write to os.Stderr (logf's
+		// deliberate fallback) in every white-box test.
+		cfg:             Config{NodeID: self, ReplicationFactor: r, LogOutput: io.Discard},
 		multi:           true,
 		factory:         h,
 		unitCount:       storageunit.MustUnitCount(n),
