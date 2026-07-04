@@ -186,10 +186,7 @@ func (c *Cluster) mountReplicaUnits() error {
 	// rules below (defer-on-marker, skip-on-error, mount-on-success) are
 	// UNCHANGED; only the iteration is parallel, and the set of positions that end
 	// up mounted/skipped/deferred is identical to the serial mount.
-	conc := c.cfg.OpenConcurrency
-	if conc <= 0 {
-		conc = defaultOpenConcurrency
-	}
+	conc := c.openConcurrency()
 	if conc > len(units) {
 		conc = len(units)
 	}

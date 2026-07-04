@@ -239,15 +239,20 @@ type Config struct {
 	// HA + LWW conflict resolution is opt-in via ReplicationFactor > 1.
 	ReplicationFactor int
 
-	// OpenConcurrency bounds how many owned replica positions the
-	// boot-time mount (mountReplicaUnits) opens IN PARALLEL. Each
-	// (unit, replica) position is an independent durable database, so
-	// concurrent opens of DISTINCT positions never fence one another;
-	// the cap exists so the cold-start open burst cannot itself
-	// overwhelm the shared object store. Zero (or negative) is
-	// normalized to defaultOpenConcurrency. A value of 1 reproduces the
-	// strictly-sequential mount exactly. Only consulted in multi-backend
-	// R>1 mode (the per-replica mount loop).
+	// OpenConcurrency bounds how many replica-position opens run IN
+	// PARALLEL on this node - BOTH the boot-time mount pool
+	// (mountReplicaUnits) AND the background overlap acquires the
+	// reconcile spawns during a membership transition
+	// (acquireReplicaUnitOverlap), which take a node-wide permit around
+	// each OpenReplicaUnit. Each (unit, replica) position is an
+	// independent durable database, so concurrent opens of DISTINCT
+	// positions never fence one another; the cap exists because
+	// concurrent REAL-DATA opens are unsafe in the shipped slatedb-go
+	// binding (see defaultOpenConcurrency) and, secondarily, so an open
+	// burst cannot overwhelm the shared object store. Zero (or negative)
+	// is normalized to defaultOpenConcurrency (1 = strictly sequential,
+	// the proven-safe mode). Raising it is a deliberate, revalidated act
+	// via this one knob. Only consulted in multi-backend R>1 mode.
 	OpenConcurrency int
 
 	// WriteConsistency picks how many replica acks a Put / Delete
@@ -555,6 +560,21 @@ type Cluster struct {
 	// acquire must NOT spawn a second open for the same position. Guarded by
 	// mountMu.
 	acquireInFlight map[storageunit.ReplicaUnit]struct{}
+
+	// openSem is the node-wide permit gate bounding how many replica-unit
+	// opens run CONCURRENTLY on this node's factory, sized by
+	// Config.OpenConcurrency (normalized via openConcurrency; default 1).
+	// The background overlap acquires (acquireReplicaUnitOverlap goroutines)
+	// take a permit around each OpenReplicaUnit, so a node gaining many
+	// positions at once queues the opens at the SAME bound the boot mount
+	// pool (mountReplicaUnits) enforces - one knob governs every real-data
+	// open on the node. The queued positions stay PhaseAcquiring (the union
+	// covers them) so bounding costs availability nothing; it only sequences
+	// the FFI opens, which is required while concurrent real-data opens are
+	// unsafe in the shipped binding (see defaultOpenConcurrency). Created
+	// LAZILY under mountMu on first use so its size reflects the config at
+	// first acquire (mirrors mountReplicaUnits sizing its pool at call time).
+	openSem chan struct{}
 
 	// draining is a TEST-ONLY override for the gossiped Draining set: when
 	// non-nil, drainingIDs returns it directly instead of reading the membership

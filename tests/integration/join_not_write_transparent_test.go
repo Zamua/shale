@@ -75,6 +75,14 @@ func startReplicatedNodeSlowAcquire(t *testing.T, id, seedAddr string, unitCount
 		ReadConsistency:   cluster.ReadAll,
 		GRPCAddr:          grpcAddr,
 		WriteTimeout:      writeTimeout,
+		// The gates this helper serves arm MULTI-SECOND per-open delays across
+		// MANY positions at once; at the production default open bound (1) those
+		// would serialize into N x delay and bust the probe windows. The mock
+		// double has no FFI concurrency hazard, so lift the bound to keep these
+		// gates testing what they test (transparency DURING concurrent slow
+		// mounts). The bound itself is pinned by
+		// TestOverlapAcquire_BoundedByOpenConcurrency in pkg/cluster.
+		OpenConcurrency: 8,
 	}
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}
@@ -421,6 +429,11 @@ func TestLeaveIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 	mutate := func(cfg *cluster.Config) {
 		cfg.WriteTimeout = 300 * time.Millisecond
 		cfg.GracefulLeaveDrainTimeout = 12 * time.Second // enable the graceful drain (small: keeps teardown fast)
+		// Survivors acquire the leaver's positions with a 6s mock delay armed
+		// across several positions at once; the default node-wide open bound (1)
+		// would serialize them past the drain budget. No FFI hazard in the mock
+		// double; the bound is pinned separately in pkg/cluster.
+		cfg.OpenConcurrency = 8
 	}
 	n1 := startReplicatedNodeCfg(t, "lv-a", "", uc, rf, backing, mutate)
 	n2 := startReplicatedNodeCfg(t, "lv-b", n1.BindAddr, uc, rf, backing, mutate)

@@ -575,6 +575,21 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 			delete(c.acquireInFlight, ru)
 			c.mountMu.Unlock()
 		}()
+		// NODE-WIDE OPEN BOUND: take a permit before the slow open, so a node
+		// gaining many positions at once runs at most Config.OpenConcurrency
+		// (default 1) real-data FFI opens concurrently - the SAME knob the boot
+		// mount pool enforces, because concurrent real-data opens are the
+		// documented "empty SSTable" corruption trigger in the shipped binding
+		// (see defaultOpenConcurrency). While queued the position simply stays
+		// PhaseAcquiring and the union keeps covering it via the still-mounted
+		// current owner, so the bound sequences the opens without any
+		// availability cost. The acquireInFlight entry is held across the queue
+		// wait, so a reconcile re-drive never spawns a duplicate waiter.
+		release := c.acquireOpenPermit()
+		defer release()
+		if c.closed.Load() {
+			return // Close ran while queued; nothing to open.
+		}
 		c.acquireReplicaUnitOverlapBlocking(ru)
 	}()
 }

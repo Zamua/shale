@@ -76,6 +76,38 @@ const epochAtOpen storageunit.Epoch = 0
 // re-validated against PROD-SHAPED DATA before use. Until then the default is 1.
 const defaultOpenConcurrency = 1
 
+// openConcurrency returns the node-wide bound on concurrent replica-unit
+// opens: Config.OpenConcurrency normalized (zero/negative -> the safe
+// defaultOpenConcurrency). BOTH open paths consult it - the boot mount pool
+// (mountReplicaUnits) and the background overlap acquires (via
+// acquireOpenPermit) - so every real-data FFI open on a node respects ONE
+// knob, and raising it is one deliberate, revalidated act (see the
+// defaultOpenConcurrency doc for why the default stays 1).
+func (c *Cluster) openConcurrency() int {
+	conc := c.cfg.OpenConcurrency
+	if conc <= 0 {
+		conc = defaultOpenConcurrency
+	}
+	return conc
+}
+
+// acquireOpenPermit blocks until a node-wide open permit is available and
+// returns the release func. The permit gate (openSem) is created lazily
+// under mountMu on first use, sized by openConcurrency() at that moment.
+// Used by the background overlap acquires; the boot mount pool carries the
+// same bound via its own errgroup limit (boot and reconcile do not overlap:
+// mountReplicaUnits completes before Open returns and starts the loops).
+func (c *Cluster) acquireOpenPermit() (release func()) {
+	c.mountMu.Lock()
+	if c.openSem == nil {
+		c.openSem = make(chan struct{}, c.openConcurrency())
+	}
+	sem := c.openSem
+	c.mountMu.Unlock()
+	sem <- struct{}{}
+	return func() { <-sem }
+}
+
 // genUnitBytes encodes a GenUnit (the generation-qualified storage identity)
 // as 12 fixed-width big-endian bytes: 8 bytes of Generation followed by 4
 // bytes of UnitID. This is the stable encoding fed to the ring (LocateKey
