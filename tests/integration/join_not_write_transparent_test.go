@@ -133,6 +133,130 @@ func probeClass(entry *cluster.Cluster, uk map[storageunit.UnitID]string, units 
 // the mount: the newcomer advertises the Joining bit, so the still-mounted
 // displaced replica stays a CURRENT owner and the union write acks over the two
 // mounted holders while the newcomer mounts in the background.
+// TestJoinResidual_FenceAtOpenStart_MovingShardsWedge reproduces the RESIDUAL
+// measured on the real cluster (a clean 3->4 scale-up wedged writes ~42s during
+// the newcomer's real-MinIO mount, even with the Joining-bit fix). It is the SAME
+// setup as TestJoinIsWriteTransparent, but the backing is switched to
+// fence-at-open-START timing (SetEagerFence) - real slatedb's DbBuilder.Build
+// fences the prior owner the INSTANT the newcomer begins its slow open, not at
+// mount completion. Under that timing the displaced owner is fenced for the whole
+// mount and CANNOT serve the union, so a moving-shard write reaches only the
+// un-displaced co-replica (1 ack of 2) and WEDGES - exactly the residual. The
+// default fence-at-completion timing (which the passing test uses) hides this: it
+// keeps the displaced owner unfenced during the modeled mount.
+//
+// This proves the residual is the FENCE TIMING, not the gossip-ordering race the
+// Joining bit already closes (it rides the first Meta; cluster.go startJoining).
+func TestJoinResidual_FenceAtOpenStart_MovingShardsWedge(t *testing.T) {
+	const uc, rf = 16, 2
+	backing := sharedfactory.NewBacking()
+	backing.SetEagerFence(true) // real slatedb: fence at open-START, not completion
+	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
+
+	n1 := startReplicatedNodeCfg(t, "jr-a", "", uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "jr-b", n1.BindAddr, uc, rf, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "jr-c", n1.BindAddr, uc, rf, backing, mutate)
+	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
+		t.Fatalf("3-node convergence: %v", err)
+	}
+	time.Sleep(800 * time.Millisecond)
+
+	uk := oneKeyPerUnit(t, n1.Cluster, uc)
+	plantAllServingMarkers(t, n1.Handle, uc, rf)
+
+	old3 := []string{"jr-a", "jr-b", "jr-c"}
+	new4 := []string{"jr-a", "jr-b", "jr-c", "jr-d"}
+	var moving, stable []storageunit.UnitID
+	for u := range uk {
+		if contains(replicaIDsForMembers(new4, u, rf), "jr-d") && !contains(replicaIDsForMembers(old3, u, rf), "jr-d") {
+			moving = append(moving, u)
+		} else {
+			stable = append(stable, u)
+		}
+	}
+	sort.Slice(moving, func(i, j int) bool { return moving[i] < moving[j] })
+	if len(moving) == 0 {
+		t.Skip("no unit moves onto the 4th node under this hashing")
+	}
+	t.Logf("of %d units: %d MOVE onto jr-d, %d stay put (eager-fence: real-slatedb timing)", uc, len(moving), len(stable))
+
+	const mountDelay = 25 * time.Second
+	n4 := startReplicatedNodeSlowAcquire(t, "jr-d", n1.BindAddr, uc, rf, backing, mountDelay, 300*time.Millisecond)
+	cs4 := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
+	if err := waitForMembersAll(cs4, 4, 30*time.Second); err != nil {
+		t.Fatalf("4-node convergence: %v", err)
+	}
+	if len(n1.Cluster.Members()) != 4 {
+		t.Fatalf("entry node not converged to 4 members")
+	}
+
+	// WAIT for jr-d to actually START opening (under eager-fence, OpenReplicaUnit
+	// bumps the durable epoch + fences the displaced owner BEFORE its long sleep):
+	// poll moving-shard writes until one FAILS mid-acquire while jr-d is still
+	// mid-mount. That is the fence engaging. If NO moving-shard write ever fails
+	// while jr-d warms (it stays available the whole time), the union covers the
+	// mount even under fence-at-open-start, and the fence-timing is REFUTED as the
+	// residual - we say so.
+	fenceEngaged := false
+	fenceDeadline := time.Now().Add(20 * time.Second)
+	for time.Now().Before(fenceDeadline) {
+		if desiredButUnmounted(n4.Cluster) == 0 {
+			break // jr-d finished warming without ever wedging
+		}
+		if isMidAcquire(n1.Cluster.Put([]byte(uk[moving[0]]), []byte("engage"))) {
+			fenceEngaged = true
+			break
+		}
+		time.Sleep(150 * time.Millisecond)
+	}
+	if !fenceEngaged {
+		t.Logf("REFUTED: no moving-shard write ever wedged under eager-fence while jr-d warmed - the union covers "+
+			"the mount even with fence-at-open-start. The fence-timing is NOT the residual (jr-d unmounted=%d).",
+			desiredButUnmounted(n4.Cluster))
+		for _, n := range []*sharedNode{n1, n2, n3, n4} {
+			n.Handle.SetAcquireDelay(0)
+		}
+		t.Skip("fence-timing did not reproduce the residual; see log")
+	}
+
+	// MEASURE the sustained wedge while jr-d is still mid-mount (fence engaged).
+	var movOK, movMid, movOther, stOK, stMid, stOther int
+	rounds := 0
+	for r := 0; r < 5 && desiredButUnmounted(n4.Cluster) > 0; r++ {
+		o, m, x := probeClass(n1.Cluster, uk, moving)
+		movOK += o
+		movMid += m
+		movOther += x
+		o, m, x = probeClass(n1.Cluster, uk, stable)
+		stOK += o
+		stMid += m
+		stOther += x
+		rounds++
+		time.Sleep(400 * time.Millisecond)
+	}
+	for _, n := range []*sharedNode{n1, n2, n3, n4} {
+		n.Handle.SetAcquireDelay(0)
+	}
+	movTotal := movOK + movMid + movOther
+	t.Logf("RESIDUAL (eager-fence) MOVING-shard writes during mount: ok=%d midAcquire=%d other=%d (total=%d)", movOK, movMid, movOther, movTotal)
+	t.Logf("RESIDUAL (eager-fence) STABLE-shard writes during mount: ok=%d midAcquire=%d other=%d", stOK, stMid, stOther)
+
+	if rounds == 0 || movTotal == 0 {
+		t.Fatalf("no during-mount moving-shard probes ran (jr-d mounted too fast; raise mountDelay)")
+	}
+	if movMid == 0 {
+		t.Fatalf("expected the fence-at-open-start RESIDUAL to WEDGE moving-shard writes (mid-acquire), saw none "+
+			"(ok=%d) - the residual did not reproduce", movOK)
+	}
+	if rate := float64(movMid) / float64(movTotal); rate < 0.6 {
+		t.Fatalf("residual not dominant: only %.0f%% of moving-shard writes wedged under eager-fence (ok=%d mid=%d)", rate*100, movOK, movMid)
+	}
+	t.Logf("RESIDUAL REPRODUCED: with fence-at-open-start (real slatedb), %d/%d moving-shard writes WEDGE during "+
+		"jr-d's mount because the displaced owner is fenced the instant jr-d begins opening its position - so the "+
+		"union's displaced-owner leg returns the fence (transient) and only the un-displaced co-replica acks (1 of 2). "+
+		"The default fence-at-completion timing hides this. Stable shards stay available (%d ok).", movMid, movTotal, stOK)
+}
+
 func TestJoinIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()

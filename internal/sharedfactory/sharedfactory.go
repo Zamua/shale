@@ -106,6 +106,19 @@ type Backing struct {
 	// self-heal) gets them without changing the overlap tests' behavior.
 	strictReadFencing atomic.Bool
 
+	// eagerFence, when true, models real slatedb's fence timing: the durable
+	// writer-epoch bumps at open-START (inside DbBuilder.Build), fencing the prior
+	// owner the INSTANT the successor begins its (slow) open, NOT at mount
+	// completion. The default OpenReplicaUnit sleeps the acquireDelay BEFORE the
+	// epoch bump, which defers the fence to completion - so a displaced/draining
+	// owner stays UNFENCED for the whole modeled mount and keeps serving the union.
+	// That is a test-double fidelity gap: on real slatedb the prior owner is fenced
+	// for the whole mount and CANNOT serve, so the union write reaches only the
+	// un-displaced co-replica (1 ack) and WEDGES. eagerFence bumps the epoch first,
+	// then sleeps, matching production. Opt-in per test (default false), so the
+	// existing availability tests keep their fence-at-completion timing.
+	eagerFence atomic.Bool
+
 	// servingMarkers is the durable, poll-observable SERVING MARKER registry
 	// (v0.8 Phase 2e, Option B overlap handoff): per-replica-position, the open
 	// epoch of the latest live owner that reached Ready. It is the in-memory
@@ -392,6 +405,14 @@ func (b *Backing) SetOpenReplicaFault(ru storageunit.ReplicaUnit, err error) {
 // false (reads pass through, the overlap-union-read model). Test-only.
 func (b *Backing) SetStrictReadFencing(on bool) { b.strictReadFencing.Store(on) }
 
+// SetEagerFence toggles fence-at-open-START timing (real slatedb's DbBuilder.Build
+// behavior) instead of the default fence-at-completion. When on, OpenReplicaUnit
+// bumps the durable writer-epoch (fencing the prior owner) BEFORE it sleeps the
+// acquireDelay, so a displaced/draining owner is fenced for the whole modeled
+// mount and cannot serve the union - reproducing the real-cluster residual the
+// default (fence-at-completion) timing hides. Default false. Test-only.
+func (b *Backing) SetEagerFence(on bool) { b.eagerFence.Store(on) }
+
 // OpenReplicaUnit opens replica position ru.Replica of unit ru.Unit against
 // the per-replica shared backing, fencing any prior writer of the SAME
 // replica position. It returns a fencedReplicaBackend over the SHARED
@@ -426,10 +447,28 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	}
 	h.mu.Unlock()
 
-	// Simulate object-store open latency to widen the acquiring window (test
-	// support for the Phase 2d write-availability gate). The sleep is BEFORE the
-	// epoch bump, so the unit is genuinely unmounted (a routed op gets the
-	// retryable acquiring-window error) for the whole delay.
+	// EAGER FENCE (real slatedb timing): bump the durable writer-epoch FIRST, so
+	// the prior owner is fenced the instant this slow open begins (DbBuilder.Build
+	// fences at open-START), THEN sleep the mount latency. The store is still not
+	// returned until after the sleep, so this node stays unmounted (routed ops get
+	// the transient) for the whole delay - but the prior owner is ALREADY fenced and
+	// cannot serve the union. This is the production timing the default hides.
+	if h.backing.eagerFence.Load() {
+		store, opened := h.backing.acquireReplica(ru, epoch)
+		if d := h.acquireDelayNanos.Load(); d > 0 {
+			time.Sleep(time.Duration(d))
+		}
+		h.mu.Lock()
+		h.openReplica[ru] = opened
+		h.mu.Unlock()
+		return &fencedReplicaBackend{backing: h.backing, unit: ru, epoch: opened, store: store}, opened, nil
+	}
+
+	// DEFAULT (fence-at-completion): simulate object-store open latency to widen the
+	// acquiring window (test support for the Phase 2d write-availability gate). The
+	// sleep is BEFORE the epoch bump, so the unit is genuinely unmounted (a routed op
+	// gets the retryable acquiring-window error) for the whole delay AND the prior
+	// owner stays unfenced (the fence-timing gap eagerFence closes).
 	if d := h.acquireDelayNanos.Load(); d > 0 {
 		time.Sleep(time.Duration(d))
 	}
