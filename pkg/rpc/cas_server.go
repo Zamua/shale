@@ -32,7 +32,15 @@ import (
 // uses a gRPC status code, because there is no committed/conflict/error
 // triple to fill when we refuse to even open the transaction.
 func (s *Server) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*pb.CommitCASResponse, error) {
-	if !s.c.OwnsKey(req.GetPinKey()) {
+	// The gate is the DESIGNATED-CAS-owner predicate (OwnsCASPin), not the raw
+	// ring head (OwnsKey): during a join transition the designation moves to the
+	// displaced still-mounted current head while the full-ring head is a warming
+	// Joining newcomer, and the gate must accept commits exactly where the client
+	// dispatch (commitCAS) sends them - both evaluate the same pure function of
+	// (ring, joining set), so at most one node accepts per converged view. In
+	// steady state OwnsCASPin == OwnsKey. See docs/SPEC.md "CAS during a
+	// transition: ONE designated owner".
+	if !s.c.OwnsCASPin(req.GetPinKey()) {
 		return nil, status.Error(codes.FailedPrecondition,
 			"shale: CommitCAS: this node does not own pin_key; re-pin against the current ring")
 	}

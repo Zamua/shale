@@ -1054,10 +1054,16 @@ func (m *Membership) SetDraining(draining bool) error {
 		}
 	}
 	m.cacheMu.Unlock()
-	// UpdateNode re-reads NodeMeta (now reflecting the flag) and gossips
-	// it. The 0 timeout means "do not block waiting for the broadcast to
-	// flush"; the change still propagates via the normal gossip loop.
-	return m.ml.UpdateNode(0)
+	// UpdateNode re-reads NodeMeta (now reflecting the flag) and gossips it,
+	// BOUNDED by metaUpdateTimeout. The bound is load-bearing: memberlist treats
+	// a 0 timeout as "wait forever" (NOT "do not wait"), and with any remembered
+	// alive peer UpdateNode blocks on the broadcast's notify channel, which never
+	// fires if a concurrent same-node broadcast (the meta-refresh loop) SUPERSEDES
+	// this one before it transmits, or if the peers are unreachable mid-teardown -
+	// wedging the calling goroutine permanently (the exact hazard metaUpdateTimeout
+	// documents for the refresh loop). A timed-out update is best-effort, not an
+	// error: the new Meta is already queued and still propagates via normal gossip.
+	return m.ml.UpdateNode(metaUpdateTimeout)
 }
 
 // SetJoining flips the LOCAL node's joining bit and gossips the change to peers.
@@ -1097,7 +1103,15 @@ func (m *Membership) SetJoining(joining bool) error {
 		}
 	}
 	m.cacheMu.Unlock()
-	return m.ml.UpdateNode(0)
+	// BOUNDED UpdateNode (see SetDraining for the full rationale): a 0 timeout is
+	// memberlist's "wait forever", and the Joining-bit CLEAR runs on the reconcile
+	// cadence where a meta-refresh re-broadcast can supersede it (its notify never
+	// fires) or the cluster can be mid-teardown (peers unreachable) - either way
+	// the reconcile goroutine that called this would wedge in UpdateNode forever
+	// (caught by goleak as a leaked settle-timer reconcile blocked 1+ min in
+	// UpdateNode during the integration suite's teardown). The queued broadcast
+	// still propagates via normal gossip after a timeout, so bounding is safe.
+	return m.ml.UpdateNode(metaUpdateTimeout)
 }
 
 // Leave broadcasts the graceful departure to peers WITHOUT shutting the

@@ -98,7 +98,9 @@ func TestJoinMassBoot_QuorumFloorNeverFalseAcks(t *testing.T) {
 	// floor failure) would be LOST and caught there. We also require MANY wedges, so
 	// the run provably exercised the floor rather than being trivially available.
 	var probes, wedged, acked, otherErr int
+	var casProbes, casWedgedN, casAcked, casOther int
 	acks := make(map[string]string, len(units)*4)
+	casAcks := make(map[string]string, len(units)*2)
 	for round := 0; round < 8; round++ {
 		for _, u := range units {
 			probes++
@@ -114,9 +116,31 @@ func TestJoinMassBoot_QuorumFloorNeverFalseAcks(t *testing.T) {
 				otherErr++
 			}
 		}
+		// CAS PROBES (workstream B): the CAS surface must obey the SAME floor
+		// contract - under an all-warming unit either the SAFE wedge (retryable
+		// refusal) or a genuine ack backed by R durable copies (verified by the
+		// durability sweep below). A false CAS ack below R copies would be lost
+		// there. Probe a few units per round with fresh If-None-Match commits.
+		for i := 0; i < 4 && i < len(units); i++ {
+			u := units[(round*4+i)%len(units)]
+			casProbes++
+			k := casKeysForUnit(u, uc, 1, fmt.Sprintf("mb-%d-%d", u, round))[0]
+			err := casProbe(r1.Cluster, k, "mbcas")
+			switch {
+			case err == nil:
+				casAcked++
+				casAcks[k] = "mbcas"
+			case casWedged(err) || status.Code(err) == codes.DeadlineExceeded:
+				casWedgedN++
+			default:
+				casOther++
+				t.Logf("mass-boot CAS probe unexpected error on unit %d: %v", u, err)
+			}
+		}
 		time.Sleep(250 * time.Millisecond)
 	}
-	t.Logf("MASS-BOOT warm window: probes=%d wedged(safe)=%d acked=%d other=%d", probes, wedged, acked, otherErr)
+	t.Logf("MASS-BOOT warm window: probes=%d wedged(safe)=%d acked=%d other=%d; CAS probes=%d wedged(safe)=%d acked=%d other=%d",
+		probes, wedged, acked, otherErr, casProbes, casWedgedN, casAcked, casOther)
 
 	// SAFETY ASSERTION (a): the mass boot degraded to the SAFE wedge for the
 	// fully-warming units (many probes wedged, unavailable-but-not-lost), and no
@@ -127,6 +151,10 @@ func TestJoinMassBoot_QuorumFloorNeverFalseAcks(t *testing.T) {
 	}
 	if otherErr > 0 {
 		t.Fatalf("unexpected non-wedge hard errors during the mass boot: %d (want only mid-acquire/Unavailable wedges)", otherErr)
+	}
+	if casOther > 0 {
+		t.Fatalf("unexpected non-wedge hard errors from CAS probes during the mass boot: %d (the CAS surface must "+
+			"degrade to the same safe wedge)", casOther)
 	}
 
 	// HEAL: drop the slow mount so both nodes finish warming, and let the reconcile
@@ -165,6 +193,15 @@ func TestJoinMassBoot_QuorumFloorNeverFalseAcks(t *testing.T) {
 		if string(got) != v {
 			mismatched++
 			lostKeys = append(lostKeys, fmt.Sprintf("%s(got %q want %q)", k, got, v))
+		}
+	}
+	// CAS acks obey the same contract: an acked If-None-Match commit below R
+	// durable copies would be lost here.
+	for k, v := range casAcks {
+		got, err := getWithRetryUnavailable(t, r1.Cluster, k, 15*time.Second)
+		if err != nil || string(got) != v {
+			lost++
+			lostKeys = append(lostKeys, fmt.Sprintf("cas:%s(got %q want %q err %v)", k, got, v, err))
 		}
 	}
 	// Seed keys not overwritten by a later acked probe must also survive.

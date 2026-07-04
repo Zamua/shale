@@ -113,11 +113,18 @@ func (f *liveFleet) seedsForLocked(except string) string {
 // restart replaces the node with stable id `id`: it gracefully closes the old
 // instance (best case for peer convergence) and brings a fresh instance up on a
 // new bind/grpc address, seeded to a live peer, over the SAME durable backing.
+//
+// The map slot is set nil UNDER f.mu BEFORE old.Close() runs: Close mutates
+// old.Cluster (sharedNode.Close nils the field), and the concurrent readers
+// (clusters()/nodes(), called by the background writers) read that field under
+// f.mu - so Close must never run while old is still reachable through the map,
+// or the field write races the locked reads (caught by -race).
 func (f *liveFleet) restart(id string) {
 	f.t.Helper()
 	f.mu.Lock()
 	seed := f.seedsForLocked(id)
 	old := f.live[id]
+	f.live[id] = nil // readers skip the slot while it is mid-replace
 	f.mu.Unlock()
 	if old != nil {
 		old.Close() // graceful membership Leave + gRPC stop

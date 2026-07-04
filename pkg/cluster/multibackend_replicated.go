@@ -464,7 +464,41 @@ func (c *Cluster) applyBatchToUnit(writes []EnvelopeWrite) error {
 	if !ok {
 		return errUnitAcquiring("ApplyBatch")
 	}
+	return c.applyBatchToBackend(b, ru, writes)
+}
 
+// applyBatchToReplicaUnit applies a CAS write-set APPLY-IF-NEWER against the
+// EXPLICIT mounted position ru (the position-addressed sibling of
+// applyBatchToUnit). It is the owner-side extra-position apply of the CAS
+// write-set fan-out (workstream B): a designated owner that holds TWO positions
+// of the pin unit mid-transition (the index-shuffling survivor: its draining old
+// slot AND its acquired new slot) commits owner-locally against one and applies
+// the batch to the other through this, so both durable copies carry the write
+// exactly as the put path's dual-position routing achieves. Mirrors
+// resolveAndApplyReplicaPut's reshard pause discipline. An unmounted ru returns
+// the retryable acquiring-window error (counts as no ack, never a failure).
+func (c *Cluster) applyBatchToReplicaUnit(ru storageunit.ReplicaUnit, writes []EnvelopeWrite) error {
+	if len(writes) == 0 {
+		return nil
+	}
+	if c.parentSlotMidSplit(ru) {
+		pause := c.pauseLockFor(ru.Unit.ID)
+		pause.RLock()
+		defer pause.RUnlock()
+	}
+	b, ok := c.localBackendForReplicaUnit(ru)
+	if !ok {
+		return errUnitAcquiring("ApplyBatch")
+	}
+	return c.applyBatchToBackend(b, ru, writes)
+}
+
+// applyBatchToBackend is the shared apply loop of applyBatchToUnit and
+// applyBatchToReplicaUnit: ONE transaction on the resolved mounted backend,
+// APPLY-IF-NEWER per key, under c.applyMu, with every error site fence-recoded
+// to the transient acquiring-window error (the fan-out classifies it as neither
+// ack nor failure).
+func (c *Cluster) applyBatchToBackend(b backend.Backend, ru storageunit.ReplicaUnit, writes []EnvelopeWrite) error {
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
 
@@ -629,20 +663,33 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 	// stable set, so this is the unchanged static path. The read N (quorum / all)
 	// is computed over the STABLE replica count, NOT widened by the union, matching
 	// the write ack bar.
-	allReplicas, stableR := c.routedReplicasForKey(key)
-	if len(allReplicas) == 0 {
+	// POSITION-ADDRESSED union read (workstream B): resolve the routed union WITH
+	// each member's ReplicaUnit and dispatch by explicit position, exactly as the
+	// write fan-out does. The member-keyed forward (GetForwarded without a ru) is
+	// guard-gated on the receiver's ring view, which REFUSES a displaced current
+	// owner during a join for a key it does not physically hold (the fresh-key
+	// If-None-Match read) - the position-addressed wire (GetAtReplica ->
+	// LocalReplicaGetAt) resolves mountMap[ru] directly with no guard, so every
+	// union leg answers value / not-found / acquiring on its own mount state. In
+	// steady state routed == the stable set at its ring indices, so the resolved
+	// backends are identical to the old member-keyed path.
+	routed, stableR := c.routedReplicasWithUnit(key)
+	if len(routed) == 0 {
 		return nil, status.Error(codes.Unavailable, "shale: no replicas available for key")
 	}
 	rc := c.cfg.ReadConsistency
 	// N is the stable read quorum, NOT widened by a transient union member; clamp
 	// to the routed size so a single-replica routed set is still answerable.
-	n := min(requiredReadReplicas(rc, stableR), len(allReplicas))
-	queried := allReplicas
+	n := min(requiredReadReplicas(rc, stableR), len(routed))
+	queried := make([]ring.Member, len(routed))
+	for i, rr := range routed {
+		queried[i] = rr.member
+	}
 
 	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
 	_, _, resultsCh := fanout(fanoutCtx, queried, n,
-		func(ctx context.Context, _ int, replica ring.Member) ([]byte, error) {
-			return c.dispatchReplicaGetUnit(ctx, replica, key)
+		func(ctx context.Context, idx int, replica ring.Member) ([]byte, error) {
+			return c.dispatchReplicaGetUnitAt(ctx, replica, routed[idx].ru, key)
 		})
 
 	gathered := make([]collected, 0, len(queried))
@@ -709,20 +756,18 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 	return winner.env.Payload, nil
 }
 
-// dispatchReplicaGetUnit is the multi-backend analogue of dispatchReplicaGet:
-// the local-self branch serves from the key's MOUNTED unit (localBackendForKey)
-// instead of c.backend; the remote branch forwards to the replica node, whose
-// LocalGet serves from its mounted unit. An owner-but-unmounted replica
-// returns the transient acquiring-window error the read fan-out skips.
-func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Member, key []byte) ([]byte, error) {
+// dispatchReplicaGetUnitAt is the POSITION-ADDRESSED read leg of the routed
+// union fan-out (the read mirror of dispatchReplicaPutUnit): the local-self
+// branch resolves mountMap[ru] directly (a mid-mount position returns the
+// transient errUnitAcquiring the fan-out skips); the remote branch carries the
+// explicit ru on the wire (GetAtReplica -> LocalReplicaGetAt) so the receiver
+// resolves the exact mounted copy it holds, with no ring-view ownership guard -
+// a displaced current owner during a join answers from its still-mounted
+// position, and a fresh key it holds no value for flows back as a plain
+// not-found (usable by the read quorum) instead of a loop-guard refusal.
+func (c *Cluster) dispatchReplicaGetUnitAt(ctx context.Context, replica ring.Member, ru storageunit.ReplicaUnit, key []byte) ([]byte, error) {
 	if replica.ID == c.cfg.NodeID {
-		// v0.8 Phase 2e (pending ranges): serve the union read locally. The
-		// resolver finds the CURRENT position (current owner / leaver) or the
-		// PENDING position (a mounted pending owner). A pending owner still
-		// mid-mount has no mounted position and returns the transient
-		// errUnitAcquiring, which the read fan-out skips while another union member
-		// (the still-mounted current owner) answers.
-		b, ok := c.localBackendForKey(key)
+		b, ok := c.localBackendForReplicaUnit(ru)
 		if !ok {
 			return nil, errUnitAcquiring("Get")
 		}
@@ -735,7 +780,7 @@ func (c *Cluster) dispatchReplicaGetUnit(ctx context.Context, replica ring.Membe
 	if err != nil {
 		return nil, err
 	}
-	v, found, err := cli.GetForwarded(ctx, key)
+	v, found, err := cli.GetAtReplica(ctx, ru, key)
 	if err != nil {
 		return nil, err
 	}

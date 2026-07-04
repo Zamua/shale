@@ -6,6 +6,7 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -162,7 +163,7 @@ func txApplyIfNewer(tx backend.Transaction, key []byte, incomingStamp Stamp) (bo
 // covers the whole batch. Each dispatch inherits a WriteTimeout deadline
 // so a hung peer cancels at the deadline instead of leaking goroutines,
 // the same shape putReplicated uses.
-func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error {
+func (c *Cluster) replicateCASBatch(pinKey []byte, committedRU storageunit.ReplicaUnit, writes []EnvelopeWrite) error {
 	// v0.8 Phase 2d: in MULTI-BACKEND replicated mode, wrap the post-commit
 	// fan-out in the SAME WriteTimeout-bounded retry-on-acquiring as
 	// putReplicatedUnit, so a CAS commit whose remote replicas are mid-handoff
@@ -178,12 +179,12 @@ func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error
 	// migration-guard window exactly as before Phase 2d).
 	if c.multiReplicated() {
 		return c.retryWriteThroughHandoff(func(attemptCtx context.Context) writeAttempt {
-			return c.replicateCASBatchAttempt(attemptCtx, pinKey, writes)
+			return c.replicateCASBatchAttempt(attemptCtx, pinKey, committedRU, writes)
 		})
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.WriteTimeout)
 	defer cancel()
-	return c.replicateCASBatchAttempt(ctx, pinKey, writes).err
+	return c.replicateCASBatchAttempt(ctx, pinKey, committedRU, writes).err
 }
 
 // replicateCASBatchAttempt is ONE fan-out pass of the post-commit CAS write-set
@@ -191,24 +192,59 @@ func (c *Cluster) replicateCASBatch(pinKey []byte, writes []EnvelopeWrite) error
 // batch to the R-1 non-owner replicas, and reports a structured writeAttempt
 // the retry wrapper classifies. The owner's local commit is pre-counted as one
 // ack (the wrapper never re-runs it).
-func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, writes []EnvelopeWrite) writeAttempt {
+func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, committedRU storageunit.ReplicaUnit, writes []EnvelopeWrite) writeAttempt {
 	// Re-key the replica set per UNIT in multi-backend mode (v0.8 Phase 2b):
-	// the batch fans out to the pin key's UNIT's R replica nodes (every key in
+	// the batch fans out to the pin key's UNIT's replica nodes (every key in
 	// a CAS commit co-shards with the pin key, so one unit covers the batch),
 	// not the per-node LocateKeyN over the raw shard key the legacy path uses.
+	//
+	// Workstream B (join/leave transparency): the replica set is the ROUTED
+	// UNION (current + pending members, exactly what a plain put fans out to)
+	// and the ack bar is held at the STABLE quorum over stableR = len(current) -
+	// NOT over the raw full-ring set. During a join the displaced still-mounted
+	// owner is a union member whose leg can ack, so a moving unit's CAS commit
+	// reaches W via the displaced owner + the un-displaced co-replica while the
+	// warming newcomer (a bonus apply target) is still mounting. Members are
+	// deduped by ID: ApplyBatch is unit-scoped on the wire (the receiver resolves
+	// its own mounted position), so a member routed at two positions (the
+	// index-shuffling survivor) gets ONE batch. In steady state the union is the
+	// stable set and stableR its size - byte-identical to the old behavior.
 	var allReplicas []ring.Member
+	var w int
+	localAcks := 1 // the owner-local commit is always the first ack
 	if c.multiReplicated() {
-		allReplicas = c.replicasForKey(pinKey)
+		routed, stableR := c.routedReplicasWithUnit(pinKey)
+		seen := make(map[string]struct{}, len(routed))
+		for _, rr := range routed {
+			if rr.member.ID == c.cfg.NodeID && rr.ru != committedRU {
+				// OWNER EXTRA POSITION (the index-shuffling survivor mid-transition):
+				// the designated owner is routed at a SECOND position of the pin unit
+				// (its draining old slot alongside the acquired slot the commit
+				// landed in, or vice versa). Apply the batch to that mounted position
+				// directly - the CAS mirror of the put path's dual-position routing -
+				// and count a durable success as an ack (it is an independent durable
+				// db carrying the write). A miss (unmounted / fenced, recoded
+				// transient) counts as nothing; the remote legs still race for W.
+				if err := c.applyBatchToReplicaUnit(rr.ru, writes); err == nil {
+					localAcks++
+				}
+			}
+			if _, dup := seen[rr.member.ID]; dup {
+				continue
+			}
+			seen[rr.member.ID] = struct{}{}
+			allReplicas = append(allReplicas, rr.member)
+		}
+		w = c.writeAckBar(stableR)
 	} else {
 		allReplicas = c.ring.LocateKeyN(c.shardKey(pinKey), c.replicationFactor())
+		// W over the full replica set (the owner is one of them and its local
+		// commit is already one ack) - the legacy per-node path, unchanged.
+		w = requiredWriteAcks(c.cfg.WriteConsistency, len(allReplicas))
 	}
 	if len(allReplicas) == 0 {
 		return writeAttempt{err: status.Error(codes.Unavailable, "shale: no replicas available for CAS write-set")}
 	}
-
-	// W is computed over the full replica set (the owner is one of them
-	// and its local commit is already one ack).
-	w := requiredWriteAcks(c.cfg.WriteConsistency, len(allReplicas))
 
 	// The replicas the fan-out actually dispatches to: everyone except
 	// the owner (this node), which already holds the write.
@@ -221,23 +257,23 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, w
 	}
 	if len(others) == 0 {
 		// Owner is the only replica (R clamped to 1 by a small live ring).
-		// The local commit is the entire durability; nothing to fan out. A
-		// W>1 shortfall here is structural (no other replica exists), not a
+		// The local commit(s) are the entire durability; nothing to fan out. A
+		// W shortfall here is structural (no other replica exists), not a
 		// handoff blip, so it is NOT retryable.
-		if w > 1 {
+		if w > localAcks {
 			return writeAttempt{err: status.Errorf(codes.Unavailable,
 				"shale: CAS write needed %d acks, only the owner is a replica", w)}
 		}
 		return writeAttempt{}
 	}
 
-	// Owner's local commit is the first ack; the fan-out must collect
-	// (w - 1) more from the other replicas. remoteNeeded <= 0 means W is
-	// already satisfied by the local commit alone (WriteOne): dispatch the
-	// fan-out best-effort (durability is still desirable) but do NOT gate
-	// the return on it, mirroring putReplicated's surplus-in-background
-	// behavior at W=1.
-	remoteNeeded := w - 1
+	// The owner's local commit (plus any extra-position local applies) are the
+	// first acks; the fan-out must collect (w - localAcks) more from the other
+	// replicas. remoteNeeded <= 0 means W is already satisfied locally
+	// (WriteOne, or the dual-position owner at W=2): dispatch the fan-out
+	// best-effort (durability is still desirable) but do NOT gate the return on
+	// it, mirroring putReplicated's surplus-in-background behavior at W=1.
+	remoteNeeded := w - localAcks
 
 	acks, errs, resultsCh := fanout(ctx, others, remoteNeeded,
 		func(opCtx context.Context, _ int, replica ring.Member) ([]byte, error) {
@@ -254,13 +290,13 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, w
 	}()
 
 	if remoteNeeded <= 0 {
-		// W satisfied by the owner's local commit; remote acks are bonus
+		// W satisfied by the owner's local commit(s); remote acks are bonus
 		// durability collected in the background by the drainer above.
 		return writeAttempt{}
 	}
 
-	// Total acks = owner's local commit (1) + remote acks collected.
-	return classifyWriteAttempt(acks+1, w, errs)
+	// Total acks = owner's local commit(s) + remote acks collected.
+	return classifyWriteAttempt(acks+localAcks, w, errs)
 }
 
 // dispatchApplyBatch routes one replica's batch apply to either the local

@@ -235,14 +235,42 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, ru st
 	}
 	gu := c.genSnapshot().resolveGenUnit(h)
 	pos, ok := c.localReplicaPos(gu)
-	if !ok {
+	if ok {
+		ru = storageunit.NewReplicaUnit(gu, pos)
+		c.mountMu.RLock()
+		be, ok = c.mountMap[ru]
+		c.mountMu.RUnlock()
+		if ok {
+			return be, ru, pause.RUnlock, true
+		}
+	}
+	// TRANSITION FALLBACK (workstream B; see docs/SPEC.md "CAS during a
+	// transition"): the ring-index resolve missed - either this node is not in
+	// the unit's full-ring set (a DISPLACED current owner during a join: the
+	// newcomer shifted the chain, but this node's mount is still keyed by the
+	// position it actually holds), or the indexed position is not mounted. Fall
+	// back to the LOWEST mounted position of the SAME unit, so the displaced
+	// owner can open its still-mounted copy for the owner-local CAS begin and
+	// the batch apply. Steady state never reaches here (the index resolve hits).
+	// Safety: every write through the fallback mount is fence-guarded (a stale
+	// mount recodes to the transient) and applied apply-if-newer, so a fallback
+	// can degrade to a retry but never to a wrong ack. Lowest-position pick keeps
+	// the resolve deterministic for a dual-position holder.
+	c.mountMu.RLock()
+	found := false
+	for cand, b := range c.mountMap {
+		if cand.Unit != gu {
+			continue
+		}
+		if !found || cand.Replica < ru.Replica {
+			ru, be, found = cand, b, true
+		}
+	}
+	c.mountMu.RUnlock()
+	if !found {
 		return nil, storageunit.ReplicaUnit{}, pause.RUnlock, false
 	}
-	ru = storageunit.NewReplicaUnit(gu, pos)
-	c.mountMu.RLock()
-	be, ok = c.mountMap[ru]
-	c.mountMu.RUnlock()
-	return be, ru, pause.RUnlock, ok
+	return be, ru, pause.RUnlock, true
 }
 
 // evictStaleMount drops ru from the mount map if the entry still points at the
