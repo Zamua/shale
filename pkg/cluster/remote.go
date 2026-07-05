@@ -179,6 +179,14 @@ func (c *peerClient) DeleteAtReplica(ctx context.Context, ru storageunit.Replica
 	return err
 }
 
+// ScanPrefixAtReplica opens a POSITION-ADDRESSED forwarded scan stream (the
+// union scan leg): the receiver resolves the explicit ru against its own
+// mount map (LocalReplicaScanAt) with no ring-ownership guard, the exact
+// mirror of GetAtReplica.
+func (c *peerClient) ScanPrefixAtReplica(ctx context.Context, ru storageunit.ReplicaUnit, prefix []byte) (grpc.ServerStreamingClient[pb.ScanPrefixResponse], error) {
+	return c.api.ScanPrefix(ctx, &pb.ScanPrefixRequest{Prefix: prefix, Forwarded: true, Ru: replicaUnitRef(ru)})
+}
+
 // The plain (non-forwarded) variants are still here for tests +
 // future non-routed call sites; they leave Forwarded=false so the
 // server treats them as a first-hop request and routes normally.

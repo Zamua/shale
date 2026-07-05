@@ -1845,6 +1845,13 @@ func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed
 	}
+	if c.multiReplicated() {
+		// R>1 (v0.8 Phase 2e union reads): a scan is a READ and is served by
+		// whoever in the routed union physically holds the prefix's unit -
+		// current-first, so in steady state this is the ring primary exactly
+		// as below. See docs/SPEC.md "Union scans".
+		return c.scanReplicatedUnit(prefix)
+	}
 	owner, local := c.ownerOf(prefix)
 	if local {
 		if c.multi {

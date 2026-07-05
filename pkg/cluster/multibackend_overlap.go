@@ -173,11 +173,30 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		if c.handoffPhaseOf(ru).Phase != 0 {
 			continue
 		}
+		// INTRA-NODE POSITION-MOVE HOLD (docs/SPEC.md "Transitional mounts are
+		// HELD", rule 5): a ring change can shuffle this node's index within the
+		// unit's replica set with NO transition bit in flight (canonically the
+		// moment a drained leaver actually departs, when the genuinely-rebuilt
+		// ring differs from the drain-time successor-chain approximation).
+		// Releasing the old-index copy in the same pass that starts the (slow)
+		// acquire of the new index would destroy this node's only readable copy
+		// of the unit for the whole mount window - the post-leave read hole. HOLD
+		// it (it keeps serving reads via the mounted-position fallback) until the
+		// same-unit acquire completes; the next pass then releases it here. A
+		// successor of the OLD index that opens it just fences the held handle
+		// (recode + evict as usual), so the hold never blocks anyone's acquire.
+		if c.desiresUnitElsewhereUnmounted(ru, currentSet, pendingSet, mountedSet) {
+			continue
+		}
 		c.releaseReplicaUnit(ru)
 	}
 
 	// ACQUIRE half (PENDING owner): a position this node holds in PENDING but not
-	// in CURRENT, and not yet mounted. This is the pending-owner acquire TRIGGER:
+	// in CURRENT, and not yet mounted.
+	//
+	// (The position-move hold above never starves these acquires: it only skips a
+	// RELEASE, and acquiring a desired position never waits on releasing an
+	// undesired one.) This is the pending-owner acquire TRIGGER:
 	// the draining-exclusion split makes this node the future owner of the
 	// leaver's exact slot, so it mounts that ReplicaUnit (the leaver's durable
 	// copy in shared storage) in the background and writes its serving marker on
@@ -258,6 +277,32 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	}
 
 	c.logAcquireQueueSummary()
+}
+
+// desiresUnitElsewhereUnmounted reports whether this node desires ru's UNIT at
+// some OTHER position (in its current or pending set) that it has NOT mounted
+// yet - the intra-node position-move signature the release hold above keys on.
+// Once the same-unit desire mounts (or vanishes), this returns false and the
+// held copy takes the plain clean-cut release on the next pass.
+func (c *Cluster) desiresUnitElsewhereUnmounted(
+	ru storageunit.ReplicaUnit,
+	currentSet, pendingSet, mountedSet map[storageunit.ReplicaUnit]struct{},
+) bool {
+	for cand := range currentSet {
+		if cand.Unit == ru.Unit && cand != ru {
+			if _, isMounted := mountedSet[cand]; !isMounted {
+				return true
+			}
+		}
+	}
+	for cand := range pendingSet {
+		if cand.Unit == ru.Unit && cand != ru {
+			if _, isMounted := mountedSet[cand]; !isMounted {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // logAcquireQueueSummary emits ONE line per reconcile pass while any gainer

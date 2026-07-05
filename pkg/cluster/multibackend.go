@@ -456,6 +456,45 @@ func (c *Cluster) localBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backen
 	return b, ok
 }
 
+// localReadBackendForReplicaUnit resolves the mounted backend a READ leg
+// addressed at ru serves from: mountMap[ru] when the exact position is
+// mounted, FALLING BACK to the LOWEST mounted position of the SAME unit when
+// it is not (returning the ru actually resolved, so a fence recode evicts the
+// right mount). This is the READ sibling of localWriteBackendForKey's
+// transition fallback (docs/SPEC.md "Union reads", mounted-position
+// fallback): a ring change can shuffle a member's index within a unit's
+// replica set, so during the post-change reconcile window the member
+// physically holds the unit's bytes at its OLD position while the routed set
+// addresses it at the NEW one. A replica copy at another index of the same
+// unit is just another replica of the same data, so serving a READ from it is
+// the union model working as intended ("whoever physically holds the unit
+// serves"). READ-ONLY by design: write legs never fall back (a write applied
+// only to a soon-released old-index copy could be lost); steady state never
+// reaches the fallback (the exact resolve hits). ok=false means this node has
+// NO position of ru's unit mounted (a mid-acquire pending owner): the caller
+// returns the transient acquiring error and the union covers the read.
+func (c *Cluster) localReadBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backend.Backend, storageunit.ReplicaUnit, bool) {
+	c.mountMu.RLock()
+	defer c.mountMu.RUnlock()
+	if b, ok := c.mountMap[ru]; ok {
+		return b, ru, true
+	}
+	var (
+		be    backend.Backend
+		got   storageunit.ReplicaUnit
+		found bool
+	)
+	for cand, b := range c.mountMap {
+		if cand.Unit != ru.Unit {
+			continue
+		}
+		if !found || cand.Replica < got.Replica {
+			got, be, found = cand, b, true
+		}
+	}
+	return be, got, found
+}
+
 // localMountedBackendForKey resolves the key's unit against this node's PHYSICAL
 // mountMap (ANY replica index), NOT the live-ring index. It backs LocalGet (the
 // "we physically hold this key even though the ring moved it off us" read

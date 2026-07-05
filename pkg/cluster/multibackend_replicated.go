@@ -691,11 +691,13 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 
 	gathered := make([]collected, 0, len(queried))
 	var nonTransientErr error
+	sawTransient := false
 	usable := 0
 
 	for res := range resultsCh {
 		if res.Err != nil {
 			if isTransientReplicaErr(res.Err) {
+				sawTransient = true
 				continue
 			}
 			if errors.Is(res.Err, backend.ErrNotFound) {
@@ -729,6 +731,14 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 	if len(gathered) == 0 {
 		if nonTransientErr != nil {
 			return nil, nonTransientErr
+		}
+		if sawTransient {
+			// Every union leg reported the transient acquiring window and none
+			// answered (all routed positions mid-handoff at once). Surface the
+			// RETRYABLE acquiring error, never ErrNotFound: a key that exists
+			// must not be reported absent because its unit is mid-transition
+			// everywhere (docs/SPEC.md "Union reads", guard 2).
+			return nil, errUnitAcquiring("Get")
 		}
 		return nil, backend.ErrNotFound
 	}
@@ -764,7 +774,12 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 // not-found (usable by the read quorum) instead of a loop-guard refusal.
 func (c *Cluster) dispatchReplicaGetUnitAt(ctx context.Context, replica ring.Member, ru storageunit.ReplicaUnit, key []byte) ([]byte, error) {
 	if replica.ID == c.cfg.NodeID {
-		b, ok := c.localBackendForReplicaUnit(ru)
+		// Read-side mounted-position fallback (docs/SPEC.md "Union reads",
+		// guard 1): a ring change can shuffle this member's index within the
+		// unit's replica set, leaving the bytes mounted at the OLD position
+		// while the routed set addresses the NEW one; serve the read from the
+		// mounted copy of the same unit rather than refusing.
+		b, _, ok := c.localReadBackendForReplicaUnit(ru)
 		if !ok {
 			return nil, errUnitAcquiring("Get")
 		}
