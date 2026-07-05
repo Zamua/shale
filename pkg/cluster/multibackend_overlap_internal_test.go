@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
+	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -58,6 +59,52 @@ func TestOverlap_pendingUnitReplicas_DropsDrainingMember(t *testing.T) {
 		if m.ID == current[0].ID {
 			t.Fatalf("draining member %q must not appear in the pending set", current[0].ID)
 		}
+	}
+}
+
+// TestOverlap_pendingUnitReplicas_ExactPostLeavePlacement pins the EXACTNESS
+// contract (docs/SPEC.md "PENDING replica set"): for EVERY unit, the pending
+// set under a draining member equals the placement over a ring GENUINELY
+// rebuilt without that member. The removed successor-chain drop-trick
+// approximation violated this under bounded-load hashing (a FULL-MOVE unit's
+// approximated pending was disjoint from the true post-leave placement),
+// which mis-aimed the whole ordered-removal protocol for that unit and opened
+// the post-exit read hole. The member names here are the fixture the
+// integration repro uses; sg-a is the leaver and unit 5 is the historical
+// full-move divergence.
+func TestOverlap_pendingUnitReplicas_ExactPostLeavePlacement(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	members := []string{"sg-a", "sg-b", "sg-c", "sg-d", "sg-e"}
+	c := newReplicatedCluster(t, "sg-b", 16, 2, backing, members...)
+
+	survivors := ring.New()
+	for _, id := range members {
+		if id == "sg-a" {
+			continue
+		}
+		survivors.Add(ring.Member{ID: id, Addr: id + ":0"})
+	}
+	draining := map[string]struct{}{"sg-a": {}}
+	mismatches := 0
+	for _, u := range storageunit.MustUnitCount(16).IDs() {
+		gu := storageunit.NewGenUnit(0, u)
+		got := c.pendingUnitReplicas(gu, draining)
+		want := survivors.LocateKeyN(genUnitBytes(gu), 2)
+		if len(got) != len(want) {
+			t.Errorf("unit %d: pending size %d, want %d", u, len(got), len(want))
+			mismatches++
+			continue
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID {
+				t.Errorf("unit %d index %d: pending=%s, post-leave placement=%s", u, i, got[i].ID, want[i].ID)
+				mismatches++
+			}
+		}
+	}
+	if mismatches > 0 {
+		t.Fatalf("pending diverges from the genuinely-rebuilt post-leave placement on %d positions - "+
+			"the ordered-removal protocol drains onto the wrong successors for those units", mismatches)
 	}
 }
 

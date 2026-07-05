@@ -175,17 +175,29 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		}
 		// INTRA-NODE POSITION-MOVE HOLD (docs/SPEC.md "Transitional mounts are
 		// HELD", rule 5): a ring change can shuffle this node's index within the
-		// unit's replica set with NO transition bit in flight (canonically the
-		// moment a drained leaver actually departs, when the genuinely-rebuilt
-		// ring differs from the drain-time successor-chain approximation).
-		// Releasing the old-index copy in the same pass that starts the (slow)
-		// acquire of the new index would destroy this node's only readable copy
-		// of the unit for the whole mount window - the post-leave read hole. HOLD
-		// it (it keeps serving reads via the mounted-position fallback) until the
-		// same-unit acquire completes; the next pass then releases it here. A
-		// successor of the OLD index that opens it just fences the held handle
-		// (recode + evict as usual), so the hold never blocks anyone's acquire.
+		// unit's replica set with NO transition bit in flight. Releasing the
+		// old-index copy in the same pass that starts the (slow) acquire of the
+		// new index would destroy this node's only readable copy of the unit for
+		// the whole mount window - the post-leave read hole. HOLD it (it keeps
+		// serving reads via the mounted-position fallback) until the same-unit
+		// acquire completes; the next pass then releases it here. A successor of
+		// the OLD index that opens it just fences the held handle (recode +
+		// evict as usual), so the hold never blocks anyone's acquire.
 		if c.desiresUnitElsewhereUnmounted(ru, currentSet, pendingSet, mountedSet) {
+			continue
+		}
+		// MARKER-GATED ABANDONED RELEASE (docs/SPEC.md "Transitional mounts are
+		// HELD", rule 6): never destroy the last local copy of a live position
+		// before a SUCCESSOR provably serves it. Transition-bit flaps can clear
+		// a drain phase and re-classify a still-load-bearing copy as abandoned;
+		// gate the release on the position's serving marker sitting strictly
+		// above this node's open epoch (drainCheck's exact release rule), so an
+		// abandoned copy keeps serving reads (via the mounted-position fallback)
+		// until its re-opener has mounted. Best-effort I/O on a rare branch; a
+		// marker-read failure HOLDS (fail toward availability, re-checked next
+		// pass). Out-of-range indices and retired generations release clean-cut
+		// as before (no successor will ever mark those).
+		if c.heldForMissingSuccessorMarker(ru) {
 			continue
 		}
 		c.releaseReplicaUnit(ru)
@@ -303,6 +315,37 @@ func (c *Cluster) desiresUnitElsewhereUnmounted(
 		}
 	}
 	return false
+}
+
+// heldForMissingSuccessorMarker reports whether the abandoned-release of ru
+// must be HELD because no successor has proven it serves ru yet (rule 6): the
+// position is at a live-generation index the unit's live placement still uses,
+// and its serving marker is not STRICTLY ABOVE this node's open epoch (the
+// same strict-> rule drainCheck releases an explicit drain on). Returns false
+// (release normally) for an out-of-range index or a non-live generation -
+// nobody will ever re-open those, so holding them would leak the mount - and
+// for a factory-less cluster. A marker-read error holds: failing toward
+// availability costs one reconcile tick, failing toward release can destroy
+// the last copy.
+func (c *Cluster) heldForMissingSuccessorMarker(ru storageunit.ReplicaUnit) bool {
+	if c.replicaFactory == nil {
+		return false
+	}
+	if ru.Unit.Gen != c.genSnapshot().gen {
+		return false // retired/foreign generation: reshard retirement owns it.
+	}
+	if int(ru.Replica) >= len(c.unitReplicas(ru.Unit)) {
+		return false // index outside the unit's live placement: never re-marked.
+	}
+	own := c.ownOpenEpoch(ru)
+	epoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
+	if err != nil {
+		return true // cannot prove a successor serves: hold, re-check next pass.
+	}
+	if !ok {
+		return true // no successor has ever marked it: hold until one does.
+	}
+	return epoch <= own
 }
 
 // logAcquireQueueSummary emits ONE line per reconcile pass while any gainer
