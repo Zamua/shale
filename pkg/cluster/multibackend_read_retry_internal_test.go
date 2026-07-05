@@ -26,9 +26,16 @@ import (
 // openFenceWindow fences ru's mounted copy via a foreign higher-epoch open that
 // sleeps holdFor before completing (eager fence: the bump lands at open ENTRY),
 // returning once the fence is provably engaged. heal re-acquires the position
-// on the cluster after healAfter, restoring a serving leg mid-budget.
-func openFenceWindow(t *testing.T, c *Cluster, backing *sharedfactory.Backing, ru storageunit.ReplicaUnit, holdFor, healAfter time.Duration) {
+// on the cluster at armT+healAfter, restoring a serving leg mid-budget.
+//
+// It returns armT (the window origin every timing assertion anchors on) and
+// healDone; the CALLER MUST drain healDone before opening another window or
+// returning, so no heal goroutine ever leaks into a later window or a later
+// -count iteration (the per-invocation reset hygiene that keeps these tests
+// deterministic under -count=N).
+func openFenceWindow(t *testing.T, c *Cluster, backing *sharedfactory.Backing, ru storageunit.ReplicaUnit, holdFor, healAfter time.Duration) (armT time.Time, healDone chan struct{}) {
 	t.Helper()
+	armT = time.Now()
 	h := backing.Handle()
 	h.SetAcquireDelay(holdFor)
 	before := backing.OpenReplicaStartCount(ru)
@@ -44,14 +51,18 @@ func openFenceWindow(t *testing.T, c *Cluster, backing *sharedfactory.Backing, r
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
+	healDone = make(chan struct{})
 	go func() {
-		time.Sleep(healAfter)
+		defer close(healDone)
+		time.Sleep(time.Until(armT.Add(healAfter)))
 		// The cluster re-acquires its position above the foreign epoch - the
-		// self-heal a real cluster's reconcile performs after the eviction.
+		// (scripted, deterministic) self-heal a real cluster's reconcile
+		// performs after the eviction.
 		c.reconcileMu.Lock()
 		c.acquireReplicaUnit(ru)
 		c.reconcileMu.Unlock()
 	}()
+	return armT, healDone
 }
 
 func TestUnionReadRetry_ServesThroughFenceWindow(t *testing.T) {
@@ -60,6 +71,12 @@ func TestUnionReadRetry_ServesThroughFenceWindow(t *testing.T) {
 	backing.SetStrictReadFencing(true) // real slatedb: fenced handle fails reads
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self")
 	c.cfg.ReadTimeout = 3 * time.Second
+	// Pin the eviction-armed debounced reconcile (evictStaleMount ->
+	// scheduleReconcile) out of the test window: the binary-wide test settle
+	// delay is 300ms, so without this the cluster's OWN self-heal re-mounts the
+	// evicted position ~300ms in and races the scripted 400ms heal - the
+	// nondeterminism seen under -count=N. The scripted heal is the only healer.
+	c.cfg.RebalanceSettleDelay = time.Hour
 
 	key := []byte("rr-window-key")
 	ru := storageunit.NewReplicaUnit(c.genUnitForKey(key), 0)
@@ -77,32 +94,40 @@ func TestUnionReadRetry_ServesThroughFenceWindow(t *testing.T) {
 		t.Fatalf("seed: %v", err)
 	}
 
+	const holdFor, healAfter = 300 * time.Millisecond, 400 * time.Millisecond
+
 	// GET issued INTO the fence window: every union leg is transient (the
 	// fenced mount recodes + evicts, then the position is mid-acquire) until
-	// the heal at +400ms. The read must WAIT it out and serve, not error.
-	openFenceWindow(t, c, backing, ru, 300*time.Millisecond, 400*time.Millisecond)
+	// the heal at armT+healAfter. The read must WAIT it out and serve, not
+	// error - and it cannot have served BEFORE the heal (there is nothing to
+	// serve from), which is what the armT+healAfter lower bound pins.
+	armT, healDone := openFenceWindow(t, c, backing, ru, holdFor, healAfter)
 	t0 := time.Now()
 	got, err := c.getReplicatedUnit(key)
-	elapsed := time.Since(t0)
+	servedAt := time.Now()
+	elapsed := servedAt.Sub(t0)
 	if err != nil {
 		t.Fatalf("Get into the fence window must succeed within ReadTimeout, got error after %v: %v", elapsed, err)
 	}
 	if !bytes.Equal(got, []byte("v1")) {
 		t.Fatalf("Get returned %q, want %q", got, "v1")
 	}
-	if elapsed < 200*time.Millisecond {
-		t.Fatalf("Get returned in %v - too fast to have crossed the fence window (window did not engage?)", elapsed)
+	if servedAt.Before(armT.Add(healAfter)) {
+		t.Fatalf("Get served %v after the window opened - BEFORE the heal at +%v; something other than the "+
+			"scripted heal served the read (fixture leak)", servedAt.Sub(armT), healAfter)
 	}
 	if elapsed >= c.cfg.ReadTimeout {
 		t.Fatalf("Get took %v, exceeding the ReadTimeout budget %v", elapsed, c.cfg.ReadTimeout)
 	}
-	t.Logf("fence-window GET served after %v (window heal at 400ms, budget %v)", elapsed, c.cfg.ReadTimeout)
+	t.Logf("fence-window GET served %v after the window opened (heal at +%v, budget %v)", servedAt.Sub(armT), healAfter, c.cfg.ReadTimeout)
+	<-healDone // never let a pending heal leak into the next window
 
 	// SCAN issued INTO a fresh fence window: same contract.
-	openFenceWindow(t, c, backing, ru, 300*time.Millisecond, 400*time.Millisecond)
+	armT, healDone = openFenceWindow(t, c, backing, ru, holdFor, healAfter)
 	t0 = time.Now()
 	it, err := c.scanReplicatedUnit(key)
-	elapsed = time.Since(t0)
+	servedAt = time.Now()
+	elapsed = servedAt.Sub(t0)
 	if err != nil {
 		t.Fatalf("ScanPrefix into the fence window must succeed within ReadTimeout, got error after %v: %v", elapsed, err)
 	}
@@ -121,16 +146,21 @@ func TestUnionReadRetry_ServesThroughFenceWindow(t *testing.T) {
 	if seen == 0 {
 		t.Fatalf("scan returned no pairs for a seeded key")
 	}
-	if elapsed < 200*time.Millisecond || elapsed >= c.cfg.ReadTimeout {
-		t.Fatalf("scan elapsed %v outside the expected fence-window range [200ms, %v)", elapsed, c.cfg.ReadTimeout)
+	if servedAt.Before(armT.Add(healAfter)) {
+		t.Fatalf("scan served %v after the window opened - BEFORE the heal at +%v (fixture leak)", servedAt.Sub(armT), healAfter)
 	}
-	t.Logf("fence-window SCAN served after %v (window heal at 400ms, budget %v)", elapsed, c.cfg.ReadTimeout)
+	if elapsed >= c.cfg.ReadTimeout {
+		t.Fatalf("scan took %v, exceeding the ReadTimeout budget %v", elapsed, c.cfg.ReadTimeout)
+	}
+	t.Logf("fence-window SCAN served %v after the window opened (heal at +%v, budget %v)", servedAt.Sub(armT), healAfter, c.cfg.ReadTimeout)
+	<-healDone // reset hygiene: no goroutine outlives the test invocation
 }
 
 func TestUnionReadRetry_BudgetRespectedWhenNoLegServes(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self")
 	c.cfg.ReadTimeout = 600 * time.Millisecond
+	c.cfg.RebalanceSettleDelay = time.Hour // no background reconcile inside the budget window
 
 	// Nothing is ever mounted: every sweep is all-transient forever. The read
 	// must keep re-polling until ~ReadTimeout, then surface the retryable
