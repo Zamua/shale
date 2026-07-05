@@ -25,6 +25,7 @@ import (
 	"context"
 	"errors"
 	"io"
+	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
@@ -34,7 +35,20 @@ import (
 
 // scanReplicatedUnit serves ScanPrefix at R>1 (multiReplicated) from the
 // routed union of the prefix's unit. See the file header for the contract.
+// A walk in which every reachable leg was TRANSIENT is re-polled within the
+// ReadTimeout budget (docs/SPEC.md "Union scans"), the same all-legs-transient
+// retry the union read applies, so the fence-window blip is bounded scan
+// latency rather than a client error; hard errors return immediately.
 func (c *Cluster) scanReplicatedUnit(prefix []byte) (backend.Iterator, error) {
+	return retryReadThroughHandoff(c, func(time.Time) (backend.Iterator, error) {
+		return c.scanReplicatedUnitOnce(prefix)
+	})
+}
+
+// scanReplicatedUnitOnce is ONE union leg walk (the pre-retry scanReplicatedUnit
+// body). It returns the acquiring-tagged error ONLY for the all-legs-transient
+// outcome, which is the retry wrapper's re-poll signal.
+func (c *Cluster) scanReplicatedUnitOnce(prefix []byte) (backend.Iterator, error) {
 	routed, _ := c.routedReplicasWithUnit(prefix)
 	if len(routed) == 0 {
 		return nil, status.Error(codes.Unavailable, "shale: no replicas available for key")

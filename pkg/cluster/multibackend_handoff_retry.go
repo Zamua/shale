@@ -171,3 +171,45 @@ func jitteredBackoff(d time.Duration) time.Duration {
 	factor := 0.5 + rand.Float64()*0.5
 	return time.Duration(float64(d) * factor)
 }
+
+// retryReadThroughHandoff is the READ-side mirror of retryWriteThroughHandoff
+// (docs/SPEC.md "Union reads" guard 2 / "Union scans"): it re-runs attempt
+// while the outcome is the ALL-LEGS-TRANSIENT acquiring error (every union leg
+// mid-acquire or fenced-recode - the sub-second fence-at-open-start blip),
+// bounded by the ReadTimeout wall clock, with the same jittered exponential
+// backoff the write retry uses. Any other outcome - success, not-found, a
+// non-transient leg failure - is returned IMMEDIATELY, unretried, so a real
+// outage still fails fast; only the budget expiring mid-blip surfaces the
+// retryable acquiring error. attempt receives the shared wall-clock deadline
+// so per-attempt fan-out contexts never outlive the overall budget, and each
+// attempt re-resolves the routed union from the live ring. Under
+// TestingForceCleanCut (the break-demo) the retry is disabled exactly as the
+// write retry is, so it cannot mask the clean-cut gap the demo measures.
+func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time) (T, error)) (T, error) {
+	deadline := time.Now().Add(c.cfg.ReadTimeout)
+	if c.cfg.TestingForceCleanCut {
+		return attempt(deadline)
+	}
+	backoff := time.Duration(c.retryAfterMs()) * time.Millisecond
+
+	for {
+		v, err := attempt(deadline)
+		if err == nil || !isAcquiringErr(err) {
+			return v, err
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return v, err
+		}
+		sleep := jitteredBackoff(backoff)
+		if sleep > remaining {
+			sleep = remaining
+		}
+		time.Sleep(sleep)
+
+		backoff *= 2
+		if backoff > handoffRetryBackoffCap {
+			backoff = handoffRetryBackoffCap
+		}
+	}
+}

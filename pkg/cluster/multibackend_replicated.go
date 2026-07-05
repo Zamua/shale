@@ -670,6 +670,24 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 	// union leg answers value / not-found / acquiring on its own mount state. In
 	// steady state routed == the stable set at its ring indices, so the resolved
 	// backends are identical to the old member-keyed path.
+	// ALL-LEGS-TRANSIENT RETRY (docs/SPEC.md "Union reads" guard 2): one sweep
+	// that finds every union leg transiently unable to serve (mid-acquire, or
+	// the fence-at-open-start blip recodes) is RE-POLLED within the ReadTimeout
+	// budget - the read mirror of the write path's retry-through-handoff - so a
+	// sub-second transient window is bounded latency, not a client error. Each
+	// attempt re-resolves the routed union from the live ring; any non-transient
+	// outcome returns immediately.
+	return retryReadThroughHandoff(c, func(deadline time.Time) ([]byte, error) {
+		return c.getReplicatedUnitOnce(deadline, key)
+	})
+}
+
+// getReplicatedUnitOnce is ONE union read sweep (the pre-retry getReplicatedUnit
+// body): resolve the routed union, fan out position-addressed reads, gather per
+// ReadConsistency, LWW-select, read-repair. It returns the acquiring-tagged
+// error ONLY for the all-legs-transient outcome, which is the retry wrapper's
+// re-poll signal.
+func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte, error) {
 	routed, stableR := c.routedReplicasWithUnit(key)
 	if len(routed) == 0 {
 		return nil, status.Error(codes.Unavailable, "shale: no replicas available for key")
@@ -683,7 +701,9 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 		queried[i] = rr.member
 	}
 
-	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
+	// The fan-out shares the retry wrapper's overall wall-clock deadline, so
+	// attempts never stack budgets past ReadTimeout.
+	fanoutCtx, cancelFanout := context.WithDeadline(context.Background(), deadline)
 	_, _, resultsCh := fanout(fanoutCtx, queried, n,
 		func(ctx context.Context, idx int, replica ring.Member) ([]byte, error) {
 			return c.dispatchReplicaGetUnitAt(ctx, replica, routed[idx].ru, key)
