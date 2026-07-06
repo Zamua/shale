@@ -244,19 +244,30 @@ func TestRollingRestartWedge_MembershipDivergence(t *testing.T) {
 	if membersAgreeNow {
 		t.Fatalf("expected divergent member views across nodes while wedged (membership-race arm), but they agreed.\nstate:%s", stateDump)
 	}
-	// The wedge dominates: the orphaned unit is essentially unwritable while
-	// diverged. A small non-zero success count is the ~0.2%-duty flicker when the
-	// 5s periodic reconcile briefly reverts the ring before the re-force; allow a
-	// generous margin so the test is reliable, not knife-edge.
+	// RE-CONTRACTED (v0.10.x): this test originally PINNED the divergence
+	// wedge - it asserted the orphaned unit was essentially unwritable
+	// (<=20% success) while the rings disagreed. The write-transparent
+	// membership work (Joining/Draining union routing + quorum floor +
+	// transitional holds) changed the outcome to a BIMODAL-BY-DESIGN split:
+	// when the diverged view still overlaps a mounted holder, the union
+	// routes writes through the divergence (observed ~70-91% success);
+	// when the forced phantom placement excludes every mounted holder, the
+	// quorum floor takes the SAFE arm - unavailable-but-lossless, every
+	// failure the retryable mid-acquire class (observed 0% success). A
+	// success-rate assertion is therefore scenario-luck in both directions.
+	// The real invariants are: (a) the divergence mechanism arms above,
+	// (b) FAILURE PURITY - every failed probe is the safe acquiring class,
+	// never an unexpected error and never a false ack, and (c) full
+	// recovery once the divergence releases (asserted below).
 	if total == 0 {
 		t.Fatalf("no probes ran")
 	}
-	if rate := float64(success) / float64(total); rate > 0.20 {
-		t.Fatalf("wedge not sustained: %.0f%% of writes to the orphaned unit succeeded while diverged (want <=20%%); "+
-			"divergence not held tightly enough.\nstate:%s", rate*100, stateDump)
+	if other != 0 {
+		t.Fatalf("%d probe failures were NOT the safe mid-acquire class while diverged (sample=%v); "+
+			"the wedge must be lossless-and-retryable or covered, never eclectic.\nstate:%s", other, sampleErr, stateDump)
 	}
-	t.Logf("WEDGE CONFIRMED (membership arm): orphaned unit %d unwritable (%d/%d mid-acquire) while the victim's ring diverged; "+
-		"rings DISAGREE across nodes -> divergent desiredReplicaUnits -> perpetual 1-of-2", wedgeUnit, midAcquire, total)
+	t.Logf("DIVERGENCE OUTCOME (membership arm): orphaned unit %d - %d/%d writes ok, %d safe mid-acquire refusals; "+
+		"union covers when a mounted holder overlaps, quorum floor holds the safe arm when none does", wedgeUnit, success, total, midAcquire)
 
 	// RECOVERY: once the divergence is released the periodic reconcile restores
 	// r2c's 3-node ring + re-acquires the position, so the SAME unit writes again.
