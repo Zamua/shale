@@ -803,6 +803,21 @@ Key points, grounded:
   bounded by the owned-unit count times the per-unit object count. Phase 2 ships
   `SweepOrphans` as a single callable pass; the scheduling loop is a thin wrapper
   the cmd binary owns (deferred to the integration, like the cmd-side wiring).
+- **SHIPPED SHAPE + THE SINGLE-SNAPSHOT TOPOLOGY GUARD (supersedes the sketch
+  above).** The implementation enumerates MOUNTED units (not desired ownership -
+  the earlier P0) and protects objects via a referenced-object-key set scanned
+  from the node's local brefs, all documented on `BlobKV.SweepOrphans` itself.
+  The guard this section now REQUIRES: the pass captures the mounted-unit set
+  ONCE, BEFORE the referenced scan, sweeps ONLY that snapshot, and ABORTS
+  fail-closed if the mounted set has changed by the end of the referenced scan
+  OR if any membership transition (Joining/Draining) is in flight. Without it
+  the referenced set and the object enumeration are two reads of a MOVING mount
+  view: a unit acquired between them is enumerated for objects with NONE of its
+  brefs in the referenced set, so every bound blob under it that is older than
+  the grace is deleted - committed-data loss (observed live: a >3h-old bound
+  canary blob deleted mid-rollout while its metadata and pointer stayed
+  intact). A skipped pass is a storage leak retried next tick; a torn pass is
+  data loss - fail closed.
 
 ### 11.8 Reshard interaction (pointer moves with the unit; bytes stay put)
 
