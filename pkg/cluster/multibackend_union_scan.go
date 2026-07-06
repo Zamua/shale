@@ -86,7 +86,7 @@ func (c *Cluster) scanReplicatedUnitOnce(prefix []byte) (backend.Iterator, error
 
 		it, err := c.openRemoteUnionScanLeg(rr, prefix)
 		if err != nil {
-			if !isTransientUnionScanLegErr(err) && firstHardErr == nil {
+			if !isTransientReadLegErr(err) && firstHardErr == nil {
 				firstHardErr = err
 			}
 			continue
@@ -130,23 +130,6 @@ func (c *Cluster) openRemoteUnionScanLeg(rr routedReplica, prefix []byte) (backe
 		return nil, err
 	}
 	return &primedRemoteIterator{inner: inner, first: first, hasFirst: true}, nil
-}
-
-// isTransientUnionScanLegErr classifies a union scan leg failure as
-// SKIP-AND-TRY-THE-NEXT-LEG: everything the read-leg classification skips
-// (mid-acquire recode, fenced recode, a closed-mid-release mount in either
-// its in-process or wire form; see isTransientReadLegErr) and an unreachable
-// member (codes.Unavailable - a just-killed leaver's refused dial, or a
-// receiver shutting down). Anything else (a real server-side failure) is a
-// hard error candidate the walk reports if no other leg serves.
-func isTransientUnionScanLegErr(err error) bool {
-	if isTransientReadLegErr(err) {
-		return true
-	}
-	if st, ok := status.FromError(err); ok {
-		return st.Code() == codes.Unavailable
-	}
-	return false
 }
 
 // primedRemoteIterator replays the primed first stream message, then

@@ -29,12 +29,14 @@ package integration
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
+	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -374,4 +376,81 @@ func TestSurgeReadTransparent_JoinLeaveJoinComposition(t *testing.T) {
 		t.Fatalf("SURGE composition is not read-transparent: %d client-visible read failures across the "+
 			"join/leave/join timeline - the k8s rollout probe failure reproduced", len(fails))
 	}
+}
+
+// TestLeaveEntryServesWhileDraining pins ENTRY-DURING-DRAIN (docs/SPEC.md
+// "Union reads"): a gracefully-leaving node keeps serving Get and ScanPrefix
+// as the ENTRY node for the whole drain - DrainForLeave runs at the top of
+// Close BEFORE the closed flip, so the not-ready fast-fail engages only once
+// Close's teardown actually begins. After Close returns, entry ops fail fast
+// with backend.ErrClosed (the pinned boundary); covering that teardown tail is
+// the orchestrator's routing-drain job, not shale's.
+func TestLeaveEntryServesWhileDraining(t *testing.T) {
+	const uc, rf = 16, 2
+	backing := sharedfactory.NewBacking()
+	mutate := func(cfg *cluster.Config) {
+		cfg.GracefulLeaveDrainTimeout = 25 * time.Second
+		cfg.OpenConcurrency = 8
+		cfg.RebalanceSettleDelay = 300 * time.Millisecond
+	}
+	n1 := startReplicatedNodeCfg(t, "le-a", "", uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "le-b", n1.BindAddr, uc, rf, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "le-c", n1.BindAddr, uc, rf, backing, mutate)
+	n4 := startReplicatedNodeCfg(t, "le-d", n1.BindAddr, uc, rf, backing, mutate)
+	all := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
+	if err := waitForMembersAll(all, 4, 30*time.Second); err != nil {
+		t.Fatalf("4-node convergence: %v", err)
+	}
+	time.Sleep(900 * time.Millisecond)
+	uk := oneKeyPerUnit(t, n1.Cluster, uc)
+
+	// Slow the survivors' acquires so the drain window is wide enough to probe.
+	for _, n := range []*sharedNode{n1, n2, n3} {
+		n.Handle.SetAcquireDelay(2500 * time.Millisecond)
+	}
+	drainDone := make(chan struct{})
+	go func() { defer close(drainDone); _ = n4.Cluster.Close() }()
+	time.Sleep(600 * time.Millisecond) // let the Draining bit gossip
+
+	// ENTRY THROUGH THE LEAVER, for the whole drain: every Get and ScanPrefix
+	// must serve (single attempt per op; the union + the leaver's still-mounted
+	// copies cover everything).
+	var fails []string
+	rounds := 0
+drainLoop:
+	for {
+		select {
+		case <-drainDone:
+			break drainLoop
+		default:
+		}
+		fails = append(fails, probeReadsOnce([]*sharedNode{n4}, uk, []byte("seed"))...)
+		rounds++
+		time.Sleep(250 * time.Millisecond)
+		if rounds > 120 {
+			break
+		}
+	}
+	for _, n := range []*sharedNode{n1, n2, n3} {
+		n.Handle.SetAcquireDelay(0)
+	}
+	if rounds < 3 {
+		t.Fatalf("drain completed after only %d probe rounds; widen the acquire delay for a provable window", rounds)
+	}
+	summarizeFails(t, "ENTRY-THROUGH-LEAVER (drain window)", fails, 12)
+	if len(fails) > 0 {
+		t.Fatalf("a draining node refused entry reads %d times across %d rounds - entry traffic must be served "+
+			"for the whole drain (notReady flips only at the actual close)", len(fails), rounds)
+	}
+
+	// After Close returns: the pinned fast-fail boundary.
+	t0 := time.Now()
+	_, err := n4.Cluster.Get([]byte(uk[0]))
+	if !errors.Is(err, backend.ErrClosed) {
+		t.Fatalf("entry Get after Close = %v, want backend.ErrClosed", err)
+	}
+	if el := time.Since(t0); el > 100*time.Millisecond {
+		t.Fatalf("post-Close entry Get took %v - must fail fast", el)
+	}
+	t.Logf("entry served through %d drain rounds; post-Close entry fails fast with ErrClosed", rounds)
 }

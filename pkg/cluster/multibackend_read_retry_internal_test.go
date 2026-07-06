@@ -17,11 +17,13 @@ package cluster
 import (
 	"bytes"
 	"errors"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
+	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -327,8 +329,116 @@ func TestUnionReadRetry_ClosedLegClassification(t *testing.T) {
 	if isTransientReadLegErr(status.Error(codes.Unknown, "some real server bug")) {
 		t.Fatalf("an unrelated Unknown error must stay non-transient")
 	}
-	if isTransientReadLegErr(status.Error(codes.Unavailable, "connection refused")) {
-		t.Fatalf("a down peer's dial error must stay non-transient for the read gather")
+	if !isTransientReadLegErr(status.Error(codes.Unavailable, `connection error: desc = "transport: Error while dialing: dial tcp 10.0.0.1:7947: connect: connection refused"`)) {
+		t.Fatalf("a refused dial to a departed member must classify transient on a read leg (docs/SPEC.md guard 2)")
+	}
+	if isTransientReadLegErr(status.Error(codes.FailedPrecondition, "shale: forwarding loop refused")) {
+		t.Fatalf("the loop-guard refusal must stay non-transient")
+	}
+}
+
+// TestUnionReadRetry_DeadMemberLegIsTransient pins the unreachable-member
+// classification end to end (the staging capture: a union read leg dialed a
+// just-departed member's dead address and the refused dial poisoned the
+// gather). One routed leg dials a REAL refused address, the other is
+// mid-acquire; the read must absorb both (re-poll) and serve once the local
+// position mounts - never surface the dial error.
+func TestUnionReadRetry_DeadMemberLegIsTransient(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "ghost")
+	c.cfg.ReadTimeout = 3 * time.Second
+	c.cfg.RebalanceSettleDelay = time.Hour
+	c.clients = make(map[string]*peerClient) // the fixture never dials; this test's ghost leg does
+	t.Cleanup(func() {
+		for _, cli := range c.clients {
+			_ = cli.Close()
+		}
+	})
+
+	// Point the ghost member at a genuinely REFUSED loopback address (bind,
+	// note the port, close) so its leg fails with the captured dial error.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("probe listen: %v", err)
+	}
+	deadAddr := l.Addr().String()
+	_ = l.Close()
+	rg := ring.New()
+	rg.Add(ring.Member{ID: "self", Addr: "self:0"})
+	rg.Add(ring.Member{ID: "ghost", Addr: deadAddr})
+	c.ring = rg
+
+	key := []byte("rr-dead-member-key")
+	gu := c.genUnitForKey(key)
+	reps := c.unitReplicas(gu)
+	selfIdx := -1
+	for i, m := range reps {
+		if m.ID == "self" {
+			selfIdx = i
+		}
+	}
+	if selfIdx < 0 {
+		t.Fatalf("fixture: self not a replica of %q", key)
+	}
+	ru := storageunit.NewReplicaUnit(gu, uint8(selfIdx))
+
+	// Seed the durable store for self's position, but leave it UNMOUNTED (the
+	// mid-acquire leg); heal at +300ms.
+	seedH := backing.Handle()
+	sb, _, err := seedH.OpenReplicaUnit(ru, 1)
+	if err != nil {
+		t.Fatalf("seed open: %v", err)
+	}
+	env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "seed"}, Payload: []byte("v1")})
+	if err := sb.Put(key, env); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+
+	const healAfter = 300 * time.Millisecond
+	armT := time.Now()
+	healDone := make(chan struct{})
+	go func() {
+		defer close(healDone)
+		time.Sleep(healAfter)
+		c.reconcileMu.Lock()
+		c.acquireReplicaUnit(ru)
+		c.reconcileMu.Unlock()
+	}()
+
+	got, err := c.getReplicatedUnit(key)
+	servedAt := time.Now()
+	if err != nil {
+		t.Fatalf("Get with a dead-member leg must be absorbed by the re-poll, got after %v: %v", servedAt.Sub(armT), err)
+	}
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("Get returned %q, want %q", got, "v1")
+	}
+	if servedAt.Before(armT.Add(healAfter)) {
+		t.Fatalf("Get served %v after arming - before the heal (fixture leak)", servedAt.Sub(armT))
+	}
+	t.Logf("dead-member GET absorbed: served %v after arming (heal at +%v)", servedAt.Sub(armT), healAfter)
+	<-healDone
+
+	// Scan through the same shape (dead leg + now-mounted self leg): the walk
+	// must skip the dead leg and serve from self.
+	it, err := c.scanReplicatedUnit(key)
+	if err != nil {
+		t.Fatalf("ScanPrefix with a dead-member leg: %v", err)
+	}
+	seen := 0
+	for {
+		k, _, nerr := it.Next()
+		if nerr != nil {
+			t.Fatalf("scan Next: %v", nerr)
+		}
+		if k == nil {
+			break
+		}
+		seen++
+	}
+	_ = it.Close()
+	if seen == 0 {
+		t.Fatalf("scan returned no pairs for a seeded key")
 	}
 }
 

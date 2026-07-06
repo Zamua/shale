@@ -195,7 +195,11 @@ func fanout(
 // replica no longer consumes the failure budget. See docs/SPEC.md
 // "v0.8 Phase 2d".
 // isTransientReadLegErr is the READ-leg transient classification (docs/SPEC.md
-// "Union reads" guard 2): everything isTransientReplicaErr skips, PLUS a
+// "Union reads" guard 2): everything isTransientReplicaErr skips, PLUS an
+// UNREACHABLE member (codes.Unavailable - a refused dial or transport failure
+// against a just-departed member's address is definitive "this copy is not
+// here anymore" during a transition; the union scan always treated this leg
+// as skip-and-try-next, and the read gather now matches), PLUS a
 // CLOSED-MID-RELEASE mount. A read leg that resolves a local handle in the
 // same instant ordered removal's release closes it reads backend.ErrClosed;
 // a leaving node's own shutdown surfaces the same to a forwarded leg, crossing
@@ -213,9 +217,13 @@ func isTransientReadLegErr(err error) bool {
 	if errors.Is(err, backend.ErrClosed) {
 		return true
 	}
-	if st, ok := status.FromError(err); ok && st.Code() == codes.Unknown &&
-		strings.Contains(st.Message(), backend.ErrClosed.Error()) {
-		return true
+	if st, ok := status.FromError(err); ok {
+		if st.Code() == codes.Unavailable {
+			return true
+		}
+		if st.Code() == codes.Unknown && strings.Contains(st.Message(), backend.ErrClosed.Error()) {
+			return true
+		}
 	}
 	return false
 }
