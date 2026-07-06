@@ -331,7 +331,16 @@ func (c *Cluster) heldForMissingSuccessorMarker(ru storageunit.ReplicaUnit) bool
 	if c.replicaFactory == nil {
 		return false
 	}
-	if ru.Unit.Gen != c.genSnapshot().gen {
+	gs := c.genSnapshot()
+	if !gs.nextCount.IsZero() {
+		// A reshard is IN FLIGHT: generation machinery owns retirement, and
+		// every future acquire happens at the NEW generation - no old-gen
+		// marker is coming. Holding a live-gen position here wedged the
+		// holder's own flip and broke split convergence (the v0.10.0
+		// regression): the abandoned stale releases clean-cut instead.
+		return false
+	}
+	if ru.Unit.Gen != gs.gen {
 		return false // retired/foreign generation: reshard retirement owns it.
 	}
 	if int(ru.Replica) >= len(c.unitReplicas(ru.Unit)) {
@@ -343,7 +352,13 @@ func (c *Cluster) heldForMissingSuccessorMarker(ru storageunit.ReplicaUnit) bool
 		return true // cannot prove a successor serves: hold, re-check next pass.
 	}
 	if !ok {
-		return true // no successor has ever marked it: hold until one does.
+		// NO marker has EVER been written for this position: its current
+		// holder mounted at boot (boot mounts do not mark), so there is no
+		// pending acquire whose marker would release this hold - holding
+		// would wedge forever against a signal that is not coming. The
+		// flap-interleaving class the rule defends always involves a marked
+		// acquire, so requiring an existing marker keeps the defense.
+		return false
 	}
 	return epoch <= own
 }

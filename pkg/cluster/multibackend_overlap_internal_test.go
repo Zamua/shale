@@ -108,6 +108,68 @@ func TestOverlap_pendingUnitReplicas_ExactPostLeavePlacement(t *testing.T) {
 	}
 }
 
+// TestOverlap_MarkerHold_Conditions pins rule 6's firing conditions
+// (docs/SPEC.md "Transitional mounts are HELD", rule 6), including the two
+// carve-outs whose absence broke split convergence in v0.10.0:
+//
+//   - RESHARD IN FLIGHT: rule 6 disarms entirely (generation machinery owns
+//     retirement; every future acquire happens at the NEW generation, so no
+//     old-gen marker is coming - holding wedged the holder's own flip).
+//   - MARKER ABSENT: releases clean-cut (boot mounts never mark, so a
+//     never-acquired position has no marker and no future marker-writer).
+//   - Marker at-or-below our epoch: HELD (the flap-interleaving defense).
+//   - Marker strictly above: released (the successor provably serves).
+func TestOverlap_MarkerHold_Conditions(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2")
+
+	desired := c.desiredReplicaUnits()
+	if len(desired) == 0 {
+		t.Fatalf("fixture: self owns nothing")
+	}
+	ru := desired[0]
+	h := backing.Handle()
+	b, opened, err := h.OpenReplicaUnit(ru, 1)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	c.mountMap[ru] = b
+	c.myOpenEpoch.Store(ru, opened)
+
+	// MARKER ABSENT (a boot-mounted position): must NOT hold.
+	if c.heldForMissingSuccessorMarker(ru) {
+		t.Fatalf("marker-absent position must release clean-cut, not hold (no future marker-writer)")
+	}
+
+	// Marker at our own epoch: HELD (no successor has re-opened above us).
+	if err := h.WriteServingMarker(ru, opened); err != nil {
+		t.Fatalf("mark: %v", err)
+	}
+	if !c.heldForMissingSuccessorMarker(ru) {
+		t.Fatalf("marker at own epoch must HOLD (successor not provably serving)")
+	}
+
+	// RESHARD IN FLIGHT: rule 6 disarms even though the marker condition
+	// would hold - the split's own machinery owns retirement.
+	c.genMu.Lock()
+	c.genState.nextCount = storageunit.MustUnitCount(8)
+	c.genMu.Unlock()
+	if c.heldForMissingSuccessorMarker(ru) {
+		t.Fatalf("rule 6 must disarm while a reshard is in flight (the v0.10.0 split-convergence wedge)")
+	}
+	c.genMu.Lock()
+	c.genState.nextCount = storageunit.UnitCount{}
+	c.genMu.Unlock()
+
+	// Marker strictly above our epoch: released (successor provably serving).
+	if err := h.WriteServingMarker(ru, opened+1); err != nil {
+		t.Fatalf("mark above: %v", err)
+	}
+	if c.heldForMissingSuccessorMarker(ru) {
+		t.Fatalf("marker strictly above own epoch must release")
+	}
+}
+
 // -- desiredPendingReplicaUnits (the pending-owner enumeration) -----------
 
 // TestOverlap_desiredPendingReplicaUnits_NoDrainingEqualsCurrent pins that with
