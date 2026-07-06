@@ -345,11 +345,11 @@ func TestUnionReadRetry_ClosedLegClassification(t *testing.T) {
 	}
 }
 
-// TestUnionReadRetry_OutageSurfacesDialErrorFast pins the capped re-poll for
-// unreachable-only sweeps (docs/SPEC.md guard 2): a replica set that is
-// genuinely ALL down surfaces the FIRST dial error VERBATIM after a
-// sub-second capped re-poll - never a full ReadTimeout stall, never a
-// swallowed diagnostic.
+// TestUnionReadRetry_OutageSurfacesDialErrorFast pins the time-bounded
+// re-poll for unreachable-only sweeps (docs/SPEC.md guard 2): a replica set
+// that is genuinely ALL down surfaces the FIRST dial error VERBATIM at ~the
+// unreachable grace - not before it (the grace must be honored, or ring-lag
+// windows surface spurious errors) and never the full ReadTimeout stall.
 func TestUnionReadRetry_OutageSurfacesDialErrorFast(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	// self is NOT a ring member: every routed leg is a remote dial to a dead
@@ -386,10 +386,13 @@ func TestUnionReadRetry_OutageSurfacesDialErrorFast(t *testing.T) {
 	if !ok || st.Code() != codes.Unavailable || !strings.Contains(st.Message(), "connection refused") {
 		t.Fatalf("Get outage error = %v, want the dial error surfaced verbatim (Unavailable + connection refused)", err)
 	}
-	if elapsed >= 2*time.Second {
-		t.Fatalf("Get outage surfaced after %v - the unreachable-only cap must bound this well under the %v budget", elapsed, c.cfg.ReadTimeout)
+	if elapsed < unreachableOnlyGrace-200*time.Millisecond {
+		t.Fatalf("Get outage surfaced after %v - BEFORE the %v unreachable grace (ring-lag windows would surface spurious errors)", elapsed, unreachableOnlyGrace)
 	}
-	t.Logf("outage GET surfaced the dial error after %v (budget %v)", elapsed, c.cfg.ReadTimeout)
+	if elapsed >= 3500*time.Millisecond {
+		t.Fatalf("Get outage surfaced after %v - must be bounded at ~the %v grace, well under the %v budget", elapsed, unreachableOnlyGrace, c.cfg.ReadTimeout)
+	}
+	t.Logf("outage GET surfaced the dial error after %v (grace %v, budget %v)", elapsed, unreachableOnlyGrace, c.cfg.ReadTimeout)
 
 	t0 = time.Now()
 	_, err = c.scanReplicatedUnit(key)
@@ -401,10 +404,10 @@ func TestUnionReadRetry_OutageSurfacesDialErrorFast(t *testing.T) {
 	if !ok || st.Code() != codes.Unavailable || !strings.Contains(st.Message(), "connection refused") {
 		t.Fatalf("scan outage error = %v, want the dial error surfaced verbatim", err)
 	}
-	if elapsed >= 2*time.Second {
-		t.Fatalf("scan outage surfaced after %v - must be capped well under the budget", elapsed)
+	if elapsed < unreachableOnlyGrace-200*time.Millisecond || elapsed >= 3500*time.Millisecond {
+		t.Fatalf("scan outage surfaced after %v - must land at ~the %v grace, well under the %v budget", elapsed, unreachableOnlyGrace, c.cfg.ReadTimeout)
 	}
-	t.Logf("outage SCAN surfaced the dial error after %v (budget %v)", elapsed, c.cfg.ReadTimeout)
+	t.Logf("outage SCAN surfaced the dial error after %v (grace %v, budget %v)", elapsed, unreachableOnlyGrace, c.cfg.ReadTimeout)
 }
 
 // TestUnionScan_WedgedLegBoundedByBudget pins the scan walk's deadline
@@ -592,4 +595,88 @@ func TestUnionReadRetry_ClosedClusterStillFailsFast(t *testing.T) {
 	if !errors.Is(err, backend.ErrClosed) {
 		t.Fatalf("ScanPrefix on a closed cluster = %v, want backend.ErrClosed", err)
 	}
+}
+
+// TestUnionReadRetry_LingeringDeadMemberAbsorbed pins the ring-lag window
+// (docs/SPEC.md guard 2): a just-departed member's address lingers in the
+// routed union until the membership update propagates and the ring rebuilds.
+// During that window every sweep is unreachable-only - EXPECTED, transient -
+// and the read must keep re-polling (within the unreachable grace) so it
+// serves the moment the ring updates and a live position mounts, instead of
+// surfacing the dial error mid-lag (the staging jwt11 battery-3 read-canary
+// 500s).
+func TestUnionReadRetry_LingeringDeadMemberAbsorbed(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "g1", "g2")
+	c.cfg.ReadTimeout = 5 * time.Second
+	c.cfg.RebalanceSettleDelay = time.Hour
+	c.clients = make(map[string]*peerClient)
+	t.Cleanup(func() {
+		for _, cli := range c.clients {
+			_ = cli.Close()
+		}
+	})
+
+	// Phase 1 ring: both routed members dead (the reader's STALE view right
+	// after the members departed - the lag window).
+	staleRing := ring.New()
+	for _, id := range []string{"g1", "g2"} {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("probe listen: %v", err)
+		}
+		addr := l.Addr().String()
+		_ = l.Close()
+		staleRing.Add(ring.Member{ID: id, Addr: addr})
+	}
+	c.ring = staleRing
+
+	key := []byte("rr-lag-key")
+	gu := c.genUnitForKey(key)
+	ru := storageunit.NewReplicaUnit(gu, 0)
+	seedH := backing.Handle()
+	sb, _, err := seedH.OpenReplicaUnit(ru, 1)
+	if err != nil {
+		t.Fatalf("seed open: %v", err)
+	}
+	env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "seed"}, Payload: []byte("v1")})
+	if err := sb.Put(key, env); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+
+	// At +800ms (well inside the unreachable grace, far past the old 2-sweep
+	// cap) the RING UPDATES: the departed members vanish, self becomes the
+	// owner and mounts the position - the reconcile-after-reap a real reader
+	// performs.
+	const ringUpdateAt = 800 * time.Millisecond
+	armT := time.Now()
+	updated := make(chan struct{})
+	go func() {
+		defer close(updated)
+		time.Sleep(ringUpdateAt)
+		// Mutate the ring IN PLACE (Remove/Add under the ring's own lock),
+		// exactly as reconcileRingFromMembership does - the cluster never
+		// swaps the ring pointer while routing reads it.
+		c.ring.Remove("g1")
+		c.ring.Remove("g2")
+		c.ring.Add(ring.Member{ID: "self", Addr: "self:0"})
+		c.reconcileMu.Lock()
+		c.acquireReplicaUnit(ru)
+		c.reconcileMu.Unlock()
+	}()
+
+	got, err := c.getReplicatedUnit(key)
+	servedAt := time.Now()
+	if err != nil {
+		t.Fatalf("Get through the ring-lag window must be absorbed (re-polled until the ring updates), "+
+			"got after %v: %v", servedAt.Sub(armT), err)
+	}
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("Get returned %q, want %q", got, "v1")
+	}
+	if servedAt.Before(armT.Add(ringUpdateAt)) {
+		t.Fatalf("Get served %v after arming - before the ring update (fixture leak)", servedAt.Sub(armT))
+	}
+	t.Logf("ring-lag GET absorbed: served %v after arming (ring update at +%v)", servedAt.Sub(armT), ringUpdateAt)
+	<-updated
 }

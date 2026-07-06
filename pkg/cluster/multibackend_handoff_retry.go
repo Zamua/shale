@@ -193,7 +193,7 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 		return v, unwrapUnreachableOnly(err)
 	}
 	backoff := time.Duration(c.retryAfterMs()) * time.Millisecond
-	unreachableSweeps := 0
+	var unreachableRunStart time.Time
 
 	for {
 		v, err := attempt(deadline)
@@ -203,15 +203,19 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 		switch {
 		case isAcquiringErr(err):
 			// Handoff-class evidence: full-budget re-poll; reset the
-			// unreachable-only cap (a live transition is in progress).
-			unreachableSweeps = 0
+			// unreachable-only run (a live transition is in progress).
+			unreachableRunStart = time.Time{}
 		case isUnreachableOnly(err):
-			// Unreachable-only sweep: weaker evidence, CAPPED re-poll
-			// (docs/SPEC.md guard 2). Surface the dial error verbatim once the
-			// cap is hit, so a genuine outage costs a sub-second re-poll, not
-			// the full budget.
-			unreachableSweeps++
-			if unreachableSweeps >= unreachableOnlySweepCap {
+			// Unreachable-only sweep: weaker evidence, TIME-BOUNDED re-poll
+			// (docs/SPEC.md guard 2). A just-departed member's address lingers
+			// in the routed union until the ring rebuilds, so unreachable-only
+			// sweeps inside that lag are EXPECTED; keep re-polling for the
+			// unreachable grace, then surface the dial error verbatim - a
+			// genuine outage costs ~the grace, never the full budget.
+			if unreachableRunStart.IsZero() {
+				unreachableRunStart = time.Now()
+			}
+			if time.Since(unreachableRunStart) >= unreachableOnlyGrace {
 				return v, unwrapUnreachableOnly(err)
 			}
 		default:
@@ -234,11 +238,16 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 	}
 }
 
-// unreachableOnlySweepCap bounds how many unreachable-only sweeps the read
-// retry re-polls before surfacing the first dial error verbatim: the second
-// such sweep (one backoff apart, still nothing but dead legs) is the give-up
-// point - a genuine outage surfaces in well under a second.
-const unreachableOnlySweepCap = 2
+// unreachableOnlyGrace bounds how long the read retry re-polls consecutive
+// unreachable-only sweeps before surfacing the first dial error verbatim. It
+// must OUTLAST the ring-lag window (a departed member's address lingering in
+// the routed union until the membership update propagates, the ring rebuilds,
+// and the reconcile settles - broadcast plus settle in a graceful leave, the
+// suspicion timeout in a crash), or mid-rollout reads surface spurious dial
+// errors; 2s covers those with headroom while keeping a genuine outage's
+// surface time well under the default 5s read budget. Always additionally
+// bounded by ReadTimeout (a shorter budget wins).
+const unreachableOnlyGrace = 2 * time.Second
 
 // isUnreachableOnly reports whether err is the unreachable-only sweep marker.
 func isUnreachableOnly(err error) bool {
