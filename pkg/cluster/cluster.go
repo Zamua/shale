@@ -239,16 +239,33 @@ type Config struct {
 	// HA + LWW conflict resolution is opt-in via ReplicationFactor > 1.
 	ReplicationFactor int
 
-	// OpenConcurrency bounds how many owned replica positions the
-	// boot-time mount (mountReplicaUnits) opens IN PARALLEL. Each
-	// (unit, replica) position is an independent durable database, so
-	// concurrent opens of DISTINCT positions never fence one another;
-	// the cap exists so the cold-start open burst cannot itself
-	// overwhelm the shared object store. Zero (or negative) is
-	// normalized to defaultOpenConcurrency. A value of 1 reproduces the
-	// strictly-sequential mount exactly. Only consulted in multi-backend
-	// R>1 mode (the per-replica mount loop).
+	// OpenConcurrency bounds how many replica-position opens run IN
+	// PARALLEL on this node - BOTH the boot-time mount pool
+	// (mountReplicaUnits) AND the background overlap acquires the
+	// reconcile spawns during a membership transition
+	// (acquireReplicaUnitOverlap), which take a node-wide permit around
+	// each OpenReplicaUnit. Each (unit, replica) position is an
+	// independent durable database, so concurrent opens of DISTINCT
+	// positions never fence one another; the cap exists because
+	// concurrent REAL-DATA opens are unsafe in the shipped slatedb-go
+	// binding (see defaultOpenConcurrency) and, secondarily, so an open
+	// burst cannot overwhelm the shared object store. Zero (or negative)
+	// is normalized to defaultOpenConcurrency (1 = strictly sequential,
+	// the proven-safe mode). Raising it is a deliberate, revalidated act
+	// via this one knob. Only consulted in multi-backend R>1 mode.
 	OpenConcurrency int
+
+	// OpenPermitTimeout bounds how long ONE background overlap acquire may
+	// hold the node-wide open permit before the permit watchdog releases
+	// the PERMIT ONLY, so queued positions proceed while the slow/hung open
+	// keeps running to completion (the FFI open is not cancellable; the
+	// position stays deduped by acquireInFlight, so no double-open). This
+	// converts a wedged open from a total acquire-pipeline stall into one
+	// stuck position. See docs/SPEC.md "v0.8 Phase 2e" (the permit
+	// watchdog) for the overlap-risk reasoning. Zero (or negative) is
+	// normalized to defaultOpenPermitTimeout (60s). Only consulted in
+	// multi-backend R>1 mode.
+	OpenPermitTimeout time.Duration
 
 	// WriteConsistency picks how many replica acks a Put / Delete
 	// waits for. Zero is normalized to WriteQuorum by Open (the v0.4
@@ -556,11 +573,54 @@ type Cluster struct {
 	// mountMu.
 	acquireInFlight map[storageunit.ReplicaUnit]struct{}
 
+	// openSem is the node-wide permit gate bounding how many replica-unit
+	// opens run CONCURRENTLY on this node's factory, sized by
+	// Config.OpenConcurrency (normalized via openConcurrency; default 1).
+	// The background overlap acquires (acquireReplicaUnitOverlap goroutines)
+	// take a permit around each OpenReplicaUnit, so a node gaining many
+	// positions at once queues the opens at the SAME bound the boot mount
+	// pool (mountReplicaUnits) enforces - one knob governs every real-data
+	// open on the node. The queued positions stay PhaseAcquiring (the union
+	// covers them) so bounding costs availability nothing; it only sequences
+	// the FFI opens, which is required while concurrent real-data opens are
+	// unsafe in the shipped binding (see defaultOpenConcurrency). Created
+	// LAZILY under mountMu on first use so its size reflects the config at
+	// first acquire (mirrors mountReplicaUnits sizing its pool at call time).
+	openSem chan struct{}
+
+	// drainPollerActive guards the at-most-one background fast drain poller
+	// (ensureDrainPoller): while any position is Draining the poller re-runs
+	// the release checks every displacedDrainPollInterval so a displaced
+	// owner releases within ~half a second of its successor's serving marker
+	// instead of waiting for the periodic reconcile tick.
+	drainPollerActive atomic.Bool
+
+	// permitHolders tracks which positions currently hold a node-wide open
+	// permit and since when (ru -> time.Time). Observability only: the
+	// per-tick acquire-queue summary line names the oldest holder, which is
+	// exactly the datum a wedged-open pipeline stall hides without it.
+	permitHolders sync.Map
+
 	// draining is a TEST-ONLY override for the gossiped Draining set: when
 	// non-nil, drainingIDs returns it directly instead of reading the membership
 	// snapshot. It lets the white-box pending-ranges tests inject a transition
 	// without a memberlist. Nil in production (the snapshot is authoritative).
 	draining map[string]struct{}
+
+	// joining is a TEST-ONLY override for the gossiped Joining set: when non-nil,
+	// joiningIDs returns it directly instead of reading the membership snapshot.
+	// It lets the white-box pending-ranges tests inject a JOIN transition (and
+	// exercise the quorum floor) without a memberlist. Nil in production (the
+	// snapshot is authoritative). The entry-side mirror of draining above.
+	joining map[string]struct{}
+
+	// selfJoining tracks whether THIS node currently advertises the Joining bit.
+	// Set true at boot when mountReplicaUnits boot-defers one or more owned
+	// positions (a peer is serving them); cleared by the reconcile once every
+	// owned position is mounted. Kept as a local atomic so the reconcile's
+	// clear-decision does not race a self-snapshot; the authoritative gossiped bit
+	// is driven through membership.SetJoining alongside this flag.
+	selfJoining atomic.Bool
 
 	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
 	// capability view of factory: non-nil iff the factory implements
@@ -799,11 +859,23 @@ func Open(cfg Config) (*Cluster, error) {
 		return nil, errors.New("cluster: GRPCAddr is required in multi-node mode")
 	}
 
+	// JOIN write-transparency (v0.8 Phase 2e, entry side): a node JOINING an
+	// existing REPLICATED cluster (it has seeds, and R>1) advertises the Joining
+	// bit in its VERY FIRST gossip Meta - atomically with its ring presence - so a
+	// peer never learns the newcomer is a member (and clean-cut releases a position
+	// it displaces) BEFORE it learns the newcomer is Joining (which tells it to HOLD
+	// + drain instead). A founder (no seeds) or an R=1 node leaves it false, so cold
+	// first-cluster formation and the single-replica path are unchanged. The
+	// reconcile clears the bit once this node has mounted every position it owns.
+	startJoining := multi && cfg.ReplicationFactor > 1 && len(cfg.Seeds) > 0
+	c.selfJoining.Store(startJoining)
+
 	mem, err := membership.Open(membership.Config{
 		NodeID:    cfg.NodeID,
 		BindAddr:  cfg.BindAddr,
 		GRPCAddr:  cfg.GRPCAddr,
 		Seeds:     cfg.Seeds,
+		Joining:   startJoining,
 		LogOutput: cfg.LogOutput,
 		// Gossip this node's standing declared shard count (SHALE_UNIT_COUNT)
 		// so the cluster can detect cluster-wide AGREEMENT on a desired count
@@ -1772,6 +1844,13 @@ func (c *Cluster) Delete(key []byte) error {
 func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed
+	}
+	if c.multiReplicated() {
+		// R>1 (v0.8 Phase 2e union reads): a scan is a READ and is served by
+		// whoever in the routed union physically holds the prefix's unit -
+		// current-first, so in steady state this is the ring primary exactly
+		// as below. See docs/SPEC.md "Union scans".
+		return c.scanReplicatedUnit(prefix)
 	}
 	owner, local := c.ownerOf(prefix)
 	if local {

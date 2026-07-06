@@ -507,9 +507,16 @@ func (*DeleteResponse) Descriptor() ([]byte, []int) {
 }
 
 type ScanPrefixRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Prefix        []byte                 `protobuf:"bytes,1,opt,name=prefix,proto3" json:"prefix,omitempty"`
-	Forwarded     bool                   `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Prefix    []byte                 `protobuf:"bytes,1,opt,name=prefix,proto3" json:"prefix,omitempty"`
+	Forwarded bool                   `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
+	// ru: see PutRequest.ru. Position-addressed union scan leg (Phase 2e
+	// union reads): when set with forwarded=true, the receiver resolves the
+	// explicit ReplicaUnit directly against its mount map (with the same
+	// mounted-position fallback the Get leg uses) instead of re-routing by
+	// ring ownership - the exact mirror of GetRequest.ru. See docs/SPEC.md
+	// "Union scans".
+	Ru            *ReplicaUnitRef `protobuf:"bytes,3,opt,name=ru,proto3" json:"ru,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -556,6 +563,13 @@ func (x *ScanPrefixRequest) GetForwarded() bool {
 		return x.Forwarded
 	}
 	return false
+}
+
+func (x *ScanPrefixRequest) GetRu() *ReplicaUnitRef {
+	if x != nil {
+		return x.Ru
+	}
+	return nil
 }
 
 type ScanPrefixResponse struct {
@@ -2160,10 +2174,11 @@ const file_shale_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1c\n" +
 	"\tforwarded\x18\x02 \x01(\bR\tforwarded\x12(\n" +
 	"\x02ru\x18\x03 \x01(\v2\x18.shale.v1.ReplicaUnitRefR\x02ru\"\x10\n" +
-	"\x0eDeleteResponse\"I\n" +
+	"\x0eDeleteResponse\"s\n" +
 	"\x11ScanPrefixRequest\x12\x16\n" +
 	"\x06prefix\x18\x01 \x01(\fR\x06prefix\x12\x1c\n" +
-	"\tforwarded\x18\x02 \x01(\bR\tforwarded\"<\n" +
+	"\tforwarded\x18\x02 \x01(\bR\tforwarded\x12(\n" +
+	"\x02ru\x18\x03 \x01(\v2\x18.shale.v1.ReplicaUnitRefR\x02ru\"<\n" +
 	"\x12ScanPrefixResponse\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"*\n" +
@@ -2336,47 +2351,48 @@ var file_shale_proto_depIdxs = []int32{
 	1,  // 0: shale.v1.PutRequest.ru:type_name -> shale.v1.ReplicaUnitRef
 	1,  // 1: shale.v1.GetRequest.ru:type_name -> shale.v1.ReplicaUnitRef
 	1,  // 2: shale.v1.DeleteRequest.ru:type_name -> shale.v1.ReplicaUnitRef
-	14, // 3: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
-	21, // 4: shale.v1.MigrateChunk.kv:type_name -> shale.v1.KeyValue
-	22, // 5: shale.v1.MigrateChunk.done:type_name -> shale.v1.MigrationDone
-	25, // 6: shale.v1.ProposeRebalanceResponse.ranges:type_name -> shale.v1.RangePlanItem
-	27, // 7: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
-	28, // 8: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
-	31, // 9: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
-	0,  // 10: shale.v1.ReshardControlRequest.phase:type_name -> shale.v1.ReshardPhase
-	2,  // 11: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
-	4,  // 12: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
-	6,  // 13: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
-	8,  // 14: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
-	10, // 15: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
-	12, // 16: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
-	15, // 17: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
-	17, // 18: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
-	19, // 19: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
-	23, // 20: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
-	26, // 21: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
-	30, // 22: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
-	33, // 23: shale.v1.ShaleNode.ReshardControl:input_type -> shale.v1.ReshardControlRequest
-	35, // 24: shale.v1.ShaleNode.GenState:input_type -> shale.v1.GenStateRequest
-	3,  // 25: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
-	5,  // 26: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
-	7,  // 27: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
-	9,  // 28: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
-	11, // 29: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
-	13, // 30: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
-	16, // 31: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
-	18, // 32: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
-	20, // 33: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
-	24, // 34: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
-	29, // 35: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
-	32, // 36: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
-	34, // 37: shale.v1.ShaleNode.ReshardControl:output_type -> shale.v1.ReshardControlResponse
-	36, // 38: shale.v1.ShaleNode.GenState:output_type -> shale.v1.GenStateResponse
-	25, // [25:39] is the sub-list for method output_type
-	11, // [11:25] is the sub-list for method input_type
-	11, // [11:11] is the sub-list for extension type_name
-	11, // [11:11] is the sub-list for extension extendee
-	0,  // [0:11] is the sub-list for field type_name
+	1,  // 3: shale.v1.ScanPrefixRequest.ru:type_name -> shale.v1.ReplicaUnitRef
+	14, // 4: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
+	21, // 5: shale.v1.MigrateChunk.kv:type_name -> shale.v1.KeyValue
+	22, // 6: shale.v1.MigrateChunk.done:type_name -> shale.v1.MigrationDone
+	25, // 7: shale.v1.ProposeRebalanceResponse.ranges:type_name -> shale.v1.RangePlanItem
+	27, // 8: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
+	28, // 9: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
+	31, // 10: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
+	0,  // 11: shale.v1.ReshardControlRequest.phase:type_name -> shale.v1.ReshardPhase
+	2,  // 12: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
+	4,  // 13: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
+	6,  // 14: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
+	8,  // 15: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
+	10, // 16: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
+	12, // 17: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
+	15, // 18: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
+	17, // 19: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
+	19, // 20: shale.v1.ShaleNode.MigrateRange:input_type -> shale.v1.RangeSpec
+	23, // 21: shale.v1.ShaleNode.ProposeRebalance:input_type -> shale.v1.ProposeRebalanceRequest
+	26, // 22: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
+	30, // 23: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
+	33, // 24: shale.v1.ShaleNode.ReshardControl:input_type -> shale.v1.ReshardControlRequest
+	35, // 25: shale.v1.ShaleNode.GenState:input_type -> shale.v1.GenStateRequest
+	3,  // 26: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
+	5,  // 27: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
+	7,  // 28: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
+	9,  // 29: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
+	11, // 30: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
+	13, // 31: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
+	16, // 32: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
+	18, // 33: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
+	20, // 34: shale.v1.ShaleNode.MigrateRange:output_type -> shale.v1.MigrateChunk
+	24, // 35: shale.v1.ShaleNode.ProposeRebalance:output_type -> shale.v1.ProposeRebalanceResponse
+	29, // 36: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
+	32, // 37: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
+	34, // 38: shale.v1.ShaleNode.ReshardControl:output_type -> shale.v1.ReshardControlResponse
+	36, // 39: shale.v1.ShaleNode.GenState:output_type -> shale.v1.GenStateResponse
+	26, // [26:40] is the sub-list for method output_type
+	12, // [12:26] is the sub-list for method input_type
+	12, // [12:12] is the sub-list for extension type_name
+	12, // [12:12] is the sub-list for extension extendee
+	0,  // [0:12] is the sub-list for field type_name
 }
 
 func init() { file_shale_proto_init() }

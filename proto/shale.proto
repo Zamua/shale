@@ -219,6 +219,13 @@ message DeleteResponse {}
 message ScanPrefixRequest {
   bytes prefix = 1;
   bool forwarded = 2;
+  // ru: see PutRequest.ru. Position-addressed union scan leg (Phase 2e
+  // union reads): when set with forwarded=true, the receiver resolves the
+  // explicit ReplicaUnit directly against its mount map (with the same
+  // mounted-position fallback the Get leg uses) instead of re-routing by
+  // ring ownership - the exact mirror of GetRequest.ru. See docs/SPEC.md
+  // "Union scans".
+  ReplicaUnitRef ru = 3;
 }
 
 message ScanPrefixResponse {

@@ -25,3 +25,4 @@ shaled-pebble
 !pkg/shaled/
 !backends/slate/cmd/shaled-slate/
 !backends/pebble/cmd/shaled-pebble/
+Dockerfile.*.local

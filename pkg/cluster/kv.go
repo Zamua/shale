@@ -25,6 +25,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"time"
 
@@ -118,7 +119,15 @@ func (t *Tx) Delete(key []byte) error { return t.tx.Delete(key) }
 type BlobKV struct {
 	*KV
 	blobs blob.Store
+	// testingSweepMidPass, when set (Testing* convention), runs between the
+	// referenced scan and the topology guard inside SweepOrphans, so a test can
+	// mutate the mount view at the exact torn-pass instant. Nil in production.
+	testingSweepMidPass func()
 }
+
+// TestingSetSweepMidPassHook installs the SweepOrphans mid-pass hook (see the
+// field). Test-only, following the Testing* white-box convention.
+func (b *BlobKV) TestingSetSweepMidPassHook(f func()) { b.testingSweepMidPass = f }
 
 // NewBlobKV wraps a blob-configured cluster. cfg.BlobStore MUST be non-nil:
 // NewBlobKV returns an error otherwise, since the whole point of *BlobKV is the
@@ -321,17 +330,50 @@ func (b *BlobKV) GetBlob(ctx context.Context, routeKey []byte, blobid string) (i
 // leak, never data loss, since GetBlob still resolves via the stored pointer).
 // Delete is idempotent (a double sweep or a race with a manual delete is
 // harmless).
+//
+// THE SINGLE-SNAPSHOT TOPOLOGY GUARD (docs/design/blob-values.md 11.7): the
+// mounted-unit set is captured ONCE, BEFORE the referenced scan, the sweep
+// enumerates ONLY that snapshot, and the pass ABORTS fail-closed if the
+// mounted set changed by the end of the scan or a membership transition
+// (Joining/Draining) is in flight. Without the guard the referenced set and
+// the object enumeration are two reads of a MOVING mount view: a unit
+// ACQUIRED between them (a reconcile acquire during a rollout, a fence-evict
+// re-acquire, a boot mount completing) is enumerated for objects with NONE of
+// its brefs in the referenced set, so every bound blob under it older than
+// the grace is deleted - committed-data loss (a bound blob whose pointer and
+// metadata stay intact while the bytes vanish). A skipped pass is a leak
+// retried next tick; a torn pass is data loss.
 func (b *BlobKV) SweepOrphans(ctx context.Context, now time.Time, grace time.Duration) error {
+	// Refuse to sweep mid-transition: the mount view is expected to move while
+	// members join/drain, and the guard below would only catch the mutation
+	// after the (wasted) scan.
+	if joining, draining := b.c.transitionSets(); len(joining) > 0 || len(draining) > 0 {
+		return fmt.Errorf("shale: orphan sweep skipped: membership transition in flight (%d joining, %d draining); retry next pass", len(joining), len(draining))
+	}
+	// Snapshot the mount view FIRST; the referenced scan and the object
+	// enumeration below must both read exactly this view.
+	unitsBefore := b.c.MountedUnits()
+
 	// The referenced-object set is computed ONCE per pass from the node's local
 	// pointers; it covers every unit this node has MOUNTED (the local scan sees
-	// only the brefs for mounted units), the SAME view MountedUnits enumerates
-	// below. Fail-closed: a scan error keeps every object.
+	// only the brefs for mounted units). Fail-closed: a scan error keeps every
+	// object.
 	referenced, err := b.referencedObjKeys()
 	if err != nil {
 		return err
 	}
+	if b.testingSweepMidPass != nil {
+		b.testingSweepMidPass()
+	}
+	// FAIL-CLOSED TOPOLOGY GUARD: the referenced set is only sound for the
+	// mount view it was scanned under. Any acquire/release since the snapshot
+	// means an enumerated unit's brefs may be missing from the set - abort and
+	// let the next tick retry on a calm view.
+	if !sameUnitTokenSet(unitsBefore, b.c.MountedUnits()) {
+		return fmt.Errorf("shale: orphan sweep aborted: mounted units changed during the referenced scan; retry next pass")
+	}
 	cutoff := now.Add(-grace)
-	for _, unit := range b.c.MountedUnits() {
+	for _, unit := range unitsBefore {
 		prefix := blob.FinalPrefixForUnit(unit)
 		for obj, lerr := range b.blobs.List(ctx, prefix) {
 			if lerr != nil {
@@ -351,6 +393,24 @@ func (b *BlobKV) SweepOrphans(ctx context.Context, now time.Time, grace time.Dur
 		}
 	}
 	return nil
+}
+
+// sameUnitTokenSet reports whether two mounted-unit token slices contain the
+// same set (order-independent; the slices are small).
+func sameUnitTokenSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	set := make(map[string]struct{}, len(a))
+	for _, t := range a {
+		set[t] = struct{}{}
+	}
+	for _, t := range b {
+		if _, ok := set[t]; !ok {
+			return false
+		}
+	}
+	return true
 }
 
 // referencedObjKeys returns the set of blob object keys this node's LOCAL

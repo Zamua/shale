@@ -42,6 +42,22 @@ type Backend interface {
 	Close() error
 }
 
+// Flusher is an OPTIONAL capability a Backend may implement: force all
+// in-memory write state (e.g. an LSM memtable) durable to the backing
+// store NOW, without closing the backend. The cluster layer uses it
+// best-effort at handoff edges (the displacement flush, see docs/SPEC.md
+// "Displacement flush") so a successor's open recovers a minimal WAL
+// tail; a Backend that does not implement it is skipped silently.
+//
+// Contract: Flush is safe to call concurrently with reads and writes,
+// never loses or reorders an acked write, and returns an error when the
+// flush cannot complete (the writer was fenced by a higher-epoch owner,
+// or the backend is closed). Callers treat any error as "no flush
+// happened" - an optimization miss, never data loss.
+type Flusher interface {
+	Flush() error
+}
+
 // Iterator walks a scan result. Next returns successive (key, value)
 // pairs in key-ascending order. When the scan is exhausted Next
 // returns nil for both key and value (and no error). Close MUST be

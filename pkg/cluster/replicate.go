@@ -192,6 +192,64 @@ func fanout(
 // and skipped by the ResourceExhausted branch. Either way a mid-acquire
 // replica no longer consumes the failure budget. See docs/SPEC.md
 // "v0.8 Phase 2d".
+// isTransientReadLegErr is the READ-leg HANDOFF-CLASS transient classification
+// (docs/SPEC.md "Union reads" guard 2): everything isTransientReplicaErr
+// skips, PLUS a CLOSED-MID-RELEASE mount. Handoff-class evidence earns the
+// FULL-budget re-poll; the weaker unreachable-member class is classified
+// separately (isUnreachableLegErr) and earns only the capped re-poll. A read leg that resolves a local handle in the
+// same instant ordered removal's release closes it reads backend.ErrClosed;
+// a leaving node's own shutdown surfaces the same to a forwarded leg, crossing
+// gRPC as the bare codes.Unknown wrapping of the error text (gRPC wraps
+// non-status errors that way, so the wire form is matched by message). On a
+// union leg either form means "this copy just moved on" - another leg or the
+// next re-poll serves - so it must count as neither ack nor failure and must
+// be re-polled by the read retry, not surfaced. READ legs only: the write
+// fan-out's accounting is unchanged, and a client op entering a genuinely
+// closed cluster still gets backend.ErrClosed from the entry not-ready check.
+func isTransientReadLegErr(err error) bool {
+	if isTransientReplicaErr(err) {
+		return true
+	}
+	if errors.Is(err, backend.ErrClosed) {
+		return true
+	}
+	if st, ok := status.FromError(err); ok {
+		// EXACT-message match for the wire form: gRPC wraps the receiver's raw
+		// non-status error verbatim, so the message is exactly ErrClosed's text.
+		// A wrapped error merely EMBEDDING the text is some other failure and
+		// must stay hard (a substring match would silently absorb it).
+		if st.Code() == codes.Unknown && st.Message() == backend.ErrClosed.Error() {
+			return true
+		}
+	}
+	return false
+}
+
+// isUnreachableLegErr classifies a read leg's bare codes.Unavailable (a
+// refused dial / transport failure - a just-departed member's dead address,
+// or a receiver dying mid-request). Skipped within a sweep like the handoff
+// classes, but weaker evidence of a transition: a sweep whose ONLY transient
+// evidence is unreachable legs earns the CAPPED re-poll (docs/SPEC.md guard
+// 2), so a genuinely all-down replica set surfaces its dial error after a
+// sub-second capped re-poll instead of stalling to the full read budget.
+// Checked AFTER isTransientReadLegErr at every call site, so an
+// Unavailable-coded handoff refusal (the in-process acquiring sentinel)
+// classifies as handoff, never as unreachable.
+func isUnreachableLegErr(err error) bool {
+	st, ok := status.FromError(err)
+	return ok && st.Code() == codes.Unavailable
+}
+
+// unreachableOnlyError marks a sweep whose only transient evidence was
+// unreachable legs, carrying the FIRST dial error VERBATIM (its text is the
+// diagnostic the operator needs). Internal to the read retry: the wrapper
+// counts these sweeps against the cap and always returns the INNER error to
+// callers, never the marker.
+type unreachableOnlyError struct{ inner error }
+
+func (e *unreachableOnlyError) Error() string { return e.inner.Error() }
+func (e *unreachableOnlyError) Unwrap() error { return e.inner }
+
 func isTransientReplicaErr(err error) bool {
 	if err == nil {
 		return false

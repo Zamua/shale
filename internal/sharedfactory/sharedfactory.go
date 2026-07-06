@@ -106,6 +106,40 @@ type Backing struct {
 	// self-heal) gets them without changing the overlap tests' behavior.
 	strictReadFencing atomic.Bool
 
+	// eagerFence, when true, models real slatedb's fence timing: the durable
+	// writer-epoch bumps at open-START (inside DbBuilder.Build), fencing the prior
+	// owner the INSTANT the successor begins its (slow) open, NOT at mount
+	// completion. The default OpenReplicaUnit sleeps the acquireDelay BEFORE the
+	// epoch bump, which defers the fence to completion - so a displaced/draining
+	// owner stays UNFENCED for the whole modeled mount and keeps serving the union.
+	// That is a test-double fidelity gap: on real slatedb the prior owner is fenced
+	// for the whole mount and CANNOT serve, so the union write reaches only the
+	// un-displaced co-replica (1 ack) and WEDGES. eagerFence bumps the epoch first,
+	// then sleeps, matching production. Opt-in per test (default false), so the
+	// existing availability tests keep their fence-at-completion timing.
+	eagerFence atomic.Bool
+
+	// openHangs holds, per replica position, a channel OpenReplicaUnit blocks
+	// on at entry until the test releases it (HangOpenReplica) - modeling an
+	// open WEDGED mid-FFI against a degraded store, the permit-watchdog pin's
+	// scenario. Distinct from acquireDelayNanos (a bounded latency) and
+	// openFaults (an immediate error). A sync.Map (arm/release without mu).
+	openHangs sync.Map
+
+	// openReplicaStarts counts OpenReplicaUnit ENTRIES per position across
+	// every handle (guarded by mu). The permit-watchdog pin asserts a stuck
+	// position is opened EXACTLY ONCE (no double-open) even after the permit
+	// is released around it. The OpenTimeline records only COMPLETED opens,
+	// so a hung open is visible here and nowhere else.
+	openReplicaStarts map[storageunit.ReplicaUnit]int
+
+	// replicaFlushes counts backend.Flusher.Flush calls per replica position
+	// across every handle's backends (test observability for the cluster's
+	// DISPLACEMENT FLUSH, v0.8 Phase 2e: the Owned -> Draining edge flushes the
+	// displaced owner's backend exactly once). Guarded by mu; read via
+	// ReplicaFlushCount.
+	replicaFlushes map[storageunit.ReplicaUnit]int
+
 	// servingMarkers is the durable, poll-observable SERVING MARKER registry
 	// (v0.8 Phase 2e, Option B overlap handoff): per-replica-position, the open
 	// epoch of the latest live owner that reached Ready. It is the in-memory
@@ -123,11 +157,13 @@ type Backing struct {
 // NewBacking returns an empty shared backing (no units written yet).
 func NewBacking() *Backing {
 	return &Backing{
-		stores:         make(map[storageunit.GenUnit]*memory.Memory),
-		epochs:         make(map[storageunit.GenUnit]storageunit.Epoch),
-		replicaStores:  make(map[storageunit.ReplicaUnit]*memory.Memory),
-		replicaEpochs:  make(map[storageunit.ReplicaUnit]storageunit.Epoch),
-		servingMarkers: make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		stores:            make(map[storageunit.GenUnit]*memory.Memory),
+		epochs:            make(map[storageunit.GenUnit]storageunit.Epoch),
+		replicaStores:     make(map[storageunit.ReplicaUnit]*memory.Memory),
+		replicaEpochs:     make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		replicaFlushes:    make(map[storageunit.ReplicaUnit]int),
+		openReplicaStarts: make(map[storageunit.ReplicaUnit]int),
+		servingMarkers:    make(map[storageunit.ReplicaUnit]storageunit.Epoch),
 	}
 }
 
@@ -350,6 +386,11 @@ type Handle struct {
 	mu          sync.Mutex
 	open        map[storageunit.GenUnit]storageunit.Epoch     // units THIS handle has open + at what epoch (R=1)
 	openReplica map[storageunit.ReplicaUnit]storageunit.Epoch // replicas THIS handle has open + at what epoch (R>1)
+
+	// openSpans records every OpenReplicaUnit call's (position, start, end)
+	// in completion order (guarded by mu; read via OpenTimeline). Test
+	// support for the handoff-cycle latency pins. Test-only.
+	openSpans []OpenSpan
 }
 
 // Handle returns a fresh per-node handle over this backing. Each node in a
@@ -375,6 +416,31 @@ func (h *Handle) SetAcquireDelay(d time.Duration) {
 // parallel up to, and never beyond, the configured bound).
 func (h *Handle) MaxConcurrentOpens() int64 { return h.openMaxInFlight.Load() }
 
+// OpenSpan is one recorded OpenReplicaUnit call on a handle: the position and
+// the wall-clock start/end of the call. Test support for the handoff-cycle
+// latency pins (assert queued opens CHAIN event-driven - the next open starts
+// the moment the previous finishes - rather than waiting a reconcile tick).
+type OpenSpan struct {
+	RU    storageunit.ReplicaUnit
+	Start time.Time
+	End   time.Time
+}
+
+// OpenTimeline returns a copy of every OpenReplicaUnit span recorded on this
+// handle, in completion order.
+func (h *Handle) OpenTimeline() []OpenSpan {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return append([]OpenSpan(nil), h.openSpans...)
+}
+
+// recordOpenSpan appends one completed open to the handle's timeline.
+func (h *Handle) recordOpenSpan(ru storageunit.ReplicaUnit, start time.Time) {
+	h.mu.Lock()
+	h.openSpans = append(h.openSpans, OpenSpan{RU: ru, Start: start, End: time.Now()})
+	h.mu.Unlock()
+}
+
 // SetOpenReplicaFault arms (err != nil) or clears (err == nil) an injected
 // OpenReplicaUnit failure for replica position ru on the SHARED backing, so
 // every handle that tries to open ru sees it - modeling a permanently
@@ -387,10 +453,49 @@ func (b *Backing) SetOpenReplicaFault(ru storageunit.ReplicaUnit, err error) {
 	b.openFaults.Store(ru, err)
 }
 
+// HangOpenReplica arms a HANG on every subsequent OpenReplicaUnit of ru: the
+// open blocks at entry until the returned release func is called (idempotent).
+// Models an open wedged mid-FFI against a degraded store. Test-only; the
+// caller MUST release before test end or the blocked goroutine leaks.
+func (b *Backing) HangOpenReplica(ru storageunit.ReplicaUnit) (release func()) {
+	ch := make(chan struct{})
+	b.openHangs.Store(ru, ch)
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			b.openHangs.Delete(ru)
+			close(ch)
+		})
+	}
+}
+
+// OpenReplicaStartCount reports how many OpenReplicaUnit calls for ru have
+// STARTED across every handle (completed or still in flight). Test-only.
+func (b *Backing) OpenReplicaStartCount(ru storageunit.ReplicaUnit) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.openReplicaStarts[ru]
+}
+
+// countOpenReplicaStart records one OpenReplicaUnit entry for ru.
+func (b *Backing) countOpenReplicaStart(ru storageunit.ReplicaUnit) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.openReplicaStarts[ru]++
+}
+
 // SetStrictReadFencing toggles whether a fenced handle also fails READS (Get +
 // ScanPrefix) with ErrFenced, modeling real slatedb's close-on-fence. Default
 // false (reads pass through, the overlap-union-read model). Test-only.
 func (b *Backing) SetStrictReadFencing(on bool) { b.strictReadFencing.Store(on) }
+
+// SetEagerFence toggles fence-at-open-START timing (real slatedb's DbBuilder.Build
+// behavior) instead of the default fence-at-completion. When on, OpenReplicaUnit
+// bumps the durable writer-epoch (fencing the prior owner) BEFORE it sleeps the
+// acquireDelay, so a displaced/draining owner is fenced for the whole modeled
+// mount and cannot serve the union - reproducing the real-cluster residual the
+// default (fence-at-completion) timing hides. Default false. Test-only.
+func (b *Backing) SetEagerFence(on bool) { b.eagerFence.Store(on) }
 
 // OpenReplicaUnit opens replica position ru.Replica of unit ru.Unit against
 // the per-replica shared backing, fencing any prior writer of the SAME
@@ -400,6 +505,17 @@ func (b *Backing) SetStrictReadFencing(on bool) { b.strictReadFencing.Store(on) 
 // owner of the same position acquires it. Distinct replica positions are
 // independent stores: opening replica 1 never touches replica 0.
 func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	// Timeline recording (test-only): every call's (start, end) span, so the
+	// handoff-cycle latency pins can assert queued opens chain event-driven.
+	openStart := time.Now()
+	defer h.recordOpenSpan(ru, openStart)
+	h.backing.countOpenReplicaStart(ru)
+	// Injected hang (test-only): block at entry until released, modeling an
+	// open wedged mid-FFI. Before the fault check so a hang + fault compose
+	// as hang-then-fail.
+	if ch, ok := h.backing.openHangs.Load(ru); ok {
+		<-ch.(chan struct{})
+	}
 	// Concurrency high-water tracking (test-only, Phase 2g): record the peak
 	// number of simultaneously in-flight opens so a test can assert the boot
 	// mount runs them in parallel up to its bound. Wraps the whole call (defer)
@@ -426,10 +542,28 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	}
 	h.mu.Unlock()
 
-	// Simulate object-store open latency to widen the acquiring window (test
-	// support for the Phase 2d write-availability gate). The sleep is BEFORE the
-	// epoch bump, so the unit is genuinely unmounted (a routed op gets the
-	// retryable acquiring-window error) for the whole delay.
+	// EAGER FENCE (real slatedb timing): bump the durable writer-epoch FIRST, so
+	// the prior owner is fenced the instant this slow open begins (DbBuilder.Build
+	// fences at open-START), THEN sleep the mount latency. The store is still not
+	// returned until after the sleep, so this node stays unmounted (routed ops get
+	// the transient) for the whole delay - but the prior owner is ALREADY fenced and
+	// cannot serve the union. This is the production timing the default hides.
+	if h.backing.eagerFence.Load() {
+		store, opened := h.backing.acquireReplica(ru, epoch)
+		if d := h.acquireDelayNanos.Load(); d > 0 {
+			time.Sleep(time.Duration(d))
+		}
+		h.mu.Lock()
+		h.openReplica[ru] = opened
+		h.mu.Unlock()
+		return &fencedReplicaBackend{backing: h.backing, unit: ru, epoch: opened, store: store}, opened, nil
+	}
+
+	// DEFAULT (fence-at-completion): simulate object-store open latency to widen the
+	// acquiring window (test support for the Phase 2d write-availability gate). The
+	// sleep is BEFORE the epoch bump, so the unit is genuinely unmounted (a routed op
+	// gets the retryable acquiring-window error) for the whole delay AND the prior
+	// owner stays unfenced (the fence-timing gap eagerFence closes).
 	if d := h.acquireDelayNanos.Load(); d > 0 {
 		time.Sleep(time.Duration(d))
 	}
@@ -682,3 +816,35 @@ func (f *fencedReplicaBackend) ScanPrefix(prefix []byte) (backend.Iterator, erro
 }
 
 func (f *fencedReplicaBackend) Close() error { return nil }
+
+// Flush implements the OPTIONAL backend.Flusher capability (the cluster's
+// displacement flush, v0.8 Phase 2e). The double has no memtable to make
+// durable - the shared *memory.Memory IS the durable bytes - so the flush is
+// a semantic no-op; it COUNTS the call on the shared backing (test
+// observability: the pin test asserts exactly one flush per Owned -> Draining
+// edge) and mirrors the real backend's contract by failing once fenced (a
+// higher-epoch owner took the database over; the caller treats it as a
+// best-effort miss).
+func (f *fencedReplicaBackend) Flush() error {
+	f.backing.countReplicaFlush(f.unit)
+	if f.fenced() {
+		return ErrFenced
+	}
+	return nil
+}
+
+// countReplicaFlush records one Flush call against ru (under mu).
+func (b *Backing) countReplicaFlush(ru storageunit.ReplicaUnit) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.replicaFlushes[ru]++
+}
+
+// ReplicaFlushCount reports how many times ru's backends were asked to
+// Flush, across every handle. Test observability for the displacement
+// flush's exactly-once-per-transition guarantee.
+func (b *Backing) ReplicaFlushCount(ru storageunit.ReplicaUnit) int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.replicaFlushes[ru]
+}

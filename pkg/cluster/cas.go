@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -237,7 +238,17 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 	// + any replica that acked, the same best-effort-to-W model single-key
 	// Put has. A read-only commit (no writes) has nothing to replicate.
 	if replicated && len(encodedWrites) > 0 {
-		if err := c.replicateCASBatch(pinKey, encodedWrites); err != nil {
+		// Thread the position the owner-local commit applied to (the pausedTx's
+		// resolved ru, multi mode) into the fan-out, so the owner's OTHER mounted
+		// position of the pin unit (the index-shuffling survivor mid-transition)
+		// receives the batch too and counts as a durable ack - the CAS mirror of
+		// the put path's dual-position routing. Zero-valued on the legacy per-node
+		// path (no pausedTx), where the attempt ignores it.
+		var committedRU storageunit.ReplicaUnit
+		if pt, ok := tx.(*pausedTx); ok {
+			committedRU = pt.ru
+		}
+		if err := c.replicateCASBatch(pinKey, committedRU, encodedWrites); err != nil {
 			return backend.CASResult{Err: err}
 		}
 	}

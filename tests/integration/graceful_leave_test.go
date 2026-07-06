@@ -97,6 +97,12 @@ func runGracefulLeave(t *testing.T, drainTimeout, mountDelay time.Duration) grac
 
 	mutate := func(cfg *cluster.Config) {
 		cfg.GracefulLeaveDrainTimeout = drainTimeout
+		// Survivors acquire the leaver's positions with a multi-second mock
+		// delay armed across several positions at once; the default node-wide
+		// open bound (1) would serialize them past the drain budget. No FFI
+		// hazard in the mock double; the bound is pinned separately in
+		// pkg/cluster (TestOverlapAcquire_BoundedByOpenConcurrency).
+		cfg.OpenConcurrency = 8
 	}
 
 	// Start a 4-node R=2 cluster (default 5s WriteTimeout) and let it fully

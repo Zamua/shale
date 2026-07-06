@@ -76,6 +76,53 @@ const epochAtOpen storageunit.Epoch = 0
 // re-validated against PROD-SHAPED DATA before use. Until then the default is 1.
 const defaultOpenConcurrency = 1
 
+// openConcurrency returns the node-wide bound on concurrent replica-unit
+// opens: Config.OpenConcurrency normalized (zero/negative -> the safe
+// defaultOpenConcurrency). BOTH open paths consult it - the boot mount pool
+// (mountReplicaUnits) and the background overlap acquires (via
+// acquireOpenPermit) - so every real-data FFI open on a node respects ONE
+// knob, and raising it is one deliberate, revalidated act (see the
+// defaultOpenConcurrency doc for why the default stays 1).
+func (c *Cluster) openConcurrency() int {
+	conc := c.cfg.OpenConcurrency
+	if conc <= 0 {
+		conc = defaultOpenConcurrency
+	}
+	return conc
+}
+
+// defaultOpenPermitTimeout is the permit watchdog bound when
+// Config.OpenPermitTimeout is unset: how long one overlap acquire may hold
+// the node-wide open permit before the permit is released to unstarve the
+// queue (the open itself keeps running). Roughly 2x a worst-case clean open
+// against a loaded object store.
+const defaultOpenPermitTimeout = 60 * time.Second
+
+// openPermitTimeout returns the normalized permit watchdog bound.
+func (c *Cluster) openPermitTimeout() time.Duration {
+	if d := c.cfg.OpenPermitTimeout; d > 0 {
+		return d
+	}
+	return defaultOpenPermitTimeout
+}
+
+// acquireOpenPermit blocks until a node-wide open permit is available and
+// returns the release func. The permit gate (openSem) is created lazily
+// under mountMu on first use, sized by openConcurrency() at that moment.
+// Used by the background overlap acquires; the boot mount pool carries the
+// same bound via its own errgroup limit (boot and reconcile do not overlap:
+// mountReplicaUnits completes before Open returns and starts the loops).
+func (c *Cluster) acquireOpenPermit() (release func()) {
+	c.mountMu.Lock()
+	if c.openSem == nil {
+		c.openSem = make(chan struct{}, c.openConcurrency())
+	}
+	sem := c.openSem
+	c.mountMu.Unlock()
+	sem <- struct{}{}
+	return func() { <-sem }
+}
+
 // genUnitBytes encodes a GenUnit (the generation-qualified storage identity)
 // as 12 fixed-width big-endian bytes: 8 bytes of Generation followed by 4
 // bytes of UnitID. This is the stable encoding fed to the ring (LocateKey
@@ -407,6 +454,45 @@ func (c *Cluster) localBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backen
 	defer c.mountMu.RUnlock()
 	b, ok := c.mountMap[ru]
 	return b, ok
+}
+
+// localReadBackendForReplicaUnit resolves the mounted backend a READ leg
+// addressed at ru serves from: mountMap[ru] when the exact position is
+// mounted, FALLING BACK to the LOWEST mounted position of the SAME unit when
+// it is not (returning the ru actually resolved, so a fence recode evicts the
+// right mount). This is the READ sibling of localWriteBackendForKey's
+// transition fallback (docs/SPEC.md "Union reads", mounted-position
+// fallback): a ring change can shuffle a member's index within a unit's
+// replica set, so during the post-change reconcile window the member
+// physically holds the unit's bytes at its OLD position while the routed set
+// addresses it at the NEW one. A replica copy at another index of the same
+// unit is just another replica of the same data, so serving a READ from it is
+// the union model working as intended ("whoever physically holds the unit
+// serves"). READ-ONLY by design: write legs never fall back (a write applied
+// only to a soon-released old-index copy could be lost); steady state never
+// reaches the fallback (the exact resolve hits). ok=false means this node has
+// NO position of ru's unit mounted (a mid-acquire pending owner): the caller
+// returns the transient acquiring error and the union covers the read.
+func (c *Cluster) localReadBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backend.Backend, storageunit.ReplicaUnit, bool) {
+	c.mountMu.RLock()
+	defer c.mountMu.RUnlock()
+	if b, ok := c.mountMap[ru]; ok {
+		return b, ru, true
+	}
+	var (
+		be    backend.Backend
+		got   storageunit.ReplicaUnit
+		found bool
+	)
+	for cand, b := range c.mountMap {
+		if cand.Unit != ru.Unit {
+			continue
+		}
+		if !found || cand.Replica < got.Replica {
+			got, be, found = cand, b, true
+		}
+	}
+	return be, got, found
 }
 
 // localMountedBackendForKey resolves the key's unit against this node's PHYSICAL

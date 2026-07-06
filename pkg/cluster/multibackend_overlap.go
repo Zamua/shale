@@ -39,6 +39,10 @@
 package cluster
 
 import (
+	"sync"
+	"time"
+
+	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -59,12 +63,17 @@ import (
 //
 // Caller MUST hold reconcileMu; mount + phase mutations take mountMu.
 func (c *Cluster) reconcileReplicaUnitsOverlap() {
-	draining := c.drainingIDs()
+	joining, draining := c.transitionSets()
 
-	// current = positions the LIVE ring (including draining members) assigns this
-	// node. desired = current here: the set this node owns + must keep mounted
-	// (current owners stay mounted throughout a transition).
-	current := c.desiredReplicaUnits()
+	// current = positions this node owns under the CURRENT view (the ring
+	// EXCLUDING joining members, quorum-floored, draining members INCLUDED): the
+	// set it holds + must keep mounted as a stable current owner throughout a
+	// transition. With no joining members this is desiredReplicaUnits (the full
+	// ring), so the leave path is unchanged. Excluding a JOINING newcomer here is
+	// what routes a moving position's DRAIN half onto the still-mounted displaced
+	// owner (it stays in current-not-pending) and the ACQUIRE half onto the
+	// newcomer (it is pending-not-current), the exact mirror of a leave.
+	current := c.desiredCurrentReplicaUnits(joining)
 	currentSet := make(map[storageunit.ReplicaUnit]struct{}, len(current))
 	for _, ru := range current {
 		currentSet[ru] = struct{}{}
@@ -164,11 +173,42 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		if c.handoffPhaseOf(ru).Phase != 0 {
 			continue
 		}
+		// INTRA-NODE POSITION-MOVE HOLD (docs/SPEC.md "Transitional mounts are
+		// HELD", rule 5): a ring change can shuffle this node's index within the
+		// unit's replica set with NO transition bit in flight. Releasing the
+		// old-index copy in the same pass that starts the (slow) acquire of the
+		// new index would destroy this node's only readable copy of the unit for
+		// the whole mount window - the post-leave read hole. HOLD it (it keeps
+		// serving reads via the mounted-position fallback) until the same-unit
+		// acquire completes; the next pass then releases it here. A successor of
+		// the OLD index that opens it just fences the held handle (recode +
+		// evict as usual), so the hold never blocks anyone's acquire.
+		if c.desiresUnitElsewhereUnmounted(ru, currentSet, pendingSet, mountedSet) {
+			continue
+		}
+		// MARKER-GATED ABANDONED RELEASE (docs/SPEC.md "Transitional mounts are
+		// HELD", rule 6): never destroy the last local copy of a live position
+		// before a SUCCESSOR provably serves it. Transition-bit flaps can clear
+		// a drain phase and re-classify a still-load-bearing copy as abandoned;
+		// gate the release on the position's serving marker sitting strictly
+		// above this node's open epoch (drainCheck's exact release rule), so an
+		// abandoned copy keeps serving reads (via the mounted-position fallback)
+		// until its re-opener has mounted. Best-effort I/O on a rare branch; a
+		// marker-read failure HOLDS (fail toward availability, re-checked next
+		// pass). Out-of-range indices and retired generations release clean-cut
+		// as before (no successor will ever mark those).
+		if c.heldForMissingSuccessorMarker(ru) {
+			continue
+		}
 		c.releaseReplicaUnit(ru)
 	}
 
 	// ACQUIRE half (PENDING owner): a position this node holds in PENDING but not
-	// in CURRENT, and not yet mounted. This is the pending-owner acquire TRIGGER:
+	// in CURRENT, and not yet mounted.
+	//
+	// (The position-move hold above never starves these acquires: it only skips a
+	// RELEASE, and acquiring a desired position never waits on releasing an
+	// undesired one.) This is the pending-owner acquire TRIGGER:
 	// the draining-exclusion split makes this node the future owner of the
 	// leaver's exact slot, so it mounts that ReplicaUnit (the leaver's durable
 	// copy in shared storage) in the background and writes its serving marker on
@@ -247,6 +287,103 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		}
 		c.acquireReplicaUnit(ru)
 	}
+
+	c.logAcquireQueueSummary()
+}
+
+// desiresUnitElsewhereUnmounted reports whether this node desires ru's UNIT at
+// some OTHER position (in its current or pending set) that it has NOT mounted
+// yet - the intra-node position-move signature the release hold above keys on.
+// Once the same-unit desire mounts (or vanishes), this returns false and the
+// held copy takes the plain clean-cut release on the next pass.
+func (c *Cluster) desiresUnitElsewhereUnmounted(
+	ru storageunit.ReplicaUnit,
+	currentSet, pendingSet, mountedSet map[storageunit.ReplicaUnit]struct{},
+) bool {
+	for cand := range currentSet {
+		if cand.Unit == ru.Unit && cand != ru {
+			if _, isMounted := mountedSet[cand]; !isMounted {
+				return true
+			}
+		}
+	}
+	for cand := range pendingSet {
+		if cand.Unit == ru.Unit && cand != ru {
+			if _, isMounted := mountedSet[cand]; !isMounted {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// heldForMissingSuccessorMarker reports whether the abandoned-release of ru
+// must be HELD because no successor has proven it serves ru yet (rule 6): the
+// position is at a live-generation index the unit's live placement still uses,
+// and its serving marker is not STRICTLY ABOVE this node's open epoch (the
+// same strict-> rule drainCheck releases an explicit drain on). Returns false
+// (release normally) for an out-of-range index or a non-live generation -
+// nobody will ever re-open those, so holding them would leak the mount - and
+// for a factory-less cluster. A marker-read error holds: failing toward
+// availability costs one reconcile tick, failing toward release can destroy
+// the last copy.
+func (c *Cluster) heldForMissingSuccessorMarker(ru storageunit.ReplicaUnit) bool {
+	if c.replicaFactory == nil {
+		return false
+	}
+	if ru.Unit.Gen != c.genSnapshot().gen {
+		return false // retired/foreign generation: reshard retirement owns it.
+	}
+	if int(ru.Replica) >= len(c.unitReplicas(ru.Unit)) {
+		return false // index outside the unit's live placement: never re-marked.
+	}
+	own := c.ownOpenEpoch(ru)
+	epoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
+	if err != nil {
+		return true // cannot prove a successor serves: hold, re-check next pass.
+	}
+	if !ok {
+		return true // no successor has ever marked it: hold until one does.
+	}
+	return epoch <= own
+}
+
+// logAcquireQueueSummary emits ONE line per reconcile pass while any gainer
+// position is unmounted: mounted count, acquiring count, permits held and the
+// oldest holder's tenure. Low-noise (silent in steady state) and exactly the
+// datum a wedged-open pipeline stall hides: a single line naming which
+// position has held the open permit for how long.
+func (c *Cluster) logAcquireQueueSummary() {
+	c.mountMu.RLock()
+	inFlight := len(c.acquireInFlight)
+	gainers := 0
+	for _, st := range c.handoffPhase {
+		if st.Phase.IsGainer() {
+			gainers++
+		}
+	}
+	mounted := len(c.mountMap)
+	c.mountMu.RUnlock()
+	if gainers == 0 && inFlight == 0 {
+		return // steady state: no line.
+	}
+	holders := 0
+	var oldestRU storageunit.ReplicaUnit
+	var oldest time.Time
+	c.permitHolders.Range(func(k, v any) bool {
+		holders++
+		if ts := v.(time.Time); oldest.IsZero() || ts.Before(oldest) {
+			oldest, oldestRU = ts, k.(storageunit.ReplicaUnit)
+		}
+		return true
+	})
+	if holders > 0 {
+		c.logf("shale: acquire queue: %d mounted, %d acquiring, %d in flight, %d holding an open permit (oldest %s held %s)",
+			mounted, gainers, inFlight, holders, oldestRU, time.Since(oldest).Round(time.Second))
+		return
+	}
+	c.logf("shale: acquire queue: %d mounted, %d acquiring, %d in flight, 0 holding an open permit",
+		mounted, gainers, inFlight)
 }
 
 // finishStuckFlipIfNeeded completes a handoff flip that the background acquire
@@ -314,6 +451,31 @@ func (c *Cluster) desiredPendingReplicaUnits(draining map[string]struct{}) []sto
 	}
 	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []ring.Member {
 		return c.pendingUnitReplicas(gu, draining)
+	})
+}
+
+// desiredCurrentReplicaUnits returns the positions this node owns under the
+// CURRENT view (the ring EXCLUDING joining members, quorum-floored): the slots it
+// holds + must keep mounted RIGHT NOW as a stable current owner. It is the
+// entry-side mirror of desiredPendingReplicaUnits and the reconcile's current
+// input. With no joining members it is identical to desiredReplicaUnits (steady
+// state), so the transition halves of the reconcile are empty.
+//
+// It mirrors desiredReplicaUnits exactly (including the v0.9 gen-(g+1) split
+// children) but supplies the JOINING-EXCLUDED-with-floor replica lookup
+// (currentUnitReplicas) as replicaAt, sharing the core desiredReplicaUnitsVia -
+// exactly as desiredPendingReplicaUnits supplies the draining-excluded lookup.
+// Keeping current + pending as thin calls over the shared core guarantees they
+// stay in lockstep (the reconcile treats any spurious divergence as a transition).
+func (c *Cluster) desiredCurrentReplicaUnits(joining map[string]struct{}) []storageunit.ReplicaUnit {
+	if len(joining) == 0 {
+		return c.desiredReplicaUnits()
+	}
+	// Build the reduced (joining-excluded) ring ONCE and reuse it across every
+	// unit's replica lookup, rather than rebuilding per unit inside currentUnitReplicas.
+	reduced := c.buildReducedRing(joining)
+	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []ring.Member {
+		return c.currentReplicasFromReduced(reduced, gu)
 	})
 }
 
@@ -390,7 +552,8 @@ func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	// corrected next poll), never release early.
 	open := c.ownOpenEpoch(ru)
 	c.mountMu.Lock()
-	if _, mounted := c.mountMap[ru]; !mounted {
+	b, mounted := c.mountMap[ru]
+	if !mounted {
 		// Lost the mount under us (a concurrent evict); nothing to drain.
 		c.mountMu.Unlock()
 		return
@@ -407,6 +570,140 @@ func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	next.OpenEpoch = open
 	c.handoffPhase[ru] = next
 	c.mountMu.Unlock()
+
+	// DISPLACEMENT FLUSH (docs/SPEC.md "Displacement flush"): this call is the
+	// Owned -> Draining edge - reached ONLY when the phase was just armed above
+	// (the phase!=0 return keeps re-entrant drain ticks out), so the flush fires
+	// EXACTLY ONCE per displacement transition. Flushing the displaced owner's
+	// memtable NOW means the successor's fencing open (already racing this)
+	// replays a minimal WAL tail instead of the whole unflushed tail. A reclaim
+	// + re-drain is a NEW edge and flushes again by design.
+	c.flushDisplaced(b)
+
+	// FAST DRAIN POLL (docs/SPEC.md "Displacement flush" sibling change): while
+	// any position is Draining, poll the release gate on the short
+	// displacedDrainPollInterval cadence instead of waiting for the periodic
+	// reconcile tick, so the displaced owner releases (close + cleanup) within
+	// ~half a second of the successor's serving marker landing rather than up
+	// to a full reconcileInterval later. Poll-only is preserved: this is a
+	// LOCAL cadence change, no push RPC. The leaver's own DrainForLeave already
+	// fast-polls; this covers the JOIN direction's displaced owner.
+	c.ensureDrainPoller()
+}
+
+// displacedDrainPollInterval is the short cadence a displaced owner polls its
+// Draining positions' release gate at (drainCheck: one serving-marker read per
+// draining position per poll). Coarser than DrainForLeave's drainPollInterval
+// because the displaced owner is not blocking a process exit; fine enough that
+// release cleanup follows the successor's marker within ~half a second.
+const displacedDrainPollInterval = 500 * time.Millisecond
+
+// drainPollerMaxLife caps one fast-poller run. The fast cadence exists for
+// the NORMAL case (the successor's marker lands within seconds of the drain
+// edge); a drain still unresolved after this long is stuck on a slow or
+// failed successor, and burning a marker read every half second at the store
+// indefinitely buys nothing - the poller exits and the periodic reconcile's
+// tick-cadence drainCheck remains the backstop, exactly the pre-poller
+// behavior. A NEW Owned -> Draining edge arms a fresh poller.
+const drainPollerMaxLife = 30 * time.Second
+
+// ensureDrainPoller starts, at most one at a time, a background poller that
+// re-runs the drain release checks every displacedDrainPollInterval while ANY
+// loser-phase (Draining) position exists, for at most drainPollerMaxLife,
+// then exits. Armed from beginDrain (the Owned -> Draining edge). The
+// periodic reconcile keeps running the same checks as the backstop;
+// drainCheck's mountMap CAS-delete keeps the release exactly-once regardless
+// of how many pollers observe the marker.
+func (c *Cluster) ensureDrainPoller() {
+	if !c.drainPollerActive.CompareAndSwap(false, true) {
+		return // a poller is already running.
+	}
+	c.loopWG.Add(1)
+	go func() {
+		defer c.loopWG.Done()
+		expired := false
+		defer func() {
+			c.drainPollerActive.Store(false)
+			// Close the exit-vs-new-drain race: a beginDrain that ran after
+			// this poller's final "no losers left" check but before the
+			// Store(false) above found drainPollerActive still true and did
+			// not start a poller. Re-check and re-arm so that drain is not
+			// left to the slow tick. NEVER re-arm on expiry: a stuck drain
+			// would otherwise re-spawn the poller forever, defeating the cap.
+			if !expired && !c.closed.Load() && c.hasLoserPhase() {
+				c.ensureDrainPoller()
+			}
+		}()
+		t := time.NewTicker(displacedDrainPollInterval)
+		defer t.Stop()
+		expiry := time.NewTimer(drainPollerMaxLife)
+		defer expiry.Stop()
+		for {
+			select {
+			case <-c.closeCh:
+				return
+			case <-expiry.C:
+				expired = true
+				return // stuck drain: hand back to the tick backstop.
+			case <-t.C:
+				if c.closed.Load() {
+					return
+				}
+				c.reconcileMu.Lock()
+				c.runDrainChecks()
+				c.reconcileMu.Unlock()
+				if !c.hasLoserPhase() {
+					return // every drain resolved; the next edge re-arms.
+				}
+			}
+		}
+	}()
+}
+
+// hasLoserPhase reports whether any position is currently in a loser
+// (Draining) phase. Reads under mountMu.
+func (c *Cluster) hasLoserPhase() bool {
+	c.mountMu.RLock()
+	defer c.mountMu.RUnlock()
+	for _, st := range c.handoffPhase {
+		if st.Phase.IsLoser() {
+			return true
+		}
+	}
+	return false
+}
+
+// flushDisplaced asks a displaced (newly-Draining) position's backend to make
+// its in-memory write state durable, best-effort. It never creates an error
+// path: a backend without the OPTIONAL backend.Flusher capability is skipped,
+// and a flush failure is discarded (the only failure modes are benign - the
+// successor's open already fenced this owner, which is exactly the pre-flush
+// behavior, or the backend is closing). The flush runs in a background
+// goroutine because it is backing-store I/O and the caller holds reconcileMu
+// (a slow flush must never stall the reconcile tick or routed ops); loopWG
+// tracks it so Close awaits it.
+func (c *Cluster) flushDisplaced(b backend.Backend) {
+	fl, ok := flushableBackend(b)
+	if !ok || c.closed.Load() {
+		return
+	}
+	c.loopWG.Add(1)
+	go func() {
+		defer c.loopWG.Done()
+		_ = fl.Flush()
+	}()
+}
+
+// flushableBackend reports whether b (a mountMap entry) supports the OPTIONAL
+// Flusher capability, unwrapping the fencedSelfHealing decorator storeMount
+// wraps every mounted backend in. The unwrap keeps the capability honest: the
+// decorator itself must not advertise Flush for an inner backend that cannot.
+func flushableBackend(b backend.Backend) (backend.Flusher, bool) {
+	if fsh, ok := b.(*fencedSelfHealing); ok {
+		b = fsh.inner
+	}
+	fl, ok := b.(backend.Flusher)
+	return fl, ok
 }
 
 // beginAcquire records PhaseAcquiring for a pending position MOVING IN. There is
@@ -501,9 +798,107 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 			delete(c.acquireInFlight, ru)
 			c.mountMu.Unlock()
 		}()
-		c.acquireReplicaUnitOverlapBlocking(ru)
+		// NODE-WIDE OPEN BOUND: take a permit around each open attempt, so a
+		// node gaining many positions at once runs at most
+		// Config.OpenConcurrency (default 1) real-data FFI opens concurrently -
+		// the SAME knob the boot mount pool enforces, because concurrent
+		// real-data opens are the documented "empty SSTable" corruption trigger
+		// in the shipped binding (see defaultOpenConcurrency). While queued the
+		// position simply stays PhaseAcquiring and the union keeps covering it
+		// via the still-mounted current owner, so the bound sequences the opens
+		// without any availability cost. Queued goroutines block on the permit
+		// channel, so when one open finishes the next queued open starts
+		// IMMEDIATELY (event-driven chaining, never a reconcile-tick wait). The
+		// acquireInFlight entry is held across the whole loop, so a reconcile
+		// re-drive never spawns a duplicate waiter.
+		//
+		// FAILURE RE-DRIVE (handoff-cycle latency): a FAILED open used to
+		// strand the position as Acquiring until the NEXT periodic reconcile
+		// re-drove it - quantizing every transient open failure to a full
+		// reconcileInterval. Retry here instead on a short jittered backoff,
+		// RELEASING the permit between attempts so a failing position never
+		// starves the queued positions behind it. Bounded: once the backoff
+		// exceeds acquireRedriveCap the goroutine exits and the periodic
+		// reconcile remains the backstop (identical to the pre-fix behavior
+		// from that point on). Success/failure is read off lastAcquireErr,
+		// the same signal the reconcile re-drive path uses.
+		spawned := time.Now()
+		backoff := acquireRedriveBase
+		attempt := 0
+		for {
+			if c.closed.Load() {
+				return
+			}
+			permitRelease := c.acquireOpenPermit()
+			// Exactly-once permit release shared by the normal path and the
+			// watchdog, plus holder bookkeeping for the queue summary line.
+			var relOnce sync.Once
+			rel := func() {
+				relOnce.Do(func() {
+					c.permitHolders.Delete(ru)
+					permitRelease()
+				})
+			}
+			c.permitHolders.Store(ru, time.Now())
+			if c.closed.Load() {
+				rel()
+				return // Close ran while queued; nothing to open.
+			}
+			attempt++
+			if attempt == 1 {
+				c.logf("shale: acquire start %s: waited %s for the open permit",
+					ru, time.Since(spawned).Round(time.Millisecond))
+			}
+			// PERMIT WATCHDOG (docs/SPEC.md "v0.8 Phase 2e", the permit
+			// watchdog): a slow/hung open must not starve the queue. After
+			// OpenPermitTimeout release the PERMIT ONLY - queued positions
+			// proceed; this position's open keeps running (un-cancellable FFI)
+			// and stays the only open for ru (acquireInFlight dedupes), so the
+			// watchdog can never double-open a position. The overlap this
+			// creates with the next queued open is the accepted, detected-and-
+			// retried degraded mode argued in the spec.
+			wd := time.AfterFunc(c.openPermitTimeout(), func() {
+				c.logf("shale: acquire %s: open still running after %s; releasing the open permit so queued positions proceed (the open continues; this position stays deduped)",
+					ru, c.openPermitTimeout())
+				rel()
+			})
+			attemptStart := time.Now()
+			c.acquireReplicaUnitOverlapBlocking(ru)
+			wd.Stop()
+			rel()
+			errVal, failed := c.lastAcquireErr.Load(ru)
+			if !failed {
+				c.logf("shale: acquire done %s: attempt %d took %s, %s total since armed",
+					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), time.Since(spawned).Round(time.Millisecond))
+				return // mounted (or superseded); done.
+			}
+			if backoff > acquireRedriveCap {
+				c.logf("shale: acquire failed %s: attempt %d after %s (%v); backoff budget exhausted, periodic reconcile is the backstop",
+					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), errVal)
+				return // hand the retry back to the periodic reconcile backstop.
+			}
+			c.logf("shale: acquire failed %s: attempt %d after %s (%v); retrying in ~%s",
+				ru, attempt, time.Since(attemptStart).Round(time.Millisecond), errVal, backoff)
+			select {
+			case <-c.closeCh:
+				return
+			case <-time.After(jitteredBackoff(backoff)):
+			}
+			backoff *= 2
+		}
 	}()
 }
+
+// acquireRedriveBase / acquireRedriveCap bound the in-goroutine retry of a
+// FAILED overlap open: attempts after ~250ms, 500ms, 1s, 2s (jittered), then
+// the periodic reconcile takes over. Short enough that a transient open
+// failure costs sub-second latency instead of a full reconcileInterval;
+// bounded so a permanently failing position degrades to exactly the old
+// tick-driven retry cadence.
+const (
+	acquireRedriveBase = 250 * time.Millisecond
+	acquireRedriveCap  = 2 * time.Second
+)
 
 // acquireReplicaUnitOverlapBlocking performs the GAINER's slow mount + flip
 // synchronously. It is run from acquireReplicaUnitOverlap's background goroutine
@@ -511,6 +906,7 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 // deterministic blocking behavior. It must NOT be called while holding mountMu
 // (it takes mountMu for the flip).
 func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) {
+	openStart := time.Now()
 	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 	if err != nil {
 		// SELF-HEAL the same factory/cluster desync as the clean-cut path (#408):
@@ -578,7 +974,10 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	// Write the serving marker EXACTLY ONCE, AFTER the mount flip (outside the
 	// lock: it is shared-storage I/O). This is the durable, poll-observable release
 	// signal the old owner's drainCheck polls. No RPC is sent.
+	markStart := time.Now()
 	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	c.logf("shale: mounted %s at epoch %d: open %s, serving-mark %s",
+		ru, openedEpoch, markStart.Sub(openStart).Round(time.Millisecond), time.Since(markStart).Round(time.Millisecond))
 }
 
 // drainCheck is the OLD owner's POLL-ONLY release-check for a Draining position,

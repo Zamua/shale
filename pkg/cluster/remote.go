@@ -179,6 +179,14 @@ func (c *peerClient) DeleteAtReplica(ctx context.Context, ru storageunit.Replica
 	return err
 }
 
+// ScanPrefixAtReplica opens a POSITION-ADDRESSED forwarded scan stream (the
+// union scan leg): the receiver resolves the explicit ru against its own
+// mount map (LocalReplicaScanAt) with no ring-ownership guard, the exact
+// mirror of GetAtReplica.
+func (c *peerClient) ScanPrefixAtReplica(ctx context.Context, ru storageunit.ReplicaUnit, prefix []byte) (grpc.ServerStreamingClient[pb.ScanPrefixResponse], error) {
+	return c.api.ScanPrefix(ctx, &pb.ScanPrefixRequest{Prefix: prefix, Forwarded: true, Ru: replicaUnitRef(ru)})
+}
+
 // The plain (non-forwarded) variants are still here for tests +
 // future non-routed call sites; they leave Forwarded=false so the
 // server treats them as a first-hop request and routes normally.
@@ -283,11 +291,15 @@ func (c *Cluster) commitCAS(pinKey []byte, level backend.IsolationLevel, reads [
 	if c.notReady() {
 		return backend.ErrClosed
 	}
-	// Re-resolve the owner from the LIVE ring in case it moved between
-	// pin and commit. When the owner is us, take the in-process fast-path
-	// (CommitCASApply, no RPC); otherwise serialize onto the wire and
-	// call the peer's CommitCAS RPC.
-	curOwner, isLocal := c.ownerOf(pinKey)
+	// Re-resolve the DESIGNATED owner from the LIVE view in case it moved
+	// between pin and commit. casDesignatedOwner is ownerOf in steady state; only
+	// during a join transition whose full-ring head is a warming (Joining)
+	// newcomer does it re-designate to the displaced still-mounted current head,
+	// so the commit lands on a node that can actually serve the owner-local
+	// transaction (see docs/SPEC.md "CAS during a transition"). When the
+	// designated owner is us, take the in-process fast-path (CommitCASApply, no
+	// RPC); otherwise serialize onto the wire and call the peer's CommitCAS RPC.
+	curOwner, isLocal := c.casDesignatedOwner(pinKey)
 	if isLocal {
 		res := c.CommitCASApply(context.Background(), level, pinKey, reads, writes)
 		return casResultToError(res)

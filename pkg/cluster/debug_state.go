@@ -31,6 +31,18 @@ func (c *Cluster) DebugState() string {
 	sort.Strings(dids)
 	fmt.Fprintf(&b, "draining-members=%v\n", dids)
 
+	joining := c.joiningIDs()
+	jids := make([]string, 0, len(joining))
+	for id := range joining {
+		jids = append(jids, id)
+	}
+	sort.Strings(jids)
+	fmt.Fprintf(&b, "joining-members=%v self-joining=%v\n", jids, c.selfJoining.Load())
+
+	// `desired` is this node's REAL ownership set (the full ring), so a warming
+	// joiner's owned-but-unmounted positions correctly show as desired-but-unmounted
+	// (the wedge indicator). The CURRENT-view (joining-excluded) set is a routing
+	// concern, not an ownership one, so it is not what the wedge flag keys on.
 	desired := ruBoolSet(c.desiredReplicaUnits())
 	pending := ruBoolSet(c.desiredPendingReplicaUnits(draining))
 

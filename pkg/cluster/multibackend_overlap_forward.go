@@ -46,6 +46,12 @@ func (c *Cluster) LocalReplicaGetAtWire(gen uint64, unit, replica uint32, key []
 	return c.LocalReplicaGetAt(replicaUnitFromWire(gen, unit, replica), key)
 }
 
+// LocalReplicaScanAtWire is the rpc.Server entry point for a position-addressed
+// forwarded ScanPrefix (the union scan leg).
+func (c *Cluster) LocalReplicaScanAtWire(gen uint64, unit, replica uint32, prefix []byte) (backend.Iterator, error) {
+	return c.LocalReplicaScanAt(replicaUnitFromWire(gen, unit, replica), prefix)
+}
+
 // LocalReplicaDeleteAtWire is the rpc.Server entry point for a position-addressed
 // forwarded Delete.
 func (c *Cluster) LocalReplicaDeleteAtWire(gen uint64, unit, replica uint32, key, value []byte) error {
@@ -78,18 +84,57 @@ func (c *Cluster) LocalReplicaPutAt(ru storageunit.ReplicaUnit, key, bytesToWrit
 }
 
 // LocalReplicaGetAt serves a position-addressed union read DIRECTLY from the
-// explicit ru's mounted backend. Mirrors LocalReplicaPutAt: an unmounted ru
-// returns ErrNotFound-or-acquiring so the originator's read fan-out skips this
-// leg. backend.ErrNotFound is surfaced as not-found.
+// explicit ru's mounted backend, falling back to the lowest mounted position
+// of the SAME unit when the exact index is not mounted (the read-side
+// mounted-position fallback; a ring change can shuffle this member's index
+// while the bytes still sit mounted at the old one). Mirrors
+// LocalReplicaPutAt: an unmounted unit returns the acquiring refusal so the
+// originator's read fan-out skips this leg - RECODED for the wire
+// (recodeForwardedReplicaErr, exactly as the Put/Delete legs do), because the
+// acquiring sentinel does not survive gRPC and a bare codes.Unavailable would
+// be miscounted as a down peer (a non-transient error) at the originator.
+// backend.ErrNotFound is surfaced as not-found.
 func (c *Cluster) LocalReplicaGetAt(ru storageunit.ReplicaUnit, key []byte) ([]byte, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed
 	}
-	b, ok := c.localBackendForReplicaUnit(ru)
+	b, _, ok := c.localReadBackendForReplicaUnit(ru)
 	if !ok {
-		return nil, errUnitAcquiring("Get")
+		return nil, recodeForwardedReplicaErr(errUnitAcquiring("Get"))
 	}
-	return b.Get(key)
+	// b is the fence-self-healing mount (storeMount): a fenced read recodes to
+	// the transient acquiring-window error + evicts the stale mount; recode
+	// that transient for the wire too.
+	v, err := b.Get(key)
+	if err != nil {
+		return nil, recodeForwardedReplicaErr(err)
+	}
+	return v, nil
+}
+
+// LocalReplicaScanAt serves a position-addressed union scan leg DIRECTLY from
+// the explicit ru's mounted backend (with the same mounted-position fallback
+// as LocalReplicaGetAt), with NO ring-ownership guard: the union deliberately
+// routes a scan to a member the receiver's own ring view may not consider the
+// owner (gossip lag), and the receiver answers from what it physically holds.
+// An unmounted unit returns the acquiring refusal recoded for the wire so the
+// originator's leg walk skips this member and tries the next union member.
+func (c *Cluster) LocalReplicaScanAt(ru storageunit.ReplicaUnit, prefix []byte) (backend.Iterator, error) {
+	if c.notReady() {
+		return nil, backend.ErrClosed
+	}
+	b, got, ok := c.localReadBackendForReplicaUnit(ru)
+	if !ok {
+		return nil, recodeForwardedReplicaErr(errUnitAcquiring("ScanPrefix"))
+	}
+	it, err := b.ScanPrefix(prefix)
+	if err != nil {
+		// A fenced mount recodes to the transient + evicts (targeting the ru
+		// actually resolved, which may be the fallback position); any other
+		// error passes through as a hard failure.
+		return nil, recodeForwardedReplicaErr(c.fenceToTransient(got, b, "ScanPrefix", err))
+	}
+	return it, nil
 }
 
 // LocalReplicaDeleteAt clears key DIRECTLY from ru's mounted backend. At R>1 a

@@ -211,6 +211,19 @@ func (s *Server) Delete(_ context.Context, req *pb.DeleteRequest) (*pb.DeleteRes
 // client cancels.
 func (s *Server) ScanPrefix(req *pb.ScanPrefixRequest, stream grpc.ServerStreamingServer[pb.ScanPrefixResponse]) error {
 	s.scans.Add(1)
+	if ru := req.GetRu(); req.GetForwarded() && ru != nil {
+		// v0.8 Phase 2e (union scan leg, position-addressed): resolve the
+		// explicit ru directly against the mount map (with the read-side
+		// mounted-position fallback), bypassing the ring-ownership guard - the
+		// union deliberately routes a scan to a member whose own ring view may
+		// disagree mid-transition. An unmounted unit returns the retryable
+		// acquiring recode so the originator's leg walk skips this member.
+		it, err := s.c.LocalReplicaScanAtWire(ru.GetGen(), ru.GetUnit(), ru.GetReplica(), req.GetPrefix())
+		if err != nil {
+			return err
+		}
+		return streamScan(it, stream)
+	}
 	if req.GetForwarded() && !s.c.OwnsKey(req.GetPrefix()) {
 		return errForwardLoop("ScanPrefix: this node does not own the prefix")
 	}
@@ -218,6 +231,13 @@ func (s *Server) ScanPrefix(req *pb.ScanPrefixRequest, stream grpc.ServerStreami
 	if err != nil {
 		return err
 	}
+	return streamScan(it, stream)
+}
+
+// streamScan drains it onto the ScanPrefix response stream, closing the
+// iterator when done. Shared by the routed and the position-addressed
+// (union scan leg) branches.
+func streamScan(it backend.Iterator, stream grpc.ServerStreamingServer[pb.ScanPrefixResponse]) error {
 	defer func() { _ = it.Close() }()
 	for {
 		k, v, err := it.Next()

@@ -43,10 +43,12 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -55,6 +57,20 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
+
+// Logf is the slate backend's operator log hook for the rare, operator-
+// critical open events (the per-open fence-read/build phase split a handoff
+// investigation needs). Default log.Printf (stderr with timestamps, which a
+// containerized deployment captures); an embedding application may replace
+// it or set it to nil to silence the backend.
+var Logf func(format string, args ...any) = log.Printf
+
+// logf guards the nil hook.
+func logf(format string, args ...any) {
+	if Logf != nil {
+		Logf(format, args...)
+	}
+}
 
 // BackingConfig captures the shared-bucket connection parameters. Every
 // node's factory in one cluster uses the SAME values (one shared
@@ -781,15 +797,23 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	// full durable WAL tail) and this open must be adjusted to RE-SCAN the WAL
 	// tail after the fence (via the WalReader surface) before serving; until the
 	// pins pass on real slate, Phase 2e is BLOCKED per the spec's P0 gate.
+	fenceStart := time.Now()
 	opened, err := h.backing.fenceEpochReplica(ru, epoch)
 	if err != nil {
+		logf("slate: open replica %s: fence-read FAILED after %s: %v", ru, time.Since(fenceStart).Round(time.Millisecond), err)
 		return nil, 0, err
 	}
+	fenceDur := time.Since(fenceStart)
 
+	buildStart := time.Now()
 	s, err := h.backing.openSlateReplica(ru)
 	if err != nil {
+		logf("slate: open replica %s: fence-read %s, build FAILED after %s: %v",
+			ru, fenceDur.Round(time.Millisecond), time.Since(buildStart).Round(time.Millisecond), err)
 		return nil, 0, err
 	}
+	logf("slate: open replica %s: fence-read %s, build %s, epoch %d",
+		ru, fenceDur.Round(time.Millisecond), time.Since(buildStart).Round(time.Millisecond), opened)
 
 	h.mu.Lock()
 	h.openReplica[ru] = &mountedUnit{slate: s, epoch: opened}

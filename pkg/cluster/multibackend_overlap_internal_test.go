@@ -19,6 +19,7 @@ import (
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
+	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -58,6 +59,52 @@ func TestOverlap_pendingUnitReplicas_DropsDrainingMember(t *testing.T) {
 		if m.ID == current[0].ID {
 			t.Fatalf("draining member %q must not appear in the pending set", current[0].ID)
 		}
+	}
+}
+
+// TestOverlap_pendingUnitReplicas_ExactPostLeavePlacement pins the EXACTNESS
+// contract (docs/SPEC.md "PENDING replica set"): for EVERY unit, the pending
+// set under a draining member equals the placement over a ring GENUINELY
+// rebuilt without that member. The removed successor-chain drop-trick
+// approximation violated this under bounded-load hashing (a FULL-MOVE unit's
+// approximated pending was disjoint from the true post-leave placement),
+// which mis-aimed the whole ordered-removal protocol for that unit and opened
+// the post-exit read hole. The member names here are the fixture the
+// integration repro uses; sg-a is the leaver and unit 5 is the historical
+// full-move divergence.
+func TestOverlap_pendingUnitReplicas_ExactPostLeavePlacement(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	members := []string{"sg-a", "sg-b", "sg-c", "sg-d", "sg-e"}
+	c := newReplicatedCluster(t, "sg-b", 16, 2, backing, members...)
+
+	survivors := ring.New()
+	for _, id := range members {
+		if id == "sg-a" {
+			continue
+		}
+		survivors.Add(ring.Member{ID: id, Addr: id + ":0"})
+	}
+	draining := map[string]struct{}{"sg-a": {}}
+	mismatches := 0
+	for _, u := range storageunit.MustUnitCount(16).IDs() {
+		gu := storageunit.NewGenUnit(0, u)
+		got := c.pendingUnitReplicas(gu, draining)
+		want := survivors.LocateKeyN(genUnitBytes(gu), 2)
+		if len(got) != len(want) {
+			t.Errorf("unit %d: pending size %d, want %d", u, len(got), len(want))
+			mismatches++
+			continue
+		}
+		for i := range want {
+			if got[i].ID != want[i].ID {
+				t.Errorf("unit %d index %d: pending=%s, post-leave placement=%s", u, i, got[i].ID, want[i].ID)
+				mismatches++
+			}
+		}
+	}
+	if mismatches > 0 {
+		t.Fatalf("pending diverges from the genuinely-rebuilt post-leave placement on %d positions - "+
+			"the ordered-removal protocol drains onto the wrong successors for those units", mismatches)
 	}
 }
 
@@ -156,14 +203,33 @@ func TestOverlap_Reconcile_DrainSplit_SetsDrainingKeepsMount(t *testing.T) {
 
 // TestOverlap_Reconcile_PlainDropOut_Releases: a mounted position NOT in CURRENT
 // and NOT in PENDING (it vanished from this node's set entirely, with no draining
-// split keeping it) is plain clean-cut released, NOT drained.
+// split keeping it and no same-unit position still desired here) is plain
+// clean-cut released, NOT drained.
 func TestOverlap_Reconcile_PlainDropOut_Releases(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
 
-	// Mount a position at an out-of-range replica index so it is in neither the
-	// current nor the pending set (R=2, index 5 has no holder).
-	target := ru(0, 0, 5)
+	// Pick a unit self does NOT replicate at all, so a mount of it (at an
+	// out-of-range index no set ever holds) is genuinely abandoned: neither in
+	// current nor pending, and NOT protected by the intra-node position-move
+	// hold (self desires no other position of the unit). A unit self DOES own
+	// takes the hold path instead; that behavior is pinned separately below.
+	ownedUnits := make(map[storageunit.GenUnit]struct{})
+	for _, d := range c.desiredReplicaUnits() {
+		ownedUnits[d.Unit] = struct{}{}
+	}
+	var unowned uint32
+	found := false
+	for u := uint32(0); u < 4; u++ {
+		if _, own := ownedUnits[gu(0, u)]; !own {
+			unowned, found = u, true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("self replicates every unit under this fixture; cannot model a plain drop-out")
+	}
+	target := ru(0, unowned, 5)
 	h := backing.Handle()
 	b, _, err := h.OpenReplicaUnit(target, 1)
 	if err != nil {
@@ -178,6 +244,55 @@ func TestOverlap_Reconcile_PlainDropOut_Releases(t *testing.T) {
 	}
 	if _, mounted := c.localBackendForReplicaUnit(target); mounted {
 		t.Fatalf("plain drop-out position must be released (unmounted)")
+	}
+}
+
+// TestOverlap_Reconcile_PositionMoveHold_HeldUntilSameUnitMounts pins the
+// INTRA-NODE POSITION-MOVE HOLD (docs/SPEC.md "Transitional mounts are HELD",
+// rule 5): a mounted position in neither current nor pending is NOT released
+// while self still desires the SAME unit at a different, not-yet-mounted
+// position (the post-leave reshuffle window: the old-index copy is the node's
+// only readable copy of the unit until the new index mounts). Once the desired
+// position mounts, the next pass releases the held copy via the plain
+// clean-cut branch.
+func TestOverlap_Reconcile_PositionMoveHold_HeldUntilSameUnitMounts(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
+
+	// Pick a unit self DOES replicate; leave its desired position UNMOUNTED and
+	// mount a stale other-index copy of the same unit (the shuffled old index).
+	desired := c.desiredReplicaUnits()
+	if len(desired) == 0 {
+		t.Fatalf("self owns no positions; ring fixture broken")
+	}
+	want := desired[0]
+	held := ru(0, uint32(want.Unit.ID), 5) // same unit, an index no set holds
+	h := backing.Handle()
+	b, _, err := h.OpenReplicaUnit(held, 1)
+	if err != nil {
+		t.Fatalf("seed mount: %v", err)
+	}
+	c.mountMap[held] = b
+
+	// PASS 1: the release half must HOLD the stale copy (same-unit desire not
+	// yet mounted when the release half runs), while the acquire half mounts
+	// the desired position (sharedfactory mounts instantly).
+	c.reconcileReplicaUnitsOverlap()
+	if _, mounted := c.localBackendForReplicaUnit(held); !mounted {
+		t.Fatalf("position-move hold: stale same-unit copy must stay mounted while the desired position is unmounted")
+	}
+	if st := c.handoffPhaseOf(held); st.Phase != 0 {
+		t.Fatalf("held copy must NOT enter a handoff phase, got %v", st.Phase)
+	}
+	if _, mounted := c.localBackendForReplicaUnit(want); !mounted {
+		t.Fatalf("desired position %v must have been acquired in the same pass", want)
+	}
+
+	// PASS 2: the desired position is mounted, the hold lapses, the stale copy
+	// takes the plain clean-cut release.
+	c.reconcileReplicaUnitsOverlap()
+	if _, mounted := c.localBackendForReplicaUnit(held); mounted {
+		t.Fatalf("held copy must be released once the same-unit desired position is mounted")
 	}
 }
 

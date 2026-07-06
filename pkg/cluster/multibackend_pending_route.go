@@ -67,6 +67,137 @@ func (c *Cluster) drainingIDs() map[string]struct{} {
 	return draining
 }
 
+// joiningIDs returns the set of node IDs currently advertising the Joining bit,
+// read from the authoritative membership snapshot. It is the entry-side mirror of
+// drainingIDs: empty (nil) in the common steady state, so the current-set
+// computation short-circuits to the full ring with no allocation. A nil
+// membership (legacy / test harness) yields no joining members.
+func (c *Cluster) joiningIDs() map[string]struct{} {
+	// Test hook: white-box tests without a membership layer inject the joining
+	// set directly. In production c.joining is nil and the snapshot is
+	// authoritative.
+	if c.joining != nil {
+		return c.joining
+	}
+	if c.membership == nil {
+		return nil
+	}
+	var joining map[string]struct{}
+	for _, m := range c.membership.Snapshot() {
+		if m.Joining {
+			if joining == nil {
+				joining = make(map[string]struct{}, 2)
+			}
+			joining[m.ID] = struct{}{}
+		}
+	}
+	return joining
+}
+
+// transitionSets returns the joining and draining ID sets from a SINGLE
+// membership snapshot scan. The hot routing path needs BOTH per op; calling
+// joiningIDs + drainingIDs separately would scan (and allocate) the snapshot
+// twice on every Put/Get. It preserves the individual methods' white-box
+// test-hook semantics exactly: when either hook is injected (test path), it
+// defers to them; in production (no hooks) it does one combined scan. Both are
+// nil in the common steady state, so the routing fast path short-circuits.
+func (c *Cluster) transitionSets() (joining, draining map[string]struct{}) {
+	if c.joining != nil || c.draining != nil {
+		return c.joiningIDs(), c.drainingIDs()
+	}
+	if c.membership == nil {
+		return nil, nil
+	}
+	for _, m := range c.membership.Snapshot() {
+		if m.Joining {
+			if joining == nil {
+				joining = make(map[string]struct{}, 2)
+			}
+			joining[m.ID] = struct{}{}
+		}
+		if m.Draining {
+			if draining == nil {
+				draining = make(map[string]struct{}, 2)
+			}
+			draining[m.ID] = struct{}{}
+		}
+	}
+	return joining, draining
+}
+
+// currentUnitReplicas resolves the CURRENT replica set for gu: the ring EXCLUDING
+// the joining members, with a QUORUM FLOOR. It is the unified split's current
+// half (the pending half is pendingUnitReplicas over the draining set). Draining
+// members are NOT excluded here (they stay current owners); only joining
+// (warming) members are, so the still-mounted DISPLACED owner stays in current
+// and the warming newcomer is dropped from the ack-bar set.
+//
+// THE QUORUM FLOOR: excluding joiners is safe only while >= R non-joining holders
+// remain. If dropping the joiners would leave fewer than R members in current
+// (the MASS-BOOT case: 2+ of a unit's replicas are freshly-booted at once), fall
+// back to the FULL-ring set (joiners included). That reverts the unit to the
+// pre-Joining-bit behavior: unavailable-but-SAFE (a routed op to a warming
+// replica returns the mid-acquire transient, so the write WEDGES) with
+// stableR = len(current) >= R, so requiredWriteAcks never drops below the normal
+// bar and a write can NEVER ack below R durable copies. Without the floor a mass
+// boot would compute current empty -> stableR 0 -> requiredWriteAcks(All,0)=0 ->
+// a write acking with ZERO durable applies (a lost acked write). The leave path
+// never needs the floor (a draining node stays a stable MOUNTED current owner, so
+// stableR == R by construction).
+func (c *Cluster) currentUnitReplicas(gu storageunit.GenUnit, joining map[string]struct{}) []ring.Member {
+	if len(joining) == 0 {
+		return c.unitReplicas(gu)
+	}
+	return c.currentReplicasFromReduced(c.buildReducedRing(joining), gu)
+}
+
+// buildReducedRing returns a FRESH ring holding every current member EXCEPT the
+// excluded ids. It is used to compute the CURRENT (pre-join) placement: because
+// the consistent-hash library is NOT removal-invariant (adding a member reshuffles
+// placement under bounded loads, so "locate R+k over the full ring then drop the
+// excluded ids" does NOT reconstruct the ring as it was WITHOUT those members - it
+// gives a different, wrong set), the ONLY way to recover the exact placement the
+// non-excluded members mounted is to locate over a ring genuinely built from just
+// them. That ring is byte-identical to the one those members used before the
+// excluded (joining) member was added, so unitReplicas over it == the ACTUAL
+// mounted placement. pendingUnitReplicas uses the SAME exact construction for
+// the DRAINING exclusion: pending is the protocol's prediction of the
+// post-leave placement, and an approximation there (the removed drop trick)
+// diverges from the genuinely-rebuilt ring under bounded loads - the full-move
+// read hole. Only built when an exclusion set is non-empty (a rare, brief
+// transition), so the per-op ring build is off the steady-state path.
+func (c *Cluster) buildReducedRing(exclude map[string]struct{}) *ring.Ring {
+	r := ring.New()
+	for _, m := range c.ring.Members() {
+		if _, ex := exclude[m.ID]; ex {
+			continue
+		}
+		r.Add(m)
+	}
+	return r
+}
+
+// currentReplicasFromReduced resolves gu's CURRENT replica set over an
+// already-built reduced ring (members minus joining), applying the QUORUM FLOOR:
+// if locating over the reduced ring yields fewer than R members (or fewer than the
+// full-ring set - the mass-boot case where 2+ of a unit's replicas are joining at
+// once), fall back to the full-ring set. That keeps stableR = len(current) >= R,
+// so requiredWriteAcks never drops below the normal bar and a write can NEVER ack
+// below R durable copies. See currentUnitReplicas + buildReducedRing.
+func (c *Cluster) currentReplicasFromReduced(reduced *ring.Ring, gu storageunit.GenUnit) []ring.Member {
+	full := c.unitReplicas(gu)
+	if reduced == nil || reduced.Empty() {
+		return full
+	}
+	excl := reduced.LocateKeyN(genUnitBytes(gu), c.replicationFactor())
+	if len(excl) < c.replicationFactor() || len(excl) < len(full) {
+		// Quorum floor: not enough non-joining holders to keep current at full
+		// size. Fall back to the full ring (the safe wedge for this unit).
+		return full
+	}
+	return excl
+}
+
 // routedReplicasForKey resolves a key to the replica set an op fans out to,
 // AND reports the STABLE replica count the ack bar is held at. It is the
 // pending-ranges core consulted by every replicated fan-out (put / get / delete
@@ -79,23 +210,28 @@ func (c *Cluster) drainingIDs() map[string]struct{} {
 //     NOT raise the bar even though len(routed) > stableR.
 //
 // current is the ring located over ALL members (draining included); pending is
-// current with draining members dropped from the chain and the chain extended
-// to keep R distinct survivors. They are equal in steady state, so the common
-// path returns current with no union work.
+// the placement over a ring genuinely rebuilt without the draining members.
+// They are equal in steady state, so the common path returns current with no
+// union work.
 func (c *Cluster) routedReplicasForKey(key []byte) (routed []ring.Member, stableR int) {
-	current := c.unitReplicas(c.genUnitForKey(key))
+	gu := c.genUnitForKey(key)
+	joining, draining := c.transitionSets()
+
+	// UNIFIED SPLIT: current = ring EXCLUDING joining (floored); pending = ring
+	// EXCLUDING draining. In steady state both equal the full ring.
+	current := c.currentUnitReplicas(gu, joining)
 	stableR = len(current)
 
-	draining := c.drainingIDs()
-	if len(draining) == 0 {
+	if len(joining) == 0 && len(draining) == 0 {
 		// Steady state: no transition, routed == stable set.
 		return current, stableR
 	}
 
-	pending := c.pendingReplicasForKey(key, draining)
+	pending := c.pendingUnitReplicas(gu, draining)
 	if sameMemberSet(current, pending) {
-		// A draining member exists somewhere in the cluster, but NOT in this
-		// key's current replica set (or its removal does not change the set):
+		// A joining/draining member exists somewhere in the cluster, but this
+		// key's current and pending sets coincide (the member is not in this
+		// unit's set, or the quorum floor reverted current to the full ring):
 		// the position is not in transition. Route the stable set.
 		return current, stableR
 	}
@@ -104,28 +240,42 @@ func (c *Cluster) routedReplicasForKey(key []byte) (routed []ring.Member, stable
 }
 
 // pendingUnitReplicas resolves the PENDING replica set for an explicit GenUnit:
-// the unit's replica set over the ring with the draining members EXCLUDED. It is
-// the unit-addressed sibling of pendingReplicasForKey (which takes a key), used
-// by the reconcile to enumerate this node's pending positions per unit. Same
-// successor-chain semantics: locate (R + |draining|) over the full ring and drop
-// the draining hits, keeping the first R survivors.
+// the unit's replica set over a ring GENUINELY REBUILT WITHOUT the draining
+// members (buildReducedRing, the same exact construction currentUnitReplicas
+// uses for the joining exclusion). It is the unit-addressed sibling of
+// pendingReplicasForKey (which takes a key), used by the reconcile to enumerate
+// this node's pending positions per unit.
+//
+// EXACTNESS IS REQUIRED (docs/SPEC.md "PENDING replica set"): pending is the
+// protocol's prediction of the post-leave placement - ordered removal drains
+// the leaver against pending's successors and holds displaced owners against
+// pending membership. An earlier implementation used the successor-chain drop
+// trick (locate R+|draining| over the full ring, drop the draining ids) on the
+// theory that the future set did not need to be exact; but bounded-load
+// consistent hashing is not removal-invariant, so the approximation can
+// DIVERGE from the genuinely-rebuilt post-leave ring. A unit whose approximated
+// pending is disjoint from its true post-leave placement (a FULL MOVE) then
+// drains onto the WRONG successors: at the leaver's exit the true owners hold
+// nothing, every physical holder is un-routed, and reads fail for the whole
+// post-exit acquire window (the hole pinned by
+// TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent). The exact rebuild makes
+// pending == the post-transition placement by construction, in both transition
+// directions. Only built while draining members exist (a rare, brief window),
+// the same cost profile as the joining-side reduced ring.
 func (c *Cluster) pendingUnitReplicas(gu storageunit.GenUnit, draining map[string]struct{}) []ring.Member {
 	if c.ring == nil || c.ring.Empty() {
 		return c.unitReplicas(gu)
 	}
-	r := c.replicationFactor()
-	chain := c.ring.LocateKeyN(genUnitBytes(gu), r+len(draining))
-	out := make([]ring.Member, 0, r)
-	for _, m := range chain {
-		if _, isDraining := draining[m.ID]; isDraining {
-			continue
-		}
-		out = append(out, m)
-		if len(out) == r {
-			break
-		}
+	if len(draining) == 0 {
+		return c.unitReplicas(gu)
 	}
-	return out
+	reduced := c.buildReducedRing(draining)
+	if reduced.Empty() {
+		// Every member is draining: there is no post-leave placement to
+		// predict; fall back to the full ring (the safe wedge).
+		return c.unitReplicas(gu)
+	}
+	return reduced.LocateKeyN(genUnitBytes(gu), c.replicationFactor())
 }
 
 // routedReplica pairs a routed union member with the ReplicaUnit it physically
@@ -148,7 +298,11 @@ type routedReplica struct {
 // mounted. In steady state every member is a current owner and pending == current.
 func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, stableR int) {
 	gu := c.genUnitForKey(key)
-	current := c.unitReplicas(gu)
+	joining, draining := c.transitionSets()
+
+	// UNIFIED SPLIT: current = ring EXCLUDING joining (floored); pending = ring
+	// EXCLUDING draining. In steady state both equal the full ring.
+	current := c.currentUnitReplicas(gu, joining)
 	stableR = len(current)
 
 	withUnit := func(members []ring.Member) []routedReplica {
@@ -159,8 +313,7 @@ func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, st
 		return out
 	}
 
-	draining := c.drainingIDs()
-	if len(draining) == 0 {
+	if len(joining) == 0 && len(draining) == 0 {
 		return withUnit(current), stableR
 	}
 	pending := c.pendingUnitReplicas(gu, draining)
@@ -169,17 +322,18 @@ func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, st
 	}
 
 	// Union over (member, POSITION) PAIRS - current-first, then every pending
-	// pair not already present. A leave shuffles replica indices: a survivor that
-	// moves from replica-1 (its CURRENT slot, which it keeps serving until drain)
-	// to replica-0 (its PENDING slot, which it acquires + fences the leaver off)
-	// appears in BOTH sets at DIFFERENT indices, so it is routed to BOTH (gu,1) and
-	// (gu,0). Deduping by member ID alone (keeping only the current index) was the
-	// during-leave write-availability gap: the survivor was never routed to the
-	// position it acquired, so within the fence cascade (the leaver released at
-	// (gu,0), the survivor's old (gu,1) fenced by its own successor) a write could
-	// reach only one live db and miss W. Pairing it at both positions keeps a
-	// second live copy reachable throughout. Dedup is by the (member, ru) pair so
-	// the steady state (pending == current) is unchanged.
+	// pair not already present. A leave OR a join shuffles replica indices: a
+	// survivor that moves from replica-1 (its CURRENT slot, which it keeps serving
+	// until drain) to replica-0 (its PENDING slot, which it acquires + fences the
+	// prior holder off) appears in BOTH sets at DIFFERENT indices, so it is routed to
+	// BOTH (gu,1) and (gu,0). Deduping by member ID alone (keeping only the current
+	// index) was the during-transition write-availability gap: the survivor was never
+	// routed to the position it acquired, so within the fence cascade a write could
+	// reach only one live db and miss W. Pairing it at both positions keeps a second
+	// live copy reachable throughout. Dedup is by the (member, ru) pair so the steady
+	// state (pending == current) is unchanged. (The join direction gets the mirror
+	// treatment because current = ring-excluding-joining, pending = full ring, so the
+	// displaced owner and the newcomer land at their respective indices.)
 	curRR := withUnit(current)
 	penRR := withUnit(pending)
 	out := make([]routedReplica, 0, len(curRR)+len(penRR))
@@ -194,15 +348,9 @@ func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, st
 }
 
 // pendingReplicasForKey resolves the PENDING replica set for a key: the
-// unit's replica set over the ring with the draining members EXCLUDED. Removing
-// a node from a consistent-hash ring shifts each of its keys to the next
-// clockwise survivor, which is exactly the next distinct member in the
-// GetClosestN successor chain - so locating (R + |draining|) members over the
-// FULL ring and dropping the draining ones, keeping the first R survivors, is
-// equivalent to re-locating R over a ring that never had the draining members,
-// WITHOUT mutating the shared ring. (At most |draining| of the first
-// R+|draining| chain entries can be draining, so R survivors always remain when
-// the ring has R non-draining members.)
+// unit's replica set over a ring genuinely rebuilt without the draining
+// members. See pendingUnitReplicas for why the exact rebuild (and not the
+// successor-chain drop trick) is required.
 func (c *Cluster) pendingReplicasForKey(key []byte, draining map[string]struct{}) []ring.Member {
 	return c.pendingUnitReplicas(c.genUnitForKey(key), draining)
 }
