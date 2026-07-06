@@ -29,6 +29,8 @@ import (
 	"sync"
 	"time"
 
+	"strings"
+
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
 	"google.golang.org/grpc/codes"
@@ -192,6 +194,32 @@ func fanout(
 // and skipped by the ResourceExhausted branch. Either way a mid-acquire
 // replica no longer consumes the failure budget. See docs/SPEC.md
 // "v0.8 Phase 2d".
+// isTransientReadLegErr is the READ-leg transient classification (docs/SPEC.md
+// "Union reads" guard 2): everything isTransientReplicaErr skips, PLUS a
+// CLOSED-MID-RELEASE mount. A read leg that resolves a local handle in the
+// same instant ordered removal's release closes it reads backend.ErrClosed;
+// a leaving node's own shutdown surfaces the same to a forwarded leg, crossing
+// gRPC as the bare codes.Unknown wrapping of the error text (gRPC wraps
+// non-status errors that way, so the wire form is matched by message). On a
+// union leg either form means "this copy just moved on" - another leg or the
+// next re-poll serves - so it must count as neither ack nor failure and must
+// be re-polled by the read retry, not surfaced. READ legs only: the write
+// fan-out's accounting is unchanged, and a client op entering a genuinely
+// closed cluster still gets backend.ErrClosed from the entry not-ready check.
+func isTransientReadLegErr(err error) bool {
+	if isTransientReplicaErr(err) {
+		return true
+	}
+	if errors.Is(err, backend.ErrClosed) {
+		return true
+	}
+	if st, ok := status.FromError(err); ok && st.Code() == codes.Unknown &&
+		strings.Contains(st.Message(), backend.ErrClosed.Error()) {
+		return true
+	}
+	return false
+}
+
 func isTransientReplicaErr(err error) bool {
 	if err == nil {
 		return false

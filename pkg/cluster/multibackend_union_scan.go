@@ -76,7 +76,7 @@ func (c *Cluster) scanReplicatedUnitOnce(prefix []byte) (backend.Iterator, error
 				// A fenced mount recodes to the transient + evicts (targeting
 				// the ru actually resolved); a non-fence error is a hard
 				// failure candidate, but keep trying the other union legs.
-				if err = c.fenceToTransient(got, b, "ScanPrefix", err); !isTransientReplicaErr(err) && firstHardErr == nil {
+				if err = c.fenceToTransient(got, b, "ScanPrefix", err); !isTransientReadLegErr(err) && firstHardErr == nil {
 					firstHardErr = err
 				}
 				continue
@@ -133,13 +133,14 @@ func (c *Cluster) openRemoteUnionScanLeg(rr routedReplica, prefix []byte) (backe
 }
 
 // isTransientUnionScanLegErr classifies a union scan leg failure as
-// SKIP-AND-TRY-THE-NEXT-LEG: the mid-acquire recode (ResourceExhausted, per
-// isTransientReplicaErr) and an unreachable member (codes.Unavailable - a
-// just-killed leaver's refused dial, or a receiver shutting down). Anything
-// else (a real server-side failure) is a hard error candidate the walk
-// reports if no other leg serves.
+// SKIP-AND-TRY-THE-NEXT-LEG: everything the read-leg classification skips
+// (mid-acquire recode, fenced recode, a closed-mid-release mount in either
+// its in-process or wire form; see isTransientReadLegErr) and an unreachable
+// member (codes.Unavailable - a just-killed leaver's refused dial, or a
+// receiver shutting down). Anything else (a real server-side failure) is a
+// hard error candidate the walk reports if no other leg serves.
 func isTransientUnionScanLegErr(err error) bool {
-	if isTransientReplicaErr(err) {
+	if isTransientReadLegErr(err) {
 		return true
 	}
 	if st, ok := status.FromError(err); ok {

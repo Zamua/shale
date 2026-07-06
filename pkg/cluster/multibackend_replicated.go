@@ -716,7 +716,9 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 
 	for res := range resultsCh {
 		if res.Err != nil {
-			if isTransientReplicaErr(res.Err) {
+			// READ-leg classification: acquiring/fenced-recode PLUS the
+			// closed-mid-release mount (docs/SPEC.md "Union reads" guard 2).
+			if isTransientReadLegErr(res.Err) {
 				sawTransient = true
 				continue
 			}

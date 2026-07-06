@@ -16,11 +16,15 @@ package cluster
 
 import (
 	"bytes"
+	"errors"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
+	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/storageunit"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 // openFenceWindow fences ru's mounted copy via a foreign higher-epoch open that
@@ -196,4 +200,158 @@ func TestUnionReadRetry_BudgetRespectedWhenNoLegServes(t *testing.T) {
 		t.Fatalf("ScanPrefix elapsed %v outside the budget window [550ms, 3s)", elapsed)
 	}
 	t.Logf("no-serving-leg SCAN surfaced the retryable error after %v (budget %v)", elapsed, c.cfg.ReadTimeout)
+}
+
+// closedStubBackend models a mount whose close landed under an in-flight read
+// leg (releaseReplicaUnit removes the map entry BEFORE CloseReplicaUnit, so a
+// leg that resolved the handle in that instant reads a closing backend): every
+// op returns backend.ErrClosed.
+type closedStubBackend struct{}
+
+func (closedStubBackend) Put(_, _ []byte) error        { return backend.ErrClosed }
+func (closedStubBackend) Get(_ []byte) ([]byte, error) { return nil, backend.ErrClosed }
+func (closedStubBackend) Delete(_ []byte) error        { return backend.ErrClosed }
+func (closedStubBackend) ScanPrefix(_ []byte) (backend.Iterator, error) {
+	return nil, backend.ErrClosed
+}
+func (closedStubBackend) Begin(_ backend.IsolationLevel) (backend.Transaction, error) {
+	return nil, backend.ErrClosed
+}
+func (closedStubBackend) Close() error { return nil }
+
+// TestUnionReadRetry_ClosedMountLegIsTransient pins the closed-mid-release
+// classification (docs/SPEC.md "Union reads" guard 2): a union read/scan leg
+// that reads backend.ErrClosed from a mount whose release landed under it is
+// TRANSIENT - absorbed by the re-poll, which serves once the position is
+// re-acquired - never a client-visible "backend: closed".
+func TestUnionReadRetry_ClosedMountLegIsTransient(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self")
+	c.cfg.ReadTimeout = 3 * time.Second
+	c.cfg.RebalanceSettleDelay = time.Hour // scripted heal is the only healer
+
+	key := []byte("rr-closed-key")
+	ru := storageunit.NewReplicaUnit(c.genUnitForKey(key), 0)
+
+	// Seed the position's durable store, then plant a CLOSED mount handle at
+	// the position - the state a read leg observes when the release's close
+	// lands between its map resolve and its Get.
+	seedH := backing.Handle()
+	sb, _, err := seedH.OpenReplicaUnit(ru, 1)
+	if err != nil {
+		t.Fatalf("seed open: %v", err)
+	}
+	env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "seed"}, Payload: []byte("v1")})
+	if err := sb.Put(key, env); err != nil {
+		t.Fatalf("seed put: %v", err)
+	}
+	c.mountMu.Lock()
+	c.mountMap[ru] = closedStubBackend{}
+	c.mountMu.Unlock()
+
+	const healAfter = 300 * time.Millisecond
+	heal := func() chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			time.Sleep(healAfter)
+			c.reconcileMu.Lock()
+			c.acquireReplicaUnit(ru) // re-mounts over the closed handle
+			c.reconcileMu.Unlock()
+		}()
+		return done
+	}
+
+	armT := time.Now()
+	healDone := heal()
+	got, err := c.getReplicatedUnit(key)
+	servedAt := time.Now()
+	if err != nil {
+		t.Fatalf("Get across a closed-mid-release mount must be absorbed by the re-poll, got after %v: %v",
+			servedAt.Sub(armT), err)
+	}
+	if !bytes.Equal(got, []byte("v1")) {
+		t.Fatalf("Get returned %q, want %q", got, "v1")
+	}
+	if servedAt.Before(armT.Add(healAfter)) {
+		t.Fatalf("Get served %v after arming - before the heal; something else served (fixture leak)", servedAt.Sub(armT))
+	}
+	t.Logf("closed-mount GET absorbed: served %v after arming (heal at +%v)", servedAt.Sub(armT), healAfter)
+	<-healDone
+
+	// Same for a SCAN leg: re-plant the closed handle over the healed mount.
+	c.mountMu.Lock()
+	c.mountMap[ru] = closedStubBackend{}
+	c.mountMu.Unlock()
+	armT = time.Now()
+	healDone = heal()
+	it, err := c.scanReplicatedUnit(key)
+	servedAt = time.Now()
+	if err != nil {
+		t.Fatalf("ScanPrefix across a closed-mid-release mount must be absorbed, got after %v: %v",
+			servedAt.Sub(armT), err)
+	}
+	seen := 0
+	for {
+		k, _, nerr := it.Next()
+		if nerr != nil {
+			t.Fatalf("scan Next: %v", nerr)
+		}
+		if k == nil {
+			break
+		}
+		seen++
+	}
+	_ = it.Close()
+	if seen == 0 {
+		t.Fatalf("scan returned no pairs for a seeded key")
+	}
+	if servedAt.Before(armT.Add(healAfter)) {
+		t.Fatalf("scan served %v after arming - before the heal (fixture leak)", servedAt.Sub(armT))
+	}
+	t.Logf("closed-mount SCAN absorbed: served %v after arming (heal at +%v)", servedAt.Sub(armT), healAfter)
+	<-healDone
+}
+
+// TestUnionReadRetry_ClosedLegClassification pins the classifier itself,
+// including the WIRE form: gRPC wraps a non-status error as codes.Unknown
+// carrying the error text, so a remote leg's "backend: closed" arrives as
+// exactly the captured `rpc error: code = Unknown desc = backend: closed`.
+func TestUnionReadRetry_ClosedLegClassification(t *testing.T) {
+	if !isTransientReadLegErr(backend.ErrClosed) {
+		t.Fatalf("in-process backend.ErrClosed must classify transient on a read leg")
+	}
+	if !isTransientReadLegErr(status.Error(codes.Unknown, "backend: closed")) {
+		t.Fatalf("wire-form Unknown/backend: closed must classify transient on a read leg")
+	}
+	if isTransientReadLegErr(status.Error(codes.Unknown, "some real server bug")) {
+		t.Fatalf("an unrelated Unknown error must stay non-transient")
+	}
+	if isTransientReadLegErr(status.Error(codes.Unavailable, "connection refused")) {
+		t.Fatalf("a down peer's dial error must stay non-transient for the read gather")
+	}
+}
+
+// TestUnionReadRetry_ClosedClusterStillFailsFast pins the boundary: a client
+// op entering a GENUINELY closed cluster gets backend.ErrClosed immediately
+// from the entry not-ready check - the closed-mount reclassification applies
+// to union legs only, never to the caller's own shut-down cluster.
+func TestUnionReadRetry_ClosedClusterStillFailsFast(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self")
+	c.cfg.ReadTimeout = 3 * time.Second
+	c.closed.Store(true)
+
+	t0 := time.Now()
+	_, err := c.Get([]byte("any-key"))
+	if !errors.Is(err, backend.ErrClosed) {
+		t.Fatalf("Get on a closed cluster = %v, want backend.ErrClosed", err)
+	}
+	if el := time.Since(t0); el > 100*time.Millisecond {
+		t.Fatalf("Get on a closed cluster took %v - must fail fast, not retry", el)
+	}
+	_, err = c.ScanPrefix([]byte("any-key"))
+	if !errors.Is(err, backend.ErrClosed) {
+		t.Fatalf("ScanPrefix on a closed cluster = %v, want backend.ErrClosed", err)
+	}
 }
