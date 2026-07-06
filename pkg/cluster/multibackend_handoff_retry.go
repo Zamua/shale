@@ -34,6 +34,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"math/rand"
 	"time"
 
@@ -188,18 +189,37 @@ func jitteredBackoff(d time.Duration) time.Duration {
 func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time) (T, error)) (T, error) {
 	deadline := time.Now().Add(c.cfg.ReadTimeout)
 	if c.cfg.TestingForceCleanCut {
-		return attempt(deadline)
+		v, err := attempt(deadline)
+		return v, unwrapUnreachableOnly(err)
 	}
 	backoff := time.Duration(c.retryAfterMs()) * time.Millisecond
+	unreachableSweeps := 0
 
 	for {
 		v, err := attempt(deadline)
-		if err == nil || !isAcquiringErr(err) {
+		if err == nil {
+			return v, nil
+		}
+		switch {
+		case isAcquiringErr(err):
+			// Handoff-class evidence: full-budget re-poll; reset the
+			// unreachable-only cap (a live transition is in progress).
+			unreachableSweeps = 0
+		case isUnreachableOnly(err):
+			// Unreachable-only sweep: weaker evidence, CAPPED re-poll
+			// (docs/SPEC.md guard 2). Surface the dial error verbatim once the
+			// cap is hit, so a genuine outage costs a sub-second re-poll, not
+			// the full budget.
+			unreachableSweeps++
+			if unreachableSweeps >= unreachableOnlySweepCap {
+				return v, unwrapUnreachableOnly(err)
+			}
+		default:
 			return v, err
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			return v, err
+			return v, unwrapUnreachableOnly(err)
 		}
 		sleep := jitteredBackoff(backoff)
 		if sleep > remaining {
@@ -212,4 +232,26 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 			backoff = handoffRetryBackoffCap
 		}
 	}
+}
+
+// unreachableOnlySweepCap bounds how many unreachable-only sweeps the read
+// retry re-polls before surfacing the first dial error verbatim: the second
+// such sweep (one backoff apart, still nothing but dead legs) is the give-up
+// point - a genuine outage surfaces in well under a second.
+const unreachableOnlySweepCap = 2
+
+// isUnreachableOnly reports whether err is the unreachable-only sweep marker.
+func isUnreachableOnly(err error) bool {
+	var uo *unreachableOnlyError
+	return errors.As(err, &uo)
+}
+
+// unwrapUnreachableOnly strips the internal unreachable-only marker so callers
+// only ever see the underlying dial error; any other error passes through.
+func unwrapUnreachableOnly(err error) error {
+	var uo *unreachableOnlyError
+	if errors.As(err, &uo) {
+		return uo.inner
+	}
+	return err
 }

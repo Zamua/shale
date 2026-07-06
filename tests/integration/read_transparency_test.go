@@ -142,7 +142,8 @@ func TestJoinReadTransparent_GetScanEveryNode(t *testing.T) {
 		}
 	}
 	if primaryMoves == 0 {
-		t.Skip("no unit's primary moves onto the 4th node under this hashing; adjust node ids")
+		t.Fatalf("FIXTURE DRIFT: no unit's primary moves onto the 4th node under this hashing - the ring placement " +
+			"changed; recompute node names so the single-owner-routed scan worst case stays covered")
 	}
 	t.Logf("%d of %d units get rt-d as PRIMARY on the 4-node ring", primaryMoves, uc)
 

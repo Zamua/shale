@@ -711,15 +711,25 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 
 	gathered := make([]collected, 0, len(queried))
 	var nonTransientErr error
-	sawTransient := false
+	var firstUnreachable error
+	sawHandoffTransient := false
 	usable := 0
 
 	for res := range resultsCh {
 		if res.Err != nil {
-			// READ-leg classification: acquiring/fenced-recode PLUS the
-			// closed-mid-release mount (docs/SPEC.md "Union reads" guard 2).
+			// READ-leg classification (docs/SPEC.md "Union reads" guard 2):
+			// handoff-class transients (acquiring / fenced-recode / closed-mid-
+			// release) earn the full-budget re-poll; a bare unreachable leg is
+			// skipped too but tracked separately - unreachable-only sweeps get
+			// the capped re-poll, then surface the dial error verbatim.
 			if isTransientReadLegErr(res.Err) {
-				sawTransient = true
+				sawHandoffTransient = true
+				continue
+			}
+			if isUnreachableLegErr(res.Err) {
+				if firstUnreachable == nil {
+					firstUnreachable = res.Err
+				}
 				continue
 			}
 			if errors.Is(res.Err, backend.ErrNotFound) {
@@ -754,13 +764,18 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 		if nonTransientErr != nil {
 			return nil, nonTransientErr
 		}
-		if sawTransient {
+		if sawHandoffTransient {
 			// Every union leg reported the transient acquiring window and none
 			// answered (all routed positions mid-handoff at once). Surface the
 			// RETRYABLE acquiring error, never ErrNotFound: a key that exists
 			// must not be reported absent because its unit is mid-transition
 			// everywhere (docs/SPEC.md "Union reads", guard 2).
 			return nil, errUnitAcquiring("Get")
+		}
+		if firstUnreachable != nil {
+			// Only unreachable legs: the capped re-poll's signal (the wrapper
+			// unwraps the marker, so callers only ever see the dial error).
+			return nil, &unreachableOnlyError{inner: firstUnreachable}
 		}
 		return nil, backend.ErrNotFound
 	}

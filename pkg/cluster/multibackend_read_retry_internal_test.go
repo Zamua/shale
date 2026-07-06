@@ -18,6 +18,7 @@ import (
 	"bytes"
 	"errors"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -329,12 +330,139 @@ func TestUnionReadRetry_ClosedLegClassification(t *testing.T) {
 	if isTransientReadLegErr(status.Error(codes.Unknown, "some real server bug")) {
 		t.Fatalf("an unrelated Unknown error must stay non-transient")
 	}
-	if !isTransientReadLegErr(status.Error(codes.Unavailable, `connection error: desc = "transport: Error while dialing: dial tcp 10.0.0.1:7947: connect: connection refused"`)) {
-		t.Fatalf("a refused dial to a departed member must classify transient on a read leg (docs/SPEC.md guard 2)")
+	dial := status.Error(codes.Unavailable, `connection error: desc = "transport: Error while dialing: dial tcp 10.0.0.1:7947: connect: connection refused"`)
+	if isTransientReadLegErr(dial) {
+		t.Fatalf("a refused dial is the UNREACHABLE class, not handoff-class transient (it earns the capped re-poll)")
+	}
+	if !isUnreachableLegErr(dial) {
+		t.Fatalf("a refused dial must classify as an unreachable leg (docs/SPEC.md guard 2)")
 	}
 	if isTransientReadLegErr(status.Error(codes.FailedPrecondition, "shale: forwarding loop refused")) {
 		t.Fatalf("the loop-guard refusal must stay non-transient")
 	}
+	if isTransientReadLegErr(status.Error(codes.Unknown, "apply batch: backend: closed (wrapped)")) {
+		t.Fatalf("a wrapped error merely EMBEDDING the closed text must stay hard (exact-message match only)")
+	}
+}
+
+// TestUnionReadRetry_OutageSurfacesDialErrorFast pins the capped re-poll for
+// unreachable-only sweeps (docs/SPEC.md guard 2): a replica set that is
+// genuinely ALL down surfaces the FIRST dial error VERBATIM after a
+// sub-second capped re-poll - never a full ReadTimeout stall, never a
+// swallowed diagnostic.
+func TestUnionReadRetry_OutageSurfacesDialErrorFast(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	// self is NOT a ring member: every routed leg is a remote dial to a dead
+	// address (bind a loopback port, close it, dial refused).
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "g1", "g2")
+	c.cfg.ReadTimeout = 5 * time.Second
+	c.cfg.RebalanceSettleDelay = time.Hour
+	c.clients = make(map[string]*peerClient)
+	t.Cleanup(func() {
+		for _, cli := range c.clients {
+			_ = cli.Close()
+		}
+	})
+	rg := ring.New()
+	for _, id := range []string{"g1", "g2"} {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("probe listen: %v", err)
+		}
+		addr := l.Addr().String()
+		_ = l.Close()
+		rg.Add(ring.Member{ID: id, Addr: addr})
+	}
+	c.ring = rg
+
+	key := []byte("rr-outage-key")
+	t0 := time.Now()
+	_, err := c.getReplicatedUnit(key)
+	elapsed := time.Since(t0)
+	if err == nil {
+		t.Fatalf("Get against an all-down replica set must error")
+	}
+	st, ok := status.FromError(err)
+	if !ok || st.Code() != codes.Unavailable || !strings.Contains(st.Message(), "connection refused") {
+		t.Fatalf("Get outage error = %v, want the dial error surfaced verbatim (Unavailable + connection refused)", err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("Get outage surfaced after %v - the unreachable-only cap must bound this well under the %v budget", elapsed, c.cfg.ReadTimeout)
+	}
+	t.Logf("outage GET surfaced the dial error after %v (budget %v)", elapsed, c.cfg.ReadTimeout)
+
+	t0 = time.Now()
+	_, err = c.scanReplicatedUnit(key)
+	elapsed = time.Since(t0)
+	if err == nil {
+		t.Fatalf("ScanPrefix against an all-down replica set must error")
+	}
+	st, ok = status.FromError(err)
+	if !ok || st.Code() != codes.Unavailable || !strings.Contains(st.Message(), "connection refused") {
+		t.Fatalf("scan outage error = %v, want the dial error surfaced verbatim", err)
+	}
+	if elapsed >= 2*time.Second {
+		t.Fatalf("scan outage surfaced after %v - must be capped well under the budget", elapsed)
+	}
+	t.Logf("outage SCAN surfaced the dial error after %v (budget %v)", elapsed, c.cfg.ReadTimeout)
+}
+
+// TestUnionScan_WedgedLegBoundedByBudget pins the scan walk's deadline
+// (docs/SPEC.md "Union scans"): a WEDGED-BUT-CONNECTED leg (a listener that
+// accepts and never speaks) must not hang ScanPrefix - the open+prime is cut
+// at the ReadTimeout deadline and the scan surfaces a bounded retryable
+// error.
+func TestUnionScan_WedgedLegBoundedByBudget(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "wedge")
+	c.cfg.ReadTimeout = 800 * time.Millisecond
+	c.cfg.RebalanceSettleDelay = time.Hour
+	c.clients = make(map[string]*peerClient)
+	t.Cleanup(func() {
+		for _, cli := range c.clients {
+			_ = cli.Close()
+		}
+	})
+
+	// A live listener that accepts connections and never responds: the
+	// transport connects, the stream prime blocks forever server-side.
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("wedge listen: %v", err)
+	}
+	t.Cleanup(func() { _ = l.Close() })
+	go func() {
+		for {
+			conn, aerr := l.Accept()
+			if aerr != nil {
+				return
+			}
+			go func() {
+				buf := make([]byte, 4096)
+				for {
+					if _, rerr := conn.Read(buf); rerr != nil {
+						_ = conn.Close()
+						return
+					}
+				}
+			}()
+		}
+	}()
+	rg := ring.New()
+	rg.Add(ring.Member{ID: "wedge", Addr: l.Addr().String()})
+	c.ring = rg
+
+	key := []byte("rr-wedged-key")
+	t0 := time.Now()
+	_, err = c.scanReplicatedUnit(key)
+	elapsed := time.Since(t0)
+	if err == nil {
+		t.Fatalf("ScanPrefix against a wedged leg must surface a bounded error")
+	}
+	if elapsed >= 3*time.Second {
+		t.Fatalf("ScanPrefix took %v against a wedged leg - the walk must be cut at the %v budget, never hang", elapsed, c.cfg.ReadTimeout)
+	}
+	t.Logf("wedged-leg SCAN surfaced bounded error after %v (budget %v): %v", elapsed, c.cfg.ReadTimeout, err)
 }
 
 // TestUnionReadRetry_DeadMemberLegIsTransient pins the unreachable-member

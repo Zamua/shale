@@ -67,9 +67,11 @@ func retryMigrationGuard(t *testing.T, op func() error) error {
 			return err // anything but the migration guard: surface immediately.
 		}
 		retryAfter := 50 * time.Millisecond
-		var ms int
-		if _, serr := fmt.Sscanf(st.Message()[strings.Index(st.Message(), "retry after"):], "retry after %dms", &ms); serr == nil && ms > 0 {
-			retryAfter = time.Duration(ms) * time.Millisecond
+		if idx := strings.Index(st.Message(), "retry after"); idx >= 0 {
+			var ms int
+			if _, serr := fmt.Sscanf(st.Message()[idx:], "retry after %dms", &ms); serr == nil && ms > 0 {
+				retryAfter = time.Duration(ms) * time.Millisecond
+			}
 		}
 		time.Sleep(retryAfter)
 	}
