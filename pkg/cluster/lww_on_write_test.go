@@ -30,13 +30,51 @@ package cluster_test
 import (
 	"bytes"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+// retryMigrationGuard runs op, retrying ONLY the bootstrap-rebalance
+// migration-guard transient (codes.ResourceExhausted, "key is migrating
+// out; retry after Nms"). A late-arriving gossip round can reopen a
+// StateReceiving window on the legacy R>1 harness AFTER the fixture settled,
+// and production replica-write callers treat that refusal as a transient
+// (the fan-out counts it toward neither budget and the originator retries).
+// These tests drive LocalReplicaPut / ApplyBatchLocal DIRECTLY, so they must
+// retry the same class themselves or the reopened window fails them
+// spuriously (the standing LWW flake). Semantics match the guard's own hint:
+// sleep the retry-after the error carries (fallback 50ms, the package
+// default), a small bounded attempt budget, and FAIL HARD on any other error
+// or on exhaustion - the retry can never mask a real failure class.
+func retryMigrationGuard(t *testing.T, op func() error) error {
+	t.Helper()
+	const maxAttempts = 20
+	var err error
+	for attempt := 0; attempt < maxAttempts; attempt++ {
+		err = op()
+		if err == nil {
+			return nil
+		}
+		st, ok := status.FromError(err)
+		if !ok || st.Code() != codes.ResourceExhausted || !strings.Contains(st.Message(), "migrating") {
+			return err // anything but the migration guard: surface immediately.
+		}
+		retryAfter := 50 * time.Millisecond
+		var ms int
+		if _, serr := fmt.Sscanf(st.Message()[strings.Index(st.Message(), "retry after"):], "retry after %dms", &ms); serr == nil && ms > 0 {
+			retryAfter = time.Duration(ms) * time.Millisecond
+		}
+		time.Sleep(retryAfter)
+	}
+	return err // budget exhausted mid-migration: surface the guard error.
+}
 
 // runConcurrentIncrements seeds key=0 through the owner and fires `workers`
 // concurrent CAS read-modify-write increments, all routed through the owner
@@ -268,7 +306,7 @@ func TestLWWOnWrite_ApplyIfNewer_OlderRejectedNewerWins(t *testing.T) {
 	s1, s2, s3 := uint64(1000), uint64(2000), uint64(3000)
 
 	// s2 lands first (no stored value -> apply).
-	if err := n.cluster.LocalReplicaPut(key, mkEnv(s2, "val-s2")); err != nil {
+	if err := retryMigrationGuard(t, func() error { return n.cluster.LocalReplicaPut(key, mkEnv(s2, "val-s2")) }); err != nil {
 		t.Fatalf("apply s2: %v", err)
 	}
 	if env, ok := decodeReplica(t, n, key); !ok || env.Stamp.TimestampNanos != s2 || !bytes.Equal(env.Payload, []byte("val-s2")) {
@@ -276,7 +314,7 @@ func TestLWWOnWrite_ApplyIfNewer_OlderRejectedNewerWins(t *testing.T) {
 	}
 
 	// s1 < s2: REJECTED. Stored must stay s2.
-	if err := n.cluster.LocalReplicaPut(key, mkEnv(s1, "val-s1-stale")); err != nil {
+	if err := retryMigrationGuard(t, func() error { return n.cluster.LocalReplicaPut(key, mkEnv(s1, "val-s1-stale")) }); err != nil {
 		t.Fatalf("apply s1 (should be a committed no-op, not an error): %v", err)
 	}
 	if env, ok := decodeReplica(t, n, key); !ok || env.Stamp.TimestampNanos != s2 || !bytes.Equal(env.Payload, []byte("val-s2")) {
@@ -284,7 +322,7 @@ func TestLWWOnWrite_ApplyIfNewer_OlderRejectedNewerWins(t *testing.T) {
 	}
 
 	// s3 > s2: WINS.
-	if err := n.cluster.LocalReplicaPut(key, mkEnv(s3, "val-s3")); err != nil {
+	if err := retryMigrationGuard(t, func() error { return n.cluster.LocalReplicaPut(key, mkEnv(s3, "val-s3")) }); err != nil {
 		t.Fatalf("apply s3: %v", err)
 	}
 	if env, ok := decodeReplica(t, n, key); !ok || env.Stamp.TimestampNanos != s3 || !bytes.Equal(env.Payload, []byte("val-s3")) {
@@ -293,7 +331,7 @@ func TestLWWOnWrite_ApplyIfNewer_OlderRejectedNewerWins(t *testing.T) {
 
 	// s3 re-applied (EQUAL stamp): no-op (A.Greater(A) == false). A re-
 	// delivered identical envelope leaves the stored value intact.
-	if err := n.cluster.LocalReplicaPut(key, mkEnv(s3, "val-s3-redelivered")); err != nil {
+	if err := retryMigrationGuard(t, func() error { return n.cluster.LocalReplicaPut(key, mkEnv(s3, "val-s3-redelivered")) }); err != nil {
 		t.Fatalf("re-apply equal s3: %v", err)
 	}
 	if env, ok := decodeReplica(t, n, key); !ok || env.Stamp.TimestampNanos != s3 || !bytes.Equal(env.Payload, []byte("val-s3")) {
@@ -321,7 +359,9 @@ func TestLWWOnWrite_ApplyIfNewer_ViaApplyBatch(t *testing.T) {
 	s1, s2 := uint64(5000), uint64(9000)
 
 	// Newer batch (s2) first.
-	if err := n.cluster.ApplyBatchLocal([]cluster.EnvelopeWrite{{Key: key, Envelope: mkEnv(s2, "batch-s2")}}); err != nil {
+	if err := retryMigrationGuard(t, func() error {
+		return n.cluster.ApplyBatchLocal([]cluster.EnvelopeWrite{{Key: key, Envelope: mkEnv(s2, "batch-s2")}})
+	}); err != nil {
 		t.Fatalf("ApplyBatch s2: %v", err)
 	}
 	if env, _ := decodeReplica(t, n, key); env.Stamp.TimestampNanos != s2 {
@@ -329,7 +369,9 @@ func TestLWWOnWrite_ApplyIfNewer_ViaApplyBatch(t *testing.T) {
 	}
 
 	// Older batch (s1) arrives reordered: REJECTED per key, committed no-op.
-	if err := n.cluster.ApplyBatchLocal([]cluster.EnvelopeWrite{{Key: key, Envelope: mkEnv(s1, "batch-s1-stale")}}); err != nil {
+	if err := retryMigrationGuard(t, func() error {
+		return n.cluster.ApplyBatchLocal([]cluster.EnvelopeWrite{{Key: key, Envelope: mkEnv(s1, "batch-s1-stale")}})
+	}); err != nil {
 		t.Fatalf("ApplyBatch s1 (should be a no-op, not an error): %v", err)
 	}
 	if env, _ := decodeReplica(t, n, key); env.Stamp.TimestampNanos != s2 || !bytes.Equal(env.Payload, []byte("batch-s2")) {
@@ -385,7 +427,7 @@ func TestLWWOnWrite_ReorderedCASFanOut_Converges(t *testing.T) {
 	// ApplyBatchLocal). Each must be a committed no-op per key.
 	reorderedBatch := []cluster.EnvelopeWrite{{Key: key, Envelope: firstBytes}}
 	for i, n := range nodes {
-		if err := n.cluster.ApplyBatchLocal(reorderedBatch); err != nil {
+		if err := retryMigrationGuard(t, func() error { return n.cluster.ApplyBatchLocal(reorderedBatch) }); err != nil {
 			t.Fatalf("node %d reordered batch replay (should be a no-op, not an error): %v", i, err)
 		}
 	}
