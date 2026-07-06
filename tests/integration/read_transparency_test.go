@@ -426,16 +426,30 @@ drainLoop:
 		default:
 		}
 		roundFails := probeReadsOnce([]*sharedNode{n4}, uk, []byte("seed"))
-		// A round that TORE across Close's completion sees the pinned
-		// post-Close fast-fail (raw backend.ErrClosed) for its remaining ops -
-		// that is the boundary asserted separately below, not a drain-window
-		// refusal. Discard the torn round; count only clean pre-Close rounds.
+		// The entry fast-fail (raw backend.ErrClosed) begins the moment Close
+		// flips the closed flag - INSIDE Close, before the teardown finishes
+		// and drainDone closes. On a slow runner that post-flip stretch fits
+		// whole probe rounds, so drainDone is NOT a reliable end-of-serving
+		// signal; the observed ErrClosed IS. The first sighting marks the end
+		// of the drain's serving phase (the boundary asserted separately
+		// below). Stop there; only NON-closed failures inside the serving
+		// window count against the pin.
+		sawClosed := false
+		for _, f := range roundFails {
+			if strings.Contains(f, backend.ErrClosed.Error()) {
+				sawClosed = true
+			} else {
+				fails = append(fails, f)
+			}
+		}
+		if sawClosed {
+			break drainLoop
+		}
 		select {
 		case <-drainDone:
 			break drainLoop
 		default:
 		}
-		fails = append(fails, roundFails...)
 		rounds++
 		time.Sleep(250 * time.Millisecond)
 		if rounds > 120 {
