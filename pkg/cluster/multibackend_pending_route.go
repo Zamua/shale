@@ -347,14 +347,6 @@ func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, st
 	return out, stableR
 }
 
-// pendingReplicasForKey resolves the PENDING replica set for a key: the
-// unit's replica set over a ring genuinely rebuilt without the draining
-// members. See pendingUnitReplicas for why the exact rebuild (and not the
-// successor-chain drop trick) is required.
-func (c *Cluster) pendingReplicasForKey(key []byte, draining map[string]struct{}) []ring.Member {
-	return c.pendingUnitReplicas(c.genUnitForKey(key), draining)
-}
-
 // writeAckBar computes the write ack target W. It is ALWAYS the configured
 // consistency over the STABLE replica count (requiredWriteAcks(wc, stableR)): a
 // topology transition that widens the routed set to the union of current +
