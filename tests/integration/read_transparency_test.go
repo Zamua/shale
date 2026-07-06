@@ -425,7 +425,17 @@ drainLoop:
 			break drainLoop
 		default:
 		}
-		fails = append(fails, probeReadsOnce([]*sharedNode{n4}, uk, []byte("seed"))...)
+		roundFails := probeReadsOnce([]*sharedNode{n4}, uk, []byte("seed"))
+		// A round that TORE across Close's completion sees the pinned
+		// post-Close fast-fail (raw backend.ErrClosed) for its remaining ops -
+		// that is the boundary asserted separately below, not a drain-window
+		// refusal. Discard the torn round; count only clean pre-Close rounds.
+		select {
+		case <-drainDone:
+			break drainLoop
+		default:
+		}
+		fails = append(fails, roundFails...)
 		rounds++
 		time.Sleep(250 * time.Millisecond)
 		if rounds > 120 {
