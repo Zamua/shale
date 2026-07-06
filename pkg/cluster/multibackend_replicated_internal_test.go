@@ -49,6 +49,27 @@ func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfa
 	c.genOwner = c.genUnitOwner
 	c.initGenState()
 	c.initReplicatedFactory()
+	// Terminate the fixture's background goroutines at test end exactly as a
+	// real Close does: flip closed, close closeCh, JOIN loopWG. The
+	// displaced-drain poller a beginDrain arms exits on closeCh (production
+	// wiring); without this cleanup the never-closed fixture leaves the poller
+	// running to its 30s lifetime cap, which outlives a FAST SCOPED test run
+	// and fails goleak at TestMain (the CI shard redness) while full runs
+	// outlast the cap and hide it. The join is BOUNDED so a test bug (e.g. a
+	// HangOpenReplica left armed) surfaces as an attributable failure here
+	// instead of wedging the package to its timeout; hang-arming tests release
+	// via their own t.Cleanup, which runs before this one (LIFO).
+	t.Cleanup(func() {
+		c.closed.Store(true)
+		c.closeOnce.Do(func() { close(c.closeCh) })
+		done := make(chan struct{})
+		go func() { c.loopWG.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Errorf("fixture cleanup: background goroutines did not exit within 10s of close")
+		}
+	})
 	return c
 }
 
