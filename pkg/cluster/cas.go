@@ -136,8 +136,13 @@ var transactCommit = func(tx *clusterTx) error { return tx.Commit() }
 // is ALREADY durable on the owner + any replica that acked (same best-
 // effort-to-W shape single-key Put has), so the commit must never be
 // retried away. committed==true is the sound discriminator because the
-// owner-local Commit already returned before the fan-out ran. See
-// docs/SPEC.md "The four commit outcomes" + "Write-set replication".
+// owner-local Commit already returned before the fan-out ran. Because the
+// pods run relaxed (slate AwaitDurable=false, ack from the memtable), the
+// under-W branch first SYNCHRONOUSLY FLUSHES the owner's local backend to
+// the object store (flushOwnerUnderReplicated), so the lone owner copy is
+// bucket-durable before success returns; a flush failure is the one under-W
+// case that returns a terminal {Err} instead of success. See docs/SPEC.md
+// "The four commit outcomes" + "Write-set replication".
 //
 // pinKey anchors the replica-set lookup; every key in the commit co-
 // shards with it (the client's cross-shard guard guarantees this), so one
@@ -291,10 +296,15 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 		// position of the pin unit (the index-shuffling survivor mid-transition)
 		// receives the batch too and counts as a durable ack - the CAS mirror of
 		// the put path's dual-position routing. Zero-valued on the legacy per-node
-		// path (no pausedTx), where the attempt ignores it.
+		// path (no pausedTx), where the attempt ignores it. ownerBackend is the
+		// SAME mounted backend the owner-local commit applied against: pt.b in
+		// multi mode, c.backend on the legacy per-node replicated path (no
+		// pausedTx). It is the flush target on the under-W branch below.
 		var committedRU storageunit.ReplicaUnit
+		ownerBackend := c.backend
 		if pt, ok := tx.(*pausedTx); ok {
 			committedRU = pt.ru
+			ownerBackend = pt.b
 		}
 		if err := c.replicateCASBatch(pinKey, committedRU, encodedWrites); err != nil {
 			// POST-commit failure. committed==true is the sound discriminator:
@@ -303,20 +313,79 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 			// error return is a W-shortfall on the fan-out (a codes.Unavailable;
 			// see replicateCASBatchAttempt / classifyWriteAttempt). So this is
 			// definitionally committed-but-under-replicated, NOT not-committed:
-			// the write is already durable on the owner (+ any replica that
-			// acked). Return it as a success with degraded replication so
-			// Transact does NOT re-run fn and re-commit an already-durable write
-			// (the amplification + false-conflict bug). Err is preserved for
-			// logging/observability only; the caller maps Committed==true to nil.
-			// The missing replicas heal via apply-if-newer read-repair on the
-			// next quorum Get and via the fan-out's own WriteTimeout-bounded
-			// retry (already exercised inside replicateCASBatch). Same best-
-			// effort-to-W exposure single-key Put has. See docs/SPEC.md "The four
-			// commit outcomes".
+			// the write is durable on the owner (+ any replica that acked).
+			//
+			// DURABILITY CLOSING ADDITION (relaxed-durability seal). shale runs the
+			// pods RELAXED (slate AwaitDurable=false, ack from the memtable) and
+			// buys durability from REPLICATION: an ack to W replicas is W
+			// independent in-RAM copies that survive a single pod loss. The NORMAL
+			// W-reached path above deliberately does NOT flush (that is the whole
+			// performance design). But on THIS under-W branch the replication
+			// safety net MISSED: the write's only copy is in the owner's memtable
+			// (RAM), so acking it as durable would be unsound (an owner-pod crash
+			// in the sub-second pre-flush window is silent loss). So before
+			// returning success, synchronously FLUSH the owner's local backend to
+			// the object store, converting that lone copy from RAM-only to bucket-
+			// durable. The lock is already released (casMuHeld==false) so the flush
+			// I/O holds no lock; a backend that is already synchronously durable
+			// (memory/pebble, or slate at AwaitDurable=true) does not implement
+			// backend.Flusher and is skipped (no RAM-loss window to close).
+			if ferr := c.flushOwnerUnderReplicated(ownerBackend); ferr != nil {
+				// The flush FAILED: the lone owner copy could not be persisted.
+				// That is a genuine durability failure (committed to the memtable,
+				// could NOT be made bucket-durable), so we do NOT report success -
+				// we surface the flush error as a not-committed error the caller
+				// sees (committed-but-couldnt-persist is real; the caller must know).
+				// This does NOT amplify: a flush I/O failure is a TERMINAL error,
+				// NOT the retryable under-W codes.Unavailable, so casResultToError
+				// returns it and Transact does NOT re-run fn (the write-set applied
+				// at most once). The one flush error that DOES classify retryable is
+				// a fence (a successor opened the db at a higher epoch in the post-
+				// commit window); re-running fn there is safe, not amplifying,
+				// because a fenced memtable write was never persisted, so the OCC
+				// re-commit on the successor is a clean single apply. committed is
+				// already true, so the deferred Rollback stays suppressed - we do
+				// not un-apply the owner-local write, we only report that its
+				// durability could not be confirmed.
+				return backend.CASResult{Err: ferr}
+			}
+			// Owner copy is now bucket-durable. Return committed-under-replication
+			// SUCCESS so Transact does NOT re-run fn and re-commit an already-
+			// durable write (the amplification + false-conflict bug). Err is
+			// preserved for logging/observability only; the caller maps
+			// Committed==true to nil. The missing replica COUNT heals via apply-if-
+			// newer read-repair on the next quorum Get (NOT via the fan-out's own
+			// WriteTimeout-bounded retry - that is already exhausted here, which is
+			// exactly what produced this under-W outcome). See docs/SPEC.md "The
+			// four commit outcomes".
 			return backend.CASResult{Committed: true, UnderReplicated: true, Err: err}
 		}
 	}
 	return backend.CASResult{Committed: true}
+}
+
+// flushOwnerUnderReplicated makes the owner's lone durable copy of an under-
+// replicated CAS commit bucket-durable, on the RARE under-W branch of
+// CommitCASApply only. ownerBackend is the mounted backend the owner-local
+// commit applied against (pt.b in multi mode, c.backend on the legacy per-node
+// replicated path). The flush is OPTIONAL by capability: a backend that is
+// already synchronously durable (memory/pebble, or slate at AwaitDurable=true)
+// does not implement backend.Flusher, so there is no RAM-loss window and the
+// flush is skipped (returns nil). flushableBackend unwraps the fencedSelfHealing
+// decorator storeMount wraps a mounted backend in, so a real slate mount at
+// AwaitDurable=false is found and Flush() forces its memtable durable to the
+// object store. A non-nil return is a genuine durability failure the under-W
+// branch surfaces terminally (see the call site); a nil return means the lone
+// copy is now bucket-durable (or the backend never had a loss window).
+func (c *Cluster) flushOwnerUnderReplicated(ownerBackend backend.Backend) error {
+	if ownerBackend == nil {
+		return nil
+	}
+	fl, ok := flushableBackend(ownerBackend)
+	if !ok {
+		return nil
+	}
+	return fl.Flush()
 }
 
 // casReadPayload reads key from the owner-local tx for a CAS read-check.
