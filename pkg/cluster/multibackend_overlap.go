@@ -1089,6 +1089,14 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	delete(c.handoffPhase, ru)
 	c.mountMu.Unlock()
 
+	// Drop this backend's group-commit flush state (bounded-lifetime eviction):
+	// the unit is unmounting, a remount opens a fresh backend, so the old entry
+	// would otherwise linger forever. An in-flight flush-runner holds its own
+	// state pointer and is unaffected.
+	if fl, ok := flushableBackend(b); ok {
+		c.casFlushGroup.forget(fl)
+	}
+
 	// CloseReplicaUnit OUTSIDE the lock (the entry is already removed). Idempotent
 	// + belt-and-suspenders for acked writes (durable-before-ack).
 	_ = c.replicaFactory.CloseReplicaUnit(ru)

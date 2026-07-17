@@ -27,9 +27,10 @@ import (
 // the single shared store on the legacy per-node replicated path (one c.backend,
 // so all its under-W flushes correctly coalesce onto one entry). The Flusher is
 // always a pointer-typed backend (backends hold mutable state), so it is a
-// comparable, stable map key. Entries are bounded by the node's mounted-unit
-// count (a handful) and are reused across calls, so there is no per-call leak
-// and no eviction is needed.
+// comparable, stable map key. A live entry is reused across calls (no per-call
+// leak); an entry is EVICTED (forget) when its unit unmounts, so the map does
+// not grow with the node's cumulative mount count over its lifetime (a remount
+// opens a fresh backend = a fresh key).
 type flushGroup struct {
 	// mu guards states (its creation + entry lookup/insert). Held only for the
 	// O(1) map access, never across a Flush.
@@ -141,4 +142,18 @@ func (g *flushGroup) runFlush(f backend.Flusher, st *flushGroupState) {
 		}
 		st.mu.Unlock()
 	}
+}
+
+// forget drops the per-unit group-commit state for a backend that is unmounting,
+// so states does not grow with the node's cumulative mount count. A flush-runner
+// already in flight holds its own *flushGroupState pointer and is unaffected -
+// its pending waiters are still served; this only removes the map entry so a
+// future mount of the same unit (a fresh backend) starts clean. No-op if absent.
+func (g *flushGroup) forget(f backend.Flusher) {
+	if f == nil {
+		return
+	}
+	g.mu.Lock()
+	delete(g.states, f)
+	g.mu.Unlock()
 }

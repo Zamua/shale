@@ -262,3 +262,32 @@ func TestFlushGroup_FlushErrorFansOutAndDoesNotWedge(t *testing.T) {
 		t.Fatalf("the post-error write must have flushed once more; total flushes %d", got)
 	}
 }
+
+// TestFlushGroup_ForgetEvictsEntry pins the bounded-lifetime eviction: after a
+// flush creates a per-unit entry, forget removes it so the states map does not
+// grow with cumulative mount count. An absent key is a no-op.
+func TestFlushGroup_ForgetEvictsEntry(t *testing.T) {
+	var g flushGroup
+	f := &gateFlusher{}
+	if err := g.flush(f); err != nil {
+		t.Fatalf("flush: %v", err)
+	}
+	g.mu.Lock()
+	_, present := g.states[f]
+	g.mu.Unlock()
+	if !present {
+		t.Fatalf("entry should exist after a flush")
+	}
+	g.forget(f)
+	g.mu.Lock()
+	_, stillPresent := g.states[f]
+	g.mu.Unlock()
+	if stillPresent {
+		t.Fatalf("forget must evict the entry")
+	}
+	// A fresh flush after forget re-creates cleanly and still flushes.
+	if err := g.flush(f); err != nil {
+		t.Fatalf("post-forget flush: %v", err)
+	}
+	g.forget(nil) // no-op, must not panic
+}
