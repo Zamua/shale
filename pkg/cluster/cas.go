@@ -46,6 +46,46 @@ var casBaseBackoff = 2 * time.Millisecond
 // tests can shrink it.
 var transactUnavailableTimeout = 30 * time.Second
 
+// transactRetryableBackoffCap bounds the exponential backoff the retryable-
+// status branch of Transact grows into: each consecutive retryable commit
+// failure doubles the backoff from casBaseBackoff up to this cap, and the
+// sleep before each re-run is full-jitter, a uniform random duration in
+// (0, current-backoff]. var so tests can tune it.
+var transactRetryableBackoffCap = 500 * time.Millisecond
+
+// transactRetryableMaxRuns caps how many times Transact re-runs fn through a
+// retryable commit status before giving up with ErrTransactRetriesExhausted.
+// A retryable status does NOT always mean the prior commit applied nothing: a
+// commit whose owner-local apply durably succeeded but whose replica fan-out
+// missed W surfaces the same retryable code, and every re-run then issues a
+// FRESH durable commit. The cap bounds how many durable commits one Transact
+// can issue while riding out the window; an unbounded loop on an aggressive
+// flat backoff re-commits every few milliseconds for the whole
+// transactUnavailableTimeout, amplifying write load quadratically under
+// contention on one unit. transactUnavailableTimeout remains the outer
+// wall-clock bound; whichever trips first ends the loop. var so tests can
+// shrink it.
+var transactRetryableMaxRuns = 24
+
+// ErrTransactRetriesExhausted marks a Transact that gave up after
+// transactRetryableMaxRuns re-runs through a retryable commit status
+// (codes.Unavailable / codes.FailedPrecondition). It is returned WRAPPED
+// around the last commit error, so status.FromError still resolves the
+// retryable gRPC status through the wrap (callers classifying by code keep
+// working) while errors.Is against this sentinel lets a caller distinguish
+// "gave up retrying transient unavailability" from a hard failure.
+var ErrTransactRetriesExhausted = errors.New("cluster: Transact retryable-commit re-run budget exhausted")
+
+// transactSleep is the sleeper the retryable-status branch of Transact uses
+// between re-runs. var so unit tests can capture the requested backoff
+// durations instead of really sleeping.
+var transactSleep = time.Sleep
+
+// transactCommit commits a CAS-buffered transaction on behalf of Transact.
+// var so unit tests can inject retryable commit outcomes without standing up
+// a multi-node cluster; production behavior is exactly tx.Commit().
+var transactCommit = func(tx *clusterTx) error { return tx.Commit() }
+
 // CommitCASApply is the owner-side validate-and-apply: the heart of the
 // CAS protocol. It runs fully synchronously and owner-local, against a
 // single short backend.Transaction that opens and commits without any
@@ -400,10 +440,19 @@ func bytesEqual(a, b []byte) bool {
 // updates) is the convention.
 //
 // A commit that fails with a RETRYABLE status is NOT a conflict and NOT a hard
-// failure: Transact re-runs fn after a randomized backoff WITHOUT consuming the
-// conflict budget, up to transactUnavailableTimeout, so a brief reshard window
-// is transparent to the caller. Two status codes are retryable here (see
-// commitRetryable + docs/SPEC.md "The retry closure"):
+// failure: Transact re-runs fn after a backoff WITHOUT consuming the conflict
+// budget, so a brief reshard window is transparent to the caller. The backoff
+// is exponential with full jitter (a uniform random sleep in (0, backoff],
+// doubling per consecutive retryable failure from casBaseBackoff up to
+// transactRetryableBackoffCap), and the re-runs are bounded BOTH by
+// transactUnavailableTimeout and by transactRetryableMaxRuns, whichever trips
+// first. The bounds exist because a retryable status does not always mean the
+// prior commit applied nothing: a commit that durably applied owner-locally
+// but missed W on the replica fan-out surfaces the same retryable code, so an
+// aggressive unbounded retry loop re-issues fresh durable commits and
+// amplifies write load quadratically under contention on one unit. Two status
+// codes are retryable here (see commitRetryable + docs/SPEC.md "The retry
+// closure"):
 //   - codes.Unavailable: the cluster is briefly write-frozen for a reshard, or
 //     the pin unit's lease is mid-handoff.
 //   - codes.FailedPrecondition: a forwarded CommitCAS landed on the node that
@@ -415,12 +464,16 @@ func bytesEqual(a, b []byte) bool {
 //     immediately, before any commit.
 //
 // Past transactUnavailableTimeout either code surfaces as-is (still a retryable
-// status the caller may handle).
+// status the caller may handle); past transactRetryableMaxRuns the error is
+// wrapped in ErrTransactRetriesExhausted (errors.Is-distinguishable, and still
+// resolving to the retryable status via status.FromError).
 func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error) error {
 	if c.notReady() {
 		return backend.ErrClosed
 	}
 	var conflicted bool
+	retryableRuns := 0
+	retryableBackoff := casBaseBackoff
 	unavailableDeadline := time.Now().Add(transactUnavailableTimeout)
 	for attempt := 0; attempt < CASMaxAttempts; attempt++ {
 		tx := c.newCASTx(backend.SnapshotIsolation)
@@ -435,24 +488,46 @@ func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error)
 			_ = tx.Rollback()
 			return err
 		}
-		err = tx.Commit()
+		err = transactCommit(tx)
 		if err == nil {
 			return nil
 		}
 		// A retryable commit status (freeze / handoff Unavailable, or the
 		// reshard-cutover re-pin FailedPrecondition) is transient: back off and
 		// re-run fn from scratch without spending a conflict attempt, until the
-		// deadline. This makes a reshard barrier invisible to Transact callers -
-		// the commit re-resolves the owner from the live ring each attempt, so a
-		// re-run after a cutover lands on the new owner (the commit's gRPC status
+		// deadline or the re-run cap, whichever trips first. This makes a
+		// reshard barrier invisible to Transact callers - the commit
+		// re-resolves the owner from the live ring each attempt, so a re-run
+		// after a cutover lands on the new owner (the commit's gRPC status
 		// survives the wire per the CAS server's status-preserving path).
+		//
+		// The loop is POLITE by construction (see docs/SPEC.md "The
+		// retryable-status loop is polite"): a retryable status does not
+		// always mean the prior commit applied nothing (an owner-local commit
+		// that durably applied but missed W on the fan-out surfaces the same
+		// code), so each re-run can issue a fresh durable commit. The backoff
+		// grows exponentially with full jitter (uniform in (0, backoff],
+		// doubling per consecutive retryable failure up to
+		// transactRetryableBackoffCap) and the re-runs are capped at
+		// transactRetryableMaxRuns, past which the wrapped
+		// ErrTransactRetriesExhausted surfaces (still carrying the retryable
+		// status for callers that classify by code).
 		if commitRetryable(err) {
 			if time.Now().After(unavailableDeadline) {
 				return err
 			}
-			if casBaseBackoff > 0 {
-				jitter := time.Duration(rand.Int63n(int64(casBaseBackoff) + 1))
-				time.Sleep(casBaseBackoff + jitter)
+			if retryableRuns >= transactRetryableMaxRuns {
+				return fmt.Errorf("%w after %d re-runs: last commit error: %w",
+					ErrTransactRetriesExhausted, retryableRuns, err)
+			}
+			retryableRuns++
+			if retryableBackoff > 0 {
+				// Full jitter: a uniform random sleep in (0, retryableBackoff].
+				transactSleep(time.Duration(rand.Int63n(int64(retryableBackoff)) + 1))
+			}
+			retryableBackoff *= 2
+			if retryableBackoff > transactRetryableBackoffCap {
+				retryableBackoff = transactRetryableBackoffCap
 			}
 			attempt-- // do not consume the conflict budget for a transient freeze
 			continue
