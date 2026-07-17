@@ -337,41 +337,80 @@ func TestCASReplicate_WriteOne_SucceedsWithOwnerOnly(t *testing.T) {
 	}
 }
 
-// TestCASReplicate_WriteAll_FailsWhenReplicaDown: with WriteAll (W=3), a
-// CAS commit returns an error (under-W) when a replica's gRPC is down,
-// even though the owner's local commit already happened. The error is the
-// best-effort-to-W signal, NOT a conflict.
-func TestCASReplicate_WriteAll_FailsWhenReplicaDown(t *testing.T) {
-	// The down replica makes the under-W commit return a PERMANENT
-	// codes.Unavailable, which Transact treats as retryable. Without a short
-	// deadline it would re-run fn for the full production transactUnavailableTimeout
-	// (30s) before surfacing the error. The assertion below only cares THAT the
-	// error is a non-conflict failure, not how long the deadline is, so shrink it.
-	prevTO := cluster.SetTransactUnavailableTimeout(50 * time.Millisecond)
+// TestCASReplicate_WriteAll_UnderReplicatedCommitSucceeds: with WriteAll
+// (W=3) and a co-replica's gRPC down, a CAS commit that misses W is a SUCCESS
+// with degraded replication (outcome (c)), NOT an error. The owner-local
+// commit is durable, so the write is readable on the owner immediately and
+// Transact returns nil. This is the ROOT-fix re-contract of the old "under-W
+// fails" behavior: the owner-local commit already applied, so a fan-out
+// shortfall cannot fail it. See docs/SPEC.md "The four commit outcomes".
+func TestCASReplicate_WriteAll_UnderReplicatedCommitSucceeds(t *testing.T) {
+	// Shrink the retryable window + zero the backoff so that IF this fix ever
+	// regresses (the under-W commit surfaces retryable again), the test fails
+	// FAST with a re-run count instead of spinning for the production 30s.
+	prevTO := cluster.SetTransactUnavailableTimeout(500 * time.Millisecond)
 	defer cluster.SetTransactUnavailableTimeout(prevTO)
+	prevBK := cluster.SetCASBaseBackoffZero()
+	defer cluster.RestoreCASBaseBackoff(prevBK)
 
 	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadNearest)
 
-	nodes[2].stopGRPC()
+	key := []byte("durable")
+	owner := ownsCASPinIndex(t, nodes, key)
+	// Stop the gRPC of a co-replica (NOT the owner) so the owner commits
+	// locally but the fan-out cannot reach W=3.
+	stopACoReplica(nodes, owner)
 
-	var commitErr error
-	for _, n := range nodes {
-		commitErr = n.cluster.Transact([]byte("durable"), func(tx backend.Transaction) error {
-			if _, err := tx.Get([]byte("durable")); err != nil && !errors.Is(err, backend.ErrNotFound) {
-				return err
-			}
-			return tx.Put([]byte("durable"), []byte("x"))
-		})
-		if st, ok := status.FromError(commitErr); ok && st.Code() == codes.FailedPrecondition {
-			continue
+	fnRuns := 0
+	err := nodes[owner].cluster.Transact(key, func(tx backend.Transaction) error {
+		fnRuns++
+		if _, gerr := tx.Get(key); gerr != nil && !errors.Is(gerr, backend.ErrNotFound) {
+			return gerr
 		}
-		break
+		return tx.Put(key, []byte("x"))
+	})
+	if err != nil {
+		t.Fatalf("under-W WriteAll commit must SUCCEED (durable on owner); got %v", err)
 	}
-	if commitErr == nil {
-		t.Fatalf("WriteAll Transact with a replica down should fail under-W")
+	if fnRuns != 1 {
+		t.Fatalf("a committed-under-replicated commit must run fn exactly once (no re-run); ran %d", fnRuns)
 	}
-	if errors.Is(commitErr, backend.ErrCASConflict) {
-		t.Fatalf("under-W must NOT surface as a conflict: %v", commitErr)
+	// The write is durable on the owner's local backend immediately (no data
+	// loss), stored as a stamped envelope.
+	env, ok := decodeReplica(t, nodes[owner], key)
+	if !ok || !bytes.Equal(env.Payload, []byte("x")) {
+		t.Fatalf("under-replicated write must be durable on the owner; present=%v payload=%q", ok, env.Payload)
+	}
+}
+
+// ownsCASPinIndex returns the index of the node that is the designated CAS
+// owner of pinKey (steady state, after convergence). Fails if no single node
+// claims it.
+func ownsCASPinIndex(t *testing.T, nodes []*replicatedNode, pinKey []byte) int {
+	t.Helper()
+	owner := -1
+	for i, n := range nodes {
+		if n.cluster.OwnsCASPin(pinKey) {
+			if owner != -1 {
+				t.Fatalf("two nodes claim CAS ownership of %q (n%d and n%d)", pinKey, owner, i)
+			}
+			owner = i
+		}
+	}
+	if owner == -1 {
+		t.Fatalf("no node owns CAS pin %q", pinKey)
+	}
+	return owner
+}
+
+// stopACoReplica stops the gRPC server of the FIRST node that is not owner, so
+// the owner's fan-out loses one ack while the owner itself stays up.
+func stopACoReplica(nodes []*replicatedNode, owner int) {
+	for i, n := range nodes {
+		if i != owner {
+			n.stopGRPC()
+			return
+		}
 	}
 }
 

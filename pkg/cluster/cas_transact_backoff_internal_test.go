@@ -2,19 +2,22 @@ package cluster
 
 // White-box tests for the retryable-status branch of Transact: the loop that
 // rides out a transient codes.Unavailable / codes.FailedPrecondition commit.
-// A retryable status does NOT always mean the prior commit applied nothing
-// (an owner-local commit that durably applied but missed W on the fan-out
-// surfaces the same code), so every re-run can issue a FRESH durable commit.
-// The loop must therefore be polite: exponential backoff with full jitter
-// (base casBaseBackoff, x2 per consecutive retryable failure, capped at
+// The retryable statuses this loop handles are outcome (d) only - a PRE-commit
+// refusal that applied nothing (a cluster-wide freeze, a lease mid-handoff, a
+// reshard-cutover re-pin, a recoded graceful-leave fence). A committed-but-
+// under-replicated commit (outcome (c)) is classified as success at the source
+// and NEVER reaches this loop, so these tests exercise the (d) re-run path.
+// The loop must still be polite: exponential backoff with full jitter (base
+// casBaseBackoff, x2 per consecutive retryable failure, capped at
 // transactRetryableBackoffCap, sleep uniform in (0, current-backoff]) and a
 // hard cap of transactRetryableMaxRuns re-runs ending in
 // ErrTransactRetriesExhausted (which still carries the retryable gRPC status
-// through the wrap). See docs/SPEC.md "The retryable-status loop is polite".
+// through the wrap). See docs/SPEC.md "The four commit outcomes".
 //
 // The tests inject the commit outcome via the transactCommit seam and capture
 // the requested sleeps via the transactSleep seam, so no multi-node cluster
-// (and no real sleeping) is needed.
+// (and no real sleeping) is needed. The seam returns a raw error to the loop,
+// standing in for a (d) pre-commit refusal.
 
 import (
 	"errors"
@@ -78,7 +81,7 @@ func TestTransact_RetryableBackoff_GrowsExponentiallyToCapWithFullJitter(t *test
 	commits := 0
 	sleeps := setTransactSeams(t, func() error {
 		commits++
-		return status.Error(codes.Unavailable, "replica fan-out under W")
+		return status.Error(codes.Unavailable, "cluster write-frozen for reshard")
 	})
 
 	err := c.Transact([]byte("k"), func(_ backend.Transaction) error { return nil })
@@ -127,7 +130,7 @@ func TestTransact_RetryableRerunCap_TerminalError(t *testing.T) {
 	commits := 0
 	setTransactSeams(t, func() error {
 		commits++
-		return status.Error(codes.Unavailable, "replica fan-out under W")
+		return status.Error(codes.Unavailable, "cluster write-frozen for reshard")
 	})
 	transactRetryableMaxRuns = 5
 

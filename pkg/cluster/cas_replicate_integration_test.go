@@ -31,8 +31,6 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // ownerIndex returns the index of the node that owns key, or -1 if no node
@@ -157,20 +155,24 @@ func TestCASReplicate_R3_WriteQuorum_ToleratesOneReplicaDown(t *testing.T) {
 	}
 }
 
-// TestCASReplicate_R3_WriteAll_FailsWhenOneReplicaDown pins
-// requirement (3): R=3 + WriteAll (W=3). With one replica down the CAS
-// commit cannot collect 3 acks and returns an under-W error (NOT a
-// conflict). The owner's LOCAL commit has ALREADY landed (replication is
-// best-effort-to-W after the local tx commits), so we assert the value IS
-// present on the owner's backend even though the commit reported an error.
-func TestCASReplicate_R3_WriteAll_FailsWhenOneReplicaDown(t *testing.T) {
-	// The down replica makes the under-W commit return a PERMANENT
-	// codes.Unavailable, which Transact treats as retryable. Without a short
-	// deadline it would re-run fn for the full production transactUnavailableTimeout
-	// (30s) before surfacing the error. The assertions below only care about the
-	// error code + the durable local commit, not the deadline length, so shrink it.
-	prevTO := cluster.SetTransactUnavailableTimeout(50 * time.Millisecond)
+// TestCASReplicate_R3_WriteAll_UnderReplicatedCommitSucceeds pins
+// requirement (3) under the ROOT fix: R=3 + WriteAll (W=3). With one replica
+// down the CAS commit cannot collect 3 acks, but the owner-local commit has
+// ALREADY landed durably (replication is best-effort-to-W AFTER the local tx
+// commits), so the shortfall is a SUCCESS with degraded replication (outcome
+// (c)), NOT an error. The commit returns nil, fn runs exactly once (no re-run
+// / re-commit amplification), and the value is durable on the owner's backend.
+// This is the intended behavioral change: under-W no longer surfaces as a
+// retryable error the Transact loop re-commits. See docs/SPEC.md "The four
+// commit outcomes".
+func TestCASReplicate_R3_WriteAll_UnderReplicatedCommitSucceeds(t *testing.T) {
+	// Shrink the retryable window + zero the backoff so a REGRESSION (under-W
+	// surfacing retryable again) fails FAST instead of spinning for the
+	// production 30s.
+	prevTO := cluster.SetTransactUnavailableTimeout(500 * time.Millisecond)
 	defer cluster.SetTransactUnavailableTimeout(prevTO)
+	prevBK := cluster.SetCASBaseBackoffZero()
+	defer cluster.RestoreCASBaseBackoff(prevBK)
 
 	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadQuorum)
 
@@ -182,25 +184,24 @@ func TestCASReplicate_R3_WriteAll_FailsWhenOneReplicaDown(t *testing.T) {
 	down := (owner + 1) % 3
 	nodes[down].stopGRPC()
 
+	fnRuns := 0
 	err := nodes[owner].cluster.Transact(key, func(tx backend.Transaction) error {
+		fnRuns++
 		if _, gerr := tx.Get(key); gerr != nil && !errors.Is(gerr, backend.ErrNotFound) {
 			return gerr
 		}
 		return tx.Put(key, []byte("av"))
 	})
-	if err == nil {
-		t.Fatalf("WriteAll CAS commit with one replica down should fail under-W")
+	if err != nil {
+		t.Fatalf("under-W WriteAll CAS commit must SUCCEED (durable on owner); got %v", err)
 	}
-	if errors.Is(err, backend.ErrCASConflict) {
-		t.Fatalf("under-W must NOT surface as a conflict: %v", err)
-	}
-	if st, ok := status.FromError(err); ok && st.Code() != codes.Unavailable {
-		t.Errorf("want codes.Unavailable for under-W, got %v", st.Code())
+	if fnRuns != 1 {
+		t.Fatalf("a committed-under-replicated commit must run fn exactly once (no re-run); ran %d", fnRuns)
 	}
 
 	// Local commit landed despite the under-W fan-out: the owner's backend
-	// holds the stamped envelope. (Document the assertion: the write is
-	// durable on the owner, just not on W replicas.)
+	// holds the stamped envelope. The write is durable on the owner, just not
+	// on W replicas.
 	env, ok := decodeReplica(t, nodes[owner], key)
 	if !ok {
 		t.Fatalf("owner backend should hold the locally-committed envelope after under-W")
