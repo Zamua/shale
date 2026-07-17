@@ -414,14 +414,20 @@ message WriteOp {
   bool delete = 3;
 }
 
-// CommitCASResponse reports the outcome. committed, conflict, and error are
-// mutually exclusive: exactly one is meaningful per response. A conflict is
-// NOT an error: it is the expected OCC retry signal, so it travels as a
-// typed bool rather than a gRPC error code.
+// CommitCASResponse reports the outcome. A conflict is NOT an error: it is
+// the expected OCC retry signal, so it travels as a typed bool rather than a
+// gRPC error code. committed and conflict are mutually exclusive; error is
+// set only on a NOT-committed failure. under_replicated is an ADDITIONAL flag
+// alongside committed==true: the owner-local commit durably applied but the
+// replica fan-out missed W (a success with degraded replication, NOT a
+// failure). It carries committed==true across the wire so a forwarding node
+// treats it as success and does NOT re-run the transaction (re-committing an
+// already-durable write). See docs/SPEC.md "The four commit outcomes".
 message CommitCASResponse {
   bool committed = 1;
   bool conflict = 2;
   string error = 3;
+  bool under_replicated = 4;
 }
 
 // -- ApplyBatch ------------------------------------------------------

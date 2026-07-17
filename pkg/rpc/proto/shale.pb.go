@@ -1730,17 +1730,23 @@ func (x *WriteOp) GetDelete() bool {
 	return false
 }
 
-// CommitCASResponse reports the outcome. committed, conflict, and error are
-// mutually exclusive: exactly one is meaningful per response. A conflict is
-// NOT an error: it is the expected OCC retry signal, so it travels as a
-// typed bool rather than a gRPC error code.
+// CommitCASResponse reports the outcome. A conflict is NOT an error: it is
+// the expected OCC retry signal, so it travels as a typed bool rather than a
+// gRPC error code. committed and conflict are mutually exclusive; error is
+// set only on a NOT-committed failure. under_replicated is an ADDITIONAL flag
+// alongside committed==true: the owner-local commit durably applied but the
+// replica fan-out missed W (a success with degraded replication, NOT a
+// failure). It carries committed==true across the wire so a forwarding node
+// treats it as success and does NOT re-run the transaction (re-committing an
+// already-durable write). See docs/SPEC.md "The four commit outcomes".
 type CommitCASResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Committed     bool                   `protobuf:"varint,1,opt,name=committed,proto3" json:"committed,omitempty"`
-	Conflict      bool                   `protobuf:"varint,2,opt,name=conflict,proto3" json:"conflict,omitempty"`
-	Error         string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Committed       bool                   `protobuf:"varint,1,opt,name=committed,proto3" json:"committed,omitempty"`
+	Conflict        bool                   `protobuf:"varint,2,opt,name=conflict,proto3" json:"conflict,omitempty"`
+	Error           string                 `protobuf:"bytes,3,opt,name=error,proto3" json:"error,omitempty"`
+	UnderReplicated bool                   `protobuf:"varint,4,opt,name=under_replicated,json=underReplicated,proto3" json:"under_replicated,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *CommitCASResponse) Reset() {
@@ -1792,6 +1798,13 @@ func (x *CommitCASResponse) GetError() string {
 		return x.Error
 	}
 	return ""
+}
+
+func (x *CommitCASResponse) GetUnderReplicated() bool {
+	if x != nil {
+		return x.UnderReplicated
+	}
+	return false
 }
 
 // ApplyBatchRequest carries one CAS write-set fan-out from owner to
@@ -2244,11 +2257,12 @@ const file_shale_proto_rawDesc = "" +
 	"\aWriteOp\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x16\n" +
-	"\x06delete\x18\x03 \x01(\bR\x06delete\"c\n" +
+	"\x06delete\x18\x03 \x01(\bR\x06delete\"\x8e\x01\n" +
 	"\x11CommitCASResponse\x12\x1c\n" +
 	"\tcommitted\x18\x01 \x01(\bR\tcommitted\x12\x1a\n" +
 	"\bconflict\x18\x02 \x01(\bR\bconflict\x12\x14\n" +
-	"\x05error\x18\x03 \x01(\tR\x05error\"D\n" +
+	"\x05error\x18\x03 \x01(\tR\x05error\x12)\n" +
+	"\x10under_replicated\x18\x04 \x01(\bR\x0funderReplicated\"D\n" +
 	"\x11ApplyBatchRequest\x12/\n" +
 	"\x06writes\x18\x01 \x03(\v2\x17.shale.v1.EnvelopeWriteR\x06writes\"=\n" +
 	"\rEnvelopeWrite\x12\x10\n" +

@@ -22,6 +22,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"google.golang.org/grpc/codes"
@@ -152,11 +153,36 @@ type replicatedNode struct {
 	stopOther func()
 }
 
+// replicatedClusterOpt tweaks the replicated-cluster harness. Backward
+// compatible: existing callers pass none and get the memory-backend default.
+type replicatedClusterOpt func(*replicatedClusterCfg)
+
+type replicatedClusterCfg struct {
+	// wrapBackend, when set, wraps each node's memory backend before it is
+	// handed to cluster.Open, so a test can install a capability wrapper (e.g.
+	// a backend.Flusher counter) as the node's Backend. i is the node index and
+	// mem is that node's underlying *memory.Memory (still the replicatedNode.mem
+	// used for direct reads). The returned backend becomes cfg.Backend.
+	wrapBackend func(i int, mem *memory.Memory) backend.Backend
+}
+
+// withWrappedBackends installs a per-node backend wrapper (see
+// replicatedClusterCfg.wrapBackend). Used by the CAS under-W durability-flush
+// tests to make the owner backend a Flusher whose calls they can count.
+func withWrappedBackends(wrap func(i int, mem *memory.Memory) backend.Backend) replicatedClusterOpt {
+	return func(c *replicatedClusterCfg) { c.wrapBackend = wrap }
+}
+
 // startThreeNodeReplicatedCluster brings up 3 in-process nodes wired
 // over gRPC + memberlist, then waits for membership convergence +
 // rebalance idle. Returns the nodes; t.Cleanup tears them down.
-func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc cluster.WriteConsistency, rc cluster.ReadConsistency) []*replicatedNode {
+func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc cluster.WriteConsistency, rc cluster.ReadConsistency, opts ...replicatedClusterOpt) []*replicatedNode {
 	t.Helper()
+
+	var rc0 replicatedClusterCfg
+	for _, o := range opts {
+		o(&rc0)
+	}
 
 	mems := []*memory.Memory{memory.New(), memory.New(), memory.New()}
 	bindPorts := []int{freePort(t), freePort(t), freePort(t)}
@@ -168,9 +194,13 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 
 	clusters := make([]*cluster.Cluster, 3)
 	for i := range 3 {
+		var be backend.Backend = mems[i]
+		if rc0.wrapBackend != nil {
+			be = rc0.wrapBackend(i, mems[i])
+		}
 		cfg := cluster.Config{
 			NodeID:               fmt.Sprintf("rep-n%d", i+1),
-			Backend:              mems[i],
+			Backend:              be,
 			BindAddr:             hostPort(bindPorts[i]),
 			GRPCAddr:             grpcHarnesses[i].addr,
 			LogOutput:            io.Discard,

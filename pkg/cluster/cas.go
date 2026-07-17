@@ -55,14 +55,17 @@ var transactRetryableBackoffCap = 500 * time.Millisecond
 
 // transactRetryableMaxRuns caps how many times Transact re-runs fn through a
 // retryable commit status before giving up with ErrTransactRetriesExhausted.
-// A retryable status does NOT always mean the prior commit applied nothing: a
-// commit whose owner-local apply durably succeeded but whose replica fan-out
-// missed W surfaces the same retryable code, and every re-run then issues a
-// FRESH durable commit. The cap bounds how many durable commits one Transact
-// can issue while riding out the window; an unbounded loop on an aggressive
-// flat backoff re-commits every few milliseconds for the whole
-// transactUnavailableTimeout, amplifying write load quadratically under
-// contention on one unit. transactUnavailableTimeout remains the outer
+// The retryable statuses that reach this loop are outcome (d) only: a PRE-
+// commit refusal that applied nothing (a cluster-wide freeze / lease mid-
+// handoff codes.Unavailable, a reshard-cutover codes.FailedPrecondition, a
+// graceful-leave fence recoded to codes.Unavailable). A committed-but-under-
+// replicated commit (outcome (c)) is NO LONGER one of them: it is classified as
+// success-under-replication at the source (CommitCASApply / casResultToError),
+// so it never enters this loop. The cap therefore bounds how many times one
+// Transact re-runs fn while riding out a genuine transient window; an unbounded
+// loop on an aggressive flat backoff re-runs every few milliseconds for the
+// whole transactUnavailableTimeout, and a herd of callers behind one freeze
+// hammers the (unfreezing) owner. transactUnavailableTimeout remains the outer
 // wall-clock bound; whichever trips first ends the loop. var so tests can
 // shrink it.
 var transactRetryableMaxRuns = 24
@@ -128,9 +131,18 @@ var transactCommit = func(tx *clusterTx) error { return tx.Commit() }
 // stamped removal). After the local commit succeeds it fans the SAME
 // encoded envelopes out to the R-1 other replicas via ApplyBatch, waiting
 // for W total acks (the owner's local commit is one of them). An under-W
-// fan-out returns {Err: codes.Unavailable} but the write is ALREADY
-// durable on the owner + any replica that acked: same best-effort-to-W
-// shape single-key Put has. See docs/SPEC.md "Write-set replication".
+// fan-out returns {Committed: true, UnderReplicated: true, Err: <under-W
+// error>} - a SUCCESS with degraded replication, NOT a failure: the write
+// is ALREADY durable on the owner + any replica that acked (same best-
+// effort-to-W shape single-key Put has), so the commit must never be
+// retried away. committed==true is the sound discriminator because the
+// owner-local Commit already returned before the fan-out ran. Because the
+// pods run relaxed (slate AwaitDurable=false, ack from the memtable), the
+// under-W branch first SYNCHRONOUSLY FLUSHES the owner's local backend to
+// the object store (flushOwnerUnderReplicated), so the lone owner copy is
+// bucket-durable before success returns; a flush failure is the one under-W
+// case that returns a terminal {Err} instead of success. See docs/SPEC.md
+// "The four commit outcomes" + "Write-set replication".
 //
 // pinKey anchors the replica-set lookup; every key in the commit co-
 // shards with it (the client's cross-shard guard guarantees this), so one
@@ -273,26 +285,107 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 
 	// At R>1, the write-set is now durable on the owner. Fan the SAME
 	// encoded envelopes out to the R-1 other replicas, waiting for W total
-	// acks (owner's local commit pre-counted as 1). An under-W result is
-	// {Err: codes.Unavailable}: the write is already durable on the owner
-	// + any replica that acked, the same best-effort-to-W model single-key
-	// Put has. A read-only commit (no writes) has nothing to replicate.
+	// acks (owner's local commit pre-counted as 1). An under-W result is a
+	// committed-under-replication SUCCESS (see the return below), NOT an
+	// error: the write is already durable on the owner + any replica that
+	// acked, the same best-effort-to-W model single-key Put has. A read-only
+	// commit (no writes) has nothing to replicate.
 	if replicated && len(encodedWrites) > 0 {
 		// Thread the position the owner-local commit applied to (the pausedTx's
 		// resolved ru, multi mode) into the fan-out, so the owner's OTHER mounted
 		// position of the pin unit (the index-shuffling survivor mid-transition)
 		// receives the batch too and counts as a durable ack - the CAS mirror of
 		// the put path's dual-position routing. Zero-valued on the legacy per-node
-		// path (no pausedTx), where the attempt ignores it.
+		// path (no pausedTx), where the attempt ignores it. ownerBackend is the
+		// SAME mounted backend the owner-local commit applied against: pt.b in
+		// multi mode, c.backend on the legacy per-node replicated path (no
+		// pausedTx). It is the flush target on the under-W branch below.
 		var committedRU storageunit.ReplicaUnit
+		ownerBackend := c.backend
 		if pt, ok := tx.(*pausedTx); ok {
 			committedRU = pt.ru
+			ownerBackend = pt.b
 		}
 		if err := c.replicateCASBatch(pinKey, committedRU, encodedWrites); err != nil {
-			return backend.CASResult{Err: err}
+			// POST-commit failure. committed==true is the sound discriminator:
+			// everything after the owner-local tx.Commit() above succeeded, and
+			// the ONLY thing that can fail here is replicateCASBatch, whose every
+			// error return is a W-shortfall on the fan-out (a codes.Unavailable;
+			// see replicateCASBatchAttempt / classifyWriteAttempt). So this is
+			// definitionally committed-but-under-replicated, NOT not-committed:
+			// the write is durable on the owner (+ any replica that acked).
+			//
+			// DURABILITY CLOSING ADDITION (relaxed-durability seal). shale runs the
+			// pods RELAXED (slate AwaitDurable=false, ack from the memtable) and
+			// buys durability from REPLICATION: an ack to W replicas is W
+			// independent in-RAM copies that survive a single pod loss. The NORMAL
+			// W-reached path above deliberately does NOT flush (that is the whole
+			// performance design). But on THIS under-W branch the replication
+			// safety net MISSED: the write's only copy is in the owner's memtable
+			// (RAM), so acking it as durable would be unsound (an owner-pod crash
+			// in the sub-second pre-flush window is silent loss). So before
+			// returning success, synchronously FLUSH the owner's local backend to
+			// the object store, converting that lone copy from RAM-only to bucket-
+			// durable. The lock is already released (casMuHeld==false) so the flush
+			// I/O holds no lock; a backend that is already synchronously durable
+			// (memory/pebble, or slate at AwaitDurable=true) does not implement
+			// backend.Flusher and is skipped (no RAM-loss window to close).
+			if ferr := c.flushOwnerUnderReplicated(ownerBackend); ferr != nil {
+				// The flush FAILED: the lone owner copy could not be persisted.
+				// That is a genuine durability failure (committed to the memtable,
+				// could NOT be made bucket-durable), so we do NOT report success -
+				// we surface the flush error as a not-committed error the caller
+				// sees (committed-but-couldnt-persist is real; the caller must know).
+				// This does NOT amplify: a flush I/O failure is a TERMINAL error,
+				// NOT the retryable under-W codes.Unavailable, so casResultToError
+				// returns it and Transact does NOT re-run fn (the write-set applied
+				// at most once). The one flush error that DOES classify retryable is
+				// a fence (a successor opened the db at a higher epoch in the post-
+				// commit window); re-running fn there is safe, not amplifying,
+				// because a fenced memtable write was never persisted, so the OCC
+				// re-commit on the successor is a clean single apply. committed is
+				// already true, so the deferred Rollback stays suppressed - we do
+				// not un-apply the owner-local write, we only report that its
+				// durability could not be confirmed.
+				return backend.CASResult{Err: ferr}
+			}
+			// Owner copy is now bucket-durable. Return committed-under-replication
+			// SUCCESS so Transact does NOT re-run fn and re-commit an already-
+			// durable write (the amplification + false-conflict bug). Err is
+			// preserved for logging/observability only; the caller maps
+			// Committed==true to nil. The missing replica COUNT heals via apply-if-
+			// newer read-repair on the next quorum Get (NOT via the fan-out's own
+			// WriteTimeout-bounded retry - that is already exhausted here, which is
+			// exactly what produced this under-W outcome). See docs/SPEC.md "The
+			// four commit outcomes".
+			return backend.CASResult{Committed: true, UnderReplicated: true, Err: err}
 		}
 	}
 	return backend.CASResult{Committed: true}
+}
+
+// flushOwnerUnderReplicated makes the owner's lone durable copy of an under-
+// replicated CAS commit bucket-durable, on the RARE under-W branch of
+// CommitCASApply only. ownerBackend is the mounted backend the owner-local
+// commit applied against (pt.b in multi mode, c.backend on the legacy per-node
+// replicated path). The flush is OPTIONAL by capability: a backend that is
+// already synchronously durable (memory/pebble, or slate at AwaitDurable=true)
+// does not implement backend.Flusher, so there is no RAM-loss window and the
+// flush is skipped (returns nil). flushableBackend unwraps the fencedSelfHealing
+// decorator storeMount wraps a mounted backend in, so a real slate mount at
+// AwaitDurable=false is found and Flush() forces its memtable durable to the
+// object store. A non-nil return is a genuine durability failure the under-W
+// branch surfaces terminally (see the call site); a nil return means the lone
+// copy is now bucket-durable (or the backend never had a loss window).
+func (c *Cluster) flushOwnerUnderReplicated(ownerBackend backend.Backend) error {
+	if ownerBackend == nil {
+		return nil
+	}
+	fl, ok := flushableBackend(ownerBackend)
+	if !ok {
+		return nil
+	}
+	return fl.Flush()
 }
 
 // casReadPayload reads key from the owner-local tx for a CAS read-check.
@@ -441,18 +534,21 @@ func bytesEqual(a, b []byte) bool {
 //
 // A commit that fails with a RETRYABLE status is NOT a conflict and NOT a hard
 // failure: Transact re-runs fn after a backoff WITHOUT consuming the conflict
-// budget, so a brief reshard window is transparent to the caller. The backoff
-// is exponential with full jitter (a uniform random sleep in (0, backoff],
+// budget, so a brief reshard window is transparent to the caller. Only outcome
+// (d) - a PRE-commit refusal that applied nothing - reaches this branch; a
+// committed-but-under-replicated commit (outcome (c)) is classified as success
+// at the source (CommitCASApply returns Committed==true and the tx-commit-to-
+// error conversion maps that to nil), so it never re-runs fn. The backoff is
+// exponential with full jitter (a uniform random sleep in (0, backoff],
 // doubling per consecutive retryable failure from casBaseBackoff up to
 // transactRetryableBackoffCap), and the re-runs are bounded BOTH by
 // transactUnavailableTimeout and by transactRetryableMaxRuns, whichever trips
-// first. The bounds exist because a retryable status does not always mean the
-// prior commit applied nothing: a commit that durably applied owner-locally
-// but missed W on the replica fan-out surfaces the same retryable code, so an
-// aggressive unbounded retry loop re-issues fresh durable commits and
-// amplifies write load quadratically under contention on one unit. Two status
-// codes are retryable here (see commitRetryable + docs/SPEC.md "The retry
-// closure"):
+// first. The bounds keep the loop polite: a herd of callers riding out one
+// multi-second freeze must not hammer the (unfreezing) owner with a flat few-
+// millisecond re-run rate. Every (d) re-run applied nothing, so it is a fresh
+// single-apply attempt, never a second durable commit of the same write-set.
+// Two status codes are retryable here (see commitRetryable + docs/SPEC.md "The
+// four commit outcomes"):
 //   - codes.Unavailable: the cluster is briefly write-frozen for a reshard, or
 //     the pin unit's lease is mid-handoff.
 //   - codes.FailedPrecondition: a forwarded CommitCAS landed on the node that
@@ -501,17 +597,19 @@ func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error)
 		// after a cutover lands on the new owner (the commit's gRPC status
 		// survives the wire per the CAS server's status-preserving path).
 		//
-		// The loop is POLITE by construction (see docs/SPEC.md "The
-		// retryable-status loop is polite"): a retryable status does not
-		// always mean the prior commit applied nothing (an owner-local commit
-		// that durably applied but missed W on the fan-out surfaces the same
-		// code), so each re-run can issue a fresh durable commit. The backoff
-		// grows exponentially with full jitter (uniform in (0, backoff],
-		// doubling per consecutive retryable failure up to
-		// transactRetryableBackoffCap) and the re-runs are capped at
-		// transactRetryableMaxRuns, past which the wrapped
-		// ErrTransactRetriesExhausted surfaces (still carrying the retryable
-		// status for callers that classify by code).
+		// Only outcome (d) reaches here - a PRE-commit refusal (freeze /
+		// handoff / reshard-cutover / recoded fence) that applied nothing.
+		// Outcome (c), a committed-but-under-replicated commit, is classified as
+		// success at the source (CommitCASApply -> casResultToError / the wire
+		// mapping return nil), so it never enters this loop and fn is never re-
+		// run for an already-durable write. The loop stays POLITE anyway (see
+		// docs/SPEC.md "The four commit outcomes"): a herd behind one multi-
+		// second freeze would otherwise hammer the owner. The backoff grows
+		// exponentially with full jitter (uniform in (0, backoff], doubling per
+		// consecutive retryable failure up to transactRetryableBackoffCap) and
+		// the re-runs are capped at transactRetryableMaxRuns, past which the
+		// wrapped ErrTransactRetriesExhausted surfaces (still carrying the
+		// retryable status for callers that classify by code).
 		if commitRetryable(err) {
 			if time.Now().After(unavailableDeadline) {
 				return err
