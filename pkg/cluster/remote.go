@@ -302,6 +302,17 @@ func (c *Cluster) commitCAS(pinKey []byte, level backend.IsolationLevel, reads [
 	curOwner, isLocal := c.casDesignatedOwner(pinKey)
 	if isLocal {
 		res := c.CommitCASApply(context.Background(), level, pinKey, reads, writes)
+		if res.Committed && res.UnderReplicated {
+			// Committed durably on this (owner) node but the fan-out missed W.
+			// Log the degraded replication ONCE (res.Err is the under-W detail)
+			// before casResultToError maps Committed==true to nil - a success, so
+			// Transact does NOT re-run fn.
+			detail := "replica fan-out missed W"
+			if res.Err != nil {
+				detail = res.Err.Error()
+			}
+			c.warnUnderReplicated(pinKey, detail)
+		}
 		return casResultToError(res)
 	}
 	cli, err := c.clientFor(curOwner.Addr)
@@ -331,16 +342,71 @@ func (c *Cluster) commitCAS(pinKey []byte, level backend.IsolationLevel, reads [
 	if resp.GetConflict() {
 		return backend.ErrCASConflict
 	}
+	// Committed==true wins over any error string, mirroring casResultToError's
+	// ordering: the remote owner's owner-local commit durably applied, so the
+	// commit SUCCEEDED even when the fan-out missed W (under_replicated). The
+	// forwarding node must return nil so Transact does NOT re-run fn and re-
+	// commit an already-durable write. The owner already logged the under-W
+	// detail; note the degraded replication on the forwarding node too.
+	if resp.GetCommitted() {
+		if resp.GetUnderReplicated() {
+			c.warnUnderReplicated(pinKey, "owner reported W shortfall on the replica fan-out")
+		}
+		return nil
+	}
 	if e := resp.GetError(); e != "" {
 		return errors.New("cluster: CommitCAS owner error: " + e)
 	}
 	return nil
 }
 
+// warnUnderReplicated writes a single WARN to the configured log sink when a
+// CAS commit committed durably on the owner but replicated to fewer than W
+// replicas (outcome (c), docs/SPEC.md "The four commit outcomes"). Best-effort
+// observability, gated on cfg.LogOutput (nil sink => silent; the test default
+// is io.Discard). Rate-reasonable by construction: a committed-under-
+// replication result is now a SUCCESS and is NOT retried, so this fires at most
+// once per under-replicated commit, never once per re-run. detail is the under-
+// W fan-out error (owner path) or a short owner-reported note (forwarded path).
+func (c *Cluster) warnUnderReplicated(pinKey []byte, detail string) {
+	if c.cfg.LogOutput == nil {
+		return
+	}
+	if c.multi {
+		_, _ = fmt.Fprintf(c.cfg.LogOutput,
+			"WARN cluster: CAS commit under-replicated (durable on owner, missed W): key=%x unit=%s: %s\n",
+			pinKey, c.genUnitForKey(pinKey), detail)
+		return
+	}
+	_, _ = fmt.Fprintf(c.cfg.LogOutput,
+		"WARN cluster: CAS commit under-replicated (durable on owner, missed W): key=%x: %s\n",
+		pinKey, detail)
+}
+
 // casResultToError maps a backend.CASResult into the error the cluster
-// surface returns: nil on committed, backend.ErrCASConflict on conflict,
-// the backend / ownership error otherwise.
+// surface (clusterTx.Commit -> Transact) sees. It is the tx-commit-to-error
+// conversion the retry loop keys off, so the ordering of the checks is
+// load-bearing:
+//
+//   - Committed==true FIRST: the owner-local commit durably applied, so the
+//     transaction SUCCEEDED even when the replica fan-out missed W
+//     (UnderReplicated, with Err carrying the under-W detail for logging).
+//     Returns nil so Transact does NOT re-run fn - re-running would re-commit
+//     an already-durable write (amplification) and could make a retried
+//     insert observe its own committed write as a false conflict. The caller
+//     (commitCAS) logs the degraded replication once before this maps to nil.
+//   - Conflict: the OCC retry signal, backend.ErrCASConflict.
+//   - Err (with Committed==false): a genuine not-committed failure - a
+//     backend / ownership error, or a pre-commit retryable freeze / fence /
+//     reshard-cutover refusal that applied nothing and IS re-run by Transact.
+//
+// See docs/SPEC.md "The four commit outcomes".
 func casResultToError(r backend.CASResult) error {
+	if r.Committed {
+		// Success, possibly under-replicated. r.Err (if any) is the under-W
+		// detail, kept for the caller's WARN, and is deliberately NOT returned.
+		return nil
+	}
 	if r.Conflict {
 		return backend.ErrCASConflict
 	}

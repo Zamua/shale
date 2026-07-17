@@ -63,27 +63,50 @@ func (s *Server) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*pb.C
 	}
 
 	res := s.c.CommitCASApply(ctx, backend.IsolationLevel(req.GetIsolationLevel()), req.GetPinKey(), reads, writes)
+	return casCommitResponse(res)
+}
+
+// casCommitResponse maps a backend.CASResult to the CommitCAS wire response.
+// The check ORDER is load-bearing and mirrors casResultToError on the client:
+//
+//   - Committed FIRST. The owner-local commit durably applied, so the commit
+//     SUCCEEDED even when the R>1 replica fan-out missed W. That under-W case
+//     carries Committed==true AND UnderReplicated==true (with res.Err holding
+//     the under-W codes.Unavailable for owner-side logging), and it MUST travel
+//     as {committed, under_replicated} with NO gRPC error. Surfacing res.Err as
+//     a gRPC status here would re-introduce the exact (c)/(d) confusion this fix
+//     removes: the forwarding client would classify a DURABLE commit as
+//     retryable and re-commit an already-durable write. So the under-W detail
+//     is deliberately NOT put on the wire (it is logged owner-side); only the
+//     under_replicated flag crosses, preserving Committed across the forward.
+//   - Conflict: the OCC retry signal, a typed bool (not a gRPC error), same
+//     convention GetResponse uses for not-found.
+//   - Err with Committed==false: a genuine NOT-committed failure. A commit
+//     error carrying a gRPC status (the freeze-window / acquiring-window
+//     retryable codes.Unavailable, the reshard-cutover codes.FailedPrecondition,
+//     the migration-guard codes.ResourceExhausted) must reach the client AS a
+//     gRPC status error so status.Code() classifies it - exactly the convention
+//     ApplyBatch uses for its migration-guard rejection. Flattening it to
+//     resp.Error would erase the code (the client would wrap the string as
+//     status.Code()==Unknown and mis-read a retryable freeze as a hard
+//     failure). A plain backend failure (no status) travels as the response
+//     error string (the wire convention for an unexpected apply error -> the
+//     owner rolled back).
+//
+// See docs/SPEC.md "The four commit outcomes".
+func casCommitResponse(res backend.CASResult) (*pb.CommitCASResponse, error) {
 	resp := &pb.CommitCASResponse{}
 	switch {
+	case res.Committed:
+		resp.Committed = true
+		resp.UnderReplicated = res.UnderReplicated
 	case res.Conflict:
 		resp.Conflict = true
 	case res.Err != nil:
-		// A commit error that carries a gRPC status (the freeze-window /
-		// acquiring-window retryable codes.Unavailable, the migration-guard
-		// codes.ResourceExhausted) must reach the client AS a gRPC status error
-		// so status.Code() classifies it - exactly the convention ApplyBatch
-		// uses for its migration-guard rejection. Flattening it to resp.Error
-		// would erase the code: the client would wrap the string with
-		// status.Code()==Unknown, and a caller classifying a frozen CAS commit
-		// as retryable would mis-read it as a hard failure. A plain backend
-		// failure (no status) still travels as the response error string (the
-		// wire convention for an unexpected apply error -> the owner rolled back).
 		if _, ok := status.FromError(res.Err); ok {
 			return nil, res.Err
 		}
 		resp.Error = res.Err.Error()
-	default:
-		resp.Committed = true
 	}
 	return resp, nil
 }

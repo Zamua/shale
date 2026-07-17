@@ -100,14 +100,35 @@ type WriteOp struct {
 	Del   bool
 }
 
-// CASResult is the outcome of an owner-side validate-and-apply. Exactly
-// one of Committed / Conflict / Err is meaningful, mirroring the
-// CommitCASResponse wire shape: a Conflict is NOT an Err (it is the
+// CASResult is the outcome of an owner-side validate-and-apply, mirroring
+// the CommitCASResponse wire shape. A Conflict is NOT an Err (it is the
 // expected OCC retry signal), and a successful apply sets Committed.
+//
+// Committed is the load-bearing discriminator. It is set the instant the
+// owner-local Commit succeeds, BEFORE the R>1 replica fan-out runs, so a
+// fan-out that misses W cannot un-commit the durable owner-local write:
+// that outcome is {Committed: true, UnderReplicated: true} with Err
+// carrying the under-W error for logging/observability ONLY. A consumer
+// mapping CASResult to an error MUST treat any Committed==true result as
+// success (returning nil) even when UnderReplicated / Err is set - the
+// write is durable and must never be retried away. Only a NOT-committed
+// failure (Committed==false, Err set) is a genuine error the caller may
+// retry (a pre-commit freeze / fence / reshard-cutover refusal, which
+// applied nothing). See docs/SPEC.md "The four commit outcomes".
 type CASResult struct {
+	// Committed is true once the owner-local Commit durably applied the
+	// write-set (R=1) or the owner-local leg of an R>1 commit did.
 	Committed bool
-	Conflict  bool
-	Err       error
+	// Conflict is true when a read-check failed pre-commit (nothing applied).
+	Conflict bool
+	// UnderReplicated is true only alongside Committed==true: the owner-local
+	// commit is durable but the replica fan-out collected fewer than W acks.
+	// A success with degraded replication, NOT a failure. Always false at R=1
+	// (no fan-out) and false for a fully-replicated commit.
+	UnderReplicated bool
+	// Err carries a failure when Committed==false; when Committed==true it is
+	// non-nil only to preserve the under-W fan-out error for logging.
+	Err error
 }
 
 // IsolationLevel is the strongest visibility guarantee a transaction
