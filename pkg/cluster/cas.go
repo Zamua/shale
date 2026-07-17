@@ -377,6 +377,20 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 // object store. A non-nil return is a genuine durability failure the under-W
 // branch surfaces terminally (see the call site); a nil return means the lone
 // copy is now bucket-durable (or the backend never had a loss window).
+//
+// The Flush is GROUP-COMMITTED per storage unit through c.casFlushGroup, NOT
+// issued directly: under a same-owner write burst under-W is the common case,
+// so a per-write full-memtable flush would be a flush storm; the coordinator
+// coalesces concurrent under-W flushes on the SAME unit into a shared flush
+// (one Flush persists all their memtable-resident writes) while keeping
+// different units independent. The coordinator keys by the resolved
+// backend.Flusher identity - which is 1:1 with the mounted unit's independent
+// durable store (multi mode) and the single shared store on the legacy per-node
+// path - so "same unit" and "same flush target" coincide. It is transparent to
+// the returned error: a shared flush's error (including a %w-wrapped
+// backend.ErrFenced) reaches every waiter in the batch unchanged, so the
+// existing terminal-vs-retryable-fence classification at the call site is
+// preserved. See flushGroup + docs/SPEC.md "Owner-flush coalescing".
 func (c *Cluster) flushOwnerUnderReplicated(ownerBackend backend.Backend) error {
 	if ownerBackend == nil {
 		return nil
@@ -385,7 +399,7 @@ func (c *Cluster) flushOwnerUnderReplicated(ownerBackend backend.Backend) error 
 	if !ok {
 		return nil
 	}
-	return fl.Flush()
+	return c.casFlushGroup.flush(fl)
 }
 
 // casReadPayload reads key from the owner-local tx for a CAS read-check.

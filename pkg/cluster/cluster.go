@@ -719,6 +719,14 @@ type Cluster struct {
 	// could stripe it per shard / per partition.
 	casCommitMu sync.Mutex
 
+	// casFlushGroup group-commits the under-W owner durability flush (outcome
+	// (c)) per storage unit, so a same-owner write burst - where under-W is the
+	// COMMON case and every commit would otherwise force its own full-memtable
+	// flush - collapses to O(flush-windows) flushes instead of O(writes). See
+	// flushGroup + docs/SPEC.md "Owner-flush coalescing". Zero-value ready (its
+	// per-unit state map is lazily created on first use).
+	casFlushGroup flushGroup
+
 	// applyMu serializes the apply-if-newer LWW-on-write check on every
 	// REPLICA-RECEIVING write path (dispatchReplicaPut's local-self
 	// branch, LocalReplicaPut for a forwarded single-key Put, and
