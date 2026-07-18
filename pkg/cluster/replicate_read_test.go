@@ -13,6 +13,7 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/ring"
 )
 
 // TestReplication_R3_GetReturnsWinner pins the read path: after a
@@ -70,6 +71,79 @@ func TestReplication_R3_LWW_OlderWriteLoses(t *testing.T) {
 		}
 		if !bytes.Equal(got, []byte("newer")) {
 			t.Errorf("node %d Get: got %q want newer", i, got)
+		}
+	}
+}
+
+// TestReplication_R3_LWW_PlantedEnvelopes_NodeIDTiebreak pins clause (2)
+// of the LWW comparator on the READ path: when two replicas hold envelopes
+// with IDENTICAL TimestampNanos, the lexicographically greater NodeID wins
+// the fan-out compare.
+//
+// TestReplication_R3_LWW_OlderWriteLoses above covers clause (1) (higher
+// timestamp wins) but cannot reach clause (2): real Puts draw their stamp
+// from the monotone stamp clock, so two writes never collide on the same
+// nanosecond by construction. The only way to stage an equal-stamp race
+// without faking the clock is to PLANT hand-crafted envelopes directly on
+// each replica's backend, bypassing Put's re-stamping, and then read
+// through the cluster so getReplicated's comparator runs on them.
+//
+// Stamp.Greater's tiebreak arithmetic is unit-tested in envelope_test.go
+// (TestStamp_Greater_NodeIDTiebreak); what this test adds is that the READ
+// fan-out actually consults that clause. The planted NodeIDs are ordered so
+// the winner sits on the LAST ring replica, which is neither the primary nor
+// the node the read is issued from: a "first response wins" or "primary
+// wins" regression in getReplicated returns "from-a" here and fails, where a
+// winner planted on the primary would pass such a regression by accident.
+func TestReplication_R3_LWW_PlantedEnvelopes_NodeIDTiebreak(t *testing.T) {
+	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadAll)
+
+	key := []byte("lww-tie")
+
+	// Resolve the ring's replica ORDER for this key so the plant is precise
+	// about which physical backend gets which NodeID. At R=3 on a 3-member
+	// ring every node is a replica; only the order differs per key.
+	r := ring.New()
+	for _, m := range nodes[0].cluster.Members() {
+		r.Add(m)
+	}
+	replicas := r.LocateKeyN(key, 3)
+	if len(replicas) != 3 {
+		t.Fatalf("LocateKeyN(3) returned %d replicas, want 3", len(replicas))
+	}
+	byID := map[string]*replicatedNode{}
+	for _, n := range nodes {
+		byID[n.cluster.NodeID()] = n
+	}
+
+	// Identical TimestampNanos on all three; distinct NodeIDs. Lex order is
+	// "a" < "m" < "z", so the "z" envelope on the LAST replica must win.
+	stampNodeIDs := []string{"a", "m", "z"}
+	payloads := []string{"from-a", "from-m", "from-z"}
+	for i, rep := range replicas {
+		n := byID[rep.ID]
+		if n == nil {
+			t.Fatalf("replica %q not in harness", rep.ID)
+		}
+		env := cluster.Encode(cluster.Envelope{
+			Stamp:   cluster.Stamp{TimestampNanos: 42, NodeID: stampNodeIDs[i]},
+			Payload: []byte(payloads[i]),
+		})
+		if err := n.mem.Put(key, env); err != nil {
+			t.Fatalf("plant %q on replica[%d] %s: %v", stampNodeIDs[i], i, rep.ID, err)
+		}
+	}
+
+	// ReadAll fans out to every replica; the comparator must break the
+	// three-way timestamp tie on NodeID and return the "z" payload, from
+	// whichever node the read is issued.
+	for i, n := range nodes {
+		got, err := n.cluster.Get(key)
+		if err != nil {
+			t.Fatalf("Get via node %d: %v", i, err)
+		}
+		if !bytes.Equal(got, []byte("from-z")) {
+			t.Errorf("Get via node %d: got %q want from-z (equal stamps must break on lex-greatest NodeID)", i, got)
 		}
 	}
 }
