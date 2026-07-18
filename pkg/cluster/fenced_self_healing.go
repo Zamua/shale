@@ -52,6 +52,13 @@ func (c *Cluster) newFencedSelfHealing(ru storageunit.ReplicaUnit, inner backend
 // it. Caller MUST hold mountMu (mountMap is mountMu-guarded), exactly as the raw
 // `c.mountMap[ru] = b` assignments it replaces required.
 func (c *Cluster) storeMount(ru storageunit.ReplicaUnit, inner backend.Backend) {
+	// A successful mount clears any recorded acquire error BY CONSTRUCTION:
+	// doing it at this single choke point means no mount site (boot, reconcile
+	// acquire, overlap handoff, reshard split, or a future one) can leave a
+	// stale record behind for FailedOpenUnits/LastAcquireError to resurface
+	// once the position later unmounts. The per-site Deletes at the acquire
+	// paths remain as harmless belt and suspenders.
+	c.lastAcquireErr.Delete(ru)
 	c.mountMap[ru] = c.newFencedSelfHealing(ru, inner)
 }
 
