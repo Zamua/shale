@@ -35,6 +35,7 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math/rand"
 	"time"
 
@@ -55,22 +56,54 @@ type writeAttempt struct {
 	retryable bool
 }
 
-// classifyWriteAttempt turns a fan-out's (acks, w, errs) into a writeAttempt.
-// fanout/isTransientReplicaErr already filters transient (acquiring / migration
-// guard) outcomes OUT of errs, so:
+// classifyWriteAttempt turns a fan-out's (acks, w, errs, transient) into a
+// writeAttempt. fanout/isTransientReplicaErr already filters transient
+// (acquiring / migration guard) outcomes OUT of errs and into transient, so:
 //   - acks >= w                -> success (err nil).
 //   - acks < w, len(errs) == 0 -> W missed ONLY because of acquiring/transient
 //     replicas (none counted as failure): RETRYABLE handoff blip.
 //   - acks < w, len(errs) > 0  -> real non-transient failures exhausted the
 //     budget: HARD, returned immediately (not retryable).
-func classifyWriteAttempt(acks, w int, errs []error) writeAttempt {
+//
+// REASON IDENTITY THROUGH THE COLLAPSE. This is where R>1 stops being a fan-out
+// and becomes ONE error the caller sees, so it is where a leg's refusal reason
+// would otherwise be lost: the legs are summarized into a fresh status and every
+// leg value is dropped. A consumer gating on errors.Is(err, ErrAcquiring) would
+// therefore get a FALSE NEGATIVE on exactly the config (R>1) where the handoff
+// window is most visible. The retryable terminal is minted through reasonTerminal
+// so the reason of the underlying legs SURVIVES the collapse, on both halves of
+// the contract (in-process sentinel + wire detail, see reason.go).
+//
+// The reason is taken from EVIDENCE (legsCarryReason over the actual transient
+// legs), never from the branch: the retryable branch is also reachable with only
+// migration-guard transients, which are a DIFFERENT reason and must not be
+// reported as acquiring. When the legs carry no known reason the terminal is the
+// same plain status it has always been.
+//
+// THE MIXED CASE (some legs acquiring, others genuinely down) reports as a HARD
+// failure and deliberately does NOT carry the acquiring reason. ErrAcquiring's
+// documented contract is that the window is bounded by a mount rather than an
+// outage, so a bounded retry is guaranteed to observe it end; once a real failure
+// is in the mix that promise is false and the wait is bounded by whatever revives
+// the down peer. Claiming the reason here would send a consumer into a bounded
+// retry against a genuine outage - the false positive this whole mechanism exists
+// to prevent - and would also contradict shale's own judgment, since this branch
+// is precisely the one that sets retryable=false and refuses to retry internally.
+func classifyWriteAttempt(acks, w int, errs, transient []error) writeAttempt {
 	if acks >= w {
 		return writeAttempt{}
 	}
 	if len(errs) == 0 {
+		msg := fmt.Sprintf(
+			"shale: write needed %d acks, got %d (replicas mid-acquire)", w, acks)
+		if legsCarryReason(transient, ReasonAcquiring) {
+			return writeAttempt{
+				err:       reasonTerminal(codes.Unavailable, ReasonAcquiring, msg),
+				retryable: true,
+			}
+		}
 		return writeAttempt{
-			err: status.Errorf(codes.Unavailable,
-				"shale: write needed %d acks, got %d (replicas mid-acquire)", w, acks),
+			err:       status.Error(codes.Unavailable, msg),
 			retryable: true,
 		}
 	}
@@ -121,9 +154,20 @@ func (c *Cluster) retryWriteThroughHandoff(attempt func(ctx context.Context) wri
 			// Budget exhausted; surface the last retryable error (or a generic
 			// timeout if we never got one, which should not happen since we only
 			// loop on a retryable outcome).
+			//
+			// lastErr is the terminal that carries the legs' refusal reason
+			// (classifyWriteAttempt), so returning it verbatim is what makes the
+			// identity survive the RETRY as well as the fan-out collapse: an
+			// exhausted budget reports the same reason the attempts did.
 			if lastErr != nil {
 				return lastErr
 			}
+			// No attempt ever completed (the budget was already spent on entry),
+			// so there is NO leg evidence. This deliberately carries no reason:
+			// the message names acquiring, but an unattributed timeout - a
+			// non-positive WriteTimeout, say - is not evidence of a handoff, and
+			// the sentinel must only ever be attached to something a leg actually
+			// presented.
 			return status.Error(codes.Unavailable,
 				"shale: write timed out waiting for replicas to finish acquiring")
 		}

@@ -154,12 +154,12 @@ func (c *Cluster) copyParentIntoSurvivor(ru storageunit.ReplicaUnit, gs genState
 // quorum shortfall returns the retryable error.
 func (c *Cluster) forwardKeyQuorum(ctx context.Context, legs []routedReplica, key, envBytes []byte) error {
 	w := c.writeAckBar(len(legs))
-	acks, errs, ch := fanout(ctx, membersOf(legs), w,
+	acks, errs, transient, ch := fanout(ctx, membersOf(legs), w,
 		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchReplicaPutUnit(opCtx, replica, legs[idx].ru, key, envBytes)
 		})
 	go drainResults(ch)
-	return classifyWriteAttempt(acks, w, errs).err
+	return classifyWriteAttempt(acks, w, errs, transient).err
 }
 
 // copyParentUntilCaughtUp re-scans parent slot ru into its children until a pass

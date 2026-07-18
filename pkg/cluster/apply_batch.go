@@ -250,7 +250,7 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, c
 	// it, mirroring putReplicated's surplus-in-background behavior at W=1.
 	remoteNeeded := w - localAcks
 
-	acks, errs, resultsCh := fanout(ctx, others, remoteNeeded,
+	acks, errs, transient, resultsCh := fanout(ctx, others, remoteNeeded,
 		func(opCtx context.Context, _ int, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchApplyBatch(opCtx, replica, writes)
 		})
@@ -271,7 +271,7 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, c
 	}
 
 	// Total acks = owner's local commit(s) + remote acks collected.
-	return classifyWriteAttempt(acks+localAcks, w, errs)
+	return classifyWriteAttempt(acks+localAcks, w, errs, transient)
 }
 
 // dispatchApplyBatch routes one replica's batch apply to either the local

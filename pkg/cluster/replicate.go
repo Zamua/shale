@@ -50,7 +50,7 @@ type replicaResult struct {
 
 // fanout dispatches op against every replica in parallel, waits for a
 // decision (success or failure budget exhausted), and returns the
-// (acks, errs, resultsCh) triple. The resultsCh produces one
+// (acks, errs, transient, resultsCh) tuple. The resultsCh produces one
 // replicaResult per dispatched op (including surplus + transient), in
 // arrival order, and is closed once every op has reported.
 //
@@ -71,17 +71,23 @@ type replicaResult struct {
 // union routes a survivor that shifted replica indices to BOTH the position it is
 // draining and the position it acquired) can recover which target this goroutine
 // is for - a member-keyed lookup would collapse the duplicates onto one position.
+// fanout also returns the TRANSIENT leg errors it kept out of errs. They are
+// not budget input (that is exactly what makes them transient) - they are
+// EVIDENCE, so a caller that has to collapse the pass into one terminal error
+// can report WHY W was missed (a mid-acquire replica vs a migration guard)
+// instead of inferring it from which branch it landed in. Discarding them here
+// is what made the R>1 acquiring shortfall unattributable to its own callers.
 func fanout(
 	ctx context.Context,
 	replicas []ring.Member,
 	requiredAcks int,
 	op func(ctx context.Context, idx int, replica ring.Member) ([]byte, error),
-) (int, []error, <-chan replicaResult) {
+) (int, []error, []error, <-chan replicaResult) {
 	n := len(replicas)
 	if n == 0 {
 		empty := make(chan replicaResult)
 		close(empty)
-		return 0, nil, empty
+		return 0, nil, nil, empty
 	}
 	if requiredAcks < 1 {
 		requiredAcks = 1
@@ -116,6 +122,7 @@ func fanout(
 		mu        sync.Mutex
 		acks      int
 		errs      []error
+		transient []error
 		isDecided bool
 	)
 	markDecided := func() {
@@ -131,7 +138,12 @@ func fanout(
 			mu.Lock()
 			if res.Err == nil {
 				acks++
-			} else if !isTransientReplicaErr(res.Err) {
+			} else if isTransientReplicaErr(res.Err) {
+				// Neither ack nor failure budget; retained only as evidence
+				// (see the doc comment) so a collapsed terminal can name the
+				// reason the legs actually carried.
+				transient = append(transient, res.Err)
+			} else {
 				errs = append(errs, res.Err)
 			}
 			if acks >= requiredAcks || len(errs) > n-requiredAcks {
@@ -158,8 +170,9 @@ func fanout(
 	mu.Lock()
 	a := acks
 	e := append([]error(nil), errs...)
+	tr := append([]error(nil), transient...)
 	mu.Unlock()
-	return a, e, outCh
+	return a, e, tr, outCh
 }
 
 // isTransientReplicaErr reports whether err is the kind of replica
@@ -369,7 +382,7 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 func (c *Cluster) putReplicatedAttempt(ctx context.Context, key, envBytes []byte, replicas []ring.Member) writeAttempt {
 	w := requiredWriteAcks(c.cfg.WriteConsistency, len(replicas))
 
-	acks, errs, resultsCh := fanout(ctx, replicas, w,
+	acks, errs, transient, resultsCh := fanout(ctx, replicas, w,
 		func(opCtx context.Context, _ int, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchReplicaPut(opCtx, replica, key, envBytes)
 		})
@@ -384,7 +397,7 @@ func (c *Cluster) putReplicatedAttempt(ctx context.Context, key, envBytes []byte
 		}
 	}()
 
-	return classifyWriteAttempt(acks, w, errs)
+	return classifyWriteAttempt(acks, w, errs, transient)
 }
 
 // dispatchReplicaPut routes one replica's write to either the local
@@ -453,7 +466,7 @@ func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 	queried := allReplicas
 
 	fanoutCtx, cancelFanout := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
-	_, _, resultsCh := fanout(fanoutCtx, queried, n,
+	_, _, _, resultsCh := fanout(fanoutCtx, queried, n,
 		func(ctx context.Context, _ int, replica ring.Member) ([]byte, error) {
 			return c.dispatchReplicaGet(ctx, replica, key)
 		})
