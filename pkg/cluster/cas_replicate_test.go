@@ -512,3 +512,60 @@ func TestCASReplicate_CommitSurvivesFutureStampedReadSet(t *testing.T) {
 		return present && bytes.Equal(env.Payload, []byte("new")) && env.Stamp.TimestampNanos > future
 	})
 }
+
+// TestCASReplicate_CommitSurvivesFutureStampedBlindWrite is the BLIND-WRITE
+// variant of the observed-stamp-ratchet regression test above: the commit-
+// stamp floor must cover the whole WRITE-SET, not just the validated
+// read-set. A WriteOp on a key the fn never Gets (a normal API shape) is
+// tx.Put without decoding the stored envelope, so the validate loop never
+// Observes its stored stamp. Without the write-set floor, planting a
+// future-stamped envelope on such a key makes the owner draw a commit
+// stamp BELOW the stored one: the owner commits and acks, every replica's
+// apply-if-newer rejects that entry, a quorum read resurrects the old
+// value, and read-repair pushes it back over the owner's copy - the acked
+// commit is silently un-committed. The fix Observes the stored stamp of
+// every blind write-set key inside the owner-local tx BEFORE the commit
+// stamp is drawn, so the commit survives.
+func TestCASReplicate_CommitSurvivesFutureStampedBlindWrite(t *testing.T) {
+	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadQuorum)
+
+	key := []byte("blind-ratchet-k")
+	future := uint64(time.Now().Add(10 * time.Minute).UnixNano())
+	planted := cluster.Encode(cluster.Envelope{
+		Stamp:   cluster.Stamp{TimestampNanos: future, NodeID: "future-node"},
+		Payload: []byte("old"),
+	})
+	// Identical bytes on every replica: no laggards, so no read-repair
+	// noise from the setup itself.
+	for i, n := range nodes {
+		if err := n.mem.Put(key, planted); err != nil {
+			t.Fatalf("plant node %d: %v", i, err)
+		}
+	}
+
+	// BLIND write through the cluster: the fn never Gets the key, so the
+	// read-set is empty and the validate loop Observes nothing.
+	err := nodes[0].cluster.Transact(key, func(tx backend.Transaction) error {
+		return tx.Put(key, []byte("new"))
+	})
+	if err != nil {
+		t.Fatalf("Transact: %v", err)
+	}
+
+	// The acked blind commit must survive a quorum read. Without the
+	// write-set floor this returns "old": the commit stamp lost LWW to
+	// the planted future stamp on every non-owner replica.
+	got, err := nodes[1].cluster.Get(key)
+	if err != nil {
+		t.Fatalf("post-commit Get: %v", err)
+	}
+	if !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("post-commit Get: got %q want new (acked blind CAS commit lost LWW to the stored stamp it replaced)", got)
+	}
+
+	// And after replication + any read-repair settle, EVERY replica must
+	// hold the new payload under a stamp strictly above the planted one.
+	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
+		return present && bytes.Equal(env.Payload, []byte("new")) && env.Stamp.TimestampNanos > future
+	})
+}
