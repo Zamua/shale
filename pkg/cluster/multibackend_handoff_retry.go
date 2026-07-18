@@ -36,7 +36,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"math/rand"
 	"time"
 
 	"google.golang.org/grpc/codes"
@@ -145,7 +144,7 @@ func (c *Cluster) retryWriteThroughHandoff(attempt func(ctx context.Context) wri
 	}
 	deadline := time.Now().Add(c.cfg.WriteTimeout)
 	base := time.Duration(c.retryAfterMs()) * time.Millisecond
-	backoff := base
+	backoff := newBudgetRetryWait(base, handoffRetryBackoffCap, deadline)
 
 	var lastErr error
 	for {
@@ -187,34 +186,12 @@ func (c *Cluster) retryWriteThroughHandoff(attempt func(ctx context.Context) wri
 		lastErr = res.err
 
 		// Retryable handoff blip: back off (bounded by the remaining budget),
-		// then re-run. Re-check the budget so we never sleep past the deadline.
-		remaining = time.Until(deadline)
-		if remaining <= 0 {
+		// then re-run. The shared schedule re-checks the budget BEFORE sleeping
+		// and clamps the sleep, so we never sleep past the deadline.
+		if backoff.wait(nil) != retryWaitProceed {
 			return lastErr
 		}
-		sleep := jitteredBackoff(backoff)
-		if sleep > remaining {
-			sleep = remaining
-		}
-		time.Sleep(sleep)
-
-		backoff *= 2
-		if backoff > handoffRetryBackoffCap {
-			backoff = handoffRetryBackoffCap
-		}
 	}
-}
-
-// jitteredBackoff returns d scaled by a uniform factor in [0.5, 1.0), so a
-// thundering herd of simultaneously-acquiring writes does not re-collide on the
-// same retry tick. Matches the v0.3 cutover / freeze-window retry shape.
-func jitteredBackoff(d time.Duration) time.Duration {
-	if d <= 0 {
-		return 0
-	}
-	// 50%..100% of d.
-	factor := 0.5 + rand.Float64()*0.5
-	return time.Duration(float64(d) * factor)
 }
 
 // retryReadThroughHandoff is the READ-side mirror of retryWriteThroughHandoff
@@ -236,7 +213,8 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 		v, err := attempt(deadline)
 		return v, unwrapUnreachableOnly(err)
 	}
-	backoff := time.Duration(c.retryAfterMs()) * time.Millisecond
+	base := time.Duration(c.retryAfterMs()) * time.Millisecond
+	backoff := newBudgetRetryWait(base, handoffRetryBackoffCap, deadline)
 	var unreachableRunStart time.Time
 
 	for {
@@ -265,19 +243,8 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 		default:
 			return v, err
 		}
-		remaining := time.Until(deadline)
-		if remaining <= 0 {
+		if backoff.wait(nil) != retryWaitProceed {
 			return v, unwrapUnreachableOnly(err)
-		}
-		sleep := jitteredBackoff(backoff)
-		if sleep > remaining {
-			sleep = remaining
-		}
-		time.Sleep(sleep)
-
-		backoff *= 2
-		if backoff > handoffRetryBackoffCap {
-			backoff = handoffRetryBackoffCap
 		}
 	}
 }
