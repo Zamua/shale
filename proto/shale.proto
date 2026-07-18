@@ -58,9 +58,9 @@ service ShaleNode {
   rpc Topology(TopologyRequest) returns (TopologyResponse);
 
   // Stats returns per-node counters: how many keys this node holds,
-  // request counts since process start, latency percentiles. The
-  // percentile fields are placeholders in v0.1 (always zero) until the
-  // observability work in v0.5 wires up a real histogram.
+  // request counts since process start, and the node's mount-readiness
+  // counts. COUNTERS ONLY - the node keeps no latency histogram, so no
+  // percentiles are reported (see the reserved fields on StatsResponse).
   rpc Stats(StatsRequest) returns (StatsResponse);
 
   // Ping is a no-op round trip for liveness checks. Useful for the CLI
@@ -157,18 +157,35 @@ service ShaleNode {
 // A->B->A->B... ping-pong. Clients dialing this service from outside
 // the cluster (CLI, embedded library callers) leave the flag false.
 
-// ReplicaUnitRef is the POSITION-ADDRESSED forward target (v0.8 Phase 2e,
-// Option B overlap handoff). The plain forwarded ops carry ONLY the key, and
-// the receiver re-resolves the unit+position from the key against its OWN
-// live ring index. On the predecessor of a moving position that no longer
-// yields the draining position (the position moved away in the ring), so the
-// overlap forward instead carries the EXPLICIT ReplicaUnit (gen, unit,
-// replica). When this field is set on a forwarded op, the predecessor's
-// handler resolves mountMap[ru] DIRECTLY by that ru - explicitly willing to
-// serve a Draining-phase entry - rather than re-deriving the position from
-// its ring index. It is the ONLY proto change Phase 2e introduces. Absent
-// (unset) on every non-overlap forward, so the existing key-only forwarding
-// is unchanged.
+// ReplicaUnitRef POSITION-ADDRESSES one leg of a routed op (v0.8 Phase 2e,
+// pending ranges). It is live and load-bearing on every union write and read.
+//
+// A plain forwarded op carries ONLY the key, and the receiver re-resolves the
+// unit + position from that key against its OWN live ring index. That
+// re-derivation is exactly what breaks during a membership transition: routing
+// fans an op out over the UNION of a position's current and pending replica
+// sets, and a union member does NOT necessarily hold the position at its own
+// ring index (a pending owner mid-mount is not yet at that index; a displaced
+// current owner is no longer at it). A ring-index check on the receiver would
+// wrongly refuse those legs.
+//
+// So each union leg carries the EXPLICIT ReplicaUnit (gen, unit, replica).
+// When ru is set on a forwarded op, the receiver resolves mountMap[ru]
+// DIRECTLY by that ru - no ring-ownership guard, explicitly willing to serve a
+// Draining-phase entry. A ru that is not mounted (a pending owner still
+// mid-mount, or an already-released drain) returns the RETRYABLE acquiring
+// error, which the originator's fan-out tolerates by skipping that leg: no
+// re-forward, no A->B->A loop.
+//
+// Set by the PutAtReplica / GetAtReplica / DeleteAtReplica /
+// ScanPrefixAtReplica peer calls. Unset on ordinary key-only forwards and on
+// any client dialing from outside the cluster, so the plain forwarding path is
+// unchanged.
+//
+// NB this SUPERSEDES the predecessor-forward design an earlier Phase 2e draft
+// used, where a new owner forwarded ops BACK to a single draining predecessor
+// during its mount. There is no predecessor and no back-forward: the
+// originator addresses every union member directly.
 message ReplicaUnitRef {
   uint64 gen = 1;
   uint32 unit = 2;
@@ -181,9 +198,9 @@ message PutRequest {
   bytes key = 1;
   bytes value = 2;
   bool forwarded = 3;
-  // ru, when set, position-addresses this forwarded write to a specific
-  // Draining replica on the predecessor (Phase 2e overlap forward). Unset
-  // on every ordinary forward.
+  // ru, when set, position-addresses this forwarded write to one explicit
+  // replica position on the receiver (a leg of the Phase 2e union fan-out).
+  // Unset on every ordinary forward.
   ReplicaUnitRef ru = 4;
 }
 
@@ -194,7 +211,7 @@ message PutResponse {}
 message GetRequest {
   bytes key = 1;
   bool forwarded = 2;
-  // ru: see PutRequest.ru. Position-addressed overlap forward (Phase 2e).
+  // ru: see PutRequest.ru. Position-addressed union leg (Phase 2e).
   ReplicaUnitRef ru = 3;
 }
 
@@ -208,7 +225,7 @@ message GetResponse {
 message DeleteRequest {
   bytes key = 1;
   bool forwarded = 2;
-  // ru: see PutRequest.ru. Position-addressed overlap forward (Phase 2e).
+  // ru: see PutRequest.ru. Position-addressed union leg (Phase 2e).
   ReplicaUnitRef ru = 3;
 }
 

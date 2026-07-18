@@ -39,6 +39,19 @@ func splitBitIndex(c UnitCount) uint {
 // success the returned UnitID is guaranteed to equal UnitForHash(h, 2N) and
 // to be one of old.UnitForHash(h, old)'s two ChildUnits; the tests pin both
 // equalities.
+//
+// NOT A PRODUCTION ROUTING PATH, deliberately. The resharder and the routing
+// layer both resolve a key's post-doubling unit by the DIRECT map
+// UnitForHash(h, 2N) (see resolveGenUnit and the bisect's copy split), and
+// enumerate a unit's two targets with ChildUnits. This function is the
+// bit-arithmetic statement of WHY that direct map is correct: it computes the
+// child the long way (parent K, plus N exactly when the one new hash bit is
+// set), so the tests can assert ChildUnit(h, N) == UnitForHash(h, 2N) for
+// every hash. That equivalence IS the doubling design - it is what makes a
+// unit bisect independently into {K, K+N} with no global re-partition, and
+// what lets a co-located {tag} set land wholly in one child. Keep it and its
+// test: they pin the invariant the whole reshard rests on, and a regression
+// here would otherwise only surface as silent data misplacement mid-reshard.
 func ChildUnit(h ShardHash, old UnitCount) (UnitID, error) {
 	if _, err := old.Double(); err != nil {
 		return 0, err
