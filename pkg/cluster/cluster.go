@@ -1,25 +1,3 @@
-// Package cluster is the public API surface of shale. Apps import
-// this package + call cluster.Open(cfg) to get a Cluster handle that
-// routes KV operations across nodes.
-//
-// Two modes:
-//
-//   - single-node: cfg.BindAddr empty. Cluster delegates every op
-//     directly to the local Backend. Useful for tests, embedded apps
-//     that don't yet want gossip, and the v0.1 baseline.
-//   - multi-node:  cfg.BindAddr non-empty. Cluster brings up a
-//     membership.Membership on BindAddr (joining via cfg.Seeds) + a
-//     ring.Ring populated from membership events. Single-key ops
-//     hash the key through the ring; if the owner is the local node
-//     they hit the local Backend, otherwise they are forwarded to
-//     the owner's gRPC service via a cached rpc.Client.
-//
-// v0.2 static topology: membership join/leave events update the ring
-// but no key data moves between nodes. A node returning to an already-
-// populated cluster sees only newly-written keys. Rebalancing lands
-// in v0.3.
-//
-// See docs/SPEC.md for the full model.
 package cluster
 
 import (
