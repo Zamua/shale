@@ -923,10 +923,21 @@ type StatsResponse struct {
 	// Latency percentiles (milliseconds). Placeholders in v0.1 (zero);
 	// wired up to a real histogram in v0.5 alongside the Prometheus
 	// metrics work.
-	LatencyMsP50  float64 `protobuf:"fixed64,6,opt,name=latency_ms_p50,json=latencyMsP50,proto3" json:"latency_ms_p50,omitempty"`
-	LatencyMsP99  float64 `protobuf:"fixed64,7,opt,name=latency_ms_p99,json=latencyMsP99,proto3" json:"latency_ms_p99,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	LatencyMsP50 float64 `protobuf:"fixed64,6,opt,name=latency_ms_p50,json=latencyMsP50,proto3" json:"latency_ms_p50,omitempty"`
+	LatencyMsP99 float64 `protobuf:"fixed64,7,opt,name=latency_ms_p99,json=latencyMsP99,proto3" json:"latency_ms_p99,omitempty"`
+	// Mount-readiness counts (docs/SPEC.md "Mount readiness"): this node's
+	// per-position mount state over its DESIRED set, so an operator can read
+	// any node's mount state remotely (shale stats) without SHALE_DEBUG_ADDR.
+	// All zero in legacy single-backend mode (no per-unit mounts). The RPC
+	// reports; it does not gate - the readiness decision stays in-process in
+	// the embedding application via Cluster.Ready.
+	DesiredUnits     uint64 `protobuf:"varint,8,opt,name=desired_units,json=desiredUnits,proto3" json:"desired_units,omitempty"`
+	MountedUnits     uint64 `protobuf:"varint,9,opt,name=mounted_units,json=mountedUnits,proto3" json:"mounted_units,omitempty"`
+	PendingUnits     uint64 `protobuf:"varint,10,opt,name=pending_units,json=pendingUnits,proto3" json:"pending_units,omitempty"`
+	FailedOpenUnits  uint64 `protobuf:"varint,11,opt,name=failed_open_units,json=failedOpenUnits,proto3" json:"failed_open_units,omitempty"`
+	LastAcquireError string `protobuf:"bytes,12,opt,name=last_acquire_error,json=lastAcquireError,proto3" json:"last_acquire_error,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *StatsResponse) Reset() {
@@ -1006,6 +1017,41 @@ func (x *StatsResponse) GetLatencyMsP99() float64 {
 		return x.LatencyMsP99
 	}
 	return 0
+}
+
+func (x *StatsResponse) GetDesiredUnits() uint64 {
+	if x != nil {
+		return x.DesiredUnits
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetMountedUnits() uint64 {
+	if x != nil {
+		return x.MountedUnits
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetPendingUnits() uint64 {
+	if x != nil {
+		return x.PendingUnits
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetFailedOpenUnits() uint64 {
+	if x != nil {
+		return x.FailedOpenUnits
+	}
+	return 0
+}
+
+func (x *StatsResponse) GetLastAcquireError() string {
+	if x != nil {
+		return x.LastAcquireError
+	}
+	return ""
 }
 
 type PingRequest struct {
@@ -2209,7 +2255,7 @@ const file_shale_proto_rawDesc = "" +
 	"\bNodeInfo\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1b\n" +
 	"\tgrpc_addr\x18\x02 \x01(\tR\bgrpcAddr\"\x0e\n" +
-	"\fStatsRequest\"\xd0\x01\n" +
+	"\fStatsRequest\"\x99\x03\n" +
 	"\rStatsResponse\x12\x1b\n" +
 	"\tkeys_held\x18\x01 \x01(\x04R\bkeysHeld\x12\x12\n" +
 	"\x04puts\x18\x02 \x01(\x04R\x04puts\x12\x12\n" +
@@ -2217,7 +2263,13 @@ const file_shale_proto_rawDesc = "" +
 	"\adeletes\x18\x04 \x01(\x04R\adeletes\x12\x14\n" +
 	"\x05scans\x18\x05 \x01(\x04R\x05scans\x12$\n" +
 	"\x0elatency_ms_p50\x18\x06 \x01(\x01R\flatencyMsP50\x12$\n" +
-	"\x0elatency_ms_p99\x18\a \x01(\x01R\flatencyMsP99\"\r\n" +
+	"\x0elatency_ms_p99\x18\a \x01(\x01R\flatencyMsP99\x12#\n" +
+	"\rdesired_units\x18\b \x01(\x04R\fdesiredUnits\x12#\n" +
+	"\rmounted_units\x18\t \x01(\x04R\fmountedUnits\x12#\n" +
+	"\rpending_units\x18\n" +
+	" \x01(\x04R\fpendingUnits\x12*\n" +
+	"\x11failed_open_units\x18\v \x01(\x04R\x0ffailedOpenUnits\x12,\n" +
+	"\x12last_acquire_error\x18\f \x01(\tR\x10lastAcquireError\"\r\n" +
 	"\vPingRequest\"\x0e\n" +
 	"\fPingResponse\"Y\n" +
 	"\tRangeSpec\x12#\n" +

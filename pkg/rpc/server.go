@@ -360,12 +360,14 @@ func (s *Server) Topology(_ context.Context, _ *pb.TopologyRequest) (*pb.Topolog
 	}, nil
 }
 
-// Stats returns the per-node counters this Server has accumulated.
+// Stats returns the per-node counters this Server has accumulated, plus the
+// node's mount-readiness counts (all zero in legacy single-backend mode).
 func (s *Server) Stats(_ context.Context, _ *pb.StatsRequest) (*pb.StatsResponse, error) {
 	keys, err := s.keysHeld()
 	if err != nil {
 		return nil, err
 	}
+	mr := s.c.MountReadiness()
 	return &pb.StatsResponse{
 		KeysHeld: keys,
 		Puts:     s.puts.Load(),
@@ -375,6 +377,14 @@ func (s *Server) Stats(_ context.Context, _ *pb.StatsRequest) (*pb.StatsResponse
 		// Latency percentiles wire up in v0.5; placeholders for now.
 		LatencyMsP50: 0,
 		LatencyMsP99: 0,
+		// Mount readiness (docs/SPEC.md "Mount readiness"): reported for
+		// remote observability; the readiness DECISION stays in-process in
+		// the embedding application via Cluster.Ready.
+		DesiredUnits:     uint64(mr.DesiredUnits),
+		MountedUnits:     uint64(mr.MountedUnits),
+		PendingUnits:     uint64(mr.PendingUnits),
+		FailedOpenUnits:  uint64(mr.FailedOpenUnits),
+		LastAcquireError: mr.LastAcquireError,
 	}, nil
 }
 
