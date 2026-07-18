@@ -144,9 +144,10 @@ type ReplicaBackendFactory interface {
 	// epoch advance past the old owner's own open epoch proves SOMEONE opened
 	// at a higher epoch. It is a HINT, not a release trigger: a bare epoch
 	// advance proves a fence happened, NOT that a live owner is serving (a new
-	// owner can fence then crash mid-mount). The old owner re-verifies a live
-	// owner is serving (a readiness probe) before releasing; it NEVER releases
-	// on this bare epoch alone. See CanRelease / Releasable in handoff.go and
+	// owner can fence then crash mid-mount). The old owner releases only on the
+	// successor's durable SERVING MARKER (written on mount-complete) at an epoch
+	// strictly above its own open epoch; it NEVER releases on this bare epoch
+	// alone. See Releasable in handoff.go, ReadServingMarker below, and
 	// docs/SPEC.md "v0.8 Phase 2e".
 	//
 	// It reads durable state without side effect (no mount/unmount). A replica
