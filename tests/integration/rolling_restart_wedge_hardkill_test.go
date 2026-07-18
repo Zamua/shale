@@ -310,7 +310,18 @@ func TestHardKillRoll_IsolatedRejoinDivergesPersistently(t *testing.T) {
 	f.live["n3"] = nil
 	f.mu.Unlock()
 	old.hardKill()
-	n3 := startReplicatedNode(t, "n3", "", unitCount, rf, f.backing) // seed="" -> solo
+	// The empty seed only removes n3's OUTBOUND path: it never calls Join, so
+	// it cannot reach n1/n2. Its INBOUND path is NOT isolated by that. n1/n2
+	// still hold n3#old at its bind address and keep gossiping to it for
+	// memberlist's GossipToTheDeadTime after declaring it dead, so anything
+	// that binds that address inside the window gets fused into the cluster
+	// and the fleet converges - defeating the divergence this test exists to
+	// pin. Nothing stops the replacement from drawing the corpse's port: it
+	// was just released, and on a randomized ephemeral-port allocator (Linux
+	// CI) reuse inside the window is reachable. Forbid it explicitly so the
+	// isolation is bidirectional by construction.
+	oldBindPort := bindPortOf(t, old.BindAddr)
+	n3 := startReplicatedNode(t, "n3", "", unitCount, rf, f.backing, oldBindPort) // seed="" -> solo
 	f.mu.Lock()
 	f.live["n3"] = n3
 	f.mu.Unlock()

@@ -49,7 +49,10 @@ import (
 
 // startReplicatedNode brings up one R=replicationFactor multi-backend node
 // whose factory is a per-replica handle over backing. seedAddr empty = founder.
-func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicationFactor int, backing *sharedfactory.Backing) *sharedNode {
+// forbiddenBindPorts are bind ports this node must not be given; see
+// openClusterRetryBind. Callers that hard-kill a node and start an
+// intentionally-isolated replacement pass the dead node's port here.
+func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicationFactor int, backing *sharedfactory.Backing, forbiddenBindPorts ...int) *sharedNode {
 	t.Helper()
 	h := backing.Handle()
 
@@ -80,7 +83,7 @@ func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicati
 		cfg.Seeds = []string{seedAddr}
 	}
 
-	c, bindAddr := openClusterRetryBind(t, cfg)
+	c, bindAddr := openClusterRetryBind(t, cfg, forbiddenBindPorts...)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {

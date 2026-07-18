@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -335,12 +336,33 @@ func isBindConflict(err error) bool {
 // genuine port-exhaustion problem, not the transient release-rebind
 // race). A non-bind error (bad config, join failure) returns
 // immediately - those are real test failures, not flakes to retry.
-func openClusterRetryBind(t *testing.T, cfg cluster.Config) (*cluster.Cluster, string) {
+//
+// forbiddenPorts, if supplied, are bind ports the node must NOT be given:
+// a drawn port that matches one is discarded and re-rolled. This exists for
+// tests that hard-kill a node and start a replacement that must be
+// UNREACHABLE from the survivors. Killing a node does not erase it from its
+// peers' memberlist tables, and memberlist keeps gossiping to a member it
+// has declared dead for GossipToTheDeadTime. So for that whole window the
+// dead node's address is still live bait: whatever binds it next is fused
+// into the cluster, regardless of that process's own seed configuration.
+// A replacement that happens to draw the corpse's port therefore silently
+// rejoins the cluster it was supposed to be isolated from. Excluding the
+// port closes that door by construction instead of relying on the OS's
+// ephemeral-port allocator not to reuse it (darwin's is sequential and
+// effectively never does, which is why this hides on a Mac and bites on a
+// Linux CI runner, whose allocator is randomized).
+func openClusterRetryBind(t *testing.T, cfg cluster.Config, forbiddenPorts ...int) (*cluster.Cluster, string) {
 	t.Helper()
 	const maxAttempts = 8
 	var lastErr error
 	for range maxAttempts {
-		bindAddr := hostPort(freePort(t))
+		port := freePort(t)
+		if slices.Contains(forbiddenPorts, port) {
+			// Drew a forbidden port (e.g. a just-killed node's address).
+			// Re-roll; freePort hands out a fresh allocation each call.
+			continue
+		}
+		bindAddr := hostPort(port)
 		cfg.BindAddr = bindAddr
 		c, err := cluster.Open(cfg)
 		if err == nil {
@@ -353,6 +375,21 @@ func openClusterRetryBind(t *testing.T, cfg cluster.Config) (*cluster.Cluster, s
 	}
 	t.Fatalf("openClusterRetryBind %s: %d bind attempts all hit a port conflict: %v", cfg.NodeID, maxAttempts, lastErr)
 	return nil, ""
+}
+
+// bindPortOf extracts the port from a "host:port" bind address. Used to
+// forbid a just-killed node's port when starting its replacement.
+func bindPortOf(t *testing.T, addr string) int {
+	t.Helper()
+	_, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		t.Fatalf("bindPortOf %q: %v", addr, err)
+	}
+	port, err := strconv.Atoi(portStr)
+	if err != nil {
+		t.Fatalf("bindPortOf %q: parse port: %v", addr, err)
+	}
+	return port
 }
 
 func hostPort(port int) string {
