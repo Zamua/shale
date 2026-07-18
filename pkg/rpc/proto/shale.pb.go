@@ -920,11 +920,6 @@ type StatsResponse struct {
 	Gets    uint64 `protobuf:"varint,3,opt,name=gets,proto3" json:"gets,omitempty"`
 	Deletes uint64 `protobuf:"varint,4,opt,name=deletes,proto3" json:"deletes,omitempty"`
 	Scans   uint64 `protobuf:"varint,5,opt,name=scans,proto3" json:"scans,omitempty"`
-	// Latency percentiles (milliseconds). Placeholders in v0.1 (zero);
-	// wired up to a real histogram in v0.5 alongside the Prometheus
-	// metrics work.
-	LatencyMsP50 float64 `protobuf:"fixed64,6,opt,name=latency_ms_p50,json=latencyMsP50,proto3" json:"latency_ms_p50,omitempty"`
-	LatencyMsP99 float64 `protobuf:"fixed64,7,opt,name=latency_ms_p99,json=latencyMsP99,proto3" json:"latency_ms_p99,omitempty"`
 	// Mount-readiness counts (docs/SPEC.md "Mount readiness"): this node's
 	// per-position mount state over its DESIRED set, so an operator can read
 	// any node's mount state remotely (shale stats) without SHALE_DEBUG_ADDR.
@@ -1001,20 +996,6 @@ func (x *StatsResponse) GetDeletes() uint64 {
 func (x *StatsResponse) GetScans() uint64 {
 	if x != nil {
 		return x.Scans
-	}
-	return 0
-}
-
-func (x *StatsResponse) GetLatencyMsP50() float64 {
-	if x != nil {
-		return x.LatencyMsP50
-	}
-	return 0
-}
-
-func (x *StatsResponse) GetLatencyMsP99() float64 {
-	if x != nil {
-		return x.LatencyMsP99
 	}
 	return 0
 }
@@ -2255,21 +2236,19 @@ const file_shale_proto_rawDesc = "" +
 	"\bNodeInfo\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12\x1b\n" +
 	"\tgrpc_addr\x18\x02 \x01(\tR\bgrpcAddr\"\x0e\n" +
-	"\fStatsRequest\"\x99\x03\n" +
+	"\fStatsRequest\"\xf9\x02\n" +
 	"\rStatsResponse\x12\x1b\n" +
 	"\tkeys_held\x18\x01 \x01(\x04R\bkeysHeld\x12\x12\n" +
 	"\x04puts\x18\x02 \x01(\x04R\x04puts\x12\x12\n" +
 	"\x04gets\x18\x03 \x01(\x04R\x04gets\x12\x18\n" +
 	"\adeletes\x18\x04 \x01(\x04R\adeletes\x12\x14\n" +
-	"\x05scans\x18\x05 \x01(\x04R\x05scans\x12$\n" +
-	"\x0elatency_ms_p50\x18\x06 \x01(\x01R\flatencyMsP50\x12$\n" +
-	"\x0elatency_ms_p99\x18\a \x01(\x01R\flatencyMsP99\x12#\n" +
+	"\x05scans\x18\x05 \x01(\x04R\x05scans\x12#\n" +
 	"\rdesired_units\x18\b \x01(\x04R\fdesiredUnits\x12#\n" +
 	"\rmounted_units\x18\t \x01(\x04R\fmountedUnits\x12#\n" +
 	"\rpending_units\x18\n" +
 	" \x01(\x04R\fpendingUnits\x12*\n" +
 	"\x11failed_open_units\x18\v \x01(\x04R\x0ffailedOpenUnits\x12,\n" +
-	"\x12last_acquire_error\x18\f \x01(\tR\x10lastAcquireError\"\r\n" +
+	"\x12last_acquire_error\x18\f \x01(\tR\x10lastAcquireErrorJ\x04\b\x06\x10\aJ\x04\b\a\x10\bR\x0elatency_ms_p50R\x0elatency_ms_p99\"\r\n" +
 	"\vPingRequest\"\x0e\n" +
 	"\fPingResponse\"Y\n" +
 	"\tRangeSpec\x12#\n" +

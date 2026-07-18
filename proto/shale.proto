@@ -282,11 +282,13 @@ message StatsResponse {
   uint64 deletes = 4;
   uint64 scans = 5;
 
-  // Latency percentiles (milliseconds). Placeholders in v0.1 (zero);
-  // wired up to a real histogram in v0.5 alongside the Prometheus
-  // metrics work.
-  double latency_ms_p50 = 6;
-  double latency_ms_p99 = 7;
+  // 6, 7 were latency_ms_p50 / latency_ms_p99: never wired to a histogram,
+  // the server always sent 0. Removed rather than left reporting a constant
+  // as if it were telemetry. RESERVED so no future field reuses the numbers
+  // (an old client decoding a new field at 6 or 7 as a double would read
+  // garbage). Real percentiles are computed client-side by `shale bench`.
+  reserved 6, 7;
+  reserved "latency_ms_p50", "latency_ms_p99";
 
   // Mount-readiness counts (docs/SPEC.md "Mount readiness"): this node's
   // per-position mount state over its DESIRED set, so an operator can read
