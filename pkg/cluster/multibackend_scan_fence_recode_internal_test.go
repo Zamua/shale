@@ -13,12 +13,14 @@ import (
 // fenceScanBackend mimics REAL slatedb's closed-handle-on-read: a ScanPrefix on a
 // SUPERSEDED mount returns backend.ErrFenced, because a higher-epoch owner opened
 // the same per-(unit, replica) database and slatedb CLOSED this now-stale handle.
-// The in-memory fencedReplicaBackend deliberately lets fenced reads PASS (the
-// durable bytes survive + stay readable through any handle), so it can NOT reach
-// this surface - exactly the test-double / production divergence that hid the
-// #443 bug. This wrapper supplies the production behavior, mirroring
-// fenceAtBackend (the write-path fence-recode test's double). The wrap matches
-// the slate backend's fenceTag shape so errors.Is(err, backend.ErrFenced) holds.
+// The sharedfactory fencedReplicaBackend's OLD permissive default let fenced
+// reads PASS - exactly the test-double / production divergence that hid the #443
+// bug - and it now DEFAULTS to strict read fencing (reads-pass is the
+// SetStrictReadFencing(false) opt-out). This wrapper is still needed because the
+// test mounts a bare memory.Memory OUTSIDE the factory, so the fence is injected
+// here, mirroring fenceAtBackend (the write-path fence-recode test's double).
+// The wrap matches the slate backend's fenceTag shape so
+// errors.Is(err, backend.ErrFenced) holds.
 type fenceScanBackend struct {
 	backend.Backend
 }
