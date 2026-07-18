@@ -449,6 +449,16 @@ func TestJoinIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 func TestLeaveIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence-at-completion timing): the leave-side
+	// mirror of the join transparency gate above, pinning the Draining-bit
+	// union mechanism in ISOLATION - the leaver must stay unfenced through
+	// the survivors' 6s modeled mounts so it can serve the union. Under the
+	// backing's default eager fence (real slatedb timing) the leaver is
+	// fenced the instant a survivor starts acquiring its position and these
+	// same leaver-shard writes WEDGE, the KNOWN residual
+	// TestJoinResidual_FenceAtOpenStart_MovingShardsWedge reproduces
+	// deliberately under the default.
+	backing.SetEagerFence(false)
 	mutate := func(cfg *cluster.Config) {
 		cfg.WriteTimeout = 300 * time.Millisecond
 		cfg.GracefulLeaveDrainTimeout = 12 * time.Second // enable the graceful drain (small: keeps teardown fast)

@@ -168,6 +168,18 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 		replicaIDsForMembers(finalIDs, storageunit.UnitID(fullMove), rf))
 
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence semantics, both toggles): zero-tolerance
+	// single-attempt read probes through the leave+join overlap require
+	// the draining leaver and the physical holders to keep serving reads
+	// while successors slow-mount (fence-at-completion, reads pass
+	// through); see the justification on
+	// TestJoinReadTransparent_GetScanEveryNode. The permissive-read MASK
+	// this file's header describes (a fenced leftover handle still
+	// reading the shared store) is already removed deterministically by
+	// waitNoUndesiredMounts below, so the opt-out does not reintroduce
+	// the nondeterminism.
+	backing.SetEagerFence(false)
+	backing.SetStrictReadFencing(false)
 	mutate := func(cfg *cluster.Config) {
 		cfg.GracefulLeaveDrainTimeout = 25 * time.Second
 		cfg.OpenConcurrency = 8

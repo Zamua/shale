@@ -86,6 +86,16 @@ func casWedged(err error) bool {
 func TestCASJoinTransparency_MovingUnitsStayAvailable(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence-at-completion timing): this gate pins the
+	// CAS union mechanism in ISOLATION - the displaced owner must stay
+	// unfenced through cj-d's modeled mount so it can serve the union,
+	// exactly as the plain-put mirror TestJoinIsWriteTransparent_
+	// MovingShardsStayAvailable opts out. Under the backing's default eager
+	// fence (real slatedb timing) the displaced owner is fenced at
+	// open-START and these same moving-unit commits WEDGE, the KNOWN
+	// residual TestJoinResidual_FenceAtOpenStart_MovingShardsWedge
+	// reproduces deliberately under the default.
+	backing.SetEagerFence(false)
 	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
 
 	n1 := startReplicatedNodeCfg(t, "cj-a", "", uc, rf, backing, mutate)

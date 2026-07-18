@@ -94,6 +94,17 @@ func runGracefulLeave(t *testing.T, drainTimeout, mountDelay time.Duration) grac
 	t.Helper()
 	const unitCount = 32
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence-at-completion timing): this driver pins the
+	// graceful-leave drain mechanism in ISOLATION. Its gate asserts ~100%
+	// during-window ack with the survivors' mounts LONGER than the 5s write
+	// budget, which requires the LEAVER to keep serving the union until its
+	// successors complete (the residual being sub-second windows around the
+	// fence flip). Under the backing's default eager fence (real slatedb
+	// timing) the leaver is fenced the INSTANT each successor starts its
+	// slow open and the drain-window writes lose their union leg - the
+	// KNOWN residual TestJoinResidual_FenceAtOpenStart_MovingShardsWedge
+	// reproduces deliberately under the default.
+	backing.SetEagerFence(false)
 
 	mutate := func(cfg *cluster.Config) {
 		cfg.GracefulLeaveDrainTimeout = drainTimeout
