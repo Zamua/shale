@@ -5,7 +5,8 @@
 // TimestampNanos from stampClock.Next() instead of raw
 // time.Now().UnixNano(). Next() is strictly monotonic and unique per
 // call: max(wall clock, last+1), where last is the highest value this
-// node has ever ISSUED or OBSERVED. Observe(ts) ratchets last up to any
+// node has ever ISSUED or OBSERVED (saturating at the math.MaxUint64
+// ceiling rather than wrapping; see Next). Observe(ts) ratchets last up to any
 // stamp the node sees on a read (LWW winner selection), a CAS read-set
 // validate (the stored envelope's stamp), or a replica-receiving apply
 // (the incoming and stored stamps in the apply-if-newer compare).
@@ -30,6 +31,7 @@
 package cluster
 
 import (
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -69,11 +71,24 @@ func (s *stampClock) wallNow() uint64 {
 // regression (NTP step, VM migration): the clock can stall the wall
 // component, but last+1 keeps every issued stamp strictly above
 // everything previously issued or observed.
+//
+// One deliberate exception: once the high-water mark sits at the
+// math.MaxUint64 ceiling (only reachable by Observing a corrupt or
+// hostile stamp; real wall clocks sit ~10x below it), Next SATURATES
+// there instead of wrapping last+1 to 0. A wrap would erase the whole
+// ratchet: the node's next originated write would be stamped 0, which
+// every replica's apply-if-newer rejects while the owner-local apply
+// still acks it - silent loss of acked writes for as long as the
+// poisoned envelope exists. Saturation forfeits per-call uniqueness
+// (already meaningless in a corrupt-stamp regime), never monotonicity.
 func (s *stampClock) Next() uint64 {
 	for {
 		next := s.wallNow()
 		last := s.last.Load()
 		if next <= last {
+			if last == math.MaxUint64 {
+				return math.MaxUint64
+			}
 			next = last + 1
 		}
 		if s.last.CompareAndSwap(last, next) {

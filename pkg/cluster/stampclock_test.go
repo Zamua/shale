@@ -5,6 +5,7 @@ package cluster
 // simulate regressions without touching real time.
 
 import (
+	"math"
 	"sort"
 	"sync"
 	"testing"
@@ -55,6 +56,28 @@ func TestStampClock_ObserveFutureRatchets(t *testing.T) {
 	sc.Observe(10)
 	if got := sc.Next(); got < 5002 {
 		t.Fatalf("Next() after no-op Observe(10) = %d, want >= 5002", got)
+	}
+}
+
+// TestStampClock_ObserveMaxUint64Saturates pins the overflow guard: after
+// Observe(math.MaxUint64) (only reachable from a corrupt or hostile
+// envelope stamp; real wall clocks sit ~10x below the ceiling), Next()
+// must SATURATE at MaxUint64, never wrap to 0. A wrap would erase the
+// entire ratchet state: the node's next originated write would be
+// stamped 0, which every replica's apply-if-newer rejects while the
+// owner-local apply still acks it - intermittent silent loss of acked
+// writes for as long as the poisoned envelope exists. Uniqueness is
+// already forfeit in a corrupt-stamp regime; monotonicity must not be.
+func TestStampClock_ObserveMaxUint64Saturates(t *testing.T) {
+	sc := &stampClock{nowFn: func() int64 { return 100 }}
+	sc.Observe(math.MaxUint64)
+	for range 3 {
+		if got := sc.Next(); got != math.MaxUint64 {
+			t.Fatalf("Next() after Observe(MaxUint64) = %d, want saturation at MaxUint64 (a wrap to 0 erases the ratchet)", got)
+		}
+	}
+	if last := sc.last.Load(); last != math.MaxUint64 {
+		t.Fatalf("ratchet high-water mark = %d, want MaxUint64 retained", last)
 	}
 }
 
