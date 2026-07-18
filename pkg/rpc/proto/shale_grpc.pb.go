@@ -88,9 +88,9 @@ type ShaleNodeClient interface {
 	// this one node. In v0.2+ it reports the full memberlist view.
 	Topology(ctx context.Context, in *TopologyRequest, opts ...grpc.CallOption) (*TopologyResponse, error)
 	// Stats returns per-node counters: how many keys this node holds,
-	// request counts since process start, latency percentiles. The
-	// percentile fields are placeholders in v0.1 (always zero) until the
-	// observability work in v0.5 wires up a real histogram.
+	// request counts since process start, and the node's mount-readiness
+	// counts. COUNTERS ONLY - the node keeps no latency histogram, so no
+	// percentiles are reported (see the reserved fields on StatsResponse).
 	Stats(ctx context.Context, in *StatsRequest, opts ...grpc.CallOption) (*StatsResponse, error)
 	// Ping is a no-op round trip for liveness checks. Useful for the CLI
 	// `shale ping` subcommand + for inter-node health probes later.
@@ -382,9 +382,9 @@ type ShaleNodeServer interface {
 	// this one node. In v0.2+ it reports the full memberlist view.
 	Topology(context.Context, *TopologyRequest) (*TopologyResponse, error)
 	// Stats returns per-node counters: how many keys this node holds,
-	// request counts since process start, latency percentiles. The
-	// percentile fields are placeholders in v0.1 (always zero) until the
-	// observability work in v0.5 wires up a real histogram.
+	// request counts since process start, and the node's mount-readiness
+	// counts. COUNTERS ONLY - the node keeps no latency histogram, so no
+	// percentiles are reported (see the reserved fields on StatsResponse).
 	Stats(context.Context, *StatsRequest) (*StatsResponse, error)
 	// Ping is a no-op round trip for liveness checks. Useful for the CLI
 	// `shale ping` subcommand + for inter-node health probes later.

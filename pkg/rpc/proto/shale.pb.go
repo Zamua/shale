@@ -117,18 +117,35 @@ func (ReshardPhase) EnumDescriptor() ([]byte, []int) {
 	return file_shale_proto_rawDescGZIP(), []int{0}
 }
 
-// ReplicaUnitRef is the POSITION-ADDRESSED forward target (v0.8 Phase 2e,
-// Option B overlap handoff). The plain forwarded ops carry ONLY the key, and
-// the receiver re-resolves the unit+position from the key against its OWN
-// live ring index. On the predecessor of a moving position that no longer
-// yields the draining position (the position moved away in the ring), so the
-// overlap forward instead carries the EXPLICIT ReplicaUnit (gen, unit,
-// replica). When this field is set on a forwarded op, the predecessor's
-// handler resolves mountMap[ru] DIRECTLY by that ru - explicitly willing to
-// serve a Draining-phase entry - rather than re-deriving the position from
-// its ring index. It is the ONLY proto change Phase 2e introduces. Absent
-// (unset) on every non-overlap forward, so the existing key-only forwarding
-// is unchanged.
+// ReplicaUnitRef POSITION-ADDRESSES one leg of a routed op (v0.8 Phase 2e,
+// pending ranges). It is live and load-bearing on every union write and read.
+//
+// A plain forwarded op carries ONLY the key, and the receiver re-resolves the
+// unit + position from that key against its OWN live ring index. That
+// re-derivation is exactly what breaks during a membership transition: routing
+// fans an op out over the UNION of a position's current and pending replica
+// sets, and a union member does NOT necessarily hold the position at its own
+// ring index (a pending owner mid-mount is not yet at that index; a displaced
+// current owner is no longer at it). A ring-index check on the receiver would
+// wrongly refuse those legs.
+//
+// So each union leg carries the EXPLICIT ReplicaUnit (gen, unit, replica).
+// When ru is set on a forwarded op, the receiver resolves mountMap[ru]
+// DIRECTLY by that ru - no ring-ownership guard, explicitly willing to serve a
+// Draining-phase entry. A ru that is not mounted (a pending owner still
+// mid-mount, or an already-released drain) returns the RETRYABLE acquiring
+// error, which the originator's fan-out tolerates by skipping that leg: no
+// re-forward, no A->B->A loop.
+//
+// Set by the PutAtReplica / GetAtReplica / DeleteAtReplica /
+// ScanPrefixAtReplica peer calls. Unset on ordinary key-only forwards and on
+// any client dialing from outside the cluster, so the plain forwarding path is
+// unchanged.
+//
+// NB this SUPERSEDES the predecessor-forward design an earlier Phase 2e draft
+// used, where a new owner forwarded ops BACK to a single draining predecessor
+// during its mount. There is no predecessor and no back-forward: the
+// originator addresses every union member directly.
 type ReplicaUnitRef struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Gen           uint64                 `protobuf:"varint,1,opt,name=gen,proto3" json:"gen,omitempty"`
@@ -194,9 +211,9 @@ type PutRequest struct {
 	Key       []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	Value     []byte                 `protobuf:"bytes,2,opt,name=value,proto3" json:"value,omitempty"`
 	Forwarded bool                   `protobuf:"varint,3,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
-	// ru, when set, position-addresses this forwarded write to a specific
-	// Draining replica on the predecessor (Phase 2e overlap forward). Unset
-	// on every ordinary forward.
+	// ru, when set, position-addresses this forwarded write to one explicit
+	// replica position on the receiver (a leg of the Phase 2e union fan-out).
+	// Unset on every ordinary forward.
 	Ru            *ReplicaUnitRef `protobuf:"bytes,4,opt,name=ru,proto3" json:"ru,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -300,7 +317,7 @@ type GetRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Key       []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	Forwarded bool                   `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
-	// ru: see PutRequest.ru. Position-addressed overlap forward (Phase 2e).
+	// ru: see PutRequest.ru. Position-addressed union leg (Phase 2e).
 	Ru            *ReplicaUnitRef `protobuf:"bytes,3,opt,name=ru,proto3" json:"ru,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
@@ -413,7 +430,7 @@ type DeleteRequest struct {
 	state     protoimpl.MessageState `protogen:"open.v1"`
 	Key       []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	Forwarded bool                   `protobuf:"varint,2,opt,name=forwarded,proto3" json:"forwarded,omitempty"`
-	// ru: see PutRequest.ru. Position-addressed overlap forward (Phase 2e).
+	// ru: see PutRequest.ru. Position-addressed union leg (Phase 2e).
 	Ru            *ReplicaUnitRef `protobuf:"bytes,3,opt,name=ru,proto3" json:"ru,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
