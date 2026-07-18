@@ -237,10 +237,6 @@ func waitForWriteReady(t *testing.T, clusters []*cluster.Cluster, deadline time.
 	clustertest.WaitForWriteReady(t, clusters, deadline)
 }
 
-func isTransientWarmupErr(err error) bool {
-	return clustertest.IsTransientWarmupErr(err)
-}
-
 func waitForRingSize(c *cluster.Cluster, want int, timeout time.Duration) error {
 	return clustertest.WaitForRingSize(c, want, timeout)
 }
