@@ -127,7 +127,23 @@ func (c *Config) applyDefaults() {
 // reads. Always uses path-style addressing (bucket.host virtual-hosted
 // style doesn't work against most non-AWS S3-compatibles without
 // custom DNS, and is harmless on AWS proper).
-func (c Config) applyEnv() {
+//
+// The env vars are PROCESS-GLOBAL, so before writing anything it
+// registers the config with the per-process guard (envguard.go): a
+// construction whose object-store config CONFLICTS with one this process
+// already applied fails fast here with a config-conflict error instead of
+// silently clobbering the earlier env (and authenticating requests with
+// the wrong credentials). An identical repeat registers cleanly.
+func (c Config) applyEnv() error {
+	if err := registerEnvConfig(envConfigTuple{
+		endpoint:  c.Endpoint,
+		region:    c.Region,
+		accessKey: c.AccessKey,
+		secretKey: c.SecretKey,
+		useSSL:    c.UseSSL,
+	}); err != nil {
+		return err
+	}
 	if c.Endpoint != "" {
 		os.Setenv("AWS_ENDPOINT_URL", c.Endpoint)
 	}
@@ -142,4 +158,5 @@ func (c Config) applyEnv() {
 		os.Setenv("AWS_ALLOW_HTTP", "true")
 	}
 	os.Setenv("AWS_VIRTUAL_HOSTED_STYLE_REQUEST", "false")
+	return nil
 }

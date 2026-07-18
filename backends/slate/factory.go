@@ -175,7 +175,10 @@ type Backing struct {
 // env writes are identical across units and are set ONCE here. Two
 // Backings in one process pointing at DIFFERENT buckets is unsupported
 // (the env writes would collide) and is not a configuration the cluster
-// produces - a node has exactly one Backing.
+// produces - a node has exactly one Backing. A second construction whose
+// endpoint/region/credentials/SSL mode CONFLICTS with what this process
+// already applied fails fast here with a config-conflict error
+// (envguard.go) rather than silently clobbering the earlier env.
 func NewBacking(cfg BackingConfig) (*Backing, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err
@@ -183,7 +186,7 @@ func NewBacking(cfg BackingConfig) (*Backing, error) {
 	cfg.applyDefaults()
 	// Reuse slate.Config.applyEnv so the env-var contract stays identical
 	// to the single-instance backend (path-style, AWS_ALLOW_HTTP, etc.).
-	Config{
+	envCfg := Config{
 		Bucket:    cfg.Bucket,
 		DbName:    "_backing", // unused; applyEnv ignores DbName
 		Endpoint:  cfg.Endpoint,
@@ -191,7 +194,10 @@ func NewBacking(cfg BackingConfig) (*Backing, error) {
 		AccessKey: cfg.AccessKey,
 		SecretKey: cfg.SecretKey,
 		UseSSL:    cfg.UseSSL,
-	}.applyEnv()
+	}
+	if err := envCfg.applyEnv(); err != nil {
+		return nil, err
+	}
 	return &Backing{cfg: cfg, url: "s3://" + cfg.Bucket + "/"}, nil
 }
 
