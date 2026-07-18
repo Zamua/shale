@@ -287,6 +287,18 @@ message StatsResponse {
   // metrics work.
   double latency_ms_p50 = 6;
   double latency_ms_p99 = 7;
+
+  // Mount-readiness counts (docs/SPEC.md "Mount readiness"): this node's
+  // per-position mount state over its DESIRED set, so an operator can read
+  // any node's mount state remotely (shale stats) without SHALE_DEBUG_ADDR.
+  // All zero in legacy single-backend mode (no per-unit mounts). The RPC
+  // reports; it does not gate - the readiness decision stays in-process in
+  // the embedding application via Cluster.Ready.
+  uint64 desired_units = 8;
+  uint64 mounted_units = 9;
+  uint64 pending_units = 10;
+  uint64 failed_open_units = 11;
+  string last_acquire_error = 12;
 }
 
 // -- Ping ------------------------------------------------------------

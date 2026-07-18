@@ -244,6 +244,60 @@ func TestStatsCountersAndKeyCount(t *testing.T) {
 	}
 }
 
+// TestStats_MountReadinessCountsOverWire pins the wire exposure of the
+// mount-readiness counts (docs/SPEC.md "Mount readiness"): a multi-backend
+// node reports its desired/mounted/pending/failed-open counts through the
+// Stats RPC, so an operator can read any node's mount state remotely. A
+// single-node multi-backend cluster owns the whole unit space and mounts all
+// of it at Open, so the counts are exact: desired == mounted == UnitCount.
+func TestStats_MountReadinessCountsOverWire(t *testing.T) {
+	addr, _, cleanup := newMultiBackendServer(t) // UnitCount 4, all mounted at Open
+	defer cleanup()
+	cli := newTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := cli.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if resp.GetDesiredUnits() != 4 {
+		t.Fatalf("desired_units: want 4, got %d", resp.GetDesiredUnits())
+	}
+	if resp.GetMountedUnits() != 4 {
+		t.Fatalf("mounted_units: want 4, got %d", resp.GetMountedUnits())
+	}
+	if resp.GetPendingUnits() != 0 || resp.GetFailedOpenUnits() != 0 {
+		t.Fatalf("pending/failed_open: want 0/0, got %d/%d",
+			resp.GetPendingUnits(), resp.GetFailedOpenUnits())
+	}
+	if resp.GetLastAcquireError() != "" {
+		t.Fatalf("last_acquire_error: want empty, got %q", resp.GetLastAcquireError())
+	}
+}
+
+// TestStats_MountReadinessLegacyZero: a legacy single-backend node reports
+// all-zero mount counts over the wire (no per-unit mounts to summarize).
+func TestStats_MountReadinessLegacyZero(t *testing.T) {
+	addr, cleanup := newTestServer(t)
+	defer cleanup()
+	cli := newTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	resp, err := cli.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats: %v", err)
+	}
+	if resp.GetDesiredUnits() != 0 || resp.GetMountedUnits() != 0 ||
+		resp.GetPendingUnits() != 0 || resp.GetFailedOpenUnits() != 0 ||
+		resp.GetLastAcquireError() != "" {
+		t.Fatalf("legacy node must report zero mount counts, got %+v", resp)
+	}
+}
+
 func TestScanPrefixStreams(t *testing.T) {
 	addr, cleanup := newTestServer(t)
 	defer cleanup()

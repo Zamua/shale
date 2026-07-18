@@ -31,21 +31,31 @@ func runStats(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 
 	if opts.json {
 		out := struct {
-			KeysHeld     uint64  `json:"keys_held"`
-			Puts         uint64  `json:"puts"`
-			Gets         uint64  `json:"gets"`
-			Deletes      uint64  `json:"deletes"`
-			Scans        uint64  `json:"scans"`
-			LatencyMsP50 float64 `json:"latency_ms_p50"`
-			LatencyMsP99 float64 `json:"latency_ms_p99"`
+			KeysHeld         uint64  `json:"keys_held"`
+			Puts             uint64  `json:"puts"`
+			Gets             uint64  `json:"gets"`
+			Deletes          uint64  `json:"deletes"`
+			Scans            uint64  `json:"scans"`
+			LatencyMsP50     float64 `json:"latency_ms_p50"`
+			LatencyMsP99     float64 `json:"latency_ms_p99"`
+			DesiredUnits     uint64  `json:"desired_units"`
+			MountedUnits     uint64  `json:"mounted_units"`
+			PendingUnits     uint64  `json:"pending_units"`
+			FailedOpenUnits  uint64  `json:"failed_open_units"`
+			LastAcquireError string  `json:"last_acquire_error"`
 		}{
-			KeysHeld:     resp.GetKeysHeld(),
-			Puts:         resp.GetPuts(),
-			Gets:         resp.GetGets(),
-			Deletes:      resp.GetDeletes(),
-			Scans:        resp.GetScans(),
-			LatencyMsP50: resp.GetLatencyMsP50(),
-			LatencyMsP99: resp.GetLatencyMsP99(),
+			KeysHeld:         resp.GetKeysHeld(),
+			Puts:             resp.GetPuts(),
+			Gets:             resp.GetGets(),
+			Deletes:          resp.GetDeletes(),
+			Scans:            resp.GetScans(),
+			LatencyMsP50:     resp.GetLatencyMsP50(),
+			LatencyMsP99:     resp.GetLatencyMsP99(),
+			DesiredUnits:     resp.GetDesiredUnits(),
+			MountedUnits:     resp.GetMountedUnits(),
+			PendingUnits:     resp.GetPendingUnits(),
+			FailedOpenUnits:  resp.GetFailedOpenUnits(),
+			LastAcquireError: resp.GetLastAcquireError(),
 		}
 		enc := json.NewEncoder(stdout)
 		enc.SetIndent("", "  ")
@@ -63,5 +73,13 @@ func runStats(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	_, _ = fmt.Fprintf(stdout, "scans           %d\n", resp.GetScans())
 	_, _ = fmt.Fprintf(stdout, "latency_ms_p50  %.3f\n", resp.GetLatencyMsP50())
 	_, _ = fmt.Fprintf(stdout, "latency_ms_p99  %.3f\n", resp.GetLatencyMsP99())
+	// Mount readiness (multi-backend; all zero on a legacy node).
+	_, _ = fmt.Fprintf(stdout, "desired_units      %d\n", resp.GetDesiredUnits())
+	_, _ = fmt.Fprintf(stdout, "mounted_units      %d\n", resp.GetMountedUnits())
+	_, _ = fmt.Fprintf(stdout, "pending_units      %d\n", resp.GetPendingUnits())
+	_, _ = fmt.Fprintf(stdout, "failed_open_units  %d\n", resp.GetFailedOpenUnits())
+	if e := resp.GetLastAcquireError(); e != "" {
+		_, _ = fmt.Fprintf(stdout, "last_acquire_error %s\n", e)
+	}
 	return exitOK
 }
