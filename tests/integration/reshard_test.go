@@ -269,6 +269,35 @@ func putWithRetryReshard(t *testing.T, c *cluster.Cluster, key, val string, time
 	}
 }
 
+// awaitFirstAckBarrier blocks until every writer has closed its ready channel
+// (each closes its own after landing its FIRST acked write), or the deadline
+// passes.
+//
+// This is the barrier that makes the "concurrent" in the concurrent-write
+// reshard tests REAL rather than assumed. An in-process single-node reshard
+// completes in a few HUNDRED MICROSECONDS, which is faster than the Go runtime
+// wakes a parked P to run a freshly spawned writer goroutine on an otherwise
+// idle machine. Without the barrier the main goroutine can finish the reshard
+// and set the stop flag before any writer is ever scheduled; each writer then
+// observes stop on its very first loop check and exits having issued ZERO
+// writes, so the reshard races nothing and the read-back oracle pins nothing.
+// Blocking here until every writer has provably landed an acked write, while
+// the writers keep looping through the reshard that follows, makes the overlap
+// a structural property instead of a bet on the reshard being slow.
+func awaitFirstAckBarrier(t *testing.T, ready []chan struct{}, timeout time.Duration, stop *atomic.Bool, wg *sync.WaitGroup) {
+	t.Helper()
+	deadline := time.After(timeout)
+	for w, ch := range ready {
+		select {
+		case <-ch:
+		case <-deadline:
+			stop.Store(true)
+			wg.Wait()
+			t.Fatalf("writer %d landed no acked write within %v; cannot start a reshard that provably races live writes", w, timeout)
+		}
+	}
+}
+
 // localKeyFor returns a key whose unit at the current count is owned by node n
 // on the ring built from n's Members() - so a Put of it on n hits the LOCAL
 // write path (and thus the local freeze gate), not a forward to a peer.
@@ -308,6 +337,12 @@ func TestReshard_ConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const writers = 4
+	// Each writer closes its own ready channel after its FIRST acked write so
+	// the barrier below can hold the reshard until every writer is in flight.
+	ready := make([]chan struct{}, writers)
+	for w := range ready {
+		ready[w] = make(chan struct{})
+	}
 	for w := range writers {
 		wg.Add(1)
 		go func(w int) {
@@ -326,10 +361,18 @@ func TestReshard_ConcurrentWritesNoAckedWriteLost(t *testing.T) {
 				mu.Lock()
 				acked[k] = v
 				mu.Unlock()
+				if i == 0 {
+					close(ready[w])
+				}
 				i++
 			}
 		}(w)
 	}
+
+	// BARRIER: hold the reshard until every writer has provably landed an acked
+	// write. The writers keep looping through the reshard that follows, so the
+	// acked set spans it by construction rather than by timing luck.
+	awaitFirstAckBarrier(t, ready, 30*time.Second, &stop, &wg)
 
 	if err := n1.Cluster.Reshard(); err != nil {
 		stop.Store(true)
@@ -388,6 +431,12 @@ func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const writers = 4
+	// Each writer closes its own ready channel after its FIRST acked write so
+	// the barrier below can hold the reshard until every writer is in flight.
+	ready := make([]chan struct{}, writers)
+	for w := range ready {
+		ready[w] = make(chan struct{})
+	}
 	for w := range writers {
 		wg.Add(1)
 		go func(w int) {
@@ -411,10 +460,18 @@ func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 				mu.Lock()
 				acked[k] = v
 				mu.Unlock()
+				if i == 0 {
+					close(ready[w])
+				}
 				i++
 			}
 		}(w)
 	}
+
+	// BARRIER: hold the reshard until every writer has provably landed an acked
+	// write through its entry node, so the coordinator-driven freeze below
+	// genuinely races live writes on both first-hops.
+	awaitFirstAckBarrier(t, ready, 30*time.Second, &stop, &wg)
 
 	// Coordinator-driven reshard on n1 while writers hammer both nodes.
 	if err := n1.Cluster.Reshard(); err != nil {
