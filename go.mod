@@ -13,6 +13,7 @@ require (
 	github.com/minio/minio-go/v7 v7.2.0
 	go.uber.org/goleak v1.3.0
 	golang.org/x/sync v0.20.0
+	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
 	slatedb.io/slatedb-go v0.13.1
@@ -79,6 +80,5 @@ require (
 	golang.org/x/sys v0.44.0 // indirect
 	golang.org/x/text v0.37.0 // indirect
 	golang.org/x/tools v0.44.0 // indirect
-	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	gopkg.in/ini.v1 v1.67.2 // indirect
 )
