@@ -796,6 +796,11 @@ func (c *Cluster) reshardCoordinated() error {
 // then relies on the node-side stale-freeze self-heal).
 func (c *Cluster) resumeUntilAcked(members []memberRPC, targetGen storageunit.Generation) error {
 	deadline := time.Now().Add(resumeRetryTimeout)
+	// A CONSTANT, un-jittered wait, and the deadline check below stays this
+	// loop's own (see newConstantRetryWait): a reshard has one coordinator, so
+	// there is no herd to de-synchronize, and the budget check has to sit where
+	// it can return the right per-node lastErr.
+	backoff := newConstantRetryWait(resumeRetryBackoff)
 	pending := append([]memberRPC(nil), members...)
 	var lastErr error
 	for {
@@ -814,7 +819,7 @@ func (c *Cluster) resumeUntilAcked(members []memberRPC, targetGen storageunit.Ge
 			return lastErr
 		}
 		pending = stillPending
-		time.Sleep(resumeRetryBackoff)
+		backoff.wait(nil)
 	}
 }
 

@@ -51,6 +51,28 @@ var transactUnavailableTimeout = 30 * time.Second
 // failure doubles the backoff from casBaseBackoff up to this cap, and the
 // sleep before each re-run is full-jitter, a uniform random duration in
 // (0, current-backoff]. var so tests can tune it.
+//
+// WHY Transact DOES NOT USE THE SHARED retryWait (see retry_wait.go). Its two
+// backoffs differ from the handoff / re-drive family in KIND, not in constants:
+//
+//   - JITTER SHAPE. This branch is FULL jitter, uniform in (0, backoff]. The
+//     conflict branch below is neither that nor the shared [0.5, 1.0) shape: it
+//     sleeps casBaseBackoff + uniform[0, casBaseBackoff*(attempt+1)), i.e. an
+//     ADDITIVE, linearly-growing spread rather than a doubling one. Two distinct
+//     shapes in one loop is exactly what a single parameterized wait cannot
+//     express without becoming a bag of flags.
+//   - BUDGET SHAPE. The bound here is not one wall clock. It is a wall clock
+//     (transactUnavailableTimeout) AND a re-run cap (transactRetryableMaxRuns)
+//     AND the conflict budget (CASMaxAttempts) - and the retryable branch
+//     deliberately DECREMENTS the loop counter so a transient freeze does not
+//     consume a conflict attempt. The shared wait assumes one monotonic
+//     schedule; this loop's attempt counter is not monotonic.
+//   - INJECTION POINT. The retryable branch sleeps through the transactSleep
+//     var so unit tests can capture the requested durations without really
+//     sleeping. The shared wait sleeps for real.
+//
+// Folding this in would mean carrying three extra knobs to serve one caller, so
+// it stays hand-rolled on purpose.
 var transactRetryableBackoffCap = 500 * time.Millisecond
 
 // transactRetryableMaxRuns caps how many times Transact re-runs fn through a

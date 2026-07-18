@@ -840,7 +840,7 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 		// the shared lastAcquireErr diagnostic map (see that function's doc for
 		// why the shared map cannot carry this loop's control flow).
 		spawned := time.Now()
-		backoff := acquireRedriveBase
+		redrive := newCappedRetryWait(acquireRedriveBase, acquireRedriveCap)
 		attempt := 0
 		for {
 			if c.closed.Load() {
@@ -888,19 +888,16 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), time.Since(spawned).Round(time.Millisecond))
 				return // mounted (or superseded); done.
 			}
-			if backoff > acquireRedriveCap {
+			if redrive.exhausted() {
 				c.logf("shale: acquire failed %s: attempt %d after %s (%v); backoff budget exhausted, periodic reconcile is the backstop",
 					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), acqErr)
 				return // hand the retry back to the periodic reconcile backstop.
 			}
 			c.logf("shale: acquire failed %s: attempt %d after %s (%v); retrying in ~%s",
-				ru, attempt, time.Since(attemptStart).Round(time.Millisecond), acqErr, backoff)
-			select {
-			case <-c.closeCh:
-				return
-			case <-time.After(jitteredBackoff(backoff)):
+				ru, attempt, time.Since(attemptStart).Round(time.Millisecond), acqErr, redrive.interval())
+			if redrive.wait(c.closeCh) != retryWaitProceed {
+				return // Close ran during the backoff; nothing left to re-drive.
 			}
-			backoff *= 2
 		}
 	}()
 }
