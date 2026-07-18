@@ -549,6 +549,50 @@ func (c *Cluster) mountedUnits() []mountedUnit {
 	return out
 }
 
+// scanCoverageErr reports the acquiring refusal when this node's mount map does
+// NOT cover every position it owns, and nil when it does.
+//
+// WHY A LOCAL SCAN NEEDS THIS AT ALL. Every other entry point resolves ONE key
+// to ONE position, so a position that is owned-but-not-yet-mounted is reached
+// directly and refuses (errUnitAcquiring). A local scan resolves no key: it
+// walks the mount map. An owned position that is mid-acquire is simply ABSENT
+// from that map, so the scan skips it and returns the keys it does hold with a
+// clean end-of-iteration. There is no error anywhere. That makes a PARTIAL scan
+// indistinguishable from a COMPLETE one - the one failure shape a cross-shard
+// consumer cannot defend against, because a shorter answer is a legitimate
+// answer.
+//
+// WHY THAT IS DATA-LOSS-ADJACENT, not an availability nit. Aggregate's callers
+// build SETS and then act on what is ABSENT from them. shale's own blob GC does
+// exactly this (referencedObjKeys -> the orphan sweep): an object is deleted
+// when its key is absent from the referenced set. A silently-partial scan is
+// therefore not a smaller answer, it is a WRONG one that deletes live data, and
+// re-running afterwards cannot undo it. Fail-closed is the only safe direction,
+// which is why referencedObjKeys already aborts its whole scan on a single
+// undecodable pointer; an unmounted unit is the same hazard reached through a
+// different door.
+//
+// The predicate is MountReadiness's PendingUnits (desired positions minus
+// mounted ones) - the same diff the readiness probe and the /debug/shale/state
+// wedge flag key on, so a node that reports itself not fully mounted and a node
+// that refuses to scan can never disagree.
+//
+// It is deliberately CONSERVATIVE. A transient reconcile window (a join, a
+// handoff, a reshard's not-yet-mounted children) refuses the scan even where
+// the parent unit still covers the keyspace. The cost is a retry of a
+// background fan-out; the cost of the other error is deleted data. Refusals
+// carry ReasonAcquiring, so the caller matches cluster.ErrAcquiring and retries
+// the whole call once the mounts settle.
+func (c *Cluster) scanCoverageErr(op string) error {
+	if !c.multi {
+		return nil
+	}
+	if c.MountReadiness().PendingUnits > 0 {
+		return errUnitAcquiring(op)
+	}
+	return nil
+}
+
 // localScanMounted returns an iterator over the union of every mounted
 // unit's keys with the given prefix. It is the multi-backend form of the
 // local admin scan (LocalScanPrefix): keysHeld counts the node's whole
@@ -556,7 +600,15 @@ func (c *Cluster) mountedUnits() []mountedUnit {
 // are scanned in ascending unit order and their iterators chained; each
 // open iterator is closed when its turn ends (or on the chain's Close).
 // Multi-backend mode only.
+//
+// It refuses UP FRONT when the mount map does not cover this node's owned
+// positions (scanCoverageErr), so an incomplete scan fails fast instead of
+// streaming a partial keyspace that looks whole. The chained iterator re-checks
+// at exhaustion, covering a position that goes mid-acquire after this point.
 func (c *Cluster) localScanMounted(prefix []byte) (backend.Iterator, error) {
+	if err := c.scanCoverageErr("LocalScan"); err != nil {
+		return nil, err
+	}
 	return &mountedIterator{c: c, units: c.mountedUnits(), prefix: prefix}, nil
 }
 
@@ -590,7 +642,16 @@ func (it *mountedIterator) Next() (key, value []byte, err error) {
 	for {
 		if it.cur == nil {
 			if it.idx >= len(it.units) {
-				return nil, nil, nil
+				// EXHAUSTED. Re-check coverage before signalling a clean end:
+				// a position that went mid-acquire AFTER localScanMounted's
+				// up-front check would otherwise be reported as a normal
+				// end-of-iteration, which is precisely the partial-looks-
+				// complete shape (see scanCoverageErr). Surfacing the refusal
+				// here is what carries it across the fan-out boundary: on the
+				// peer path this becomes a stream error the originator's
+				// iterator returns from INSIDE the caller's scan fn, still
+				// carrying ReasonAcquiring, rather than an EOF.
+				return nil, nil, it.c.scanCoverageErr("LocalScan")
 			}
 			mu := it.units[it.idx]
 			it.idx++
@@ -633,6 +694,14 @@ func (it *mountedIterator) Close() error {
 // snapshotPeer: load every mounted unit's keys into a transient
 // snapshotBackend. Multi-backend mode only.
 func (c *Cluster) localMountedSnapshot() (backend.Backend, error) {
+	// Refuse a snapshot that cannot cover this node's owned positions, before
+	// and after materializing: the up-front check rejects a node already
+	// mid-acquire, the closing one rejects a position that went mid-acquire
+	// while we were reading. Without them Aggregate's LOCAL leg hands fn a
+	// short snapshot with no error at all (see scanCoverageErr).
+	if err := c.scanCoverageErr("aggregate scan"); err != nil {
+		return nil, err
+	}
 	snap := newSnapshotBackend()
 	for _, mu := range c.mountedUnits() {
 		it, err := mu.b.ScanPrefix(nil)
@@ -656,6 +725,9 @@ func (c *Cluster) localMountedSnapshot() (backend.Backend, error) {
 			_ = snap.Put(k, v)
 		}
 		_ = it.Close()
+	}
+	if err := c.scanCoverageErr("aggregate scan"); err != nil {
+		return nil, err
 	}
 	return snap, nil
 }

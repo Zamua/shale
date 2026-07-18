@@ -277,6 +277,41 @@ func TestStats_MountReadinessCountsOverWire(t *testing.T) {
 	}
 }
 
+// TestStats_SurvivesTheAcquiringWindow pins that the observability endpoint
+// stays UP while this node holds an owned position unmounted.
+//
+// The local scan Stats counts through fails CLOSED in that state, because its
+// other callers build sets and act on what is absent from them. Stats is the
+// deliberate exception: nothing decides a deletion from keys_held, and
+// propagating the refusal would black out the Stats RPC during exactly the
+// handoff window an operator is trying to observe - including PendingUnits,
+// the field that EXPLAINS why the key count is short. The count is allowed to
+// be partial; the response is not allowed to disappear.
+func TestStats_SurvivesTheAcquiringWindow(t *testing.T) {
+	addr, c, cleanup := newMultiBackendServer(t) // UnitCount 4, all mounted at Open
+	defer cleanup()
+	cli := newTestClient(t, addr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+
+	// Leave the node owner-but-unmounted for one position: the real handoff state.
+	c.TestingClearMount(storageunit.UnitID(0))
+
+	resp, err := cli.Stats(ctx)
+	if err != nil {
+		t.Fatalf("Stats went dark during the acquiring window; the operator loses the readout that "+
+			"explains the window: %v", err)
+	}
+	if resp.GetPendingUnits() == 0 {
+		t.Fatalf("pending_units = 0 with a mount cleared; the readout that qualifies keys_held is missing: %+v", resp)
+	}
+	if resp.GetMountedUnits() >= resp.GetDesiredUnits() {
+		t.Fatalf("mounted(%d) >= desired(%d) with a mount cleared",
+			resp.GetMountedUnits(), resp.GetDesiredUnits())
+	}
+}
+
 // TestStats_MountReadinessLegacyZero: a legacy single-backend node reports
 // all-zero mount counts over the wire (no per-unit mounts to summarize).
 func TestStats_MountReadinessLegacyZero(t *testing.T) {

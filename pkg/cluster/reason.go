@@ -26,17 +26,26 @@
 // exported sentinel, and one table row - no redesign, and no change to the
 // encode/decode plumbing.
 //
-// TWO PLACES A REASON CAN BE LOST, and both are covered. The first is the NODE
-// BOUNDARY, handled by the encode/decode halves below. The second is a FAN-OUT
-// COLLAPSE: at R>1 a write is many legs summarized into one error, and minting
-// that terminal fresh drops whatever the legs carried. Terminals built with
-// reasonTerminal inherit the legs' reason instead (see classifyWriteAttempt), so
-// the contract holds at R=1 and R>1 alike. A consumer's match must not depend on
-// its replication factor.
+// THREE PLACES A REASON CAN BE LOST, and all three are covered. The first is the
+// NODE BOUNDARY, handled by the encode/decode halves below. The second is a
+// FAN-OUT COLLAPSE: at R>1 a write is many legs summarized into one error, and
+// minting that terminal fresh drops whatever the legs carried. Terminals built
+// with reasonTerminal inherit the legs' reason instead (see classifyWriteAttempt),
+// so the contract holds at R=1 and R>1 alike. A consumer's match must not depend
+// on its replication factor.
+//
+// The third is the one that is NOT an error-plumbing problem at all, and so is
+// the easiest to miss: A REFUSAL THAT WAS NEVER RAISED. A cross-shard scan walks
+// the mount map, so a position this node owns but has not yet mounted is not
+// refused - it is simply ABSENT, and the scan ends cleanly having returned less
+// than it owed. No error exists to carry a reason. That is a worse failure than
+// an unmatchable error, because a short answer is indistinguishable from a
+// correct one; see scanCoverageErr (multibackend.go), which converts the gap
+// into a refusal so there is something to match in the first place.
 //
 // SCOPE. This contract covers the IN-PROCESS Cluster surface (the seam a library
-// consumer embeds: Get / Put / Delete / ScanPrefix / Transact) and every
-// cluster-internal peer RPC underneath it, because the decode interceptors are
+// consumer embeds: Get / Put / Delete / ScanPrefix / Transact / Aggregate) and
+// every cluster-internal peer RPC underneath it, because the decode interceptors are
 // installed in peerDialOptions, which is the only dial site pkg/cluster uses. It
 // does NOT cover pkg/rpc.Client, the out-of-process CLI client: that dials with
 // plain credentials and installs no interceptors, so a refusal it receives keeps
@@ -108,6 +117,51 @@ const reasonDomain = "shale.dev"
 //	if errors.Is(err, cluster.ErrAcquiring) {
 //	    // bounded retry with backoff; the handoff will finish
 //	}
+//
+// WHERE TO MATCH ON A FAN-OUT OP (Aggregate). A point op returns one error and
+// there is one place to match it. Aggregate does not: it returns a slice of
+// AggregateResult, and a refusal can arrive through EITHER of two channels.
+// BOTH must be checked, and a consumer that checks only the obvious one has a
+// hole exactly where it hurts most.
+//
+//   - AggregateResult.Err, when shale could not run fn for that peer at all
+//     (its snapshot was refused, the stream would not open).
+//   - THE SCAN FN, when fn was already running and the refusal surfaced from
+//     the iterator it holds. It leaves fn as whatever fn RETURNS - an `any`,
+//     not an error - so it crosses the fan-out boundary as a VALUE. This is
+//     the channel a consumer forgets. Carry the error out of fn (returning it,
+//     or as a field on the value fn returns) and match it there.
+//
+// Both channels deliver a real error wrapping this sentinel, so ONE predicate
+// covers both:
+//
+//	for _, r := range c.Aggregate(fn) {
+//	    if r.Err != nil {                       // channel 1
+//	        return fmt.Errorf("aggregate: %w", r.Err)
+//	    }
+//	    if out, ok := r.Value.(myScan); ok && out.err != nil {   // channel 2
+//	        return fmt.Errorf("aggregate scan: %w", out.err)
+//	    }
+//	}
+//
+// RETRY THE WHOLE CALL, never a single peer: the refused peer's slice of the
+// keyspace is missing from every other peer's result too, so a per-peer retry
+// cannot reconstruct it.
+//
+// WHY A FAN-OUT REFUSAL IS HELD TO A HIGHER BAR THAN MATCHABILITY. Aggregate's
+// callers build SETS and then act on what is ABSENT from them - a referenced-
+// blob set drives blob GC, so a key missing from the set is an object DELETED.
+// For such a caller a partial scan is not a smaller answer, it is a wrong one
+// that destroys live data, and re-running afterwards cannot undo it. So the
+// contract is not merely "a refusal is retryable": A PARTIAL RESULT MUST NEVER
+// BE MISTAKABLE FOR A COMPLETE ONE. Matchability is how a consumer retries;
+// non-mistakability is what makes silence impossible. shale therefore REFUSES a
+// local scan whose node holds any owned position unmounted, rather than
+// returning the keys it happens to have: an owned-but-unmounted position is
+// invisible to a mount-map walk, so a short scan would otherwise end cleanly
+// and read as complete. A future consumer reading only this API cannot tell
+// which of its uses is the dangerous one, so the safe shape is the only shape
+// offered.
 //
 // WHAT IT DOES NOT COVER, deliberately. A write that fell short of W because a
 // replica was GENUINELY DOWN does not match, even when other replicas were

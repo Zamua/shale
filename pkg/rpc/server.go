@@ -514,9 +514,24 @@ func (s *Server) ProposeRebalance(_ context.Context, req *pb.ProposeRebalanceReq
 // true per-node key count. Cheap for the small memory-backed clusters
 // we test against; a future revision will swap in a maintained
 // counter on the Backend side.
+//
+// IT DELIBERATELY TOLERATES THE ACQUIRING REFUSAL, unlike every other consumer
+// of LocalScanPrefix. That scan fails CLOSED when this node holds an owned
+// position unmounted, because its callers build SETS and act on what is absent
+// from them (a referenced-blob set drives GC, so a missing key deletes an
+// object). This counter is not that: it is an approximate observability gauge,
+// nothing decides deletion from it, and a partial count is strictly more useful
+// than no answer. Propagating the refusal would take Stats DOWN during exactly
+// the handoff window an operator is trying to observe - and Stats is the RPC
+// that reports PendingUnits, the number explaining why the count is short. So
+// the count is reported alongside that number and read as partial when it is
+// non-zero, rather than the whole response failing.
 func (s *Server) keysHeld() (uint64, error) {
 	it, err := s.c.LocalScanPrefix(nil)
 	if err != nil {
+		if errors.Is(err, cluster.ErrAcquiring) {
+			return 0, nil
+		}
 		return 0, err
 	}
 	defer func() { _ = it.Close() }()
@@ -524,6 +539,9 @@ func (s *Server) keysHeld() (uint64, error) {
 	for {
 		k, _, err := it.Next()
 		if err != nil {
+			if errors.Is(err, cluster.ErrAcquiring) {
+				return n, nil // partial; PendingUnits in the same response says so
+			}
 			return 0, err
 		}
 		if k == nil {
