@@ -36,13 +36,13 @@ func (ru ReplicaUnit) String() string {
 	return fmt.Sprintf("%s/r%d", ru.Unit, ru.Replica)
 }
 
-// ReplicaLookup answers "which nodes hold this unit, in replica order?" It is
-// the R>1 analogue of OwnerLookup: where OwnerLookup yields a unit's single
-// owner, ReplicaLookup yields the ordered replica set (primary first, then
-// the ring successors). In production it is the ring computed over the
-// generation-qualified unit id via LocateKeyN(., R); modeling it as a
-// one-method interface keeps OwnedReplicaUnits pure and trivially fakeable in
-// tests (no ring, just a map).
+// ReplicaLookup answers "which nodes hold this unit, in replica order?" It
+// yields the ordered replica set (primary first, then the ring successors).
+// In production it is the ring computed over the generation-qualified unit id
+// via LocateKeyN(., R), adapted to this contract by the cluster's
+// ownedReplicaUnitsAt; modeling it as a one-method interface keeps
+// OwnedReplicaUnits pure and trivially fakeable in tests (no ring, just a
+// map).
 //
 // ReplicasOf returns the ordered replica nodes for unit u, or nil/empty when
 // the unit has no owners (an empty ring, or a unit id out of range for the
@@ -59,9 +59,13 @@ type ReplicaLookupFunc func(u UnitID) []NodeID
 func (f ReplicaLookupFunc) ReplicasOf(u UnitID) []NodeID { return f(u) }
 
 // OwnedReplicaUnits returns, for the node self, every unit self replicates
-// together with the POSITION self holds in that unit's replica set. It is the
-// R>1 analogue of OwnedUnits: it enumerates 0..N-1 and keeps every unit whose
-// replica set contains self, pairing the unit with self's index in that set.
+// together with the POSITION self holds in that unit's replica set. It
+// enumerates 0..N-1 and keeps every unit whose replica set contains self,
+// pairing the unit with self's index in that set.
+//
+// It is the pure core of the R>1 mount derivation: the cluster's
+// desiredReplicaUnits qualifies each result with the live generation to get
+// the ReplicaUnit set the reconcile diffs against the mount map.
 //
 // The result is ascending by UnitID (the enumeration order) and freshly
 // allocated; an empty (non-nil) slice means self replicates no units under c.

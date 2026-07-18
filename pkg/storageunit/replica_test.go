@@ -91,6 +91,85 @@ func TestOwnedReplicaUnits_ZeroCountOrNilLookup(t *testing.T) {
 	}
 }
 
+// TestOwnedReplicaUnits_AscendingAndNonNil pins two shape guarantees the
+// reconcile depends on. ASCENDING: the derivation enumerates 0..N-1, so the
+// desired set comes back ordered by UnitID, which is what makes a
+// desired-vs-mounted diff comparable without a sort. NON-NIL: an empty result
+// is a freshly allocated empty slice, never nil, so a caller can range and
+// append over it unconditionally.
+func TestOwnedReplicaUnits_AscendingAndNonNil(t *testing.T) {
+	c := MustUnitCount(16)
+
+	// Every unit replicated by "self" at position 0: the full 0..15 ascending.
+	all := ReplicaLookupFunc(func(UnitID) []NodeID { return []NodeID{"self", "other"} })
+	got := OwnedReplicaUnits("self", c, all)
+	if len(got) != 16 {
+		t.Fatalf("OwnedReplicaUnits should return all 16 units, got %d", len(got))
+	}
+	for i, o := range got {
+		if o.Unit != UnitID(i) {
+			t.Fatalf("not ascending at index %d: got unit %d", i, o.Unit)
+		}
+		if o.Replica != 0 {
+			t.Fatalf("unit %d: replica = %d, want 0 (self is first in the set)", o.Unit, o.Replica)
+		}
+	}
+
+	// A node in no replica set owns nothing, as a non-nil empty slice.
+	none := OwnedReplicaUnits("nobody", c, staticReplicas{})
+	if none == nil {
+		t.Fatalf("OwnedReplicaUnits should return a non-nil empty slice, got nil")
+	}
+	if len(none) != 0 {
+		t.Fatalf("OwnedReplicaUnits over empty ownership = %v, want empty", none)
+	}
+}
+
+// TestOwnedReplicaUnits_CoversTheUnitSpaceRTimes pins the cluster-wide
+// placement invariant at R>1. Summing every node's owned set over a
+// round-robin placement covers the whole 0..N-1 space with EXACTLY R holders
+// per unit, and each unit's R holders occupy DISTINCT positions 0..R-1. That
+// is the durability property the replicated mount rests on: R independent
+// copies, no unit orphaned, no position held twice (which would be two writers
+// on one durable database).
+func TestOwnedReplicaUnits_CoversTheUnitSpaceRTimes(t *testing.T) {
+	const r = 2
+	c := MustUnitCount(16)
+	nodes := []NodeID{"a", "b", "c"}
+
+	// Round-robin: unit u is replicated by nodes[u], nodes[u+1], ... (R of them).
+	repl := ReplicaLookupFunc(func(u UnitID) []NodeID {
+		set := make([]NodeID, 0, r)
+		for i := 0; i < r; i++ {
+			set = append(set, nodes[(int(u)+i)%len(nodes)])
+		}
+		return set
+	})
+
+	holders := make(map[UnitID]int)
+	positions := make(map[UnitID]map[uint8]bool)
+	for _, n := range nodes {
+		for _, o := range OwnedReplicaUnits(n, c, repl) {
+			holders[o.Unit]++
+			if positions[o.Unit] == nil {
+				positions[o.Unit] = make(map[uint8]bool)
+			}
+			if positions[o.Unit][o.Replica] {
+				t.Fatalf("unit %d: position %d held by two nodes (two writers on one database)", o.Unit, o.Replica)
+			}
+			positions[o.Unit][o.Replica] = true
+		}
+	}
+	if len(holders) != 16 {
+		t.Fatalf("union of OwnedReplicaUnits covered %d units, want 16", len(holders))
+	}
+	for u, n := range holders {
+		if n != r {
+			t.Fatalf("unit %d held by %d nodes, want exactly R=%d", u, n, r)
+		}
+	}
+}
+
 func TestReplicaLookupFunc_Adapts(t *testing.T) {
 	f := ReplicaLookupFunc(func(u UnitID) []NodeID {
 		if u == 0 {
