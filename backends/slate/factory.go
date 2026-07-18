@@ -160,6 +160,33 @@ func (c BackingConfig) dbNameReplica(ru storageunit.ReplicaUnit) string {
 	return dbNameReplicaFor(c.KeyPrefix, ru)
 }
 
+// String renders the identity the way the pre-consolidation error strings did:
+// "unit g1/u5" on the R=1 path, "replica g1/u5/r0" on the R>1 path. Every
+// shared helper formats with %s over the ref, so the operator-visible messages
+// are byte-identical to the two hand-written copies they replace.
+func (r unitRef) String() string {
+	if r.replicated {
+		return "replica " + r.ru.String()
+	}
+	return "unit " + r.ru.Unit.String()
+}
+
+// closeMethod names the release entry point for this identity, so the
+// double-open error can tell the caller which one to call first.
+func (r unitRef) closeMethod() string {
+	if r.replicated {
+		return "CloseReplicaUnit"
+	}
+	return "CloseUnit"
+}
+
+// dbNameRef resolves the ref to its slatedb DbName. Delegates to the PURE
+// dbNameForRef (dbname.go), which is the SINGLE place the R=1 / R>1 on-disk
+// encoding split is decided and is pinned tagless by dbname_test.go.
+func (c BackingConfig) dbNameRef(r unitRef) string {
+	return dbNameForRef(c.KeyPrefix, r)
+}
+
 // Backing owns the shared-bucket connection parameters that every per-node
 // Handle references. One Backing per CLUSTER; one Handle per NODE off it.
 // It is the production analogue of sharedfactory.Backing: the shared
@@ -283,8 +310,16 @@ func (b *Backing) readDurableEpochBounded(dbName string) (storageunit.Epoch, err
 	return r.epoch, r.err
 }
 
+// durableEpochRef reads the ref's durable manifest writer-epoch WITHOUT opening
+// the database. It is the one implementation behind both durableEpoch (R=1) and
+// durableEpochReplica (R>1): identical read, the ONLY difference being which
+// prefix dbNameRef resolves to.
+func (b *Backing) durableEpochRef(r unitRef) (storageunit.Epoch, error) {
+	return b.readDurableEpochBounded(b.cfg.dbNameRef(r))
+}
+
 func (b *Backing) durableEpoch(gu storageunit.GenUnit) (storageunit.Epoch, error) {
-	return b.readDurableEpochBounded(b.cfg.dbName(gu))
+	return b.durableEpochRef(refUnit(gu))
 }
 
 // DurableEpochReplica is the R>1 analogue of DurableEpoch: it reads the
@@ -305,7 +340,7 @@ func (b *Backing) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.E
 // epoch: replica positions fence INDEPENDENTLY. A nil manifest means the
 // position has never been created (durable epoch 0). Mirrors durableEpoch.
 func (b *Backing) durableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Epoch, error) {
-	return b.readDurableEpochBounded(b.cfg.dbNameReplica(ru))
+	return b.durableEpochRef(refReplica(ru))
 }
 
 // minioClient builds a fresh minio S3 client against the configured endpoint +
@@ -504,24 +539,23 @@ func sortGenUnits(s []storageunit.GenUnit) {
 type Handle struct {
 	backing *Backing
 
-	mu   sync.Mutex
-	open map[storageunit.GenUnit]*mountedUnit // units THIS handle has open
-	// openLatch holds a per-GenUnit mutex so the WHOLE open of one unit
+	mu sync.Mutex
+	// open holds the positions THIS handle has mounted, keyed by unitRef so
+	// the R=1 (GenUnit) and R>1 (ReplicaUnit) surfaces share one map WITHOUT
+	// aliasing: the ref carries the replicated flag, so refUnit(gu) and
+	// refReplica(gu, 0) are different keys just as their two on-disk prefixes
+	// are different strings. A cluster runs R=1 OR R>1 (fixed at Open), so in
+	// practice only one family is ever populated; the flag is what guarantees
+	// the merge stays safe if that ever stops holding.
+	open map[unitRef]*mountedUnit
+	// openLatch holds a per-ref mutex so the WHOLE open of one position
 	// (held-check, durable-manifest fence read, slatedb open, map insert)
-	// runs in a single critical section per unit. Without it OpenUnit would
+	// runs in a single critical section per position. Without it openRef would
 	// release h.mu around the slow slatedb open, leaving a window where two
-	// goroutines opening the SAME unit could both pass the held-check and
-	// both open. Keyed per unit so opens of DIFFERENT units still proceed
-	// concurrently (the slatedb open is the slow part and is unit-local).
-	openLatch map[storageunit.GenUnit]*sync.Mutex
-
-	// openReplica + openLatchReplica are the R>1 siblings of open + openLatch,
-	// keyed by ReplicaUnit so each (gen, unit, replica) position is tracked +
-	// serialized INDEPENDENTLY. A Handle never mixes the R=1 and R>1 maps (a
-	// cluster runs R=1 OR R>1, fixed at Open); keeping them separate keeps the
-	// R=1 path byte-for-byte unchanged.
-	openReplica      map[storageunit.ReplicaUnit]*mountedUnit
-	openLatchReplica map[storageunit.ReplicaUnit]*sync.Mutex
+	// goroutines opening the SAME position could both pass the held-check and
+	// both open. Keyed per ref so opens of DIFFERENT positions still proceed
+	// concurrently (the slatedb open is the slow part and is position-local).
+	openLatch map[unitRef]*sync.Mutex
 }
 
 // mountedUnit bundles a unit's live slatedb instance with the epoch this
@@ -535,41 +569,25 @@ type mountedUnit struct {
 // cluster gets its own Handle; they all share b.
 func (b *Backing) Handle() *Handle {
 	return &Handle{
-		backing:          b,
-		open:             make(map[storageunit.GenUnit]*mountedUnit),
-		openLatch:        make(map[storageunit.GenUnit]*sync.Mutex),
-		openReplica:      make(map[storageunit.ReplicaUnit]*mountedUnit),
-		openLatchReplica: make(map[storageunit.ReplicaUnit]*sync.Mutex),
+		backing:   b,
+		open:      make(map[unitRef]*mountedUnit),
+		openLatch: make(map[unitRef]*sync.Mutex),
 	}
 }
 
-// latchFor returns the per-GenUnit open latch, creating it on first use. The
-// latch map itself is guarded by h.mu (briefly), so two goroutines opening
-// the same unit get the SAME *sync.Mutex and serialize on it; goroutines
-// opening different units get distinct latches and do not contend.
-func (h *Handle) latchFor(gu storageunit.GenUnit) *sync.Mutex {
+// latchFor returns the per-ref open latch, creating it on first use. The latch
+// map itself is guarded by h.mu (briefly), so two goroutines opening the same
+// position get the SAME *sync.Mutex and serialize on it; goroutines opening
+// different positions get distinct latches and do not contend. Because the ref
+// carries the R=1/R>1 flag, an R=1 unit and its R>1 replica-0 position latch
+// independently, matching their independent on-disk prefixes.
+func (h *Handle) latchFor(r unitRef) *sync.Mutex {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	l, ok := h.openLatch[gu]
+	l, ok := h.openLatch[r]
 	if !ok {
 		l = &sync.Mutex{}
-		h.openLatch[gu] = l
-	}
-	return l
-}
-
-// latchForReplica is the R>1 sibling of latchFor: it returns the
-// per-ReplicaUnit open latch, creating it on first use. Two goroutines
-// opening the SAME replica position get the SAME *sync.Mutex and serialize;
-// opens of different positions (or different units) get distinct latches and
-// do not contend.
-func (h *Handle) latchForReplica(ru storageunit.ReplicaUnit) *sync.Mutex {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	l, ok := h.openLatchReplica[ru]
-	if !ok {
-		l = &sync.Mutex{}
-		h.openLatchReplica[ru] = l
+		h.openLatch[r] = l
 	}
 	return l
 }
@@ -598,118 +616,217 @@ func (h *Handle) latchForReplica(ru storageunit.ReplicaUnit) *sync.Mutex {
 // SERIALIZES (the second caller sees the unit held and is rejected) rather
 // than both passing a stale held-check around the slow slatedb open.
 func (h *Handle) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
-	latch := h.latchFor(gu)
-	latch.Lock()
-	defer latch.Unlock()
-
-	// Held-check under the latch: a concurrent same-unit open holds the latch,
-	// so by the time we get here either it finished (unit held -> we reject) or
-	// it has not started (unit not held -> we proceed and it rejects).
-	h.mu.Lock()
-	cur, held := h.open[gu]
-	h.mu.Unlock()
-	if held {
-		return nil, fmt.Errorf("slate: unit %s already open on this handle at epoch %d; CloseUnit first to re-open", gu, cur.epoch)
-	}
-
-	// Fence authoritatively above the durable manifest epoch. The intended
-	// epoch is only a floor; the durable manifest governs so a stale floor
-	// cannot under-fence.
-	opened, err := h.backing.fenceEpoch(gu, epoch)
+	s, _, err := h.openRef(refUnit(gu), epoch)
 	if err != nil {
 		return nil, err
 	}
-
-	s, err := h.backing.openSlate(gu)
-	if err != nil {
-		return nil, err
-	}
-
-	h.mu.Lock()
-	h.open[gu] = &mountedUnit{slate: s, epoch: opened}
-	h.mu.Unlock()
 	return s, nil
 }
 
-// fenceEpoch computes the epoch the open will land at: strictly above the
-// unit's durable manifest writer-epoch, and at least the cluster's
-// intended floor. Opening at that epoch fences any lower-epoch writer.
+// openRef is the ONE open sequence behind both OpenUnit (R=1) and
+// OpenReplicaUnit (R>1): per-ref latch, held-check under that latch, fence
+// against the ref's durable manifest, slatedb open, mount-map insert. Keeping
+// it single-sourced is the point of unitRef: a guard added here (or a fix to
+// the fence ordering) lands on BOTH surfaces, instead of on whichever copy the
+// author happened to be editing.
+//
+// It returns the epoch the open landed at as well as the backend, because the
+// R>1 caller must use that EXACT value as its open epoch (gate + serving
+// marker) and must never re-read the durable to recover it. The R=1 surface
+// discards it, matching the narrower BackendFactory signature.
+//
+// Two behavioural properties are ref-DEPENDENT and preserved verbatim:
+//   - the durability flag: openSlateRef keeps AwaitDurable pinned true on the
+//     R=1 path regardless of RelaxedReplicaDurability (see there);
+//   - the timing log: only the R>1 path emits the fence-read/build breakdown
+//     (see logOpen).
+func (h *Handle) openRef(r unitRef, epoch storageunit.Epoch) (*Slate, storageunit.Epoch, error) {
+	latch := h.latchFor(r)
+	latch.Lock()
+	defer latch.Unlock()
+
+	// Held-check under the latch: a concurrent same-position open holds the
+	// latch, so by the time we get here either it finished (position held ->
+	// we reject) or it has not started (not held -> we proceed and it rejects).
+	h.mu.Lock()
+	cur, held := h.open[r]
+	h.mu.Unlock()
+	if held {
+		return nil, 0, fmt.Errorf("slate: %s already open on this handle at epoch %d; %s first to re-open", r, cur.epoch, r.closeMethod())
+	}
+
+	// FENCE <= RECOVERY ORDERING INVARIANT (v0.8 Phase 2e, NEW-P1-4). The new
+	// owner's recovery snapshot (the durable WAL/manifest tail it mounts) MUST
+	// be taken AT-OR-AFTER the manifest-epoch fence is durably effective, so no
+	// write the OLD owner can still ack escapes the recovered tail. Because
+	// forwarding continues until the mount flip (strictly AFTER this open
+	// completes), a forwarded write can be acked on the old owner AFTER this
+	// recovery snapshot but still BELOW the fence epoch E; to keep every such
+	// write inside the recovered tail the fence must be effective no later than
+	// the recovery cutoff. The spec's required order is therefore: make the
+	// fence effective FIRST, THEN take the recovery snapshot.
+	//
+	// WHAT THE GO LAYER CAN GUARANTEE, AND WHAT IT CANNOT (the precise
+	// assumption). At the Go level we order fenceEpochRef BEFORE openSlateRef,
+	// which is the correct fence-then-recover sequence as far as Go can express
+	// it. BUT fenceEpochRef is ARITHMETIC ONLY: it reads the ref's durable
+	// manifest writer-epoch and computes opened = max(intended, durable+1); it
+	// does NOT itself durably WRITE the bumped epoch. The actual fence AND the
+	// WAL recovery both happen INSIDE slatedb's DbBuilder.Build() (openSlateRef
+	// -> buildDb), which is a single opaque uniffi FFI call over the Rust core.
+	// The slatedb-go v0.13.1 binding exposes NO WithEpoch setter on DbBuilder
+	// and NO hook between the fence and the recovery snapshot, so from Go we can
+	// neither inject the computed epoch into the open NOR observe whether the
+	// Rust core fences-then-recovers or recovers-then-fences internally. We
+	// therefore CANNOT PROVE the fence<=recovery ordering from the module; it is
+	// an EXPLICIT ASSUMPTION about slatedb's open path (consistent with its
+	// independent WalReader surface and writer-epoch protocol, but not verified
+	// in Go source).
+	//
+	// THE RELEASE GATE. This assumption is PINNED by the two real-slate tests in
+	// factory_servingmarker_slatedb_test.go (build tag slatedb), run in the
+	// staging acceptance run, NOT here: (1) a write acked on the old owner JUST
+	// BEFORE the fence is readable on the new owner AFTER the handoff; (2) a
+	// write driven THROUGH THE FORWARD PATH concurrently with the flip (acked
+	// below E while the new owner's open/recovery races) is readable after. If
+	// either fails, the Rust core recovers-then-fences (or does not replay the
+	// full durable WAL tail) and this open must be adjusted to RE-SCAN the WAL
+	// tail after the fence (via the WalReader surface) before serving; until the
+	// pins pass on real slate, Phase 2e is BLOCKED per the spec's P0 gate.
+	//
+	// The intended epoch is only a floor; the durable manifest governs so a
+	// stale floor cannot under-fence.
+	fenceStart := time.Now()
+	opened, err := h.backing.fenceEpochRef(r, epoch)
+	if err != nil {
+		r.logOpen("slate: open %s: fence-read FAILED after %s: %v", r, time.Since(fenceStart).Round(time.Millisecond), err)
+		return nil, 0, err
+	}
+	fenceDur := time.Since(fenceStart)
+
+	buildStart := time.Now()
+	s, err := h.backing.openSlateRef(r)
+	if err != nil {
+		r.logOpen("slate: open %s: fence-read %s, build FAILED after %s: %v",
+			r, fenceDur.Round(time.Millisecond), time.Since(buildStart).Round(time.Millisecond), err)
+		return nil, 0, err
+	}
+	r.logOpen("slate: open %s: fence-read %s, build %s, epoch %d",
+		r, fenceDur.Round(time.Millisecond), time.Since(buildStart).Round(time.Millisecond), opened)
+
+	h.mu.Lock()
+	h.open[r] = &mountedUnit{slate: s, epoch: opened}
+	h.mu.Unlock()
+	return s, opened, nil
+}
+
+// logOpen emits openRef's per-open fence-read/build timing breakdown, but ONLY
+// on the R>1 replica path.
+//
+// DIVERGENCE PRESERVED DELIBERATELY. Before this consolidation the R=1 OpenUnit
+// had no instrumentation at all and the R>1 OpenReplicaUnit had all three lines
+// (fence-fail, build-fail, success). Routing both through openRef would have
+// started emitting operator log lines on every R=1 mount, which is a visible
+// behaviour change to a deployed R=1 cluster's log volume, so the gate stays.
+// Turning it on for R=1 is a deliberate, separate decision (arguably the right
+// one, since the fence/build split is exactly what a cold-start mount-hang
+// investigation needs on either path) and not something a mechanical extraction
+// should smuggle in.
+func (r unitRef) logOpen(format string, args ...any) {
+	if !r.replicated {
+		return
+	}
+	logf(format, args...)
+}
+
+// fenceEpochRef computes the epoch the open of r will land at: strictly above
+// r's durable manifest writer-epoch, and at least the cluster's intended floor.
+// Opening at that epoch fences any lower-epoch writer of the SAME ref.
+//
+// This max(intended, durable+1) arithmetic is the single fence rule for BOTH
+// R=1 and R>1; the ONLY thing the ref changes is which manifest is read. At R>1
+// that manifest is the position's own (dbNameReplica(ru)), so opening replica 1
+// reads r1's manifest only: a fence of r0 never bumps r1, and re-acquiring r0
+// at a higher epoch leaves r1 untouched. Replica positions fence INDEPENDENTLY.
+func (b *Backing) fenceEpochRef(r unitRef, intended storageunit.Epoch) (storageunit.Epoch, error) {
+	durable, err := b.durableEpochRef(r)
+	if err != nil {
+		return 0, err
+	}
+	opened := intended
+	if floor := durable + 1; floor > opened {
+		opened = floor
+	}
+	return opened, nil
+}
+
+// fenceEpoch is the R=1 spelling of fenceEpochRef, kept for the R=1 call sites
+// and tests that pin the factory's epoch arithmetic directly.
 func (b *Backing) fenceEpoch(gu storageunit.GenUnit, intended storageunit.Epoch) (storageunit.Epoch, error) {
-	durable, err := b.durableEpoch(gu)
-	if err != nil {
-		return 0, err
-	}
-	opened := intended
-	if floor := durable + 1; floor > opened {
-		opened = floor
-	}
-	return opened, nil
+	return b.fenceEpochRef(refUnit(gu), intended)
 }
 
-// fenceEpochReplica is the R>1 analogue of fenceEpoch: it computes the epoch
-// the open of replica position ru will land at - strictly above ru's
-// PER-REPLICA durable manifest writer-epoch, and at least the cluster's
-// intended floor. Identical arithmetic to fenceEpoch (max(intended,
-// durable+1)), but reading the per-replica manifest at dbNameReplica(ru), so
-// opening replica 1 reads r1's manifest only: a fence of r0 never bumps r1,
-// and re-acquiring r0 at a higher epoch leaves r1 untouched.
+// fenceEpochReplica is the R>1 spelling of fenceEpochRef.
 func (b *Backing) fenceEpochReplica(ru storageunit.ReplicaUnit, intended storageunit.Epoch) (storageunit.Epoch, error) {
-	durable, err := b.durableEpochReplica(ru)
-	if err != nil {
-		return 0, err
-	}
-	opened := intended
-	if floor := durable + 1; floor > opened {
-		opened = floor
-	}
-	return opened, nil
+	return b.fenceEpochRef(refReplica(ru), intended)
 }
 
-// openSlate opens the per-unit slatedb instance with AwaitDurable=true
-// (the multi-backend durability invariant) and the backing's Settings.
-func (b *Backing) openSlate(gu storageunit.GenUnit) (*Slate, error) {
+// openSlateRef opens the slatedb instance for r at its resolved DbName with the
+// backing's Settings/Cache. Because the DbName encodes the position, the
+// instance's WAL/LSM/manifest live at a prefix disjoint from every other unit's
+// and (at R>1) every other replica's, which is the structural
+// replica-independence guarantee.
+//
+// DURABILITY DIVERGENCE, PRESERVED DELIBERATELY. AwaitDurable is:
+//   - ALWAYS true on the R=1 path, regardless of the operator's
+//     RelaxedReplicaDurability setting. Relaxed durability at R=1 loses any
+//     un-flushed write on a single-replica crash, because there is no peer
+//     memtable holding the write. The flag is pinned here, not operator-tunable,
+//     exactly as the pre-consolidation openSlate pinned it.
+//   - true by default on the R>1 path, and false when the operator set
+//     RelaxedReplicaDurability: a write then acks at memtable insert and the
+//     background WAL flush carries durability, with the peer replica's memtable
+//     as the safety net for a single-replica pre-flush crash.
+//
+// Reading the flag off the ref (r.replicated) rather than off a call-site is
+// what keeps that R=1 protection from being lost the next time this path is
+// edited. See BackingConfig.RelaxedReplicaDurability.
+func (b *Backing) openSlateRef(r unitRef) (*Slate, error) {
 	store, err := b.resolveStore()
 	if err != nil {
 		return nil, err
 	}
-	// AwaitDurable=true: every acked write durable in the bucket before
-	// ack, per unit. Pinned here (not operator-tunable) because the
-	// multi-backend model is R=1; relaxed durability needs R>=2.
-	wopts := &slatedb.WriteOptions{AwaitDurable: true}
-	db, err := buildDb(b.cfg.dbName(gu), store, b.cfg.Settings, b.cfg.Cache)
-	if err != nil {
-		store.Destroy()
-		return nil, fmt.Errorf("slate: open unit %s: %w", gu, err)
-	}
-	return &Slate{db: db, store: store, writeOpts: wopts}, nil
-}
-
-// openSlateReplica is the R>1 analogue of openSlate: it opens the per-replica
-// slatedb instance at dbNameReplica(ru) with the backing's Settings/Cache.
-// AwaitDurable is true by default, or false when BackingConfig.
-// RelaxedReplicaDurability is set (relaxed durability is safe here because this
-// is the R>=2 path; see that field). Because the DbName encodes the replica
-// position,
-// the instance's WAL/LSM/manifest live at a prefix disjoint from every other
-// replica's, which is the structural replica-independence guarantee.
-func (b *Backing) openSlateReplica(ru storageunit.ReplicaUnit) (*Slate, error) {
-	store, err := b.resolveStore()
-	if err != nil {
-		return nil, err
-	}
-	// AwaitDurable defaults true (every acked write durable in the bucket
-	// before ack). When the operator opted into relaxed durability AND we are
-	// here (the R>=2 replica path), ack at memtable insert instead and let the
-	// background WAL flush carry durability; the peer replica's memtable is the
-	// safety net for a single-replica pre-flush crash. See BackingConfig.
-	awaitDurable := !b.cfg.RelaxedReplicaDurability
+	awaitDurable := !(r.replicated && b.cfg.RelaxedReplicaDurability)
 	wopts := &slatedb.WriteOptions{AwaitDurable: awaitDurable}
-	db, err := buildDb(b.cfg.dbNameReplica(ru), store, b.cfg.Settings, b.cfg.Cache)
+	db, err := buildDb(b.cfg.dbNameRef(r), store, b.cfg.Settings, b.cfg.Cache)
 	if err != nil {
 		store.Destroy()
-		return nil, fmt.Errorf("slate: open replica %s: %w", ru, err)
+		return nil, fmt.Errorf("slate: open %s: %w", r, err)
 	}
 	return &Slate{db: db, store: store, writeOpts: wopts}, nil
+}
+
+// closeRef is the ONE release sequence behind both CloseUnit (R=1) and
+// CloseReplicaUnit (R>1): drop the position from this handle's mount map, then
+// flush + shut down its slatedb instance (Db.Shutdown forces pending writes
+// durable) WITHOUT affecting any other position and WITHOUT deleting the bucket
+// bytes. The data stays durable at the position's prefix for the next owner.
+// Idempotent: releasing a position this handle does not hold is a no-op
+// returning nil.
+func (h *Handle) closeRef(r unitRef) error {
+	h.mu.Lock()
+	mu, held := h.open[r]
+	if held {
+		delete(h.open, r)
+	}
+	h.mu.Unlock()
+	if !held {
+		return nil
+	}
+	if err := mu.slate.Close(); err != nil {
+		return fmt.Errorf("slate: close %s: %w", r, err)
+	}
+	return nil
 }
 
 // CloseUnit releases gu from THIS handle: flushes (Db.Shutdown forces
@@ -719,19 +836,7 @@ func (b *Backing) openSlateReplica(ru storageunit.ReplicaUnit) (*Slate, error) {
 // Idempotent: closing a unit this handle does not hold is a no-op
 // returning nil.
 func (h *Handle) CloseUnit(gu storageunit.GenUnit) error {
-	h.mu.Lock()
-	mu, held := h.open[gu]
-	if held {
-		delete(h.open, gu)
-	}
-	h.mu.Unlock()
-	if !held {
-		return nil
-	}
-	if err := mu.slate.Close(); err != nil {
-		return fmt.Errorf("slate: close unit %s: %w", gu, err)
-	}
-	return nil
+	return h.closeRef(refUnit(gu))
 }
 
 // OpenReplicaUnit opens (mounts) the slatedb instance for replica position
@@ -758,76 +863,10 @@ func (h *Handle) CloseUnit(gu storageunit.GenUnit) error {
 // SERIALIZES rather than both passing a stale held-check around the slow
 // slatedb open. Opens of different positions proceed concurrently.
 func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
-	latch := h.latchForReplica(ru)
-	latch.Lock()
-	defer latch.Unlock()
-
-	h.mu.Lock()
-	cur, held := h.openReplica[ru]
-	h.mu.Unlock()
-	if held {
-		return nil, 0, fmt.Errorf("slate: replica %s already open on this handle at epoch %d; CloseReplicaUnit first to re-open", ru, cur.epoch)
-	}
-
-	// FENCE <= RECOVERY ORDERING INVARIANT (v0.8 Phase 2e, NEW-P1-4). The new
-	// owner's recovery snapshot (the durable WAL/manifest tail it mounts) MUST
-	// be taken AT-OR-AFTER the manifest-epoch fence is durably effective, so no
-	// write the OLD owner can still ack escapes the recovered tail. Because
-	// forwarding continues until the mount flip (strictly AFTER this open
-	// completes), a forwarded write can be acked on the old owner AFTER this
-	// recovery snapshot but still BELOW the fence epoch E; to keep every such
-	// write inside the recovered tail the fence must be effective no later than
-	// the recovery cutoff. The spec's required order is therefore: make the
-	// fence effective FIRST, THEN take the recovery snapshot.
-	//
-	// WHAT THE GO LAYER CAN GUARANTEE, AND WHAT IT CANNOT (the precise
-	// assumption). At the Go level we order fenceEpochReplica BEFORE
-	// openSlateReplica, which is the correct fence-then-recover sequence as far
-	// as Go can express it. BUT fenceEpochReplica is ARITHMETIC ONLY: it reads
-	// ru's durable manifest writer-epoch and computes opened = max(intended,
-	// durable+1); it does NOT itself durably WRITE the bumped epoch. The actual
-	// fence AND the WAL recovery both happen INSIDE slatedb's DbBuilder.Build()
-	// (openSlateReplica -> buildDb), which is a single opaque uniffi FFI call
-	// over the Rust core. The slatedb-go v0.13.1 binding exposes NO WithEpoch
-	// setter on DbBuilder and NO hook between the fence and the recovery
-	// snapshot, so from Go we can neither inject the computed epoch into the
-	// open NOR observe whether the Rust core fences-then-recovers or
-	// recovers-then-fences internally. We therefore CANNOT PROVE the
-	// fence<=recovery ordering from the module; it is an EXPLICIT ASSUMPTION
-	// about slatedb's open path (consistent with its independent WalReader
-	// surface and writer-epoch protocol, but not verified in Go source).
-	//
-	// THE RELEASE GATE. This assumption is PINNED by the two real-slate tests in
-	// factory_servingmarker_slatedb_test.go (build tag slatedb), run in the
-	// staging acceptance run, NOT here: (1) a write acked on the old owner JUST
-	// BEFORE the fence is readable on the new owner AFTER the handoff; (2) a
-	// write driven THROUGH THE FORWARD PATH concurrently with the flip (acked
-	// below E while the new owner's open/recovery races) is readable after. If
-	// either fails, the Rust core recovers-then-fences (or does not replay the
-	// full durable WAL tail) and this open must be adjusted to RE-SCAN the WAL
-	// tail after the fence (via the WalReader surface) before serving; until the
-	// pins pass on real slate, Phase 2e is BLOCKED per the spec's P0 gate.
-	fenceStart := time.Now()
-	opened, err := h.backing.fenceEpochReplica(ru, epoch)
+	s, opened, err := h.openRef(refReplica(ru), epoch)
 	if err != nil {
-		logf("slate: open replica %s: fence-read FAILED after %s: %v", ru, time.Since(fenceStart).Round(time.Millisecond), err)
 		return nil, 0, err
 	}
-	fenceDur := time.Since(fenceStart)
-
-	buildStart := time.Now()
-	s, err := h.backing.openSlateReplica(ru)
-	if err != nil {
-		logf("slate: open replica %s: fence-read %s, build FAILED after %s: %v",
-			ru, fenceDur.Round(time.Millisecond), time.Since(buildStart).Round(time.Millisecond), err)
-		return nil, 0, err
-	}
-	logf("slate: open replica %s: fence-read %s, build %s, epoch %d",
-		ru, fenceDur.Round(time.Millisecond), time.Since(buildStart).Round(time.Millisecond), opened)
-
-	h.mu.Lock()
-	h.openReplica[ru] = &mountedUnit{slate: s, epoch: opened}
-	h.mu.Unlock()
 	// opened is the EXACT fence epoch this open landed at; the caller uses it as
 	// this node's open epoch (gate + serving marker), never re-reading the durable.
 	return s, opened, nil
@@ -871,19 +910,7 @@ func (h *Handle) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Ep
 // the next owner. Idempotent: closing a position this handle does not hold is
 // a no-op returning nil. It is the R>1 analogue of CloseUnit.
 func (h *Handle) CloseReplicaUnit(ru storageunit.ReplicaUnit) error {
-	h.mu.Lock()
-	mu, held := h.openReplica[ru]
-	if held {
-		delete(h.openReplica, ru)
-	}
-	h.mu.Unlock()
-	if !held {
-		return nil
-	}
-	if err := mu.slate.Close(); err != nil {
-		return fmt.Errorf("slate: close replica %s: %w", ru, err)
-	}
-	return nil
+	return h.closeRef(refReplica(ru))
 }
 
 // CurrentEpoch reports the epoch THIS handle currently holds gu open at,
@@ -893,7 +920,7 @@ func (h *Handle) CloseReplicaUnit(ru storageunit.ReplicaUnit) error {
 func (h *Handle) CurrentEpoch(gu storageunit.GenUnit) (storageunit.Epoch, bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
-	mu, ok := h.open[gu]
+	mu, ok := h.open[refUnit(gu)]
 	if !ok {
 		return 0, false
 	}
@@ -904,29 +931,33 @@ func (h *Handle) CurrentEpoch(gu storageunit.GenUnit) (storageunit.Epoch, bool) 
 // by (Generation, UnitID). A fresh copy the caller may retain. This is the
 // locally-mounted set the reconcile diffs against desired; see
 // Backing.PresentUnits for the present-in-bucket set.
+//
+// It reports the R=1 mounts ONLY, which is what the storageunit.BackendFactory
+// contract asks for and what the pre-consolidation GenUnit-keyed map held; R>1
+// replica mounts are tracked in the same map now but filtered out here by the
+// ref's replicated flag, so the returned set is unchanged.
 func (h *Handle) OpenUnits() []storageunit.GenUnit {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	out := make([]storageunit.GenUnit, 0, len(h.open))
-	for gu := range h.open {
-		out = append(out, gu)
+	for r := range h.open {
+		if r.replicated {
+			continue
+		}
+		out = append(out, r.ru.Unit)
 	}
 	sortGenUnits(out)
 	return out
 }
 
-// Close releases every unit this handle still has mounted (best-effort
-// flush + shutdown). Used on node shutdown; idempotent.
+// Close releases every position this handle still has mounted, R=1 and R>1
+// alike (best-effort flush + shutdown). Used on node shutdown; idempotent.
 func (h *Handle) Close() error {
 	h.mu.Lock()
-	mounted := make([]*mountedUnit, 0, len(h.open)+len(h.openReplica))
-	for gu, mu := range h.open {
+	mounted := make([]*mountedUnit, 0, len(h.open))
+	for r, mu := range h.open {
 		mounted = append(mounted, mu)
-		delete(h.open, gu)
-	}
-	for ru, mu := range h.openReplica {
-		mounted = append(mounted, mu)
-		delete(h.openReplica, ru)
+		delete(h.open, r)
 	}
 	h.mu.Unlock()
 	var firstErr error
