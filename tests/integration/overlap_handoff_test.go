@@ -159,6 +159,16 @@ func runOverlapMembershipChange(t *testing.T, forceCleanCut bool, mountDelay tim
 	t.Helper()
 	const unitCount = 32
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence-at-completion timing): this driver pins the
+	// overlap-forward union mechanism in ISOLATION. Its gate's ack-rate
+	// assertion is "only possible because the old owner keeps serving" a
+	// mount LONGER than the 5s write budget, which requires the displaced
+	// owner to stay unfenced through the modeled mount. Under the backing's
+	// default eager fence (real slatedb timing) the displaced owner is
+	// fenced at open-START and these same moving-shard writes WEDGE, which
+	// is the KNOWN residual TestJoinResidual_FenceAtOpenStart_
+	// MovingShardsWedge reproduces deliberately under the default.
+	backing.SetEagerFence(false)
 
 	mutate := func(cfg *cluster.Config) {
 		cfg.TestingForceCleanCut = forceCleanCut

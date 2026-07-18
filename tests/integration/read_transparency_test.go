@@ -120,6 +120,19 @@ func summarizeFails(t *testing.T, label string, fails []string, limit int) {
 func TestJoinReadTransparent_GetScanEveryNode(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence semantics, both toggles): this gate pins
+	// the union READ mechanism in isolation with ZERO-tolerance
+	// single-attempt probes - the displaced owner must keep serving reads
+	// through rt-d's 8s modeled mount, which needs fence-at-completion
+	// timing (eager fence would fence it at open-START) AND
+	// reads-pass-through on the sub-second post-completion fence windows
+	// (strict read fencing would turn those into client-visible blips this
+	// gate counts as failures). Production close-on-fence read behavior is
+	// covered by TestUnionReadRetry_ServesThroughFenceWindow (pkg/cluster)
+	// and the real-slatedb TestMinIO_WriterEpochFencing pins; the eager
+	// wedge residual by TestJoinResidual_FenceAtOpenStart_MovingShardsWedge.
+	backing.SetEagerFence(false)
+	backing.SetStrictReadFencing(false)
 
 	n1 := startReplicatedNodeCfg(t, "rt-a", "", uc, rf, backing, nil)
 	n2 := startReplicatedNodeCfg(t, "rt-b", n1.BindAddr, uc, rf, backing, nil)
@@ -186,6 +199,13 @@ func TestJoinReadTransparent_GetScanEveryNode(t *testing.T) {
 func TestLeaveReadTransparent_GetScanEveryNode(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence semantics, both toggles): zero-tolerance
+	// single-attempt read probes through the drain + post-exit windows
+	// require the draining leaver (and the old-index holders) to keep
+	// serving reads while successors slow-mount; see the justification on
+	// TestJoinReadTransparent_GetScanEveryNode above.
+	backing.SetEagerFence(false)
+	backing.SetStrictReadFencing(false)
 	mutate := func(cfg *cluster.Config) {
 		cfg.GracefulLeaveDrainTimeout = 20 * time.Second
 		cfg.OpenConcurrency = 8
@@ -270,6 +290,12 @@ drainLoop:
 func TestSurgeReadTransparent_JoinLeaveJoinComposition(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence semantics, both toggles): zero-tolerance
+	// single-attempt read probes through the whole join/leave/join surge
+	// timeline; see the justification on
+	// TestJoinReadTransparent_GetScanEveryNode above.
+	backing.SetEagerFence(false)
+	backing.SetStrictReadFencing(false)
 	mutate := func(cfg *cluster.Config) {
 		cfg.GracefulLeaveDrainTimeout = 20 * time.Second
 		cfg.OpenConcurrency = 8
@@ -389,6 +415,12 @@ func TestSurgeReadTransparent_JoinLeaveJoinComposition(t *testing.T) {
 func TestLeaveEntryServesWhileDraining(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence semantics, both toggles): the draining
+	// leaver serves ENTRY reads (including its own local legs) for the
+	// whole drain while survivors slow-mount its positions; see the
+	// justification on TestJoinReadTransparent_GetScanEveryNode above.
+	backing.SetEagerFence(false)
+	backing.SetStrictReadFencing(false)
 	mutate := func(cfg *cluster.Config) {
 		cfg.GracefulLeaveDrainTimeout = 25 * time.Second
 		cfg.OpenConcurrency = 8
