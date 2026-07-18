@@ -21,7 +21,10 @@
 // env vars; it does not honor URL query parameters. New() writes the
 // relevant env vars from Config before calling ObjectStoreResolve.
 // Don't open two Slate backends pointing at different buckets in the
-// same process; the env-var writes would collide.
+// same process; the env-var writes would collide. A construction whose
+// endpoint/region/credentials/SSL mode conflicts with what this process
+// already applied fails fast with a config-conflict error (envguard.go)
+// rather than silently clobbering the earlier env.
 
 //go:build slatedb
 
@@ -74,7 +77,9 @@ func New(cfg Config) (*Slate, error) {
 		return nil, err
 	}
 	cfg.applyDefaults()
-	cfg.applyEnv()
+	if err := cfg.applyEnv(); err != nil {
+		return nil, err
+	}
 
 	url := "s3://" + cfg.Bucket + "/"
 	store, err := slatedb.ObjectStoreResolve(url)
