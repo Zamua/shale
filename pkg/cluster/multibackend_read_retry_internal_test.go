@@ -6,13 +6,14 @@ package cluster
 // instead of surfacing an error, and a cluster where no leg ever serves still
 // errors at ~ReadTimeout (budget respected, no infinite wait).
 //
-// The transient window is created with the REAL fence seams (SetEagerFence +
-// SetStrictReadFencing + a per-handle acquire delay): a foreign higher-epoch
-// open fences the mounted copy at open-START, strict read fencing makes the
-// fenced handle fail reads with ErrFenced (real slatedb's closed-on-fence), the
-// fence-self-heal recodes that to the transient + evicts, and the cluster's
-// re-acquire heals the position mid-budget - the exact fence-window blip
-// observed on the staging surge (isolated single-cycle "unit handing off").
+// The transient window is created with the REAL fence seams (the backing's
+// production-shaped defaults: eager fence + strict read fencing, plus a
+// per-handle acquire delay): a foreign higher-epoch open fences the mounted
+// copy at open-START, strict read fencing makes the fenced handle fail reads
+// with ErrFenced (real slatedb's closed-on-fence), the fence-self-heal recodes
+// that to the transient + evicts, and the cluster's re-acquire heals the
+// position mid-budget - the exact fence-window blip observed on the staging
+// surge (isolated single-cycle "unit handing off").
 
 import (
 	"bytes"
@@ -73,9 +74,10 @@ func openFenceWindow(t *testing.T, c *Cluster, backing *sharedfactory.Backing, r
 }
 
 func TestUnionReadRetry_ServesThroughFenceWindow(t *testing.T) {
+	// The backing's defaults are already production-shaped: eager fence at
+	// open-START + strict read fencing (fenced handle fails reads), which this
+	// test's fence window depends on.
 	backing := sharedfactory.NewBacking()
-	backing.SetEagerFence(true)        // real slatedb: fence at open-START
-	backing.SetStrictReadFencing(true) // real slatedb: fenced handle fails reads
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self")
 	c.cfg.ReadTimeout = 3 * time.Second
 	// Pin the eviction-armed debounced reconcile (evictStaleMount ->

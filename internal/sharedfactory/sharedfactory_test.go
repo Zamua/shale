@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -254,6 +255,97 @@ func TestServingMarkerMonotonic(t *testing.T) {
 	if e, _, _ := h.ReadServingMarker(ru); e != 12 {
 		t.Fatalf("after higher write = %d, want 12", e)
 	}
+}
+
+// TestDefaultStrictReadFencing pins the factory's DEFAULT read-fence semantics
+// to production shape: with NO toggle calls, a fenced replica handle fails
+// READS (Get + ScanPrefix) with ErrFenced too, not just writes - real slatedb
+// CLOSES a fenced handle, so every op errors. The permissive reads-pass-through
+// model is reachable only via the explicit SetStrictReadFencing(false) opt-out,
+// which the test also pins.
+func TestDefaultStrictReadFencing(t *testing.T) {
+	backing := NewBacking()
+	a := backing.Handle()
+	b := backing.Handle()
+	ru := ru0(4, 0)
+
+	ba, _, err := a.OpenReplicaUnit(ru, 1)
+	if err != nil {
+		t.Fatalf("A.OpenReplicaUnit: %v", err)
+	}
+	if err := ba.Put([]byte("k"), []byte("v")); err != nil {
+		t.Fatalf("A.Put pre-fence: %v", err)
+	}
+	// B fences A by acquiring the same replica position at a higher epoch.
+	if _, _, err := b.OpenReplicaUnit(ru, 2); err != nil {
+		t.Fatalf("B.OpenReplicaUnit: %v", err)
+	}
+
+	if _, err := ba.Get([]byte("k")); !errors.Is(err, ErrFenced) {
+		t.Fatalf("default fenced Get = %v, want ErrFenced (strict read fencing must be the default)", err)
+	}
+	if _, err := ba.ScanPrefix([]byte("k")); !errors.Is(err, ErrFenced) {
+		t.Fatalf("default fenced ScanPrefix = %v, want ErrFenced (strict read fencing must be the default)", err)
+	}
+
+	// The explicit opt-out restores the permissive model: reads pass through
+	// the fenced handle (the durable bytes are shared and real).
+	backing.SetStrictReadFencing(false)
+	if got, err := ba.Get([]byte("k")); err != nil || !bytes.Equal(got, []byte("v")) {
+		t.Fatalf("opt-out fenced Get = (%q, %v), want (v, nil)", got, err)
+	}
+}
+
+// TestDefaultEagerFenceAtOpenStart pins the factory's DEFAULT fence timing to
+// production shape: with NO toggle calls, OpenReplicaUnit bumps the durable
+// writer-epoch (fencing the prior owner) at open-START, before the modeled
+// mount latency - real slatedb's DbBuilder.Build timing. Under the permissive
+// fence-at-completion opt-out the epoch would not advance until the
+// acquireDelay elapsed, so observing the fence well inside the delay window is
+// the discriminator.
+func TestDefaultEagerFenceAtOpenStart(t *testing.T) {
+	backing := NewBacking()
+	a := backing.Handle()
+	b := backing.Handle()
+	ru := ru0(5, 0)
+
+	ba, _, err := a.OpenReplicaUnit(ru, 1)
+	if err != nil {
+		t.Fatalf("A.OpenReplicaUnit: %v", err)
+	}
+
+	const mountDelay = 1 * time.Second
+	b.SetAcquireDelay(mountDelay)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		if _, _, err := b.OpenReplicaUnit(ru, 2); err != nil {
+			t.Errorf("B.OpenReplicaUnit: %v", err)
+		}
+	}()
+
+	// The durable epoch must advance within the FIRST HALF of B's modeled
+	// mount: eager fencing bumps it in milliseconds, fence-at-completion not
+	// until the full delay has elapsed.
+	deadline := time.Now().Add(mountDelay / 2)
+	for {
+		e, err := a.DurableEpochReplica(ru)
+		if err != nil {
+			t.Fatalf("DurableEpochReplica: %v", err)
+		}
+		if e >= 2 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("durable epoch still %d halfway through B's mount delay: fence is deferred to open COMPLETION, want eager fence at open-START by default", e)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	// A is fenced while B is still mid-mount.
+	if err := ba.Put([]byte("mid"), []byte("v")); !errors.Is(err, ErrFenced) {
+		t.Fatalf("A.Put mid-mount = %v, want ErrFenced (prior owner fenced at open-START)", err)
+	}
+	<-done
 }
 
 // TestServingMarkerIndependentPositions pins that the marker is per-ReplicaUnit:

@@ -334,8 +334,9 @@ func TestMinIO_WriterEpochFencing(t *testing.T) {
 // TestMinIO_WriterEpochFencing and the real-slatedb half of the #443 fix: once a
 // higher-epoch writer supersedes a Slate, a SCAN through the now-stale handle
 // must FAIL (production slatedb CLOSES the fenced handle, unlike the in-memory
-// test double which lets fenced reads pass - the exact divergence that hid this
-// bug), AND that failure must be tagged backend.ErrFenced so the cluster's
+// test double's old permissive default which let fenced reads pass - the exact
+// divergence that hid this bug; the double now defaults to close-on-fence
+// too), AND that failure must be tagged backend.ErrFenced so the cluster's
 // cross-shard scan path recognizes it via errors.Is and recodes+evicts instead
 // of failing the whole aggregate with the raw fence. Covers the gap that the
 // non-transactional (*Slate).ScanPrefix / iterator.Next previously omitted
