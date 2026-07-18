@@ -16,12 +16,11 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"slices"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/internal/goleakignore"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
@@ -30,8 +29,6 @@ import (
 	"github.com/Zamua/shale/pkg/rpc"
 	"go.uber.org/goleak"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // TestMain shrinks the rebalance package's sweep tick + grace
@@ -286,31 +283,10 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	return n
 }
 
-// waitForMembersAll polls every cluster in cs until they each report
-// want members. Convergence under SWIM gossip is not synchronous - a
-// fresh join can reach the seed before reaching the other peers - so
-// any multi-node assertion must wait for every node to agree on the
-// ring before issuing routed ops.
+// waitForMembersAll delegates to the shared harness package. See
+// internal/clustertest.
 func waitForMembersAll(cs []*cluster.Cluster, want int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		allOK := true
-		for _, c := range cs {
-			if len(c.Members()) != want {
-				allOK = false
-				break
-			}
-		}
-		if allOK {
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	sizes := make([]int, len(cs))
-	for i, c := range cs {
-		sizes[i] = len(c.Members())
-	}
-	return fmt.Errorf("not all nodes converged to %d members: sizes=%v", want, sizes)
+	return clustertest.WaitForMembersAll(cs, want, timeout)
 }
 
 // ownerOf is the test-side mirror of cluster.ownerOf. Two rings built
@@ -325,87 +301,22 @@ func ownerOf(c *cluster.Cluster, key string) string {
 	return r.LocateKey([]byte(key)).ID
 }
 
-// freePort grabs an OS-assigned ephemeral TCP port + releases the
-// listener so the caller can bind it for real. There is a real race
-// between release and rebind: between freePort closing the probe
-// listener and memberlist re-binding the same number, another node's
-// freePort (or the OS) can take it, and memberlist binds BOTH TCP and
-// UDP, so even this TCP-only probe cannot reserve the UDP side. Under a
-// stress loop that bind-conflict surfaces as "address already in use"
-// out of memberlist.Create (~1/25 iterations observed). Callers that
-// bind this for a Cluster must go through openClusterRetryBind, which
-// re-rolls a fresh port and retries on exactly that conflict.
+// freePort, isBindConflict and openClusterRetryBind delegate to the
+// shared harness package so the port-probing + bind-retry strategy
+// cannot drift from pkg/cluster's external tests. See
+// internal/clustertest.
 func freePort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freePort: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
+	return clustertest.FreePort(t)
 }
 
-// isBindConflict reports whether err is a memberlist.Create failure
-// caused by another listener already holding the bind port (the
-// release-then-rebind race freePort cannot close on its own). memberlist
-// wraps the OS bind error as "failed to start TCP/UDP listener on ...:
-// bind: address already in use"; we match the stable substring rather
-// than reaching for syscall.EADDRINUSE so the check survives the wrap.
 func isBindConflict(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "address already in use")
+	return clustertest.IsBindConflict(err)
 }
 
-// openClusterRetryBind opens a Cluster, retrying on a memberlist bind
-// conflict with a FRESH port each time. cfg.BindAddr is replaced with a
-// new freePort allocation on every attempt (including the first, so the
-// caller does not have to seed it), and the BindAddr actually bound is
-// returned so the node fixture advertises the right seed address. This
-// waits on a REAL condition (a successful bind), not a sleep: it loops
-// only while memberlist reports the port is taken, and fails loudly if
-// every attempt in the bounded budget conflicts (which would indicate a
-// genuine port-exhaustion problem, not the transient release-rebind
-// race). A non-bind error (bad config, join failure) returns
-// immediately - those are real test failures, not flakes to retry.
-//
-// forbiddenPorts, if supplied, are bind ports the node must NOT be given:
-// a drawn port that matches one is discarded and re-rolled. This exists for
-// tests that hard-kill a node and start a replacement that must be
-// UNREACHABLE from the survivors. Killing a node does not erase it from its
-// peers' memberlist tables, and memberlist keeps gossiping to a member it
-// has declared dead for GossipToTheDeadTime. So for that whole window the
-// dead node's address is still live bait: whatever binds it next is fused
-// into the cluster, regardless of that process's own seed configuration.
-// A replacement that happens to draw the corpse's port therefore silently
-// rejoins the cluster it was supposed to be isolated from. Excluding the
-// port closes that door by construction instead of relying on the OS's
-// ephemeral-port allocator not to reuse it (darwin's is sequential and
-// effectively never does, which is why this hides on a Mac and bites on a
-// Linux CI runner, whose allocator is randomized).
 func openClusterRetryBind(t *testing.T, cfg cluster.Config, forbiddenPorts ...int) (*cluster.Cluster, string) {
 	t.Helper()
-	const maxAttempts = 8
-	var lastErr error
-	for range maxAttempts {
-		port := freePort(t)
-		if slices.Contains(forbiddenPorts, port) {
-			// Drew a forbidden port (e.g. a just-killed node's address).
-			// Re-roll; freePort hands out a fresh allocation each call.
-			continue
-		}
-		bindAddr := hostPort(port)
-		cfg.BindAddr = bindAddr
-		c, err := cluster.Open(cfg)
-		if err == nil {
-			return c, bindAddr
-		}
-		if !isBindConflict(err) {
-			t.Fatalf("openClusterRetryBind %s: cluster.Open: %v", cfg.NodeID, err)
-		}
-		lastErr = err
-	}
-	t.Fatalf("openClusterRetryBind %s: %d bind attempts all hit a port conflict: %v", cfg.NodeID, maxAttempts, lastErr)
-	return nil, ""
+	return clustertest.OpenClusterRetryBind(t, cfg, forbiddenPorts...)
 }
 
 // bindPortOf extracts the port from a "host:port" bind address. Used to
@@ -424,7 +335,7 @@ func bindPortOf(t *testing.T, addr string) int {
 }
 
 func hostPort(port int) string {
-	return "127.0.0.1:" + strconv.Itoa(port)
+	return clustertest.HostPort(port)
 }
 
 // startReplicatedCluster brings up `count` nodes joined into one
@@ -477,112 +388,16 @@ func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc clust
 	return nodes
 }
 
-// waitForWriteReady gates a freshly-stood-up multi-node cluster on the
-// one condition waitForClusterReady does NOT cover: that the routed +
-// replicated write path actually round-trips at the cluster's configured
-// WriteConsistency, from EVERY node, for keys that land on EVERY owner.
-// Ring convergence proves every node is a MEMBER; it does NOT prove (a)
-// every peer's gRPC HTTP/2 server goroutine is servicing connections yet,
-// nor (b) that every node has closed the StateReceiving window its
-// bootstrap rebalance opened. Either gap makes a fan-out leg come back
-// transient (a peer's server not accepting yet, or a local-self leg
-// hitting the migration guard), and a transient leg counts as NEITHER ack
-// NOR failure - so a WriteAll R3 lands 2 acks, 0 failures and the test's
-// seed Put fails "write needed 3 acks, got 2 (0 failures: <nil>)".
-//
-// The single-node, single-key probe the prior fix used only warmed ONE
-// (origin-node, replica-set) pair, ONCE. Two gaps remained that this gate
-// closes:
-//
-//  1. SPREAD across nodes + keys. The tests fire their seed Put through
-//     DIFFERENT nodes and against many keys, so a node whose receiving
-//     window was still open - or whose server lagged - for a DIFFERENT
-//     key range was never proven ready. This gate probes a spread of keys
-//     (enough that every member is the local-self leg for at least one)
-//     THROUGH EVERY node.
-//  2. STABILITY across time. waitForClusterReady can return idle, then a
-//     LATE-arriving SWIM gossip join notification (push/pull sync still
-//     converging under load) fires a fresh debounced reconcile that
-//     reopens a StateReceiving window MID-TEST - so a write at key 83 of
-//     100 fails even though key 0 succeeded. A single passing probe does
-//     not prove the ring will stay stable. This gate therefore requires a
-//     full CLEAN SWEEP: every (node, key) probe must succeed within ONE
-//     uninterrupted pass. Any transient anywhere in a pass restarts the
-//     whole pass. Completing a clean sweep proves the ring held stable
-//     (no reopened receiving window, every server accepting) for the full
-//     duration of that pass, which is the deterministic stand-in for "the
-//     late gossip rounds have drained."
-//
-// It retries ONLY transient warmup errors (Unavailable: refused dial /
-// not enough acks yet; ResourceExhausted: a partition still mid-
-// migration) until a clean sweep completes or the bounded deadline. A
-// non-transient error, or exhausting the deadline, fails the test loudly.
-//
-// CRUCIAL: this retry is scoped to SETUP. Once it returns the cluster is
-// proven write-ready, and any Unavailable a test then sees in its body is
-// a REAL failure - this helper never wraps those. The probe keys are
-// namespaced + tombstoned afterward so they cannot pollute a test that
-// reads replica backends directly.
+// waitForWriteReady and isTransientWarmupErr delegate to the shared
+// harness package so this tree and pkg/cluster's external tests gate on
+// identical readiness semantics. See internal/clustertest.
 func waitForWriteReady(t *testing.T, clusters []*cluster.Cluster, deadline time.Duration) {
 	t.Helper()
-	// 24 distinct keys give consistent hashing ample spread to cover
-	// every owner as a local-self leg across a small cluster, without
-	// making the warmup expensive.
-	const probeKeys = 24
-	end := time.Now().Add(deadline)
-	var lastErr error
-	for time.Now().Before(end) {
-		sweepClean := true
-		for from, c := range clusters {
-			for k := range probeKeys {
-				probeKey := fmt.Appendf(nil, "__warmup_probe__/%d/%d", from, k)
-				err := c.Put(probeKey, []byte("ready"))
-				if err == nil {
-					// Best-effort cleanup so no stray probe key lands on
-					// the replica backends a test might read directly.
-					_ = c.Delete(probeKey)
-					continue
-				}
-				if !isTransientWarmupErr(err) {
-					t.Fatalf("waitForWriteReady: probe write through node %d returned a non-transient error (real failure, not a warmup race): %v", from, err)
-				}
-				// A transient anywhere taints this sweep: the ring is not
-				// stably write-ready yet. Back off and restart the sweep so
-				// readiness means "a full clean pass with no reopened
-				// receiving window," not "one lucky probe."
-				lastErr = err
-				sweepClean = false
-				time.Sleep(50 * time.Millisecond)
-				break
-			}
-			if !sweepClean {
-				break
-			}
-		}
-		if sweepClean {
-			return
-		}
-	}
-	t.Fatalf("waitForWriteReady: cluster never completed a clean write-readiness sweep within %s; last probe error: %v", deadline, lastErr)
+	clustertest.WaitForWriteReady(t, clusters, deadline)
 }
 
-// isTransientWarmupErr reports whether err is one of the transient
-// signals expected while a freshly-joined cluster's gRPC forwarding
-// servers come up: Unavailable (peer's server not accepting yet /
-// connection refused / not enough acks landed) or ResourceExhausted (a
-// partition still mid-migration). Only these are retried during the setup
-// warmup window; everything else is a real failure.
 func isTransientWarmupErr(err error) bool {
-	st, ok := status.FromError(err)
-	if !ok {
-		return false
-	}
-	switch st.Code() {
-	case codes.Unavailable, codes.ResourceExhausted:
-		return true
-	default:
-		return false
-	}
+	return clustertest.IsTransientWarmupErr(err)
 }
 
 // waitForClusterReady is the canonical "the fixture is done settling"
