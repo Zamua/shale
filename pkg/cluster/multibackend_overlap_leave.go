@@ -148,10 +148,25 @@ func (c *Cluster) allOwnedPositionsHandedOff() bool {
 		// strict marker > open) stay false forever - the leave would never complete
 		// and the preStop drain would run to its timeout (the #410 availability gap).
 		open := c.ownOpenEpoch(ru)
-		markerEpoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
+		markerEpoch, authorID, ok, err := c.readServingMarkerAuthored(ru)
 		if err != nil || !ok || markerEpoch <= open {
 			// No successor serving this position above the leaver's epoch yet: still
 			// handing off (or a transient marker-read error - retry next poll).
+			return false
+		}
+		// ROUTED-SUCCESSOR GATE (v0.11.2), the same rule drainCheck applies. It is
+		// required HERE too, not just there: this gate is what lets Close proceed,
+		// and Close tears the mount down regardless of what drainCheck decided. A
+		// leave that completed on an unrouted author would destroy the last copy
+		// this node's readers can reach even while drainCheck was correctly holding
+		// it. The check is bounded by the same liveness backstop, which is well
+		// under GracefulLeaveDrainTimeout, so it can never be what wedges a leave.
+		//
+		// For a GENUINE leaver this is satisfied by construction: its own view has
+		// draining={self}, so its pending set IS the true post-leave placement and
+		// the successor writing the marker is in it. The rule bites only the
+		// joiner-displaced case, which is the defect.
+		if !c.releaseAllowedForAuthor(ru, authorID) {
 			return false
 		}
 	}

@@ -400,6 +400,96 @@ func (b *Backing) readServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epo
 	return storageunit.Epoch(parsed), true, nil
 }
 
+// writeServingMarkerFrom writes the serving marker for ru at epoch AND records
+// the author (the writing node's ID) in a SIBLING object (v0.11.2, the
+// author-attributed release gate).
+//
+// WHY A SIBLING OBJECT AND NOT A WIDER PAYLOAD. The epoch object's payload is a
+// bare decimal string that older nodes parse with ParseUint; any extra token in
+// it (a space, a second line) makes that parse FAIL, and a marker-read failure
+// makes an older node's drainCheck HOLD - forever, against a signal it can never
+// decode. Keeping the epoch object byte-identical and putting the author in a
+// separate key at servingMarkerAuthorKeyFor(ru) makes the format compatible in
+// BOTH directions: an old node reads the epoch object exactly as before and
+// never fetches (or notices) the author object.
+//
+// WRITE ORDER IS AUTHOR-FIRST, deliberately. A reader that sees the new epoch
+// must also see its author, or it would fall back to the epoch-only rule and
+// release to an author it never verified. Writing the author first means the
+// only observable inconsistency is an author RECORD AHEAD of the epoch object,
+// which the pairing check below discards. The author payload therefore embeds
+// the epoch it belongs to ("<epoch>\n<authorID>\n"): readServingMarkerAuthor
+// returns "" (UNKNOWN) unless the recorded epoch matches the marker epoch, so an
+// author can never be misattributed to a different epoch.
+//
+// Monotonicity is unchanged: the epoch object still refuses to go backwards, and
+// a superseded author record is simply overwritten by the next live owner.
+func (b *Backing) writeServingMarkerFrom(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, authorID string) error {
+	if authorID == "" {
+		return b.writeServingMarker(ru, epoch)
+	}
+	cur, ok, err := b.readServingMarker(ru)
+	if err != nil {
+		return err
+	}
+	if ok && cur >= epoch {
+		return nil // monotonic: never lower a recorded marker (nor its author).
+	}
+	mc, err := b.minioClient()
+	if err != nil {
+		return err
+	}
+	authorPayload := []byte(strconv.FormatUint(uint64(epoch), 10) + "\n" + authorID + "\n")
+	if _, err := mc.PutObject(context.Background(), b.cfg.Bucket,
+		servingMarkerAuthorKeyFor(b.cfg.KeyPrefix, ru),
+		bytes.NewReader(authorPayload), int64(len(authorPayload)),
+		minio.PutObjectOptions{ContentType: "text/plain"}); err != nil {
+		return fmt.Errorf("slate: write serving marker author %s: %w", ru, err)
+	}
+	return b.writeServingMarker(ru, epoch)
+}
+
+// readServingMarkerAuthor reads the ID of the node that wrote ru's serving
+// marker at markerEpoch, or "" when the attribution is UNKNOWN: no author object
+// (a marker written before author attribution, or by a node that lacks it), an
+// author object recorded against a DIFFERENT epoch (the author-ahead window
+// writeServingMarkerFrom's ordering permits), or an unparseable payload. "" is
+// never an error: it is the signal to fall back to the epoch-only rule. A real
+// I/O failure IS returned so the caller can hold rather than guess.
+func (b *Backing) readServingMarkerAuthor(ru storageunit.ReplicaUnit, markerEpoch storageunit.Epoch) (string, error) {
+	mc, err := b.minioClient()
+	if err != nil {
+		return "", err
+	}
+	key := servingMarkerAuthorKeyFor(b.cfg.KeyPrefix, ru)
+	obj, err := mc.GetObject(context.Background(), b.cfg.Bucket, key, minio.GetObjectOptions{})
+	if err != nil {
+		if isNotFound(err) {
+			return "", nil // no attribution recorded: UNKNOWN.
+		}
+		return "", fmt.Errorf("slate: read serving marker author %s: %w", ru, err)
+	}
+	defer obj.Close()
+	raw, err := io.ReadAll(obj)
+	if err != nil {
+		if isNotFound(err) {
+			return "", nil
+		}
+		return "", fmt.Errorf("slate: read serving marker author %s: %w", ru, err)
+	}
+	epochLine, authorLine, found := strings.Cut(strings.TrimSpace(string(raw)), "\n")
+	if !found {
+		return "", nil // malformed: UNKNOWN, not an error.
+	}
+	recorded, err := strconv.ParseUint(strings.TrimSpace(epochLine), 10, 64)
+	if err != nil || storageunit.Epoch(recorded) != markerEpoch {
+		// Unparseable, or recorded against a different epoch than the marker we
+		// just read (the author-ahead window). Do NOT attribute it.
+		return "", nil
+	}
+	return strings.TrimSpace(authorLine), nil
+}
+
 // isNotFound reports whether err is the S3 "object does not exist" error, which
 // the serving-marker read treats as ok == false rather than a failure.
 func isNotFound(err error) bool {
@@ -853,6 +943,29 @@ func (h *Handle) ReadServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoc
 	return h.backing.readServingMarker(ru)
 }
 
+// WriteServingMarkerFrom is WriteServingMarker carrying the writing node's ID
+// (storageunit.AuthoredMarkerFactory). The author lands in a sibling object so
+// the epoch record stays readable by nodes that predate author attribution.
+func (h *Handle) WriteServingMarkerFrom(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, authorID string) error {
+	return h.backing.writeServingMarkerFrom(ru, epoch, authorID)
+}
+
+// ReadServingMarkerFrom is ReadServingMarker plus the ID of the node that wrote
+// the marker (storageunit.AuthoredMarkerFactory). authorID is "" when no
+// attribution is recorded for the epoch that was read, which callers treat as
+// UNKNOWN and fall back to the epoch-only rule.
+func (h *Handle) ReadServingMarkerFrom(ru storageunit.ReplicaUnit) (storageunit.Epoch, string, bool, error) {
+	epoch, ok, err := h.backing.readServingMarker(ru)
+	if err != nil || !ok {
+		return epoch, "", ok, err
+	}
+	author, err := h.backing.readServingMarkerAuthor(ru, epoch)
+	if err != nil {
+		return epoch, "", ok, err
+	}
+	return epoch, author, true, nil
+}
+
 // DurableEpochReplica reads replica position ru's durable manifest writer-epoch
 // WITHOUT opening the database, satisfying the ReplicaBackendFactory seam
 // (v0.8 Phase 2e). The old (draining) owner uses it as the LIVENESS HINT that
@@ -943,3 +1056,11 @@ func (h *Handle) Close() error {
 // multi-backend mode at ReplicationFactor > 1 with a slate Handle.
 var _ storageunit.BackendFactory = (*Handle)(nil)
 var _ storageunit.ReplicaBackendFactory = (*Handle)(nil)
+
+// The author-attribution capability is OPTIONAL on the interface, so nothing
+// forces this Handle to keep implementing it. Assert it at COMPILE TIME: a
+// silent drop would not break the build, it would silently downgrade every
+// release gate in the cluster to the epoch-only rule against the PRODUCTION
+// backend - the exact defect the attribution exists to close, reintroduced
+// invisibly.
+var _ storageunit.AuthoredMarkerFactory = (*Handle)(nil)

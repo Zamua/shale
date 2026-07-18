@@ -154,6 +154,15 @@ type Backing struct {
 	// owner's WriteServingMarker is visible to the old owner's ReadServingMarker
 	// across nodes. Absence (no entry) is "no live owner yet": ok == false.
 	servingMarkers map[storageunit.ReplicaUnit]storageunit.Epoch
+
+	// markerAuthors records WHO wrote each servingMarkers entry (the gaining
+	// node's ID), the in-memory analogue of the slate factory's sibling author
+	// object. It is written in the SAME critical section as servingMarkers so
+	// the author always corresponds to the recorded epoch. A position written
+	// via the author-less WriteServingMarker has NO entry here, which reads back
+	// as authorID == "" (UNKNOWN) - exactly the legacy/rolling-upgrade shape the
+	// release gates fall back to the epoch-only rule for.
+	markerAuthors map[storageunit.ReplicaUnit]string
 }
 
 // NewBacking returns an empty shared backing (no units written yet) with
@@ -172,6 +181,7 @@ func NewBacking() *Backing {
 		replicaFlushes:    make(map[storageunit.ReplicaUnit]int),
 		openReplicaStarts: make(map[storageunit.ReplicaUnit]int),
 		servingMarkers:    make(map[storageunit.ReplicaUnit]storageunit.Epoch),
+		markerAuthors:     make(map[storageunit.ReplicaUnit]string),
 	}
 	b.strictReadFencing.Store(true)
 	b.eagerFence.Store(true)
@@ -345,30 +355,50 @@ func (b *Backing) replicaDurableEpoch(ru storageunit.ReplicaUnit) storageunit.Ep
 // it never lowers an already-recorded epoch, so a stale write from a fenced
 // prior owner cannot roll the marker back below a live higher-epoch owner's
 // value. Idempotent at the same-or-higher epoch.
-func (b *Backing) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) {
+// authorID is the writing node's ID, or "" for an author-less (legacy) write.
+// It is recorded in the SAME critical section as the epoch, so a reader never
+// observes an author paired with a different epoch.
+func (b *Backing) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, authorID string) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if cur, ok := b.servingMarkers[ru]; ok && cur >= epoch {
 		return
 	}
 	b.servingMarkers[ru] = epoch
+	if authorID == "" {
+		// An author-less write at a HIGHER epoch supersedes the prior author:
+		// leaving the old ID behind would attribute this epoch to a node that
+		// did not write it. Absence reads back as UNKNOWN, the safe fallback.
+		delete(b.markerAuthors, ru)
+		return
+	}
+	b.markerAuthors[ru] = authorID
 }
 
 // readServingMarker reports replica ru's serving-marker epoch and whether a
 // marker has been written at all (ok). The point-in-time read the old owner's
 // drainCheck polls. ok == false (no entry) means no live owner has reached
 // Ready for this position yet.
-func (b *Backing) readServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool) {
+func (b *Backing) readServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, string, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	e, ok := b.servingMarkers[ru]
-	return e, ok
+	return e, b.markerAuthors[ru], ok
 }
 
 // ServingMarker is the exported read of the serving marker for tests that
 // assert the new owner wrote it at the expected epoch after the mount flip.
 func (b *Backing) ServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool) {
-	return b.readServingMarker(ru)
+	e, _, ok := b.readServingMarker(ru)
+	return e, ok
+}
+
+// ServingMarkerAuthor is the exported read of the serving marker's AUTHOR (the
+// ID of the node that wrote it) for tests that assert the attribution, "" when
+// the marker was written author-less.
+func (b *Backing) ServingMarkerAuthor(ru storageunit.ReplicaUnit) string {
+	_, author, _ := b.readServingMarker(ru)
+	return author
 }
 
 // Handle is a per-node factory handle over a shared Backing. It implements
@@ -611,7 +641,16 @@ func (h *Handle) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Ep
 // recorded epoch) so a stale write cannot roll the marker back. It cannot fail
 // here (the in-memory backing always answers), so err is always nil.
 func (h *Handle) WriteServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) error {
-	h.backing.writeServingMarker(ru, epoch)
+	h.backing.writeServingMarker(ru, epoch, "")
+	return nil
+}
+
+// WriteServingMarkerFrom is WriteServingMarker carrying the writing node's ID
+// (storageunit.AuthoredMarkerFactory). The author is recorded atomically with
+// the epoch in the shared Backing, so a draining owner's ReadServingMarkerFrom
+// always sees an author that matches the epoch it read.
+func (h *Handle) WriteServingMarkerFrom(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, authorID string) error {
+	h.backing.writeServingMarker(ru, epoch, authorID)
 	return nil
 }
 
@@ -622,8 +661,16 @@ func (h *Handle) WriteServingMarker(ru storageunit.ReplicaUnit, epoch storageuni
 // has reached Ready yet, so the old owner stays Draining + keeps serving. It
 // cannot fail here, so err is always nil.
 func (h *Handle) ReadServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool, error) {
-	e, ok := h.backing.readServingMarker(ru)
+	e, _, ok := h.backing.readServingMarker(ru)
 	return e, ok, nil
+}
+
+// ReadServingMarkerFrom is ReadServingMarker plus the ID of the node that wrote
+// the marker (storageunit.AuthoredMarkerFactory). authorID is "" for a marker
+// written author-less (the legacy shape), which callers treat as UNKNOWN.
+func (h *Handle) ReadServingMarkerFrom(ru storageunit.ReplicaUnit) (storageunit.Epoch, string, bool, error) {
+	e, author, ok := h.backing.readServingMarker(ru)
+	return e, author, ok, nil
 }
 
 // CloseReplicaUnit releases replica ru from THIS handle. Idempotent; the
@@ -863,3 +910,13 @@ func (b *Backing) ReplicaFlushCount(ru storageunit.ReplicaUnit) int {
 	defer b.mu.Unlock()
 	return b.replicaFlushes[ru]
 }
+
+// Compile-time capability assertions. The author-attribution capability is
+// OPTIONAL on the interface, so nothing forces this Handle to keep implementing
+// it - and a silent drop would not break the build, it would silently downgrade
+// every release gate exercised by the test suite to the epoch-only rule, making
+// the routed-successor regression tests pass vacuously.
+var (
+	_ storageunit.ReplicaBackendFactory = (*Handle)(nil)
+	_ storageunit.AuthoredMarkerFactory = (*Handle)(nil)
+)

@@ -180,6 +180,108 @@ durable (not a best-effort push), monotonic, and gated by a strict epoch
 comparison; the only race is a crash in the read-to-removal gap, which is
 benign.
 
+## Author-attributed serving markers (the routed-successor release gate)
+
+The epoch-only marker above is AUTHOR-ANONYMOUS: it proves that SOMEBODY is
+serving a position at epoch E, and says nothing about WHO. That is sufficient
+only while every node agrees on who a position's successors are, and during a
+transition they do not.
+
+The reason is that the two transition bits are INDEPENDENT gossip facts. A node
+can observe a joiner's `Joining` bit before a leaver's `Draining` bit, and in
+that STALE view it computes `current` = ring-minus-joiner (excluding the
+newcomer) and `pending` = ring-minus-nobody (the leaver still included). For a
+unit whose ENTIRE replica set turns over at once - a FULL MOVE - the resulting
+routed union can contain NONE of the true post-transition owners. The node then:
+
+1. sees a position it holds as current-but-not-pending and arms a drain,
+2. observes the true successor's anonymous marker above its own open epoch, and
+3. releases its last local copy.
+
+Its routed union now names only nodes that never held the unit. Every leg of a
+read answers transiently, the all-legs-transient retry spins to `ReadTimeout`,
+and the client sees a `DeadlineExceeded` `Get` (or the retryable "unit for key
+is handing off" `ScanPrefix`). It is an AVAILABILITY defect, bounded to reads
+and scans through nodes whose view is stale, for as long as the view stays
+stale. No ACKED WRITE can be lost by it: the ack bar never falls below R (the
+quorum floor in the current-set computation), so a write that cannot reach its
+bar returns a retryable error rather than acking.
+
+THE RULE. A marker additionally carries its AUTHOR (the writing node's ID), and
+a draining owner releases only when that author is a node it ROUTES the position
+to. It never surrenders its copy to a successor invisible to its own readers:
+either the author is routed, or the release waits for the view to converge -
+which is precisely when the true successors enter the union. The strict `>` epoch
+comparison above is unchanged and still required; the author check is an
+ADDITIONAL conjunct, never a replacement.
+
+### SCOPE: this rule does NOT by itself close the availability hole
+
+Measured, and important to state plainly so the rule is not mistaken for a fix it
+is not. Under production fence semantics the successor's `OpenReplicaUnit` bumps
+the position's durable epoch at OPEN-START (real slatedb's `DbBuilder.Build`
+timing), which FENCES the predecessor immediately - and the serving marker is
+written only AFTER the successor's mount completes. So by the time the
+predecessor can observe any marker, its own handle has already been unable to
+serve for the entire duration of the successor's open. Holding the release
+therefore preserves a handle that CANNOT ANSWER, and a read through the stale
+node fails whether it holds or releases.
+
+The consequence is that the full-move hole is a ROUTING defect, not a
+release-timing one:
+
+- it OPENS at the successor's open-START, EARLIER than any release, and
+- the nodes that hold the data are simply ABSENT from the stale view's routed
+  union, so no release-side gate can make them reachable.
+
+Closing it requires making the true holder REACHABLE from the stale node. The
+author attribution is exactly the datum that makes that possible - the marker
+names a node that PROVABLY SERVES the position, which is precisely the routing
+information the stale view lacks - but consuming it as a ROUTING HINT (adding the
+marker's author to the routed set for that position, as a BONUS target that does
+NOT change `stableR` or the write ack bar) is a separate change to the hot path
+and is not part of this rule. `TestOverlap_StaleView_HeldCopyIsFencedBySuccessor_
+ReadStillFails` pins the measured behavior and should FLIP to asserting success
+when that routing change lands.
+
+What the rule DOES give: a node never destroys its last local copy on the word of
+a successor it cannot see, which is the safety property the anonymous marker was
+missing, and the attribution machinery the routing fix needs.
+
+The rule applies at BOTH release gates, not just the drain poll:
+
+- `drainCheck`, the displaced (join-direction) owner's release, and
+- the graceful-leave COMPLETION gate, because `Close` tears the mount down once
+  that gate reports true. A leave that completed on an unrouted author would
+  destroy the last routable copy even while `drainCheck` was correctly holding
+  it.
+
+For a GENUINE leaver the check is satisfied by construction: its own view has
+`draining = {self}`, so its pending set IS the true post-leave placement and the
+successor writing the marker is in it. The rule bites only the joiner-displaced
+case, which is the defect.
+
+TWO ESCAPE HATCHES, both mandatory:
+
+- LIVENESS BACKSTOP. The hold is BOUNDED. An unbounded hold would be worse than
+  the hole it closes - it could wedge a graceful leave indefinitely. Past the
+  budget the node logs loudly (naming the position and the unrouted author) and
+  releases, degrading to exactly the pre-attribution behavior for that one
+  position. The budget only has to outlive gossip convergence, and is well under
+  `GracefulLeaveDrainTimeout` so it can never be what wedges a leave.
+- ROLLING-UPGRADE COMPAT. An UNKNOWN author (`""`) falls back to the epoch-only
+  rule IMMEDIATELY. Unknown covers a marker written before attribution existed, a
+  marker written by a node that lacks it, and a factory without the capability. A
+  new node that held on every author-less marker would wedge against every old
+  node in a mixed-version fleet.
+
+The attribution is an OPTIONAL factory capability
+(`storageunit.AuthoredMarkerFactory`), not a widening of the marker contract, and
+the epoch record keeps its exact prior representation on disk. An OLD node
+therefore reads a NEW node's marker unchanged, and a NEW node reading an old
+marker gets `""`. Compatibility holds in both directions, so the change is safe
+to roll out one node at a time.
+
 ## Ordered removal (the CEP-21 ordering on pending ranges)
 
 The transition advances in the canonical order that keeps every replica set

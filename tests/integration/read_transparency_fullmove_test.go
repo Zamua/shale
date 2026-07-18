@@ -48,6 +48,14 @@ import (
 // the production pending computation: the fixture preconditions below assert
 // the SHAPE that made the approximation diverge, so they keep guarding the
 // fixture even after the production code stops using the approximation.
+//
+// IT IS NOT A MEASUREMENT OF THE SUT. The production pending computation uses
+// the EXACT rebuild (pendingUnitReplicas -> buildReducedRing), not this
+// approximation, and has done since the exact-rebuild fix. This function exists
+// only to SELECT a unit with the interesting placement shape; its output is the
+// fixture talking to itself. Do not read a divergence between it and the final
+// placement as evidence about what the cluster computed at runtime - that
+// misreading is exactly what a prior diagnosis of this test's failures made.
 func dropTrickPending(memberIDs []string, u storageunit.UnitID, rf int, leaver string) []string {
 	chain := replicaIDsForMembers(memberIDs, u, rf+1)
 	out := make([]string, 0, rf)
@@ -162,10 +170,13 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 		t.Fatalf("FIXTURE DRIFT: no drain-approximation full-move unit exists for this name set; " +
 			"the ring placement changed - search a new name set (see the shape conditions above)")
 	}
-	t.Logf("full-move unit %d: old=%v approx-pending=%v final=%v", fullMove,
+	// NB the drop-trick set below is the FIXTURE's historical shape detector, NOT
+	// anything the cluster computes (see dropTrickPending). It is printed only to
+	// document which unit the selection picked and why.
+	t.Logf("full-move unit %d: old=%v final=%v (fixture-only shape detector: historical-approx=%v)", fullMove,
 		replicaIDsForMembers(base, storageunit.UnitID(fullMove), rf),
-		dropTrickPending(with5, storageunit.UnitID(fullMove), rf, leaver),
-		replicaIDsForMembers(finalIDs, storageunit.UnitID(fullMove), rf))
+		replicaIDsForMembers(finalIDs, storageunit.UnitID(fullMove), rf),
+		dropTrickPending(with5, storageunit.UnitID(fullMove), rf, leaver))
 
 	backing := sharedfactory.NewBacking()
 	// OPT-OUT (permissive fence semantics, both toggles): zero-tolerance
@@ -272,8 +283,13 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 
 	summarizeFails(t, "FULL-MOVE window", fails, 16)
 	if len(fails) > 0 {
-		t.Fatalf("full-move unit is not read-transparent: %d client-visible read failures through the "+
-			"leave+join overlap - the drain-time pending set did not cover the true post-leave placement "+
-			"(unit %d moved onto owners that held nothing while every holder was un-routed)", len(fails), fullMove)
+		// State the OBSERVED failure only. This test does NOT check why the reads
+		// failed, so it must not assert a cause: an earlier version hardcoded a
+		// root-cause attribution here and every failure was read as confirmation
+		// of that cause, whatever the actual mechanism. The per-leg union-read
+		// diagnostic in the node logs is what names the mechanism.
+		t.Fatalf("full-move unit %d is not read-transparent: %d client-visible read failures through the "+
+			"leave+join overlap window (see the node logs' union-read sweep lines for the per-leg cause)",
+			fullMove, len(fails))
 	}
 }

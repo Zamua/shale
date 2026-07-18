@@ -420,7 +420,7 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	// a re-read of the climbing durable). This is the poll-observable release
 	// signal a DRAINING predecessor reads (drainCheck); without it a clean-cut
 	// successor of a leaving node never releases that node's drain.
-	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	_ = c.writeServingMarkerAuthored(ru, openedEpoch)
 }
 
 // releaseReplicaUnit unmounts the ReplicaUnit ru via the per-replica factory.
@@ -673,7 +673,23 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 	sawHandoffTransient := false
 	usable := 0
 
+	// PER-LEG OUTCOMES for the zero-answer diagnostic below. Collected always
+	// (the slice is R-sized and the strings are only built on the failure path),
+	// logged only when the sweep gathers NOTHING - the one outcome whose cause
+	// was previously invisible: the aggregate error says "everything was
+	// transient" without naming WHICH legs, at WHICH positions, for WHICH reason,
+	// so a routing gap (the union pointing at nodes that hold nothing) and a
+	// genuine mass-mid-mount window looked identical in the logs.
+	legErrs := make([]error, len(routed))
+	legIdx := make(map[string]int, len(routed))
+	for i, rr := range routed {
+		legIdx[rr.member.ID] = i
+	}
+
 	for res := range resultsCh {
+		if i, known := legIdx[res.Member.ID]; known {
+			legErrs[i] = res.Err
+		}
 		if res.Err != nil {
 			// READ-leg classification (docs/SPEC.md "Union reads" guard 2):
 			// handoff-class transients (acquiring / fenced-recode / closed-mid-
@@ -719,6 +735,7 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 	cancelFanout()
 
 	if len(gathered) == 0 {
+		c.logZeroAnswerSweep(routed, stableR, legErrs)
 		if nonTransientErr != nil {
 			return nil, nonTransientErr
 		}

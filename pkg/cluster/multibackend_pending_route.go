@@ -239,6 +239,29 @@ func (c *Cluster) routedReplicasForKey(key []byte) (routed []ring.Member, stable
 	return unionMembers(current, pending), stableR
 }
 
+// routedMembersForUnit is routedReplicasForKey's UNIT-ADDRESSED sibling: the
+// ROUTED union (current when not in transition, UNION(current, pending) when in
+// transition) for an explicit GenUnit rather than a key. It shares the exact
+// same split so the two can never disagree about who a unit's ops reach.
+//
+// It exists for the RELEASE GATES, which reason about a ReplicaUnit and have no
+// key in hand: "is the node that claims to be serving this position one that my
+// own readers would actually reach?" Answering that from the same computation
+// the read/write fan-out uses is the whole point - a gate built on a DIFFERENT
+// notion of "routed" could permit exactly the release the fan-out cannot cover.
+func (c *Cluster) routedMembersForUnit(gu storageunit.GenUnit) []ring.Member {
+	joining, draining := c.transitionSets()
+	current := c.currentUnitReplicas(gu, joining)
+	if len(joining) == 0 && len(draining) == 0 {
+		return current
+	}
+	pending := c.pendingUnitReplicas(gu, draining)
+	if sameMemberSet(current, pending) {
+		return current
+	}
+	return unionMembers(current, pending)
+}
+
 // pendingUnitReplicas resolves the PENDING replica set for an explicit GenUnit:
 // the unit's replica set over a ring GENUINELY REBUILT WITHOUT the draining
 // members (buildReducedRing, the same exact construction currentUnitReplicas

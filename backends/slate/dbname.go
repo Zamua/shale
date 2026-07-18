@@ -76,3 +76,20 @@ func dbNameReplicaFor(keyPrefix string, ru storageunit.ReplicaUnit) string {
 func servingMarkerKeyFor(keyPrefix string, ru storageunit.ReplicaUnit) string {
 	return dbNameReplicaFor(keyPrefix, ru) + "/serving"
 }
+
+// servingMarkerAuthorKeyFor maps a ReplicaUnit to the object key of its serving
+// marker's AUTHOR record (v0.11.2): the ID of the node that wrote the marker,
+// which the draining owner's release gate requires to be a node it actually
+// routes the position to.
+//
+//	servingMarkerAuthorKeyFor(p, ru) = servingMarkerKeyFor(p, ru) + "-author"
+//	                                 = "<keyPrefix>u/g<gen>/u<id>/r<replica>/serving-author"
+//
+// It is a SEPARATE object from "/serving" rather than a widened payload so the
+// epoch record stays byte-identical for nodes that predate author attribution
+// (they parse "/serving" exactly as before and never fetch this key). The
+// "-author" suffix keeps it outside every slatedb-internal key segment, same as
+// "/serving" itself.
+func servingMarkerAuthorKeyFor(keyPrefix string, ru storageunit.ReplicaUnit) string {
+	return servingMarkerKeyFor(keyPrefix, ru) + "-author"
+}

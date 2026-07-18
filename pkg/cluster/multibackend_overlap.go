@@ -433,7 +433,7 @@ func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
 	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at THIS
 	// node's EXACT open epoch (the recorded factory return) - exactly what the
 	// in-goroutine flip would have written, NOT a re-read of the climbing durable.
-	_ = c.replicaFactory.WriteServingMarker(ru, c.ownOpenEpoch(ru))
+	_ = c.writeServingMarkerAuthored(ru, c.ownOpenEpoch(ru))
 }
 
 // ownOpenEpoch returns the EXACT epoch this node opened ru at (recorded from
@@ -750,6 +750,10 @@ func (c *Cluster) reclaimDrainingPosition(ru storageunit.ReplicaUnit) {
 	}
 	if cur, ok := c.handoffPhase[ru]; ok && cur.Phase.IsLoser() {
 		delete(c.handoffPhase, ru)
+		// The drain is aborted, so any unrouted-author hold it accumulated is
+		// stale: a later re-drain must start from a fresh budget rather than
+		// inherit an already-expired one and release on its first poll.
+		c.unroutedAuthorHoldSince.Delete(ru)
 	}
 }
 
@@ -964,7 +968,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		c.storeMount(ru, b)
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
-		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+		_ = c.writeServingMarkerAuthored(ru, openedEpoch)
 		return
 	}
 	ready, err := storageunit.NextOnReady(cur, openedEpoch)
@@ -974,7 +978,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		c.storeMount(ru, b)
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
-		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+		_ = c.writeServingMarkerAuthored(ru, openedEpoch)
 		return
 	}
 	c.storeMount(ru, b)
@@ -990,7 +994,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	// lock: it is shared-storage I/O). This is the durable, poll-observable release
 	// signal the old owner's drainCheck polls. No RPC is sent.
 	markStart := time.Now()
-	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	_ = c.writeServingMarkerAuthored(ru, openedEpoch)
 	c.logf("shale: mounted %s at epoch %d: open %s, serving-mark %s",
 		ru, openedEpoch, markStart.Sub(openStart).Round(time.Millisecond), time.Since(markStart).Round(time.Millisecond))
 }
@@ -1036,8 +1040,8 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	}
 	c.mountMu.Unlock()
 
-	// I/O OUTSIDE the lock: poll the durable serving marker.
-	markerEpoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
+	// I/O OUTSIDE the lock: poll the durable serving marker WITH its author.
+	markerEpoch, authorID, ok, err := c.readServingMarkerAuthored(ru)
 	if err != nil {
 		return
 	}
@@ -1054,6 +1058,20 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	ready := ok && markerEpoch > state.OpenEpoch
 	if !storageunit.Releasable(state, ready) {
 		// No marker yet (or below my epoch): stay Draining + keep serving.
+		c.unroutedAuthorHoldSince.Delete(ru)
+		return
+	}
+
+	// ROUTED-SUCCESSOR GATE (v0.11.2, the full-move routing gap): the epoch says
+	// SOMEONE is serving; this asks whether that someone is a node THIS node
+	// routes the position to. Under a stale membership view (the joiner's Joining
+	// bit observed, the leaver's Draining bit not yet) the routed union can
+	// exclude every true post-transition owner, and releasing on the anonymous
+	// epoch alone destroys the last copy any of this node's readers can reach.
+	// Holding keeps the position serving until the view converges; the hold is
+	// bounded and an unknown author falls back to the epoch-only rule. See
+	// multibackend_overlap_author.go.
+	if !c.releaseAllowedForAuthor(ru, authorID) {
 		return
 	}
 
@@ -1081,7 +1099,8 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	}
 	// Exactly-once CAS-delete: only this critical section removes THIS entry.
 	delete(c.mountMap, ru)
-	c.myOpenEpoch.Delete(ru) // released; a re-acquire records a fresh open epoch.
+	c.myOpenEpoch.Delete(ru)             // released; a re-acquire records a fresh open epoch.
+	c.unroutedAuthorHoldSince.Delete(ru) // released; a later drain starts a fresh hold budget.
 	// Drop the phase entry: Releasing is transient, the steady state after the
 	// release is Absent (no mount, no phase). next validates the edge; we converge
 	// straight to Absent.

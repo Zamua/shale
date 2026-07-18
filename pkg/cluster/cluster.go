@@ -558,6 +558,16 @@ type Cluster struct {
 	// (no Open-time init).
 	myOpenEpoch sync.Map // storageunit.ReplicaUnit -> storageunit.Epoch
 
+	// unroutedAuthorHoldSince records, per Draining ReplicaUnit, WHEN this node
+	// first refused to release because the serving marker's AUTHOR was not in
+	// this node's routed union for the position (v0.11.2). It is the clock for
+	// the LIVENESS BACKSTOP: the hold is bounded by unroutedAuthorHoldBudget, so
+	// a membership view that never converges degrades to the old (epoch-only)
+	// behavior instead of wedging the drain - and therefore a graceful leave -
+	// forever. Entries are cleared the moment the position releases or its
+	// author becomes routed. sync.Map (no Open-time init).
+	unroutedAuthorHoldSince sync.Map // storageunit.ReplicaUnit -> time.Time
+
 	// handoffPhase holds, per IN-FLIGHT ReplicaUnit, the pure
 	// ownership-transition state of an overlap handoff (v0.8 Phase 2e,
 	// Option B). Absence means steady state: Owned if mountMap[ru] is present,

@@ -199,3 +199,55 @@ type ReplicaBackendFactory interface {
 	// is NOT an error (it is ok == false, epoch 0).
 	ReadServingMarker(ru ReplicaUnit) (epoch Epoch, ok bool, err error)
 }
+
+// AuthoredMarkerFactory is the OPTIONAL author-attributed extension of the
+// serving marker (v0.11.2). A ReplicaBackendFactory advertises it by
+// implementing these two methods IN ADDITION to WriteServingMarker /
+// ReadServingMarker; a factory that does not implement it keeps the exact
+// epoch-only marker contract above, and every gate that consults the author
+// degrades to the epoch-only rule.
+//
+// WHY THE AUTHOR IS PART OF THE RELEASE SIGNAL. The epoch-only marker is
+// AUTHOR-ANONYMOUS: it says "SOMEBODY is serving this position at epoch E" and
+// nothing about WHO. The draining owner's release gate (Releasable in
+// handoff.go) therefore surrenders its copy to a successor it cannot name. That
+// is safe only while every node agrees on who the successors are. It is NOT
+// safe while membership views diverge: a node that has observed a JOINER's
+// Joining bit but not yet a LEAVER's Draining bit computes a current/pending
+// split whose routed union can EXCLUDE the true post-transition owners entirely
+// (a FULL MOVE, where a unit's whole replica set turns over at once). Such a
+// node arms a drain, sees the true successor's anonymous marker, releases its
+// last local copy - and then routes reads for that unit only to nodes that
+// never held it. Every routed leg answers transiently and the read fails
+// client-visibly (Get times out; ScanPrefix surfaces the handing-off retryable)
+// for as long as the view stays stale.
+//
+// Attributing the marker closes that hole WITHOUT changing what a marker means:
+// the loser additionally requires the marker's AUTHOR to be a node it actually
+// routes the position to, so it can never hand its last copy to a successor
+// that is invisible to its own readers. See docs/design/overlap-handoff.md
+// "Author-attributed serving markers".
+//
+// COMPATIBILITY IS BUILT IN, in both directions. The epoch record keeps its
+// exact prior representation, so an OLD node reads a NEW node's marker
+// unchanged. A NEW node reading an OLD (or absent) author record gets
+// authorID == "", which every gate treats as UNKNOWN and falls back to the
+// epoch-only rule. A mixed-version cluster therefore always makes progress.
+type AuthoredMarkerFactory interface {
+	// WriteServingMarkerFrom is WriteServingMarker plus the writing node's ID.
+	// The gaining owner calls it exactly once at its Acquiring -> Ready mount
+	// flip with its own NodeID, in place of WriteServingMarker. It carries the
+	// same monotonicity + idempotence contract: it must never LOWER the recorded
+	// epoch, and the recorded author must always correspond to the recorded
+	// epoch (an implementation that cannot guarantee that pairing must report
+	// the author as unknown rather than mismatched).
+	WriteServingMarkerFrom(ru ReplicaUnit, epoch Epoch, authorID string) error
+
+	// ReadServingMarkerFrom is ReadServingMarker plus the ID of the node that
+	// wrote the marker. authorID is "" when the marker predates author
+	// attribution, was written by a node that lacks it, or cannot be paired with
+	// the returned epoch - all of which callers MUST treat as UNKNOWN (fall back
+	// to the epoch-only rule), never as "authored by nobody". epoch/ok/err carry
+	// exactly the ReadServingMarker semantics.
+	ReadServingMarkerFrom(ru ReplicaUnit) (epoch Epoch, authorID string, ok bool, err error)
+}
