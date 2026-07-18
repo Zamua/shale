@@ -48,6 +48,12 @@ func (c *Cluster) Begin(IsolationLevel) Transaction
 // at the call site.
 func (c *Cluster) Aggregate(fn func(backend.Backend) any) []AggregateResult
 
+// Mount readiness (multi-backend): per-node mount-state counts + the
+// predicate an embedding app wires into its readiness probe. See
+// "Mount readiness" under the v0.8 section.
+func (c *Cluster) MountReadiness() MountReadiness
+func (c *Cluster) Ready(minMountedFraction float64) bool
+
 // AggregateResult separates "fn ran + here's its return value" from
 // "shale couldn't even run fn here" (snapshot fetch failed, peer
 // unreachable). Exactly one of Value / Err is meaningful per entry.
@@ -1441,6 +1447,47 @@ So degraded boot shrinks the blast radius of one corrupt replica from "the whole
 **Why concurrency is safe here (no new fencing, no new races).** Each `(unit, replica)` position is an INDEPENDENT durable database (its own dbName), and the single-writer fence is PER-dbName, so opening DISTINCT positions concurrently never fences one another - the factory's per-position latch still serializes any two opens of the SAME position, while distinct positions proceed in parallel. Every per-position rule of degraded boot is UNCHANGED and simply runs inside a worker: the fence-free `ReadServingMarker` check still gates each open (so a concurrent boot still never fences a live peer), an open error or `SLATE_DB_OPEN_TIMEOUT` still SKIPS that one position (degraded, desired-but-unmounted, reconcile retries), and a success still mounts it. The shared bookkeeping is concurrency-safe: the mount map stays `mountMu`-guarded, `lastAcquireErr` / `myOpenEpoch` are already `sync.Map`, and the mounted / skipped / deferred tallies are atomic. The set of positions that end up mounted vs skipped vs deferred is IDENTICAL to the serial mount; only the wall-clock differs. A pool of size 1 degenerates to exactly the prior sequential mount, so the change is a strict generalization.
 
 **Acceptance.** An in-process gate boots a node owning many positions on a factory whose open BLOCKS on a barrier, and asserts that opens are IN FLIGHT CONCURRENTLY up to the configured limit (not one-at-a-time) and never beyond it, while a parallel assertion re-runs the degraded-boot break-demo under concurrency > 1 to confirm a single poisoned position is still skipped (node still Ready, healthy units still serve) exactly as in the serial case.
+
+### Mount readiness (programmatic mount-state surface + Ready predicate)
+
+Degraded boot (Phase 2f) deliberately lets `Open` SUCCEED with positions unmounted: the node comes up, serves its healthy positions, and the reconcile retries the rest. That is the right per-node availability call - and it creates a NEW hazard one level up: an embedding application that equates "process is up" with "node is serving its share" reports itself healthy while ZERO of its desired positions are mounted (every open failed, or every position was boot-deferred). Under a surge rollout, an orchestrator that trusts that health signal replaces every old pod with new pods that mount NOTHING, and the rollout "completes" into a cluster that cannot serve - a single mis-set backend credential is enough. The facts needed to stop this were already collected per node - `/debug/shale/state` dumps desired/pending/mounted/handoff-phase per position plus the last swallowed acquire error - but only as a human-readable debug string behind `SHALE_DEBUG_ADDR`. This section promotes those facts to a first-class programmatic surface on `Cluster` so the embedding application can gate its own readiness on actual mount state.
+
+**The surface (pkg/cluster).**
+
+```go
+// MountReadiness is a point-in-time summary of this node's mount state,
+// counted over the DESIRED set (the replica positions this node owns).
+type MountReadiness struct {
+    DesiredUnits     int    // replica positions this node owns (full ring)
+    MountedUnits     int    // desired positions currently mounted (serving locally)
+    PendingUnits     int    // desired positions not yet mounted (== Desired - Mounted)
+    FailedOpenUnits  int    // pending positions whose last acquire attempt recorded an error
+    LastAcquireError string // one representative recorded acquire error; "" when none
+}
+
+func (c *Cluster) MountReadiness() MountReadiness
+func (r MountReadiness) Ready(minMountedFraction float64) bool
+func (c *Cluster) Ready(minMountedFraction float64) bool // c.MountReadiness().Ready(f)
+```
+
+**Count semantics.** Every count is taken over the node's CURRENT desired set - `desiredReplicaUnits()`, the full-ring ownership set, the SAME set the debug dump's desired-but-unmounted wedge flag keys on (a warming joiner's owned-but-unmounted positions correctly count as pending, exactly as they correctly show the wedge flag).
+
+  - `MountedUnits` counts desired positions present in the mount map. A mounted position the node NO LONGER desires (a loser mid-drain still serving for its successor) counts NOWHERE: readiness is about what the node OWES, not what it happens to still hold.
+  - `PendingUnits` is exactly `DesiredUnits - MountedUnits`: desired positions not yet mounted, whether the acquire is quietly in flight, boot-deferred, or failing. The invariant `Mounted + Pending == Desired` always holds.
+  - `FailedOpenUnits` is the subset of pending positions whose most recent acquire attempt recorded an error in `lastAcquireErr`: an open that returned an error (degraded boot, reconcile-time acquire failure), or a boot-deferral that declined to open because a peer holds the serving marker (recorded for the same reason - the position is unmounted and the record says why). A successful mount DELETES the record, so the count never carries a stale error for a mounted position; records for positions no longer desired are ignored.
+  - `LastAcquireError` is the recorded error of the first failed position in position order (deterministic across calls at unchanged state); `""` when `FailedOpenUnits == 0`. One representative message for a probe-period diagnostic, not a join of all of them - the full per-position detail stays on `/debug/shale/state`.
+
+**The predicate.** `Ready(minMountedFraction)` returns `MountedUnits >= ceil(f * DesiredUnits)` where `f` is `minMountedFraction` clamped to `[0, 1]`. Edges, pinned deliberately:
+
+  - `DesiredUnits == 0` -> READY at every fraction. A node with no assigned positions - mid-join before ownership lands, a non-storage role, or legacy single-backend mode (no per-unit mounts; the one backend either opened at `Open` or `Open` failed) - has nothing to mount, and "vacuously ready" is the answer that does not wedge its rollout.
+  - `f <= 0` clamps to 0 (floor of 0 positions: always ready - no floor requested); `f >= 1` clamps to 1 (every desired position must be mounted); NaN clamps to 1 (the conservative end - garbage input must not accidentally disable the gate).
+  - A node still inside its initial reconcile window is NOT special-cased: the predicate reports mount state AS IT IS, even one tick after boot. Boot grace is the consumer's concern (its probe's initial delay / failure threshold), not shale's - a special case here would re-open exactly the blind spot this surface closes.
+
+**Intended consumer pattern (generic).** An embedding application wires its READINESS probe to the predicate - the readiness endpoint returns healthy iff `cluster.Ready(minFraction)` (fraction chosen by the operator: `1.0` strict, lower tolerates a degraded minority) - so an orchestrator gates rollout progress on actual mount state and a config error that makes every open fail stalls the FIRST replacement pod instead of replacing the whole fleet. LIVENESS stays separate: mount state must NOT restart the process (a restart cannot repair an unmountable backing store, and the process staying up is what lets the reconcile keep retrying while the healthy positions keep serving).
+
+**On the wire.** The same counts ride the existing `Stats` RPC as additive fields (`desired_units`, `mounted_units`, `pending_units`, `failed_open_units`, `last_acquire_error`), printed by `shale stats`, so an operator can read any node's mount state remotely without wiring `SHALE_DEBUG_ADDR`. The RPC reports; it does not gate: the readiness decision stays in-process in the embedding application (a probe must not depend on a second network hop).
+
+**Cost.** One desired-set enumeration plus one mount-map pass under the read lock: O(desired positions) per call, no formatting, no allocation beyond the desired-set slice the enumeration already builds - cheap enough to sit behind a probe polled every few seconds.
 
 ### v0.8 Phase 3: lease-handoff rebalance
 
