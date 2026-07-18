@@ -178,24 +178,88 @@ func NewBacking() *Backing {
 	return b
 }
 
-// storeFor returns the shared *memory.Memory for gu, creating it on first
-// touch. Caller must hold b.mu.
-func (b *Backing) storeFor(gu storageunit.GenUnit) *memory.Memory {
-	s, ok := b.stores[gu]
+// THE R=1 / R>1 KEYSPACE SPLIT (read before touching the helpers below).
+//
+// This double keeps FOUR maps: stores/epochs keyed by GenUnit (R=1) and
+// replicaStores/replicaEpochs keyed by ReplicaUnit (R>1). It is tempting to
+// collapse them by re-keying the R=1 pair as ReplicaUnit{gu, 0}, and that would
+// be WRONG: the production slate factory encodes the two as DIFFERENT object
+// prefixes ("u/g<g>/u<i>" for R=1 vs "u/g<g>/u<i>/r0" for R>1 replica 0, pinned
+// by backends/slate/dbname_test.go), so an R=1 unit and its R>1 replica-0
+// position are genuinely separate durable databases. Aliasing them here would
+// make the double MORE permissive than production and hide exactly the class of
+// bug it exists to catch.
+//
+// What IS shared is the LOGIC over those keyspaces. The generic helpers below
+// (storeForLocked, acquireLocked, durableEpochOf, lookupStore, wipeKeyed) hold
+// ONE copy of the fence arithmetic, the create-on-first-touch rule and the
+// in-place wipe, instantiated at each key type. A fix to the fence rule lands on
+// both keyspaces; the keyspaces themselves stay disjoint.
+
+// storeForLocked returns the shared *memory.Memory for k, creating it on first
+// touch. Caller must hold b.mu. One implementation for both keyspaces.
+func storeForLocked[K comparable](stores map[K]*memory.Memory, k K) *memory.Memory {
+	s, ok := stores[k]
 	if !ok {
 		s = memory.New()
-		b.stores[gu] = s
+		stores[k] = s
 	}
 	return s
+}
+
+// acquireLocked is THE fence arithmetic, shared by the R=1 acquire and the R>1
+// acquireReplica: open at max(intended, durable+1) so the open ALWAYS lands
+// strictly above the durable epoch (the higher-epoch-fences-lower rule) even
+// when the cluster's local epoch hint is stale, then advance the durable epoch
+// to the opened value (fencing any handle still open below it) and return the
+// shared store plus the epoch actually opened at. It NEVER rejects for being
+// "too low": a new owner must always be able to take the lease. Caller must
+// hold b.mu.
+func acquireLocked[K comparable](stores map[K]*memory.Memory, epochs map[K]storageunit.Epoch, k K, intended storageunit.Epoch) (*memory.Memory, storageunit.Epoch) {
+	opened := intended
+	if floor := epochs[k] + 1; floor > opened {
+		opened = floor
+	}
+	epochs[k] = opened
+	return storeForLocked(stores, k), opened
+}
+
+// durableEpochOf reads k's durable writer-epoch (0 if never opened) under b.mu.
+// Shared by durableEpoch (R=1) and replicaDurableEpoch (R>1).
+func durableEpochOf[K comparable](b *Backing, epochs map[K]storageunit.Epoch, k K) storageunit.Epoch {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return epochs[k]
+}
+
+// lookupStore reads k's shared store without creating it. Shared by UnitStore
+// (R=1) and ReplicaStore (R>1). It returns the concrete *memory.Memory so the
+// callers do the interface conversion themselves, preserving their exact
+// (possibly typed-nil) return shape.
+func lookupStore[K comparable](b *Backing, stores map[K]*memory.Memory, k K) (*memory.Memory, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	s, ok := stores[k]
+	return s, ok
+}
+
+// wipeKeyed empties k's shared bytes IN PLACE. Shared by WipeUnit (R=1) and
+// WipeReplica (R>1); see WipeUnit for why the deletion must be in place.
+func wipeKeyed[K comparable](b *Backing, stores map[K]*memory.Memory, k K) {
+	b.mu.Lock()
+	s, ok := stores[k]
+	b.mu.Unlock()
+	if !ok {
+		return
+	}
+	wipeStore(s)
 }
 
 // durableEpoch reports the unit's durable writer-epoch (0 if never opened).
 // This is the cross-node source of truth a real factory reads from the
 // slatedb manifest. Exposed for test assertions.
 func (b *Backing) durableEpoch(gu storageunit.GenUnit) storageunit.Epoch {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.epochs[gu]
+	return durableEpochOf(b, b.epochs, gu)
 }
 
 // DurableEpoch is the exported form of durableEpoch for tests that assert
@@ -209,9 +273,7 @@ func (b *Backing) DurableEpoch(gu storageunit.GenUnit) storageunit.Epoch {
 // which node currently owns the lease (the copy-free property), and to
 // inspect a freshly-bisected gen-(g+1) child unit's contents.
 func (b *Backing) UnitStore(gu storageunit.GenUnit) (backend.Backend, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.stores[gu]
+	s, ok := lookupStore(b, b.stores, gu)
 	return s, ok
 }
 
@@ -228,13 +290,7 @@ func (b *Backing) UnitStore(gu storageunit.GenUnit) (backend.Backend, bool) {
 // untouched so a subsequent acquire still fences correctly; only the data is
 // gone, which is precisely the failure the gate must detect.
 func (b *Backing) WipeUnit(gu storageunit.GenUnit) {
-	b.mu.Lock()
-	s, ok := b.stores[gu]
-	b.mu.Unlock()
-	if !ok {
-		return
-	}
-	wipeStore(s)
+	wipeKeyed(b, b.stores, gu)
 }
 
 // wipeStore deletes every key from s IN PLACE (so any handle holding a pointer
@@ -277,32 +333,14 @@ func wipeStore(s *memory.Memory) {
 func (b *Backing) acquire(gu storageunit.GenUnit, intended storageunit.Epoch) (*memory.Memory, storageunit.Epoch) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	opened := intended
-	if floor := b.epochs[gu] + 1; floor > opened {
-		opened = floor
-	}
-	b.epochs[gu] = opened
-	return b.storeFor(gu), opened
-}
-
-// replicaStoreFor returns the shared *memory.Memory for replica ru, creating
-// it on first touch. Caller must hold b.mu. The R>1 analogue of storeFor.
-func (b *Backing) replicaStoreFor(ru storageunit.ReplicaUnit) *memory.Memory {
-	s, ok := b.replicaStores[ru]
-	if !ok {
-		s = memory.New()
-		b.replicaStores[ru] = s
-	}
-	return s
+	return acquireLocked(b.stores, b.epochs, gu, intended)
 }
 
 // ReplicaStore returns the shared backend for replica ru (ok=false if never
 // opened). Tests use it to assert a write landed on a SPECIFIC replica copy
 // and that the R copies are independent.
 func (b *Backing) ReplicaStore(ru storageunit.ReplicaUnit) (backend.Backend, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	s, ok := b.replicaStores[ru]
+	s, ok := lookupStore(b, b.replicaStores, ru)
 	return s, ok
 }
 
@@ -310,34 +348,23 @@ func (b *Backing) ReplicaStore(ru storageunit.ReplicaUnit) (backend.Backend, boo
 // deletion semantics as WipeUnit) so a test can simulate the loss of one
 // replica copy and prove the gate catches it. Test-only; no production path.
 func (b *Backing) WipeReplica(ru storageunit.ReplicaUnit) {
-	b.mu.Lock()
-	s, ok := b.replicaStores[ru]
-	b.mu.Unlock()
-	if !ok {
-		return
-	}
-	wipeStore(s)
+	wipeKeyed(b, b.replicaStores, ru)
 }
 
 // acquireReplica is the R>1 analogue of acquire: it opens replica ru against
 // the per-replica durable store + epoch, fencing at max(intended, durable+1).
+// Same acquireLocked arithmetic as acquire, instantiated at the ReplicaUnit
+// keyspace, so the two can no longer drift apart.
 func (b *Backing) acquireReplica(ru storageunit.ReplicaUnit, intended storageunit.Epoch) (*memory.Memory, storageunit.Epoch) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	opened := intended
-	if floor := b.replicaEpochs[ru] + 1; floor > opened {
-		opened = floor
-	}
-	b.replicaEpochs[ru] = opened
-	return b.replicaStoreFor(ru), opened
+	return acquireLocked(b.replicaStores, b.replicaEpochs, ru, intended)
 }
 
 // replicaDurableEpoch reports replica ru's durable writer-epoch (0 if never
 // opened). The per-replica analogue of durableEpoch.
 func (b *Backing) replicaDurableEpoch(ru storageunit.ReplicaUnit) storageunit.Epoch {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	return b.replicaEpochs[ru]
+	return durableEpochOf(b, b.replicaEpochs, ru)
 }
 
 // writeServingMarker records the serving marker for replica ru at epoch (the
@@ -569,7 +596,7 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 		h.mu.Lock()
 		h.openReplica[ru] = opened
 		h.mu.Unlock()
-		return &fencedReplicaBackend{backing: h.backing, unit: ru, epoch: opened, store: store}, opened, nil
+		return &fencedReplicaBackend{newFencedCore(h.backing, ru, opened, store, (*Backing).replicaDurableEpoch)}, opened, nil
 	}
 
 	// OPT-OUT (fence-at-completion, SetEagerFence(false)): simulate object-store
@@ -588,7 +615,7 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	h.mu.Unlock()
 	// opened is the EXACT fence epoch this open landed at (max(intended,
 	// durable+1)); the caller uses it as this node's open epoch.
-	return &fencedReplicaBackend{backing: h.backing, unit: ru, epoch: opened, store: store}, opened, nil
+	return &fencedReplicaBackend{newFencedCore(h.backing, ru, opened, store, (*Backing).replicaDurableEpoch)}, opened, nil
 }
 
 // DurableEpochReplica reports replica ru's DURABLE writer-epoch from the
@@ -666,7 +693,7 @@ func (h *Handle) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (back
 	h.mu.Lock()
 	h.open[gu] = opened
 	h.mu.Unlock()
-	return &fencedBackend{backing: h.backing, unit: gu, epoch: opened, store: store}, nil
+	return &fencedBackend{newFencedCore(h.backing, gu, opened, store, (*Backing).durableEpoch)}, nil
 }
 
 // CloseUnit releases gu from THIS handle. It flushes nothing (memory is
@@ -712,19 +739,25 @@ func (h *Handle) OpenUnits() []storageunit.GenUnit {
 	return out
 }
 
-// fencedBackend wraps the shared *memory.Memory for one unit, captured at
-// the epoch THIS handle opened it. Reads pass through unconditionally (the
-// bytes are shared + durable). WRITES first check the backing's durable
-// epoch: if it has advanced past this backend's captured epoch, a
-// higher-epoch owner has FENCED this writer and the write returns ErrFenced.
-// This is the single-writer guarantee the lease handoff depends on: after B
-// acquires u at epoch+1, A's fencedBackend (still at epoch) cannot write,
-// even though A has not yet observed the membership change.
-type fencedBackend struct {
+// fencedCore is the WRITE-FENCING half both fenced backends share: the epoch
+// comparison and the three mutating ops that guard on it. It is generic over
+// the identity key so the R=1 (GenUnit) and R>1 (ReplicaUnit) wrappers get ONE
+// copy of the guard - a new mutating op, or a fix to the check, cannot land on
+// one wrapper and be forgotten on the other.
+//
+// The READ path is deliberately NOT here: the two wrappers diverge on it (see
+// fencedBackend.Get vs fencedReplicaBackend.Get), so each declares its own and
+// nothing is silently unified.
+//
+// durable reads the CURRENT durable epoch for this backend's identity from the
+// backing; it is the method expression of the per-keyspace reader, which is what
+// lets one generic body serve both keyspaces.
+type fencedCore[K comparable] struct {
 	backing *Backing
-	unit    storageunit.GenUnit
+	unit    K
 	epoch   storageunit.Epoch
 	store   *memory.Memory
+	durable func(*Backing, K) storageunit.Epoch
 }
 
 // fenced reports whether this writer has been superseded: the durable epoch
@@ -739,45 +772,70 @@ type fencedBackend struct {
 // and a fenced write cannot interleave. Harmless to the current gate (which
 // does not race a write against an in-flight acquire of the same unit), but
 // worth tightening before relying on the factory for concurrency fuzzing.
-func (f *fencedBackend) fenced() bool {
-	return f.backing.durableEpoch(f.unit) > f.epoch
+func (f *fencedCore[K]) fenced() bool {
+	return f.durable(f.backing, f.unit) > f.epoch
 }
 
-func (f *fencedBackend) Put(key, value []byte) error {
+func (f *fencedCore[K]) Put(key, value []byte) error {
 	if f.fenced() {
 		return ErrFenced
 	}
 	return f.store.Put(key, value)
 }
 
-func (f *fencedBackend) Delete(key []byte) error {
+func (f *fencedCore[K]) Delete(key []byte) error {
 	if f.fenced() {
 		return ErrFenced
 	}
 	return f.store.Delete(key)
 }
 
-func (f *fencedBackend) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
+func (f *fencedCore[K]) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
 	if f.fenced() {
 		return nil, ErrFenced
 	}
 	return f.store.Begin(level)
 }
 
-// Get + ScanPrefix are reads: always allowed against the shared bytes, even
-// once fenced. (A fenced node should not SERVE in practice - the cluster's
-// reconcile unmounts it - but the backend itself must not invent data loss
-// on read; the bytes are real + shared.)
+// Close is a no-op on the wrapper: the shared store outlives any one
+// handle's mount (the durable-bytes-survive-unmount property). CloseUnit /
+// CloseReplicaUnit on the Handle is the real release.
+func (f *fencedCore[K]) Close() error { return nil }
+
+// newFencedCore builds the shared write-fencing core for one mounted identity.
+// durable is the method expression of the per-keyspace durable-epoch reader
+// ((*Backing).durableEpoch at R=1, (*Backing).replicaDurableEpoch at R>1), which
+// is the ONLY thing that differs between the two wrappers' fence checks.
+func newFencedCore[K comparable](b *Backing, unit K, epoch storageunit.Epoch, store *memory.Memory, durable func(*Backing, K) storageunit.Epoch) fencedCore[K] {
+	return fencedCore[K]{backing: b, unit: unit, epoch: epoch, store: store, durable: durable}
+}
+
+// fencedBackend wraps the shared *memory.Memory for one unit, captured at
+// the epoch THIS handle opened it. Reads pass through unconditionally (the
+// bytes are shared + durable). WRITES first check the backing's durable
+// epoch: if it has advanced past this backend's captured epoch, a
+// higher-epoch owner has FENCED this writer and the write returns ErrFenced.
+// This is the single-writer guarantee the lease handoff depends on: after B
+// acquires u at epoch+1, A's fencedBackend (still at epoch) cannot write,
+// even though A has not yet observed the membership change.
+type fencedBackend struct {
+	fencedCore[storageunit.GenUnit]
+}
+
+// Get + ScanPrefix are reads: on the R=1 wrapper they are always allowed
+// against the shared bytes, even once fenced. (A fenced node should not SERVE
+// in practice - the cluster's reconcile unmounts it - but the backend itself
+// must not invent data loss on read; the bytes are real + shared.)
+//
+// DIVERGENCE, PRESERVED DELIBERATELY: the R>1 wrapper DOES fence reads by
+// default (strictReadFencing, modeling real slatedb's close-on-fence). The two
+// read policies were never the same and are not unified here; see
+// fencedReplicaBackend.Get.
 func (f *fencedBackend) Get(key []byte) ([]byte, error) { return f.store.Get(key) }
 
 func (f *fencedBackend) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	return f.store.ScanPrefix(prefix)
 }
-
-// Close is a no-op on the wrapper: the shared store outlives any one
-// handle's mount (the durable-bytes-survive-unmount property). CloseUnit on
-// the Handle is the real release.
-func (f *fencedBackend) Close() error { return nil }
 
 // fencedReplicaBackend is fencedBackend keyed by a per-replica durable epoch
 // (R>1, v0.8 Phase 2b). Writes fail once a higher-epoch owner of the SAME
@@ -785,35 +843,7 @@ func (f *fencedBackend) Close() error { return nil }
 // too, modeling real slatedb's close-on-fence, and only the permissive opt-out
 // lets reads pass through. Independent of the R=1 GenUnit-keyed fence.
 type fencedReplicaBackend struct {
-	backing *Backing
-	unit    storageunit.ReplicaUnit
-	epoch   storageunit.Epoch
-	store   *memory.Memory
-}
-
-func (f *fencedReplicaBackend) fenced() bool {
-	return f.backing.replicaDurableEpoch(f.unit) > f.epoch
-}
-
-func (f *fencedReplicaBackend) Put(key, value []byte) error {
-	if f.fenced() {
-		return ErrFenced
-	}
-	return f.store.Put(key, value)
-}
-
-func (f *fencedReplicaBackend) Delete(key []byte) error {
-	if f.fenced() {
-		return ErrFenced
-	}
-	return f.store.Delete(key)
-}
-
-func (f *fencedReplicaBackend) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
-	if f.fenced() {
-		return nil, ErrFenced
-	}
-	return f.store.Begin(level)
+	fencedCore[storageunit.ReplicaUnit]
 }
 
 func (f *fencedReplicaBackend) Get(key []byte) ([]byte, error) {
@@ -829,8 +859,6 @@ func (f *fencedReplicaBackend) ScanPrefix(prefix []byte) (backend.Iterator, erro
 	}
 	return f.store.ScanPrefix(prefix)
 }
-
-func (f *fencedReplicaBackend) Close() error { return nil }
 
 // Flush implements the OPTIONAL backend.Flusher capability (the cluster's
 // displacement flush, v0.8 Phase 2e). The double has no memtable to make
