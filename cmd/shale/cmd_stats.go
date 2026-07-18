@@ -66,13 +66,13 @@ func runStats(opts globalOpts, args []string, stdout, stderr io.Writer) int {
 	}
 
 	// Aligned columns so eyeball-scanning works on a terminal.
-	_, _ = fmt.Fprintf(stdout, "keys_held       %d\n", resp.GetKeysHeld())
-	_, _ = fmt.Fprintf(stdout, "puts            %d\n", resp.GetPuts())
-	_, _ = fmt.Fprintf(stdout, "gets            %d\n", resp.GetGets())
-	_, _ = fmt.Fprintf(stdout, "deletes         %d\n", resp.GetDeletes())
-	_, _ = fmt.Fprintf(stdout, "scans           %d\n", resp.GetScans())
-	_, _ = fmt.Fprintf(stdout, "latency_ms_p50  %.3f\n", resp.GetLatencyMsP50())
-	_, _ = fmt.Fprintf(stdout, "latency_ms_p99  %.3f\n", resp.GetLatencyMsP99())
+	_, _ = fmt.Fprintf(stdout, "keys_held          %d\n", resp.GetKeysHeld())
+	_, _ = fmt.Fprintf(stdout, "puts               %d\n", resp.GetPuts())
+	_, _ = fmt.Fprintf(stdout, "gets               %d\n", resp.GetGets())
+	_, _ = fmt.Fprintf(stdout, "deletes            %d\n", resp.GetDeletes())
+	_, _ = fmt.Fprintf(stdout, "scans              %d\n", resp.GetScans())
+	_, _ = fmt.Fprintf(stdout, "latency_ms_p50     %.3f\n", resp.GetLatencyMsP50())
+	_, _ = fmt.Fprintf(stdout, "latency_ms_p99     %.3f\n", resp.GetLatencyMsP99())
 	// Mount readiness (multi-backend; all zero on a legacy node).
 	_, _ = fmt.Fprintf(stdout, "desired_units      %d\n", resp.GetDesiredUnits())
 	_, _ = fmt.Fprintf(stdout, "mounted_units      %d\n", resp.GetMountedUnits())

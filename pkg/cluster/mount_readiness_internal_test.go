@@ -15,6 +15,7 @@ import (
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 // TestMountReadiness_AllMounted: a clean boot mounts every desired position;
@@ -188,6 +189,167 @@ func TestMountReadinessPredicate_Thresholds(t *testing.T) {
 			t.Errorf("Ready(desired=%d mounted=%d f=%v) = %v, want %v",
 				tc.desired, tc.mounted, tc.fraction, got, tc.want)
 		}
+	}
+}
+
+// TestMountReadiness_BootDeferredCountsAndClearsAtMountSeam: a position the
+// boot mount DEFERS because a peer holds its serving marker (the real Phase 2f
+// deferral path) counts in FailedOpenUnits with the boot-deferred message, and
+// the record clears when the position mounts THROUGH THE MOUNT SEAM
+// (storeMount) alone - no acquire-path per-site Delete involved. The final
+// release step is the regression pin: without the seam clear, the stale
+// boot-deferred record would resurface as a phantom failed acquire the moment
+// the position unmounts again.
+func TestMountReadiness_BootDeferredCountsAndClearsAtMountSeam(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 8, 2, backing, "n1", "n2", "n3")
+	desired := c.desiredReplicaUnits()
+	if len(desired) < 2 {
+		t.Fatalf("test needs n1 to own >=2 replica positions, got %d", len(desired))
+	}
+	served := desired[0]
+
+	// A PEER serves the position: opened it and wrote its serving marker, so
+	// the boot mount reads the marker and defers via the real deferral path.
+	peer := backing.Handle()
+	_, peerEpoch, err := peer.OpenReplicaUnit(served, storageunit.Epoch(1))
+	if err != nil {
+		t.Fatalf("peer open: %v", err)
+	}
+	if err := peer.WriteServingMarker(served, peerEpoch); err != nil {
+		t.Fatalf("peer write serving marker: %v", err)
+	}
+
+	if err := c.mountReplicaUnits(); err != nil {
+		t.Fatalf("mountReplicaUnits: %v", err)
+	}
+
+	k := len(desired)
+	r := c.MountReadiness()
+	if r.MountedUnits != k-1 || r.PendingUnits != 1 {
+		t.Fatalf("mounted/pending = %d/%d, want %d/1", r.MountedUnits, r.PendingUnits, k-1)
+	}
+	if r.FailedOpenUnits != 1 {
+		t.Fatalf("FailedOpenUnits = %d, want 1 (the deferral is a recorded non-mount)", r.FailedOpenUnits)
+	}
+	if !strings.Contains(r.LastAcquireError, "boot-deferred") {
+		t.Fatalf("LastAcquireError = %q, want the boot-deferred message", r.LastAcquireError)
+	}
+
+	// The position later mounts THROUGH THE SEAM ONLY (storeMount), the way
+	// the reshard split mounts and any future mount site do - deliberately NOT
+	// via an acquire path with its own per-site Delete. The seam itself must
+	// clear the record.
+	b, _, err := c.replicaFactory.OpenReplicaUnit(served, acquireBaseEpoch)
+	if err != nil {
+		t.Fatalf("open for mount: %v", err)
+	}
+	c.mountMu.Lock()
+	c.storeMount(served, b)
+	c.mountMu.Unlock()
+
+	r = c.MountReadiness()
+	if r.MountedUnits != k || r.PendingUnits != 0 || r.FailedOpenUnits != 0 || r.LastAcquireError != "" {
+		t.Fatalf("after seam mount: %+v, want all %d mounted, no pending/failed", r, k)
+	}
+
+	// THE PIN: unmount again (a release never touches lastAcquireErr). A
+	// stale record would resurface here; the seam clear means none exists.
+	c.reconcileMu.Lock()
+	c.releaseReplicaUnit(served)
+	c.reconcileMu.Unlock()
+	r = c.MountReadiness()
+	if r.PendingUnits != 1 {
+		t.Fatalf("after release: PendingUnits = %d, want 1", r.PendingUnits)
+	}
+	if r.FailedOpenUnits != 0 || r.LastAcquireError != "" {
+		t.Fatalf("after release: failed=%d err=%q, want 0/empty (the mount seam must have cleared the stale record)", r.FailedOpenUnits, r.LastAcquireError)
+	}
+}
+
+// TestMountReadiness_LastAcquireErrorPicksMinPosition: with TWO failed
+// positions, the one representative LastAcquireError is the failed position
+// FIRST IN POSITION ORDER (min ru.String()), stable across repeated calls at
+// unchanged state.
+func TestMountReadiness_LastAcquireErrorPicksMinPosition(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 8, 2, backing, "n1", "n2", "n3")
+	desired := c.desiredReplicaUnits()
+	if len(desired) < 3 {
+		t.Fatalf("test needs n1 to own >=3 replica positions, got %d", len(desired))
+	}
+	badA, badB := desired[0], desired[1]
+	errA := errors.New("injected fault on " + badA.String())
+	errB := errors.New("injected fault on " + badB.String())
+	backing.SetOpenReplicaFault(badA, errA)
+	backing.SetOpenReplicaFault(badB, errB)
+
+	if err := c.mountReplicaUnits(); err != nil {
+		t.Fatalf("mountReplicaUnits: %v", err)
+	}
+
+	want := errA.Error()
+	if badB.String() < badA.String() {
+		want = errB.Error()
+	}
+	for i := 0; i < 3; i++ {
+		r := c.MountReadiness()
+		if r.FailedOpenUnits != 2 || r.PendingUnits != 2 {
+			t.Fatalf("call %d: failed/pending = %d/%d, want 2/2", i, r.FailedOpenUnits, r.PendingUnits)
+		}
+		if r.LastAcquireError != want {
+			t.Fatalf("call %d: LastAcquireError = %q, want the min-position error %q", i, r.LastAcquireError, want)
+		}
+	}
+}
+
+// TestMountReadiness_NotDesiredCountsNowhere: a position present in mountMap
+// (or carrying a stale acquire-error record) that this node does NOT desire -
+// the mid-drain loser shape - counts NOWHERE: not mounted, not pending, not
+// failed. Readiness is scoped to the desired set (what the node owes).
+func TestMountReadiness_NotDesiredCountsNowhere(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 8, 2, backing, "n1", "n2", "n3")
+	if err := c.mountReplicaUnits(); err != nil {
+		t.Fatalf("mountReplicaUnits: %v", err)
+	}
+	desired := c.desiredReplicaUnits()
+	k := len(desired)
+	if k == 0 {
+		t.Fatalf("fixture must desire at least one position")
+	}
+
+	// A position this node does NOT desire: the OTHER replica position of a
+	// unit it holds (a node appears at most once in a unit's replica set, so
+	// that position belongs to a peer). Mount it directly.
+	foreign := storageunit.NewReplicaUnit(desired[0].Unit, 1-desired[0].Replica)
+	for _, ru := range desired {
+		if ru == foreign {
+			t.Fatalf("fixture broke the one-position-per-unit assumption: %s is desired", foreign)
+		}
+	}
+	fb, _, err := c.replicaFactory.OpenReplicaUnit(foreign, storageunit.Epoch(1))
+	if err != nil {
+		t.Fatalf("open foreign: %v", err)
+	}
+	c.mountMu.Lock()
+	c.storeMount(foreign, fb)
+	c.mountMu.Unlock()
+	// And a stale acquire-error record for ANOTHER non-desired position: the
+	// desired-set scoping must keep it out of the failed count too.
+	last := desired[len(desired)-1]
+	foreignPending := storageunit.NewReplicaUnit(last.Unit, 1-last.Replica)
+	c.lastAcquireErr.Store(foreignPending, "stale record for a position this node does not desire")
+
+	r := c.MountReadiness()
+	if r.DesiredUnits != k || r.MountedUnits != k || r.PendingUnits != 0 || r.FailedOpenUnits != 0 {
+		t.Fatalf("counts = %+v, want exactly the clean full mount over %d desired (non-desired positions count nowhere)", r, k)
+	}
+	if r.LastAcquireError != "" {
+		t.Fatalf("LastAcquireError = %q, want empty", r.LastAcquireError)
+	}
+	if r.MountedUnits+r.PendingUnits != r.DesiredUnits {
+		t.Fatalf("invariant Mounted+Pending==Desired violated: %+v", r)
 	}
 }
 
