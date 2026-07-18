@@ -319,6 +319,67 @@ func (c *Cluster) evictStaleMount(ru storageunit.ReplicaUnit, failed backend.Bac
 	}
 }
 
+// withLocalWriteBackend runs fn against the mounted backend a LOCAL WRITE on
+// key must apply to, owning the whole "never ack a write that did not land"
+// discipline for the single-copy (non-envelope) write paths: Cluster.Put,
+// Cluster.Delete, LocalReplicaPut and LocalReplicaDelete all reduce to one
+// call on it, so the discipline has ONE definition to change.
+//
+// The sequence, and why each step is where it is:
+//
+//   - RESOLVE under the reshard write-pause (localWriteBackendForKey). The
+//     pause read-lock is held across ALL of fn, so a cut-over that starts
+//     mid-write blocks until fn finishes: the write either lands in the old
+//     unit before it is drained, or resolves to the gen-(g+1) child. It can
+//     never land in a just-retired unit (NO ACKED WRITE LOST).
+//   - NOT MOUNTED (ok=false) means this node is the ring owner but the unit's
+//     lease is still handing off to it (the Phase 3 acquiring window), or a
+//     late writer was refused by the post-RLock freeze re-check. Either way
+//     the caller gets the RETRYABLE acquiring-window error, never an ack.
+//   - fn FAILED on an owned+mounted unit means the mount is STALE (its lease
+//     moved to a higher epoch during the reshard redistribution window).
+//     Evict it so the next reconcile re-acquires fresh, and return the same
+//     retryable error. The eviction runs BEFORE the pause is released, and
+//     evictStaleMount is itself a no-op for a Draining position (there a
+//     failed write is the expected successor fence, not a stale handle).
+//
+// op names the operation in the acquiring-window error ("Put", "Delete") and
+// is per-call-site, since it is what the originator's retry classifier and
+// the operator-facing message read.
+//
+// The underlying error from fn is deliberately NOT wrapped: a stale-mount
+// write failure is reported to the originator purely as the retryable
+// acquiring-window condition, so the retry path is uniform regardless of
+// which backend error surfaced.
+//
+// This is the SINGLE-VALUE sibling of unitApplyErrMaps, which carries the
+// same evict-then-retryable discipline into applyEnvelopesTx's per-stage
+// error mappers for the envelope (R>1 / CAS batch) paths. Multi-backend
+// mode only.
+//
+// TWO further sites run this discipline but CANNOT route through here, so a
+// change to the sequence must be considered against them as well:
+//
+//   - localBeginForKey holds the pause BEYOND its own return (the read-lock is
+//     transferred to the pausedTx wrapper so the whole CAS validate-and-apply
+//     stays on one generation), so it unlocks by hand on each error path
+//     rather than by defer.
+//   - LocalReplicaDeleteAt is POSITION-addressed: it resolves an explicit ru
+//     via localBackendForReplicaUnit instead of resolving from the key, and
+//     recodes its refusal for the forwarded replica leg.
+func (c *Cluster) withLocalWriteBackend(key []byte, op string, fn func(backend.Backend) error) error {
+	b, ru, unlock, ok := c.localWriteBackendForKey(key)
+	defer unlock()
+	if !ok {
+		return errUnitAcquiring(op)
+	}
+	if err := fn(b); err != nil {
+		c.evictStaleMount(ru, b)
+		return errUnitAcquiring(op)
+	}
+	return nil
+}
+
 // Reshard performs ONE doubling reshard: it advances the cluster from the
 // current generation g (N units) to g+1 (2N units) by bisecting every old
 // gen-g unit this node currently mounts into its two gen-(g+1) children,

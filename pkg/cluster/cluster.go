@@ -1661,31 +1661,19 @@ func (c *Cluster) Put(key, value []byte) error {
 		}
 		owner, local := c.ownerOf(key)
 		if local {
-			// Resolve the local backend UNDER the reshard write-pause (Phase 4):
-			// if a cut-over for this key's old unit is in flight, this blocks
-			// until it completes and then resolves to the new gen-(g+1) child,
-			// so the write never lands in a retired unit (NO ACKED WRITE LOST).
-			b, ru, unlock, ok := c.localWriteBackendForKey(key)
-			defer unlock()
-			if !ok {
-				// This node IS the ring owner but has not mounted the
-				// unit yet: the Phase 3 handoff is landing on us. Return
-				// the RETRYABLE acquiring-window error so the originator
-				// retries and succeeds once the reconcile has acquired
-				// (never lose the write, never serve from a wrong engine).
-				return errUnitAcquiring("Put")
-			}
-			if err := b.Put(key, value); err != nil {
-				// A failed local write on an owned+mounted unit means the mount
-				// is stale (its lease moved to a higher epoch - the reshard
-				// redistribution window). Evict it so the next reconcile
-				// re-acquires fresh, and return the RETRYABLE acquiring-window
-				// error so the originator retries (never ack a write that did
-				// not land).
-				c.evictStaleMount(ru, b)
-				return errUnitAcquiring("Put")
-			}
-			return nil
+			// Apply UNDER the reshard write-pause (Phase 4): if a cut-over
+			// for this key's old unit is in flight, this blocks until it
+			// completes and then resolves to the new gen-(g+1) child, so the
+			// write never lands in a retired unit (NO ACKED WRITE LOST). An
+			// unmounted unit (the Phase 3 handoff landing on us) or a failed
+			// write (a stale mount, evicted for re-acquire) both surface the
+			// RETRYABLE acquiring-window error, so the originator retries and
+			// succeeds once the reconcile has acquired: never lose the write,
+			// never serve it from a wrong engine, never ack a write that did
+			// not land. See withLocalWriteBackend.
+			return c.withLocalWriteBackend(key, "Put", func(b backend.Backend) error {
+				return b.Put(key, value)
+			})
 		}
 		cli, err := c.clientFor(owner.Addr)
 		if err != nil {
@@ -1836,22 +1824,14 @@ func (c *Cluster) Delete(key []byte) error {
 		}
 		owner, local := c.ownerOf(key)
 		if local {
-			// Delete is a write: resolve under the reshard write-pause so a
+			// Delete is a write: apply under the reshard write-pause so a
 			// mid-flight cut-over routes it to the new child, not a retired
-			// unit (NO ACKED WRITE LOST; see Put).
-			b, ru, unlock, ok := c.localWriteBackendForKey(key)
-			defer unlock()
-			if !ok {
-				// Owner-but-unmounted: handoff landing on us. Retryable
-				// acquiring-window error (never lose the delete).
-				return errUnitAcquiring("Delete")
-			}
-			if err := b.Delete(key); err != nil {
-				// Stale mount (lease moved): evict + retryable, same as Put.
-				c.evictStaleMount(ru, b)
-				return errUnitAcquiring("Delete")
-			}
-			return nil
+			// unit (NO ACKED WRITE LOST; see Put). Owner-but-unmounted (the
+			// handoff landing on us) and a stale mount both yield the
+			// retryable acquiring-window error, so the delete is never lost.
+			return c.withLocalWriteBackend(key, "Delete", func(b backend.Backend) error {
+				return b.Delete(key)
+			})
 		}
 		cli, err := c.clientFor(owner.Addr)
 		if err != nil {

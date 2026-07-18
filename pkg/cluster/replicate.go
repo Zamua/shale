@@ -701,20 +701,13 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 		// unit's lease is HANDING OFF to this node (Phase 3 window): return
 		// the retryable acquiring-window error so the forwarder retries once
 		// the reconcile has acquired, rather than re-forwarding or losing the
-		// write.
-		b, ru, unlock, ok := c.localWriteBackendForKey(key)
-		defer unlock()
-		if !ok {
-			return errUnitAcquiring("Put")
-		}
-		if err := b.Put(key, bytesToWrite); err != nil {
-			// Stale mount (lease moved during the reshard redistribution):
-			// evict + retryable so the forwarder retries and lands on the
-			// freshly re-acquired mount (never ack a write that did not land).
-			c.evictStaleMount(ru, b)
-			return errUnitAcquiring("Put")
-		}
-		return nil
+		// write. A failed write means the mount went stale mid-redistribution
+		// and yields the same retryable error, so the forwarder retries and
+		// lands on the freshly re-acquired mount (never ack a write that did
+		// not land). See withLocalWriteBackend.
+		return c.withLocalWriteBackend(key, "Put", func(b backend.Backend) error {
+			return b.Put(key, bytesToWrite)
+		})
 	}
 	if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 		return migrationGuardError(c.retryAfterMs())
@@ -741,20 +734,13 @@ func (c *Cluster) LocalReplicaDelete(key []byte) error {
 		if c.isFrozen() {
 			return errWriteFrozen("Delete")
 		}
-		// Resolve under the reshard write-pause (Phase 4). Owner-but-unmounted:
-		// handoff landing on us. Retryable acquiring-window error (never lose
-		// the forwarded delete).
-		b, ru, unlock, ok := c.localWriteBackendForKey(key)
-		defer unlock()
-		if !ok {
-			return errUnitAcquiring("Delete")
-		}
-		if err := b.Delete(key); err != nil {
-			// Stale mount (lease moved): evict + retryable, same as Put.
-			c.evictStaleMount(ru, b)
-			return errUnitAcquiring("Delete")
-		}
-		return nil
+		// Apply under the reshard write-pause (Phase 4). Owner-but-unmounted
+		// (handoff landing on us) and a stale mount (lease moved) both give
+		// the retryable acquiring-window error, same as Put, so the forwarded
+		// delete is never lost.
+		return c.withLocalWriteBackend(key, "Delete", func(b backend.Backend) error {
+			return b.Delete(key)
+		})
 	}
 	if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
 		return migrationGuardError(c.retryAfterMs())
