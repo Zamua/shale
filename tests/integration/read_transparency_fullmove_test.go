@@ -3,18 +3,43 @@ package integration
 // THE FULL-MOVE READ HOLE (deterministic repro; the residual behind the surge
 // gate's intermittent failure).
 //
+// WHAT THIS TEST MEASURES, AND WHAT IT DOES NOT.
+// It measures ONE thing: client-visible read failures (Get AND ScanPrefix)
+// through a leave+join overlap on a unit whose replica set turns over
+// COMPLETELY. It does NOT measure WHY those reads failed. Several distinct
+// mechanisms produce the same client-visible symptom, so a failure here is a
+// signal to go diagnose, NOT a diagnosis. Do not read a cause out of this
+// test's verdict string; earlier revisions of it hardcoded one, and that
+// misattribution sent a downstream consumer's investigation after a mechanism
+// that had already been fixed.
+//
+// THE HISTORICAL MECHANISM (fixed; NOT what this test exercises today).
 // The graceful-leave drain acquires successors per the PENDING set. When that
-// set is computed with the successor-chain drop-trick approximation ("locate
-// R+|draining| over the full ring, drop the draining ids"), it can DIVERGE
+// set was computed with the successor-chain drop-trick approximation ("locate
+// R+|draining| over the full ring, drop the draining ids"), it could DIVERGE
 // from the genuinely-rebuilt post-leave ring (bounded-load consistent hashing
-// is not removal-invariant). A unit whose approximated pending set is DISJOINT
-// from its true post-leave placement is a FULL MOVE: during the drain the
-// "wrong" successors mount + serving-mark it, the leaver exits, and the
-// genuinely-rebuilt ring routes the unit to owners that hold NOTHING - while
-// every node that physically holds a copy is no longer routed at all. Reads
-// (Get AND ScanPrefix) then fail through every entry until the true owners
-// finish their (slow) mounts, and the reconcile's abandoned-release closes
-// the holders' copies mid-window.
+// is not removal-invariant), so the drain mounted the WRONG successors and at
+// the leaver's exit no routed member held the unit. That approximation is GONE:
+// pendingUnitReplicas now rebuilds the reduced ring EXACTLY, so pending equals
+// the post-transition placement by construction. dropTrickPending below is the
+// fixture's OWN reimplementation of the retired approximation, kept purely as a
+// scenario SELECTOR (it picks a maximally demanding unit); it is not a
+// production value, and the "shape-detector" line it prints is fixture
+// bookkeeping that appears on PASSING runs too.
+//
+// THE MECHANISM THAT REMAINS (measured, and the one to suspect first).
+// The successor that a holder ROUTES to is not necessarily the successor that
+// takes over from it. A successor's OpenReplicaUnit bumps the durable epoch at
+// OPEN-START, so the predecessor's still-mounted, still-routed copy becomes
+// FENCED (and its read leg recodes to the transient acquiring error, evicting
+// the mount) the moment the successor BEGINS mounting - well before any
+// release. Nothing feeds that fence back into ROUTING: the routed union comes
+// only from the gossip membership view, so a node whose view has not yet
+// converged routes exclusively to legs the fence already made unreadable and
+// has nowhere else to go. It self-heals when the view converges. The bound is
+// TRANSIENT READ/SCAN UNAVAILABILITY: handoff moves a mount rather than bytes,
+// failing legs are skipped rather than counted as not-found, and the stable-R
+// write-ack bar is untouched, so no acked write is ever lost.
 //
 // Two things make this test DETERMINISTIC where the surge gate flaked ~1-in-8:
 //
@@ -162,7 +187,11 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 		t.Fatalf("FIXTURE DRIFT: no drain-approximation full-move unit exists for this name set; " +
 			"the ring placement changed - search a new name set (see the shape conditions above)")
 	}
-	t.Logf("full-move unit %d: old=%v approx-pending=%v final=%v", fullMove,
+	// NB: the retired-approximation column is the FIXTURE's own shape detector
+	// (see dropTrickPending), printed on passing runs too. It is NOT a value the
+	// cluster computes or routes with - production pending is the exact rebuild.
+	// Do not read it as evidence of what the SUT did.
+	t.Logf("full-move unit %d: old=%v fixture-selector[retired-approximation]=%v final=%v", fullMove,
 		replicaIDsForMembers(base, storageunit.UnitID(fullMove), rf),
 		dropTrickPending(with5, storageunit.UnitID(fullMove), rf, leaver),
 		replicaIDsForMembers(finalIDs, storageunit.UnitID(fullMove), rf))
@@ -272,8 +301,20 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 
 	summarizeFails(t, "FULL-MOVE window", fails, 16)
 	if len(fails) > 0 {
-		t.Fatalf("full-move unit is not read-transparent: %d client-visible read failures through the "+
-			"leave+join overlap - the drain-time pending set did not cover the true post-leave placement "+
-			"(unit %d moved onto owners that held nothing while every holder was un-routed)", len(fails), fullMove)
+		// SYMPTOM ONLY. This test cannot tell these apart, so it names none of
+		// them as the cause; go measure which one fired before acting:
+		//   1. a routed holder was FENCED by a successor's open-start epoch bump
+		//      while this node's membership view was still stale, so every routed
+		//      leg was transient and the union could not widen (the mechanism that
+		//      remains on current main; suspect this first);
+		//   2. the drain mounted successors that the post-leave ring does not route
+		//      to (the RETIRED drop-trick divergence; pendingUnitReplicas rebuilds
+		//      the reduced ring exactly, so this should be impossible - if it is
+		//      really back, that is a regression in the exact rebuild);
+		//   3. the true owners' mounts simply had not finished inside the probe
+		//      budget (slow open, not a routing gap at all).
+		t.Fatalf("full-move unit %d is not read-transparent: %d client-visible read failures through the "+
+			"leave+join overlap. This is the SYMPTOM, not a diagnosis - see the numbered candidate "+
+			"mechanisms above and this file's header before attributing a cause", fullMove, len(fails))
 	}
 }
