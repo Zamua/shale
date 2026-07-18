@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
-	github.com/Zamua/shale v0.11.1
+	github.com/Zamua/shale v0.12.0
 	github.com/minio/minio-go/v7 v7.2.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
 	go.uber.org/goleak v1.3.0
