@@ -835,8 +835,10 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 		// starves the queued positions behind it. Bounded: once the backoff
 		// exceeds acquireRedriveCap the goroutine exits and the periodic
 		// reconcile remains the backstop (identical to the pre-fix behavior
-		// from that point on). Success/failure is read off lastAcquireErr,
-		// the same signal the reconcile re-drive path uses.
+		// from that point on). Success/failure is the ERROR RETURNED by the
+		// blocking acquire - a signal private to this call, never a re-read of
+		// the shared lastAcquireErr diagnostic map (see that function's doc for
+		// why the shared map cannot carry this loop's control flow).
 		spawned := time.Now()
 		backoff := acquireRedriveBase
 		attempt := 0
@@ -878,22 +880,21 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 				rel()
 			})
 			attemptStart := time.Now()
-			c.acquireReplicaUnitOverlapBlocking(ru)
+			acqErr := c.acquireReplicaUnitOverlapBlocking(ru)
 			wd.Stop()
 			rel()
-			errVal, failed := c.lastAcquireErr.Load(ru)
-			if !failed {
+			if acqErr == nil {
 				c.logf("shale: acquire done %s: attempt %d took %s, %s total since armed",
 					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), time.Since(spawned).Round(time.Millisecond))
 				return // mounted (or superseded); done.
 			}
 			if backoff > acquireRedriveCap {
 				c.logf("shale: acquire failed %s: attempt %d after %s (%v); backoff budget exhausted, periodic reconcile is the backstop",
-					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), errVal)
+					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), acqErr)
 				return // hand the retry back to the periodic reconcile backstop.
 			}
 			c.logf("shale: acquire failed %s: attempt %d after %s (%v); retrying in ~%s",
-				ru, attempt, time.Since(attemptStart).Round(time.Millisecond), errVal, backoff)
+				ru, attempt, time.Since(attemptStart).Round(time.Millisecond), acqErr, backoff)
 			select {
 			case <-c.closeCh:
 				return
@@ -920,7 +921,20 @@ const (
 // (so concurrent positions overlap) and directly by tests that want the
 // deterministic blocking behavior. It must NOT be called while holding mountMu
 // (it takes mountMu for the flip).
-func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) {
+//
+// It RETURNS the open error (nil once the position is mounted, or once a
+// concurrent reconcile/Close superseded this attempt - in both cases there is
+// nothing left to retry). The returned error is the ONLY success/failure signal
+// the caller's re-drive loop branches on. It deliberately does NOT read the
+// outcome back out of lastAcquireErr: that map is shared, per-ReplicaUnit, and
+// written AND cleared by every other mount site on the node (storeMount clears
+// it at every mount choke point, boot records a non-error "boot-deferred:"
+// string under the same key). Reading it back as a branch condition let another
+// path's write decide this loop's control flow - a concurrent mount of ru could
+// clear the record and end the retry of a still-failing open, and a boot-defer
+// record could make a SUCCESSFUL open look failed and retry it. The error return
+// is private to this call, so neither confusion is expressible.
+func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) error {
 	openStart := time.Now()
 	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
 	if err != nil {
@@ -934,8 +948,10 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		if err != nil {
 			// Mount still failing; stay Acquiring. The position is not stranded: the
 			// old owner is still a routed current owner serving via the union.
+			// Mirror the failure into the diagnostic map (DebugState /
+			// MountReadiness read it) and return it as the control signal.
 			c.lastAcquireErr.Store(ru, err.Error())
-			return
+			return err
 		}
 	}
 	c.lastAcquireErr.Delete(ru)
@@ -954,7 +970,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		c.mountMu.Unlock()
 		c.myOpenEpoch.Delete(ru) // no mount installed; don't leak the recorded epoch.
 		_ = c.replicaFactory.CloseReplicaUnit(ru)
-		return
+		return nil // Close superseded this attempt; nothing to retry.
 	}
 	cur := c.handoffPhase[ru]
 	if cur.Phase != storageunit.PhaseAcquiring {
@@ -965,7 +981,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
 		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
-		return
+		return nil // Mounted (the phase entry was already resolved elsewhere).
 	}
 	ready, err := storageunit.NextOnReady(cur, openedEpoch)
 	if err != nil {
@@ -975,7 +991,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
 		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
-		return
+		return nil // Mounted (illegal FSM edge converged to Owned).
 	}
 	c.storeMount(ru, b)
 	// Ready is transient: once the mount entry is present the node serves locally,
@@ -993,6 +1009,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
 	c.logf("shale: mounted %s at epoch %d: open %s, serving-mark %s",
 		ru, openedEpoch, markStart.Sub(openStart).Round(time.Millisecond), time.Since(markStart).Round(time.Millisecond))
+	return nil
 }
 
 // drainCheck is the OLD owner's POLL-ONLY release-check for a Draining position,
