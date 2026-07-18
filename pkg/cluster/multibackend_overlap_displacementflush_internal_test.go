@@ -73,7 +73,7 @@ func TestOverlap_DisplacementFlush_FiresExactlyOncePerTransition(t *testing.T) {
 
 	// 1) Mount through the real flip: storeMount wraps the factory backend in
 	// the fencedSelfHealing decorator. No flush yet.
-	c.acquireReplicaUnitOverlapBlocking(target)
+	_ = c.acquireReplicaUnitOverlapBlocking(target)
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
 		t.Fatalf("precondition: target should be mounted via the real flip")
 	}

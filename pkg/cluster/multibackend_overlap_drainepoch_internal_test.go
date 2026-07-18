@@ -106,7 +106,7 @@ func TestOverlap_beginDrain_RealMountPath_CapturesOwnOpenEpoch(t *testing.T) {
 	// phase set up the flip installs the mount, drops to Owned, records
 	// myOpenEpoch from the factory return, and writes its own serving marker - all
 	// at its EXACT open epoch (1).
-	c.acquireReplicaUnitOverlapBlocking(target)
+	_ = c.acquireReplicaUnitOverlapBlocking(target)
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
 		t.Fatalf("leaver should have mounted via the real flip")
 	}

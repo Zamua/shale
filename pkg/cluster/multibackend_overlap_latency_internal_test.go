@@ -76,7 +76,7 @@ func TestOverlap_DrainPoller_ReleasesOnMarker_WithoutReconcileTick(t *testing.T)
 	target := ru(0, 0, 0)
 
 	// Mount through the real flip (records myOpenEpoch = 1, writes own marker).
-	c.acquireReplicaUnitOverlapBlocking(target)
+	_ = c.acquireReplicaUnitOverlapBlocking(target)
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
 		t.Fatalf("precondition: target should be mounted")
 	}

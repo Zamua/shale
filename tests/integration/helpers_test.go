@@ -396,10 +396,6 @@ func waitForWriteReady(t *testing.T, clusters []*cluster.Cluster, deadline time.
 	clustertest.WaitForWriteReady(t, clusters, deadline)
 }
 
-func isTransientWarmupErr(err error) bool {
-	return clustertest.IsTransientWarmupErr(err)
-}
-
 // waitForClusterReady is the canonical "the fixture is done settling"
 // gate. Tests call this right after spinning up + joining all nodes,
 // before issuing any Put/Get that depends on stable ownership. It
