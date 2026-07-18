@@ -39,14 +39,15 @@ const envelopeMagic byte = 0xE0
 const MaxNodeIDLen = 256
 
 // Stamp is the LWW ordering key for a write: the originating node's
-// wall-clock at Put time + that node's stable ID. The cluster layer
-// stamps once on the originator before fan-out; every replica stores
-// the same Stamp for the same write.
+// stamp-clock reading at Put time + that node's stable ID. The cluster
+// layer stamps once on the originator before fan-out; every replica
+// stores the same Stamp for the same write.
 type Stamp struct {
-	// TimestampNanos is the originating node's time.Now().UnixNano()
-	// captured at the moment Put is called. uint64 so the binary
-	// encoding is unambiguous (negative pre-1970 timestamps cannot
-	// happen here).
+	// TimestampNanos is drawn from the originating node's monotone
+	// stamp source (stampClock.Next(): max(wall clock, last issued or
+	// observed + 1); see stampclock.go) at the moment Put is called.
+	// uint64 so the binary encoding is unambiguous (negative pre-1970
+	// timestamps cannot happen here).
 	TimestampNanos uint64
 
 	// NodeID is the originator's Config.NodeID. Used as the

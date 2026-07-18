@@ -145,10 +145,18 @@ func (c *Cluster) applyEnvelopesTx(b backend.Backend, writes []EnvelopeWrite, ma
 		if derr != nil {
 			return false, derr
 		}
-		apply, aerr := txApplyIfNewer(tx, w.Key, stamp)
+		// Ratchet the node's stamp clock with every stamp this apply
+		// SEES: the incoming envelope's, and (below) the stored one the
+		// compare ran against. A node that has seen a stamp never issues
+		// a new stamp at or below it (see stampclock.go), which is what
+		// keeps this replica's own future writes from silently losing
+		// LWW to a faster peer clock.
+		c.stamps.Observe(stamp.TimestampNanos)
+		apply, stored, aerr := txApplyIfNewer(tx, w.Key, stamp)
 		if aerr != nil {
 			return false, mapTxErr(aerr)
 		}
+		c.stamps.Observe(stored.TimestampNanos)
 		if !apply {
 			continue
 		}

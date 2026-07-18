@@ -27,7 +27,6 @@ import (
 	"context"
 	"errors"
 	"sync"
-	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
@@ -338,7 +337,7 @@ func (c *Cluster) putReplicated(key, value []byte) error {
 		return status.Error(codes.Unavailable, "shale: no replicas available for key")
 	}
 	stamp := Stamp{
-		TimestampNanos: uint64(time.Now().UnixNano()),
+		TimestampNanos: c.stamps.Next(),
 		NodeID:         c.cfg.NodeID,
 	}
 	// Encode allocates its own buffer and copies env.Payload into it
@@ -525,6 +524,11 @@ func (c *Cluster) getReplicated(key []byte) ([]byte, error) {
 			winner = g
 		}
 	}
+
+	// Ratchet the node's stamp clock with the winning stamp (a no-op
+	// zero for a no-value winner): a node that has read a stamp never
+	// issues a new stamp at or below it (see stampclock.go).
+	c.stamps.Observe(winner.env.Stamp.TimestampNanos)
 
 	// Read-repair: on Quorum / All, push the winning envelope back to
 	// any replica that returned NotFound OR a strictly-older Stamp.
