@@ -303,9 +303,13 @@ func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 	if err != nil {
 		// Leaving gu unmounted is safe: routed ops get the retryable
 		// acquiring-window error and the next reconcile retries. Do not
-		// mount a half-open unit.
+		// mount a half-open unit. Record the failure so the readiness
+		// counts (FailedOpenUnits/LastAcquireError) see it, keyed by the
+		// R=1 mount position exactly as acquireReplicaUnit records at R>1.
+		c.lastAcquireErr.Store(replica0(gu), err.Error())
 		return
 	}
+	c.lastAcquireErr.Delete(replica0(gu))
 	c.mountMu.Lock()
 	if c.closed.Load() {
 		// Close raced us between OpenUnit and the mount. Close already ran
