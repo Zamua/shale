@@ -230,13 +230,20 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 	var stamp Stamp
 	var encodedWrites []EnvelopeWrite
 	if replicated {
-		// The commit stamp is drawn AFTER the read-set validation above
-		// Observed every stored stamp it decoded (casReadPayload), so it
-		// strictly exceeds every stamp in the validated read-set: the
-		// committed write-set can never lose the LWW compare to the
-		// values it replaced (a raw wall clock behind a stored stamp
-		// would let replicas reject the commit and read-repair un-commit
-		// it; see stampclock.go).
+		// The commit stamp is drawn AFTER (a) the read-set validation above
+		// Observed every stored stamp it decoded (casReadPayload) and (b)
+		// the stored stamp of every BLIND write-set key (a WriteOp key with
+		// no matching read-check, which the validate loop never decodes)
+		// has been Observed here, one header-only parse per blind key
+		// against the already-open tx. So the commit stamp strictly
+		// exceeds every stored stamp the commit replaces - read-set AND
+		// write-set: the committed write-set can never lose the LWW
+		// compare to the values it replaced (a raw wall clock behind a
+		// stored stamp would let replicas reject the commit and
+		// read-repair un-commit it; see stampclock.go).
+		if err := c.observeBlindWriteStamps(tx, reads, writes); err != nil {
+			return backend.CASResult{Err: c.casFenceToTransient(tx, "CommitCASApply", err)}
+		}
 		stamp = Stamp{
 			TimestampNanos: c.stamps.Next(),
 			NodeID:         c.cfg.NodeID,
@@ -445,6 +452,55 @@ func (c *Cluster) casReadPayload(tx backend.Transaction, key []byte, replicated 
 		return nil, false, nil
 	}
 	return env.Payload, true, nil
+}
+
+// observeBlindWriteStamps ratchets the owner's stamp clock with the stored
+// stamp of every BLIND write-set key: a WriteOp whose key has no matching
+// read-check, so the validate loop never decoded (and never Observed) its
+// stored envelope. Called by CommitCASApply at R>1, against the already-open
+// owner-local tx, BEFORE the shared commit stamp is drawn - the write-set
+// half of the commit-stamp floor (casReadPayload is the read-set half).
+// Without it a blind tx.Put could draw a commit stamp below the stored
+// value's (a faster peer clock wrote it), and the acked commit would be
+// silently un-committed by apply-if-newer rejection + read-repair.
+//
+// One tx.Get + header-only decodeStamp per distinct blind key. A missing key
+// contributes nothing; a stored value without the envelope magic byte (a
+// legacy raw value) decodes to the zero stamp, a no-op Observe. A truncated
+// or overrun envelope header is surfaced as the error it is (the commit
+// reports {Err}, the same policy casReadPayload applies to the read-set).
+func (c *Cluster) observeBlindWriteStamps(tx backend.Transaction, reads []backend.ReadCheck, writes []backend.WriteOp) error {
+	var readKeys map[string]struct{}
+	if len(reads) > 0 {
+		readKeys = make(map[string]struct{}, len(reads))
+		for _, r := range reads {
+			readKeys[string(r.Key)] = struct{}{}
+		}
+	}
+	seen := make(map[string]struct{}, len(writes))
+	for _, w := range writes {
+		k := string(w.Key)
+		if _, ok := readKeys[k]; ok {
+			continue // read-set key: casReadPayload already Observed it
+		}
+		if _, dup := seen[k]; dup {
+			continue
+		}
+		seen[k] = struct{}{}
+		got, err := tx.Get(w.Key)
+		if err != nil {
+			if errors.Is(err, backend.ErrNotFound) {
+				continue
+			}
+			return err
+		}
+		stored, _, derr := decodeStamp(got)
+		if derr != nil {
+			return derr
+		}
+		c.stamps.Observe(stored.TimestampNanos)
+	}
+	return nil
 }
 
 // casFenceToTransient recodes a FENCED owner-local CAS apply error to the
