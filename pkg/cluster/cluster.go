@@ -539,10 +539,24 @@ type Cluster struct {
 	mountMu   sync.RWMutex
 	mountMap  map[storageunit.ReplicaUnit]backend.Backend
 
-	// lastAcquireErr records, per ReplicaUnit, the most recent OpenReplicaUnit
-	// failure during an acquire (clean-cut or overlap). Diagnostic ONLY: the
-	// acquire paths otherwise swallow the error and retry next tick, so a
-	// position that fails to mount forever is invisible. Surfaced via DebugState.
+	// lastAcquireErr records, per ReplicaUnit, why a DESIRED position is not
+	// mounted: the most recent OpenReplicaUnit failure during an acquire
+	// (clean-cut, overlap, rebalance or degraded boot), or the non-error
+	// "boot-deferred:" note when boot declined to open a position a live peer
+	// is serving. The acquire paths otherwise swallow the error and retry next
+	// tick, so a position that fails to mount forever would be invisible.
+	//
+	// WRITE-ONLY OBSERVABILITY. The mount paths WRITE it; only the reporting
+	// surfaces READ it (DebugState's /debug/shale/state dump and MountReadiness,
+	// which counts FailedOpenUnits and picks LastAcquireError from it). No
+	// control flow may branch on it. It is a single map shared by every mount
+	// site on the node: storeMount clears the entry at the mount choke point and
+	// boot writes a NON-error string under the same key, so a retry loop reading
+	// it back would let an unrelated path's write decide its branch (the overlap
+	// re-drive loop did exactly that until acquireReplicaUnitOverlapBlocking was
+	// given an error return). Records for positions that are no longer desired
+	// are ignored by the readers rather than swept.
+	//
 	// sync.Map so it needs no Open-time init and no extra lock ordering.
 	lastAcquireErr sync.Map // storageunit.ReplicaUnit -> string
 
