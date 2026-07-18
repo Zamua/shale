@@ -125,6 +125,28 @@ func TestCASReplicate_R3_WriteQuorum_ToleratesOneReplicaDown(t *testing.T) {
 	if owner < 0 {
 		t.Fatalf("no owner for %q", key)
 	}
+	// Seed the key so its partition is PHYSICALLY HELD on every node before
+	// the commit below. This is load-bearing for determinism, not setup
+	// convenience: WaitForRebalanceIdle only proves the coordinator is idle
+	// at one instant, and the periodic sweep tick re-runs reconcile with
+	// retryEmpty=true on every tick regardless of ring generation. An owned
+	// partition that is merely EMPTY is not treated as settled on that path
+	// (it burns a bounded empty-retry budget instead), so on a fresh cluster
+	// with an empty keyspace essentially every owned partition gets re-
+	// registered StateReceiving for several ticks after setup. While a
+	// partition is Receiving, the replica-side migration guard REJECTS the
+	// CAS write-set batch for keys in it. That rejection is classified
+	// transient, so it counts as neither an ack nor a failure: the fan-out
+	// silently lands under W and the commit still returns nil, because an
+	// under-replicated CAS commit is a SUCCESS by design (outcome (c)).
+	// Seeding makes the partition physically present, and reconcile skips
+	// any partition it already holds, so the guard cannot reopen for this
+	// key and the fan-out below is measured on a genuinely quiet cluster.
+	//
+	// This must run while all three nodes are UP so the seed reaches every
+	// backend.
+	seedConverged(t, nodes, owner, key, []byte("seed"))
+
 	// Stop the gRPC of a NON-owner replica so the owner stays reachable as
 	// the commit target but one fan-out destination is unreachable.
 	down := (owner + 1) % 3
