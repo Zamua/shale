@@ -207,14 +207,18 @@ func TestDesiredReplicaUnits_Characterization(t *testing.T) {
 	}
 }
 
-// TestReplicasForKey_CoLocatedKeysShareReplicaSet: keys in the same {tag} set
-// resolve to one unit and therefore one replica set.
-func TestReplicasForKey_CoLocatedKeysShareReplicaSet(t *testing.T) {
+// TestRoutedReplicasForKey_CoLocatedKeysShareReplicaSet: keys in the same
+// {tag} set resolve to one unit and therefore one replica set. Asserted
+// against routedReplicasForKey, the live resolver every replicated fan-out
+// consults, so co-location is pinned on the path ops actually take. With no
+// member joining or draining the routed set IS the stable set, so this also
+// pins the steady-state stableR the ack bar is computed over.
+func TestRoutedReplicasForKey_CoLocatedKeysShareReplicaSet(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 16, 2, backing, "n1", "n2", "n3")
 
-	a := c.replicasForKey([]byte("{acct42}:balance"))
-	b := c.replicasForKey([]byte("{acct42}:name"))
+	a, stableA := c.routedReplicasForKey([]byte("{acct42}:balance"))
+	b, stableB := c.routedReplicasForKey([]byte("{acct42}:name"))
 	if len(a) != len(b) {
 		t.Fatalf("co-located keys got different replica-set sizes %d vs %d", len(a), len(b))
 	}
@@ -222,6 +226,11 @@ func TestReplicasForKey_CoLocatedKeysShareReplicaSet(t *testing.T) {
 		if a[i].ID != b[i].ID {
 			t.Fatalf("co-located keys diverge at pos %d: %q vs %q", i, a[i].ID, b[i].ID)
 		}
+	}
+	// Steady state (no joining / draining member): routed == the stable set.
+	if stableA != len(a) || stableB != len(b) {
+		t.Fatalf("steady state: stableR should equal the routed size, got (%d,%d) for routed sizes (%d,%d)",
+			stableA, stableB, len(a), len(b))
 	}
 }
 

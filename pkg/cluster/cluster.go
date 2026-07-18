@@ -1024,7 +1024,7 @@ func (c *Cluster) runEventsLoop() {
 				// current owner in the consistent-hash ring - it is NOT excluded.
 				// The current/pending split (current = ring INCLUDING draining;
 				// pending = ring EXCLUDING draining) is computed PER-OP inside
-				// replicasForKey, not baked into the ring. So the event loop Adds a
+				// routedReplicasForKey, not baked into the ring. So the event loop Adds a
 				// draining member normally (it keeps its positions + keeps serving
 				// the union); the drain ends only when its successors are provably
 				// serving (the serving-marker gate), and the real memberlist.Leave()
@@ -1102,9 +1102,9 @@ func (c *Cluster) reconcileRingFromMembership() {
 	for _, m := range snap {
 		// v0.8 Phase 2e (pending ranges): a DRAINING member STAYS a CURRENT
 		// OWNER in the ring - do NOT exclude it. The current/pending split is
-		// computed per-op inside replicasForKey (current = ring INCLUDING
-		// draining members; pending = the same ring with draining members
-		// removed from the located chain), so the ring carries every alive
+		// computed per-op inside routedReplicasForKey (current = ring INCLUDING
+		// draining members; pending = a ring genuinely REBUILT without the
+		// draining members), so the ring carries every alive
 		// member and the leaver keeps its positions + keeps serving the routed
 		// union until its successors are provably serving. (This REVERSES the
 		// superseded draining-exclusion: dropping a draining member here is what

@@ -1,8 +1,9 @@
 // Graceful-leave drain (v0.8 Phase 2e, pending ranges, scale-down). Under the
 // pending-ranges model a leaving node sets a gossiped Draining bit but STAYS a
 // full, alive member AND a current owner of every position it serves: it is NOT
-// removed from the consistent-hash ownership ring. Every node's replicasForKey
-// then computes the leaver's positions as CURRENT-but-not-PENDING (current = ring
+// removed from the consistent-hash ownership ring. Every node's
+// routedReplicasForKey then computes the leaver's positions as
+// CURRENT-but-not-PENDING (current = ring
 // including the leaver, pending = ring excluding it), forms the routed UNION, and
 // DUAL-WRITES the leaver + its pending successors. The leaver keeps serving
 // (dual-written via the union) until each successor mounts the position and
@@ -81,8 +82,9 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 
 	// SET THIS NODE DRAINING and gossip it. The node stays ALIVE, a full
 	// addressable member, AND a CURRENT OWNER in the ring (it is NOT removed from
-	// ownership - the include/exclude split is per-op in replicasForKey). The
-	// moment the Draining Meta gossips, every node's replicasForKey computes the
+	// ownership - the include/exclude split is per-op in routedReplicasForKey).
+	// The moment the Draining Meta gossips, every node's routedReplicasForKey
+	// computes the
 	// PENDING split (ring-minus-this-node) for this node's positions, forms the
 	// routed union, and dual-writes this node + its pending successors. This node
 	// keeps serving its mounts (receiving union writes + reads) throughout the
