@@ -42,11 +42,22 @@ var envConfigRegistry struct {
 // registerEnvConfig records t as this process's object-store env config.
 // The first call records it and returns nil; an IDENTICAL repeat is a
 // no-op returning nil (many constructions legitimately share one config,
-// e.g. every Handle over one Backing). A CONFLICTING call returns an error
-// naming ONLY the differing field names, never the values (AccessKey and
-// SecretKey are secrets), so a second Backing/Slate with different
-// object-store config fails fast at construction instead of silently
-// clobbering the first's process env.
+// e.g. every Handle over one Backing, or a second Backing differing only
+// by bucket, since the bucket is not part of the tuple). A CONFLICTING
+// call returns an error naming ONLY the differing field names, never the
+// values (AccessKey and SecretKey are secrets), so a second Backing/Slate
+// with different object-store config fails fast at construction instead
+// of silently clobbering the first's process env.
+//
+// The registry is WRITE-ONCE PER PROCESS by design, not an oversight:
+// applyEnv's AWS_* writes are process-global and are never unset (Close
+// does not un-apply them), and the guard tracks no liveness, so it cannot
+// tell "every handle over the first config has been Closed" apart from "a
+// live open still reads the first env". It therefore fails CLOSED: the
+// first tuple pins the process for its lifetime, even after a full Close,
+// and changing the object-store config (credential rotation, an endpoint
+// move) requires a process restart. The only reset is the test-only
+// resetEnvConfigForTest.
 func registerEnvConfig(t envConfigTuple) error {
 	envConfigRegistry.mu.Lock()
 	defer envConfigRegistry.mu.Unlock()
@@ -75,7 +86,7 @@ func registerEnvConfig(t envConfigTuple) error {
 	if t.useSSL != prev.useSSL {
 		fields = append(fields, "UseSSL")
 	}
-	return fmt.Errorf("slate: conflicting object-store env config: %s differ from the config this process already applied (the AWS_* env vars are process-global; one process supports one object-store config)", strings.Join(fields, ", "))
+	return fmt.Errorf("slate: conflicting object-store env config: %s differ from the config this process already applied (the AWS_* env vars are process-global; one process supports one object-store config for its lifetime; restart the process to change it)", strings.Join(fields, ", "))
 }
 
 // resetEnvConfigForTest clears the process registry so each guard test can

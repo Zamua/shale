@@ -144,6 +144,28 @@ func TestRegisterEnvConfig_ConcurrentRegistration(t *testing.T) {
 // error and the tagged suite (the Phase 2e release gate among it) could
 // never run green in one process. The hook must clear a registration so a
 // previously-conflicting tuple registers cleanly.
+// TestRegisterEnvConfig_DifferentBucketSameTupleAccepted pins the guard's
+// deliberate BUCKET EXCLUSION: the bucket travels in the s3:// URL, not the
+// AWS_* env, so envConfigTuple carries no bucket field and two Backings
+// differing ONLY by bucket derive the IDENTICAL tuple. The second
+// registration must be ACCEPTED (the same-env, different-bucket accept
+// path): there is no env collision for the guard to fail on. Different
+// buckets per process remain unsupported by the cluster design (one
+// Backing per node), but that is documented policy, not something this
+// guard enforces.
+func TestRegisterEnvConfig_DifferentBucketSameTupleAccepted(t *testing.T) {
+	resetEnvConfigForTest()
+	// A Backing at bucket "tenant-a" and a second Backing at bucket
+	// "tenant-b" with the same endpoint/region/credentials/SSL both derive
+	// this exact tuple.
+	if err := registerEnvConfig(guardBaseTuple()); err != nil {
+		t.Fatalf("first registration (bucket tenant-a): %v", err)
+	}
+	if err := registerEnvConfig(guardBaseTuple()); err != nil {
+		t.Fatalf("second registration differing only by bucket (tenant-b): want accept, got %v", err)
+	}
+}
+
 func TestResetEnvGuardForTest_ExportedHookClearsRegistry(t *testing.T) {
 	resetEnvConfigForTest()
 	first := guardBaseTuple()
