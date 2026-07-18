@@ -176,3 +176,76 @@ func TestServingMarkerKeyFor_ExtendsReplicaPrefix(t *testing.T) {
 		t.Fatalf("serving marker keys for distinct replica positions collide: %q", marker)
 	}
 }
+
+// TestDbNameForRef_MatchesUnconsolidatedEncodings pins that routing a DbName
+// through the consolidated unitRef seam produces EXACTLY the string the two
+// hand-written encodings produced before the R=1 / R>1 factory mirror was
+// merged. dbNameForRef is the only place the split is decided, so this is the
+// guard that the merge did not move any deployed cluster's bytes.
+func TestDbNameForRef_MatchesUnconsolidatedEncodings(t *testing.T) {
+	prefixes := []string{"", "cluster-a/"}
+	for _, kp := range prefixes {
+		for gen := storageunit.Generation(0); gen < 3; gen++ {
+			for id := storageunit.UnitID(0); id < 4; id++ {
+				gu := storageunit.NewGenUnit(gen, id)
+
+				// R=1 surface: must resolve to the plain per-unit encoding.
+				if got, want := dbNameForRef(kp, refUnit(gu)), dbNameFor(kp, gu); got != want {
+					t.Fatalf("dbNameForRef(%q, refUnit(%s)) = %q, want the R=1 encoding %q", kp, gu, got, want)
+				}
+
+				// R>1 surface: must resolve to the per-replica encoding, at
+				// EVERY position including 0.
+				for r := uint8(0); r < 3; r++ {
+					x := storageunit.NewReplicaUnit(gu, r)
+					if got, want := dbNameForRef(kp, refReplica(x)), dbNameReplicaFor(kp, x); got != want {
+						t.Fatalf("dbNameForRef(%q, refReplica(%s)) = %q, want the R>1 encoding %q", kp, x, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
+// TestDbNameForRef_R1AndReplica0DoNotAlias is the DATA-LOSS GUARD on the
+// consolidation. The R=1 surface and the R>1 surface both funnel through
+// unitRef, and refUnit(gu) carries replica position 0 - so the one mistake that
+// would silently orphan a deployed R=1 cluster's bytes is letting refUnit(gu)
+// resolve through the REPLICA encoding (dbNameReplicaFor at replica 0). The two
+// prefixes are genuinely different strings ("u/g1/u5" vs "u/g1/u5/r0"), and an
+// R=1 deployment's data lives at the former, so an R=1 open resolving to the
+// latter would mount an EMPTY database and report the unit as fresh.
+func TestDbNameForRef_R1AndReplica0DoNotAlias(t *testing.T) {
+	for _, kp := range []string{"", "p/"} {
+		gu := storageunit.NewGenUnit(1, 5)
+		r1Name := dbNameForRef(kp, refUnit(gu))
+		rep0Name := dbNameForRef(kp, refReplica(storageunit.NewReplicaUnit(gu, 0)))
+		if r1Name == rep0Name {
+			t.Fatalf("R=1 unit %s and its R>1 replica-0 position resolve to the SAME DbName %q: an R=1 deployment's bytes would be orphaned (or aliased onto the replica prefix)", gu, r1Name)
+		}
+		// And specifically: the R=1 name must NOT have picked up a replica
+		// segment (the exact regression the consolidation could introduce).
+		if want := dbNameFor(kp, gu); r1Name != want {
+			t.Fatalf("R=1 DbName drifted: got %q, want %q", r1Name, want)
+		}
+	}
+}
+
+// TestUnitRef_R1AndReplica0AreDistinctMapKeys pins the OTHER half of the
+// no-alias property: the factory's Handle now tracks R=1 mounts and R>1 replica
+// mounts in ONE unitRef-keyed map, which is only safe because the replicated
+// flag keeps refUnit(gu) and refReplica(gu, 0) distinct as map keys. If they
+// collided, an R=1 mount and an R>1 replica-0 mount of the same unit would
+// evict each other from the mount map.
+func TestUnitRef_R1AndReplica0AreDistinctMapKeys(t *testing.T) {
+	gu := storageunit.NewGenUnit(1, 5)
+	m := map[unitRef]string{}
+	m[refUnit(gu)] = "r1"
+	m[refReplica(storageunit.NewReplicaUnit(gu, 0))] = "rep0"
+	if len(m) != 2 {
+		t.Fatalf("refUnit(%s) and refReplica(%s/r0) collided as map keys: map has %d entries, want 2", gu, gu, len(m))
+	}
+	if m[refUnit(gu)] != "r1" {
+		t.Fatalf("refUnit key was clobbered by refReplica: got %q", m[refUnit(gu)])
+	}
+}
