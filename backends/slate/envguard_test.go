@@ -136,14 +136,6 @@ func TestRegisterEnvConfig_ConcurrentRegistration(t *testing.T) {
 	}
 }
 
-// TestResetEnvGuardForTest_ExportedHookClearsRegistry pins the exported
-// test-only reset hook (export_test.go) the TAGGED integration fixtures
-// depend on: each tagged test stands up its OWN MinIO (an ephemeral
-// endpoint per test), so without a reset the FIRST fixture's registration
-// would make every later test's construction fail with the config-conflict
-// error and the tagged suite (the Phase 2e release gate among it) could
-// never run green in one process. The hook must clear a registration so a
-// previously-conflicting tuple registers cleanly.
 // TestRegisterEnvConfig_DifferentBucketSameTupleAccepted pins the guard's
 // deliberate BUCKET EXCLUSION: the bucket travels in the s3:// URL, not the
 // AWS_* env, so envConfigTuple carries no bucket field and two Backings
@@ -166,6 +158,14 @@ func TestRegisterEnvConfig_DifferentBucketSameTupleAccepted(t *testing.T) {
 	}
 }
 
+// TestResetEnvGuardForTest_ExportedHookClearsRegistry pins the exported
+// test-only reset hook (export_test.go) the TAGGED integration fixtures
+// depend on: each tagged test stands up its OWN MinIO (an ephemeral
+// endpoint per test), so without a reset the FIRST fixture's registration
+// would make every later test's construction fail with the config-conflict
+// error and the tagged suite (the Phase 2e release gate among it) could
+// never run green in one process. The hook must clear a registration so a
+// previously-conflicting tuple registers cleanly.
 func TestResetEnvGuardForTest_ExportedHookClearsRegistry(t *testing.T) {
 	resetEnvConfigForTest()
 	first := guardBaseTuple()
