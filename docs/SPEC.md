@@ -1048,7 +1048,7 @@ Subcommands shipped in v0.1:
   - `shale delete <key>` - one-shot delete; idempotent
   - `shale scan <prefix>` - prints key=value pairs for everything under prefix
   - `shale topology` - prints the cluster membership + ring: which nodes exist, what range each owns. In single-node v0.1, prints "single-node cluster, node=<id>"
-  - `shale stats` - per-node counters: key count, request rate, p50/p99 latency for Put/Get
+  - `shale stats` - per-node counters: key count and lifetime Put/Get/Delete/Scan request counts, plus the node's mount-readiness counts. It reports COUNTERS ONLY: the node keeps no latency histogram, so `stats` carries no percentiles (latency is measured client-side by `shale bench`, which times the ops it issues)
   - `shale ping` - liveness check; exits 0 if the node responds
 
 Subcommands shipped in later versions:

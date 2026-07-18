@@ -374,9 +374,6 @@ func (s *Server) Stats(_ context.Context, _ *pb.StatsRequest) (*pb.StatsResponse
 		Gets:     s.gets.Load(),
 		Deletes:  s.deletes.Load(),
 		Scans:    s.scans.Load(),
-		// Latency percentiles wire up in v0.5; placeholders for now.
-		LatencyMsP50: 0,
-		LatencyMsP99: 0,
 		// Mount readiness (docs/SPEC.md "Mount readiness"): reported for
 		// remote observability; the readiness DECISION stays in-process in
 		// the embedding application via Cluster.Ready.
