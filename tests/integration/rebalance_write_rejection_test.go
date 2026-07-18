@@ -2,40 +2,58 @@ package integration
 
 // Write-rejection scenario: per docs/SPEC.md "Cutover", a Put against
 // a key whose partition is currently being migrated MUST be rejected
-// by the source with ResourceExhausted (plus a retry-after hint).
+// with ResourceExhausted (plus a retry-after hint).
 // FailedPrecondition is reserved for the forwarding loop-guard
 // (docs/SPEC.md "Failure handling"). After the migration completes,
 // the same Put MUST succeed.
 //
-// Timing reality: catching the in-flight migration window for a
-// specific key is racy in a black-box test, because we don't pause
-// the migration via a test hook (no such hook is on the public
-// surface yet, and the SPEC does not require one). To compensate,
-// the test:
+// WHICH NODE REJECTS: the DESTINATION, not the source. On the R=1
+// single-backend path the rejection is produced by the destination's
+// IsReceiving guard (LocalReplicaPut in pkg/cluster/replicate.go) on
+// the forwarded leg, NOT by the source's IsMigrating guard. The
+// source's guard in Cluster.Put sits inside the `if local` branch,
+// and ring ownership flips to the destination the instant memberlist
+// gossips the join, which is well BEFORE the source's settle-delayed
+// Evaluate registers StateSending. So by the time the source is
+// migrating, it no longer routes the key locally and never evaluates
+// its own guard. The source-side term stays live for the R>1 fan-out
+// and multi-backend paths; on this path it is unreachable from a
+// client-originated write. See docs/SPEC.md "Cutover".
+//
+// That makes the destination's StateReceiving window the thing under
+// test, and on a loopback fixture it is single-digit milliseconds
+// wide: registered inside Open, closed as soon as FetchRange finishes
+// streaming one partition. Hammering Puts hoping to land inside it is
+// bimodal, not slow-but-correct - either the first probe hits it or
+// none of several thousand over 20s does. So the test HOLDS the
+// window open with Config.TestingReceiveGate (test-only seam) instead
+// of racing it:
 //
 //   1. Picks a key whose ring owner is GUARANTEED to change when
 //      the new node joins (we pre-compute new vs old owner from two
 //      ring snapshots).
-//   2. Spawns a join goroutine that brings n3 online.
-//   3. Hammers the target key with Put requests in a tight loop for
-//      a budget that covers (settle + stream) windows. Any single Put
-//      that returns FailedPrecondition during that hammering counts
-//      as observing the rejection.
-//   4. Once the membership stabilizes + rebalance idles, asserts the
-//      same Put succeeds.
+//   2. Brings n3 online with its FetchRange parked on a gate, so the
+//      range sits in StateReceiving until we say otherwise.
+//   3. Probes the target key until one Put returns ResourceExhausted.
+//      With the window held open this is deterministic; failing to
+//      observe is now a real regression, not bad luck.
+//   4. Releases the gate, then asserts the migration COMPLETES and
+//      the same Put succeeds against the new owner.
 //
 // Failure modes the test catches:
-//   - Source never rejects writes during migration (correctness bug:
-//     a write would silently land on the soon-to-be-former owner +
-//     get swept later, costing the write).
-//   - Source still rejects long after migration completes (liveness
-//     bug: the per-range state never transitioned out of Sending /
-//     HandedOff).
+//   - Nothing rejects writes during migration (correctness bug: the
+//     destination's migration apply is a raw backend Put with no LWW
+//     compare, so a write accepted mid-stream would be clobbered by
+//     the in-flight copy).
+//   - Rejection persists long after migration completes (liveness
+//     bug: the per-range state never transitioned out of Receiving /
+//     Sending / HandedOff).
 //   - The cluster never observes the join, so no migration runs +
 //     no rejection ever fires (integration not wired).
 
 import (
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -61,8 +79,8 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 	_ = putN(t, n1.Cluster, "wr", seed)
 
 	// Pre-compute the future ring (n1, n2, n3) so we can pick a key
-	// whose owner WILL change on the join + whose current owner is
-	// known (the source we expect to do the rejecting).
+	// whose owner WILL change on the join. The destination (wr-n3) is
+	// the node we expect to do the rejecting, on the leg n1 forwards.
 	futureRing := ring.New()
 	for _, m := range n1.Cluster.Members() {
 		futureRing.Add(m)
@@ -94,14 +112,29 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 	}
 	t.Logf("target key %q current-owner=%s future-owner=wr-n3", target, currentRing.LocateKey([]byte(target)).ID)
 
-	// --- launch n3 ---
-	n3 := startTestNode(t, "wr-n3", n1.BindAddr)
+	// --- launch n3 with its receive window pinned open ---
+	//
+	// The gate parks n3's FetchRange before it dials n1, with the range
+	// already registered StateReceiving. Release is deferred BEFORE the
+	// node starts so any t.Fatalf below still unblocks FetchRange and
+	// lets teardown (and goleak) run clean.
+	gate := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(gate) }) }
+	defer release()
+
+	n3 := startGatedDestTestNode(t, "wr-n3", n1.BindAddr, gate)
 	trio := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 
-	// Hammer target with Puts until either (a) we observe one
-	// returning ResourceExhausted or (b) the time budget expires. The
-	// settle delay is 5s + stream is small; 20s budget is generous.
-	deadline := time.Now().Add(20 * time.Second)
+	// Probe target until a Put returns ResourceExhausted. The window is
+	// held open, so this normally lands on attempt 1; the deadline is a
+	// regression bound, not a race budget.
+	//
+	// Keep it SHORT (2s, ~1000x the observed latency): n1 is a plain
+	// startTestNode with RebalanceHandoffTimeout=4s, and holding the
+	// gate past that would time out n1's send-side handoff and break
+	// the post-release convergence assertions below.
+	deadline := time.Now().Add(2 * time.Second)
 	observedRejection := false
 	var lastErr error
 	attempts := 0
@@ -118,25 +151,27 @@ func TestRebalance_WriteRejectionDuringMigration(t *testing.T) {
 				}
 			}
 		}
-		// Small sleep so we don't spin so tight the source goroutine
+		// Small sleep so we don't spin so tight the forwarding leg
 		// can't make progress.
 		time.Sleep(2 * time.Millisecond)
 	}
 
 	if !observedRejection {
-		// Could be: (a) integration not wired, no rejection ever
-		// fires; (b) migration finished faster than we could hit the
-		// window; (c) source rejects with a different code shape.
-		// We require (a) to fail loudly. If membership did reach 3
-		// AND distribution is balanced, the most likely explanation
-		// is (b) or (c) and we still flag it because the SPEC is
-		// explicit about ResourceExhausted.
+		// The receive window was HELD OPEN for the whole probe, so this
+		// is not a timing miss. Either the migration-guard rejection is
+		// gone (a write during the streaming copy would be clobbered by
+		// the in-flight copy, costing the write), the join never
+		// produced a migration at all, or the rejection changed code
+		// shape (the SPEC is explicit about ResourceExhausted).
 		if err := waitForMembersAll(trio, 3, 10*time.Second); err != nil {
 			t.Fatalf("3-node convergence: %v (no rejection observed either; rebalance hook likely not wired)", err)
 		}
-		t.Fatalf("never observed ResourceExhausted on target key during migration window (attempts=%d, last err=%v). per docs/SPEC.md \"Cutover\", the source MUST reject writes for a migrating key with codes.ResourceExhausted. If the cluster v0.3 wiring lands without this rejection path, a write during the streaming copy is silently lost.",
+		t.Fatalf("no ResourceExhausted on target key while the receive window was HELD OPEN (attempts=%d, last err=%v). per docs/SPEC.md \"Cutover\", a Put for a migrating key MUST be rejected with codes.ResourceExhausted; on this R=1 path that rejection comes from the destination's IsReceiving guard in pkg/cluster/replicate.go.",
 			attempts, lastErr)
 	}
+
+	// Let the migration finish, then assert it actually completes.
+	release()
 
 	// --- wait for the rebalance to settle, then assert the same Put
 	// succeeds. ---
