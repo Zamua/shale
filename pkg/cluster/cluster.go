@@ -340,6 +340,25 @@ type Config struct {
 	// code path reads this.
 	TestingBlockPeerDials bool
 
+	// TestingReceiveGate, when non-nil, blocks every destination-side
+	// FetchRange until the channel is closed, HOLDING the range's
+	// StateReceiving window open for as long as the test wants. Must be
+	// set at construction time (not after) for the same reason
+	// TestingBlockPeerDials must: the bootstrap Evaluate runs inline
+	// inside Open for a joiner and launches the FetchRange goroutines
+	// immediately. The gate is honored BEFORE the peer dial, after the
+	// Coordinator has already registered the range StateReceiving, so
+	// IsReceiving stays true for the entire hold.
+	//
+	// It exists because the migration-guard rejection is otherwise
+	// unobservable without a race: on the R=1 path the rejection comes
+	// from the DESTINATION's IsReceiving guard (see LocalReplicaPut in
+	// replicate.go), and that window is single-digit milliseconds wide
+	// on a loopback fixture. A test that hammers Puts hoping to land
+	// inside it is bimodal, not slow-but-correct. Test-only; no
+	// production code path reads this.
+	TestingReceiveGate <-chan struct{}
+
 	// TestingMountDelay, when >0, sleeps for that long inside Open right before
 	// the unit mount, SIMULATING a slow cold-start mount (a loaded object store
 	// taking tens of seconds). Because the caller starts this node's gRPC server
@@ -1593,6 +1612,14 @@ func (c *Cluster) evictClient(addr string) {
 // is rejected with codes.ResourceExhausted + a retry-after hint (per
 // docs/SPEC.md "Cutover"). Clients should retry with backoff per the
 // hint; the SDK wraps this transparently with a bounded retry budget.
+// Note the guard below sits INSIDE the `if local` branch, so on the
+// R=1 path it is not usually the end that rejects: ownerOf flips to
+// the destination as soon as memberlist gossips the join, which is
+// before this node's settle-delayed Evaluate marks the range
+// StateSending. The write is forwarded and refused by the
+// destination's IsReceiving guard in LocalReplicaPut instead. The
+// local branch still matters for the R>1 fan-out and multi-backend
+// paths, where a replica can be mid-handoff while still routed here.
 // codes.FailedPrecondition is reserved for the forwarding loop-guard
 // (docs/SPEC.md "Failure handling"); codes.Unavailable is reserved
 // for genuine peer-down failures (so the fanout's failure budget can

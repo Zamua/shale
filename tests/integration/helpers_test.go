@@ -127,12 +127,43 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 // before the block engages.
 func startBlockedDestTestNode(t *testing.T, id, seedAddr string) *testNode {
 	t.Helper()
+	return startSeamTestNode(t, id, seedAddr, func(cfg *cluster.Config) {
+		cfg.TestingBlockPeerDials = true
+	})
+}
+
+// startGatedDestTestNode brings up a node identical to startTestNode but
+// with TestingReceiveGate wired BEFORE Open returns, so every
+// destination-side FetchRange parks until the caller closes gate. The
+// range is already registered StateReceiving by then, so the receive
+// window stays open for exactly as long as the test holds the gate.
+//
+// Same construction-time requirement as startBlockedDestTestNode: the
+// bootstrap Evaluate runs inline inside Open and launches the
+// FetchRange goroutines immediately, so a post-Open setter would race
+// them. Callers MUST arrange to close the gate on every exit path
+// (defer a release closure BEFORE starting the node) so a failing
+// assertion cannot wedge teardown.
+func startGatedDestTestNode(t *testing.T, id, seedAddr string, gate <-chan struct{}) *testNode {
+	t.Helper()
+	return startSeamTestNode(t, id, seedAddr, func(cfg *cluster.Config) {
+		cfg.TestingReceiveGate = gate
+	})
+}
+
+// startSeamTestNode is the shared body behind the Testing*-seam node
+// fixtures: startTestNode's setup with one hook, so a caller can flip a
+// test-only Config seam that MUST be set at construction time. Kept as
+// one function rather than a copy per seam so the fixture tunables
+// (settle delay, grace, handoff timeout) cannot drift between them.
+func startSeamTestNode(t *testing.T, id, seedAddr string, seam func(*cluster.Config)) *testNode {
+	t.Helper()
 
 	mem := memory.New()
 
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
-		t.Fatalf("startBlockedDestTestNode %s: listen gRPC: %v", id, err)
+		t.Fatalf("startSeamTestNode %s: listen gRPC: %v", id, err)
 	}
 	grpcAddr := lis.Addr().String()
 	grpcSrv := grpc.NewServer()
@@ -147,8 +178,8 @@ func startBlockedDestTestNode(t *testing.T, id, seedAddr string) *testNode {
 		RebalanceGraceDuration:  3 * time.Second,
 		RebalanceHandoffTimeout: 4 * time.Second,
 		ReplicationFactor:       1,
-		TestingBlockPeerDials:   true,
 	}
+	seam(&cfg)
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}
 	}

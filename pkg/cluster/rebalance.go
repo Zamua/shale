@@ -430,6 +430,15 @@ func (c *Cluster) coordinatorIdle() bool {
 // Unavailable from a dead peer MUST count, so (R - W + 1) such
 // failures fail-fast instead of waiting for every replica's
 // transport timeout.
+//
+// NB the message says "migrating out" but the guard is emitted from
+// BOTH ends of a handoff, and on the R=1 single-backend path the
+// caller is normally the DESTINATION's IsReceiving check in
+// LocalReplicaPut, not the source's IsMigrating check in Put: ring
+// ownership flips to the destination before the source's
+// settle-delayed Evaluate registers StateSending, so a client write
+// is already being forwarded to the destination by the time the
+// source considers itself migrating. See docs/SPEC.md "Cutover".
 func migrationGuardError(retryAfterMs int) error {
 	return status.Errorf(codes.ResourceExhausted,
 		"shale: key is migrating out; retry after %dms", retryAfterMs)
@@ -477,6 +486,19 @@ func (d *clusterDestination) FetchRange(ctx context.Context, peer rebalance.Memb
 		// in ComputePlan). Nothing to fetch; treat as a zero-key
 		// success so the Coordinator flips the range to Done.
 		return 0, nil
+	}
+	// Test-only receive gate (Config.TestingReceiveGate): hold the range
+	// in StateReceiving until the test releases it. Placed before the
+	// dial so nothing is in flight while we wait. The ctx arm is
+	// load-bearing, not defensive: runReceive cancels this ctx from
+	// Coordinator.Stop, so Close never wedges on a gate a failing test
+	// forgot to release (goleak would otherwise fail the whole binary).
+	if gate := d.c.cfg.TestingReceiveGate; gate != nil {
+		select {
+		case <-gate:
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
 	}
 	cli, err := d.c.clientFor(peer.Addr)
 	if err != nil {
