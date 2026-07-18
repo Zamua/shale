@@ -222,6 +222,12 @@ func TestLosslessReshardGate(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const probeWriters = 4
+	// Each probe writer closes its own ready channel after its FIRST acked write
+	// so the barrier below can hold the reshard until every writer is in flight.
+	probeReady := make([]chan struct{}, probeWriters)
+	for w := range probeReady {
+		probeReady[w] = make(chan struct{})
+	}
 	for w := range probeWriters {
 		wg.Add(1)
 		go func(w int) {
@@ -239,13 +245,18 @@ func TestLosslessReshardGate(t *testing.T) {
 				probeMu.Lock()
 				probeAcked[k] = v
 				probeMu.Unlock()
+				if i == 0 {
+					close(probeReady[w])
+				}
 				i++
 			}
 		}(w)
 	}
-	// Let the probe get going so writes are genuinely in flight when the reshard
-	// starts (some will land in copy windows).
-	time.Sleep(120 * time.Millisecond)
+	// BARRIER: hold the reshard until every probe writer has provably landed an
+	// acked write. The writers keep looping through the reshard that follows, so
+	// the acked set spans it (and lands in copy windows) by construction rather
+	// than by timing luck.
+	awaitFirstAckBarrier(t, probeReady, 30*time.Second, &stop, &wg)
 
 	// === Step 3: trigger the doubling reshard. The cluster bisects each old
 	// gen-0 unit K into its gen-1 children K and K+N, online. ===
@@ -513,6 +524,16 @@ func TestReshardGateCatchesLostWrite(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const probeWriters = 6
+	// Each probe writer closes its own ready channel after its FIRST acked write.
+	// The barrier below then holds the reshard until every writer is mid-loop, so
+	// the copy windows the broken catch-up must drop writes from are provably
+	// occupied. Without it the reshard can finish before a writer is scheduled,
+	// leaving nothing for the break to lose and turning this demonstration into a
+	// spurious "BREAK NOT CAUGHT".
+	probeReady := make([]chan struct{}, probeWriters)
+	for w := range probeReady {
+		probeReady[w] = make(chan struct{})
+	}
 	for w := range probeWriters {
 		wg.Add(1)
 		go func(w int) {
@@ -523,17 +544,24 @@ func TestReshardGateCatchesLostWrite(t *testing.T) {
 				v := fmt.Appendf(nil, "pv-%d-%07d", w, i)
 				if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 5*time.Second); err != nil {
 					// A dropped write is silent (Put still returns nil); a real
-					// transport error here would be a different failure.
+					// transport error here would be a different failure. Returning
+					// without closing this writer's ready channel makes the barrier
+					// below fail loudly rather than hang.
 					return
 				}
 				probeMu.Lock()
 				probeAcked[k] = v
 				probeMu.Unlock()
+				if i == 0 {
+					close(probeReady[w])
+				}
 				i++
 			}
 		}(w)
 	}
-	time.Sleep(80 * time.Millisecond)
+	// BARRIER: hold the broken reshard until every probe writer has provably
+	// landed an acked write.
+	awaitFirstAckBarrier(t, probeReady, 30*time.Second, &stop, &wg)
 
 	if err := n1.Cluster.Reshard(); err != nil {
 		stop.Store(true)

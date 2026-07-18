@@ -232,6 +232,12 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	var stop atomic.Bool
 	var wg sync.WaitGroup
 	const probeWriters = 6
+	// Each probe writer closes its own ready channel after its FIRST acked write
+	// so the barrier below can hold the reshard until every writer is in flight.
+	probeReady := make([]chan struct{}, probeWriters)
+	for w := range probeReady {
+		probeReady[w] = make(chan struct{})
+	}
 	for w := range probeWriters {
 		wg.Add(1)
 		go func(w int) {
@@ -250,13 +256,18 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 				probeMu.Lock()
 				probeAcked[k] = v
 				probeMu.Unlock()
+				if i == 0 {
+					close(probeReady[w])
+				}
 				i++
 			}
 		}(w)
 	}
-	// Let the probe get going so writes are genuinely in flight when the freeze
-	// barrier engages.
-	time.Sleep(150 * time.Millisecond)
+	// BARRIER: hold the reshard until every probe writer has provably landed an
+	// acked write through its entry node. The writers keep looping through the
+	// freeze barrier that follows, so the acked set spans it by construction
+	// rather than by timing luck.
+	awaitFirstAckBarrier(t, probeReady, 30*time.Second, &stop, &wg)
 
 	// === Step 4 (req 6): READS AVAILABLE DURING THE FREEZE. Spin a reader that
 	// keeps reading a known baseline key throughout the reshard and records
