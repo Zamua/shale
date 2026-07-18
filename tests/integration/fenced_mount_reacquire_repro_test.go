@@ -93,11 +93,11 @@ func TestFencedLiveMount_R2_ClusterReacquiresAndServesWrites(t *testing.T) {
 // forever. EXPECTED before the fix: RED (reads never recover).
 func TestFencedLiveMount_R2_GetWedges(t *testing.T) {
 	const unitCount = 8
+	// The backing defaults to real slatedb's close-on-fence: a fenced handle
+	// fails READS too, not just writes. The permissive reads-pass-through model
+	// (the SetStrictReadFencing(false) opt-out) would mask the routed-GET wedge
+	// this test reproduces.
 	backing := sharedfactory.NewBacking()
-	// Model real slatedb's close-on-fence: a fenced handle fails READS too, not
-	// just writes. Without this the in-memory backing lets reads through a fenced
-	// handle (the overlap-union-read model), which masks the routed-GET wedge.
-	backing.SetStrictReadFencing(true)
 	nodes := start3NodeR2(t, unitCount, backing)
 
 	const key = "fence-read-victim"

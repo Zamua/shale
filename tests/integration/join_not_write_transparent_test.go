@@ -156,21 +156,24 @@ func probeClass(entry *cluster.Cluster, uk map[storageunit.UnitID]string, units 
 // TestJoinResidual_FenceAtOpenStart_MovingShardsWedge reproduces the RESIDUAL
 // measured on the real cluster (a clean 3->4 scale-up wedged writes ~42s during
 // the newcomer's real-MinIO mount, even with the Joining-bit fix). It is the SAME
-// setup as TestJoinIsWriteTransparent, but the backing is switched to
-// fence-at-open-START timing (SetEagerFence) - real slatedb's DbBuilder.Build
-// fences the prior owner the INSTANT the newcomer begins its slow open, not at
-// mount completion. Under that timing the displaced owner is fenced for the whole
-// mount and CANNOT serve the union, so a moving-shard write reaches only the
-// un-displaced co-replica (1 ack of 2) and WEDGES - exactly the residual. The
-// default fence-at-completion timing (which the passing test uses) hides this: it
-// keeps the displaced owner unfenced during the modeled mount.
+// setup as TestJoinIsWriteTransparent, but runs under the backing's default
+// fence-at-open-START timing - real slatedb's DbBuilder.Build fences the prior
+// owner the INSTANT the newcomer begins its slow open, not at mount completion.
+// Under that timing the displaced owner is fenced for the whole mount and CANNOT
+// serve the union, so a moving-shard write reaches only the un-displaced
+// co-replica (1 ack of 2) and WEDGES - exactly the residual. The permissive
+// fence-at-completion timing (the SetEagerFence(false) opt-out the transparency
+// test uses) hides this: it keeps the displaced owner unfenced during the
+// modeled mount.
 //
 // This proves the residual is the FENCE TIMING, not the gossip-ordering race the
 // Joining bit already closes (it rides the first Meta; cluster.go startJoining).
 func TestJoinResidual_FenceAtOpenStart_MovingShardsWedge(t *testing.T) {
 	const uc, rf = 16, 2
+	// The backing defaults to eager fence timing (real slatedb: fence at
+	// open-START, not completion), which is exactly the timing this residual
+	// reproduction depends on.
 	backing := sharedfactory.NewBacking()
-	backing.SetEagerFence(true) // real slatedb: fence at open-START, not completion
 	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
 
 	n1 := startReplicatedNodeCfg(t, "jr-a", "", uc, rf, backing, mutate)
@@ -274,12 +277,20 @@ func TestJoinResidual_FenceAtOpenStart_MovingShardsWedge(t *testing.T) {
 	t.Logf("RESIDUAL REPRODUCED: with fence-at-open-start (real slatedb), %d/%d moving-shard writes WEDGE during "+
 		"jr-d's mount because the displaced owner is fenced the instant jr-d begins opening its position - so the "+
 		"union's displaced-owner leg returns the fence (transient) and only the un-displaced co-replica acks (1 of 2). "+
-		"The default fence-at-completion timing hides this. Stable shards stay available (%d ok).", movMid, movTotal, stOK)
+		"The permissive fence-at-completion timing hides this. Stable shards stay available (%d ok).", movMid, movTotal, stOK)
 }
 
 func TestJoinIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
+	// OPT-OUT (permissive fence-at-completion timing): this gate pins the
+	// Joining-bit union mechanism in ISOLATION - the displaced owner must stay
+	// unfenced through the newcomer's modeled mount so it can serve the union.
+	// Under the backing's default eager fence (real slatedb timing) the displaced
+	// owner is fenced at open-START and these same moving-shard writes WEDGE,
+	// which is the KNOWN residual TestJoinResidual_FenceAtOpenStart_
+	// MovingShardsWedge above reproduces deliberately.
+	backing.SetEagerFence(false)
 	// Short WriteTimeout so each probe returns fast (its internal retry cannot mask
 	// a mount longer than the budget) - the write budget a real client faces.
 	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
