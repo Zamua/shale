@@ -32,9 +32,10 @@ const (
 	// PhaseAcquiring is the GAINER (pending owner) mid-mount: the union already
 	// routes this position to this node but OpenReplicaUnit has not completed, so
 	// a routed op returns the transient acquiring error and the union covers the
-	// position via the still-mounted current owner. The zero value is deliberately
-	// NOT a valid phase (see phaseValid) so a zero-initialized HandoffState is
-	// never mistaken for a real Acquiring entry.
+	// position via the still-mounted current owner. The enum deliberately starts
+	// at 1, so the zero value is not a valid phase and a zero-initialized
+	// HandoffState is never mistaken for a real Acquiring entry (NextOnDrain
+	// relies on this: it reads Phase == 0 as steady-state Owned).
 	PhaseAcquiring HandoffPhase = iota + 1
 
 	// PhaseReady is the GAINER after the mount flip: mountMap[ru] is inserted and
@@ -68,12 +69,6 @@ func (p HandoffPhase) String() string {
 	}
 }
 
-// phaseValid reports whether p is one of the four defined in-flight phases.
-// The zero value is intentionally invalid.
-func (p HandoffPhase) phaseValid() bool {
-	return p >= PhaseAcquiring && p <= PhaseReleasing
-}
-
 // IsGainer reports whether p is a phase the GAINER side occupies
 // (Acquiring or Ready).
 func (p HandoffPhase) IsGainer() bool {
@@ -103,7 +98,8 @@ func (p HandoffPhase) IsLoser() bool {
 //   - Phase: which of the four in-flight phases this position is in.
 //   - OpenEpoch: the epoch the GAINER opened the position at (the fence epoch
 //     E). Meaningful from PhaseReady onward (it is what the serving marker
-//     carries and what CanRelease compares the loser's own open epoch against).
+//     carries, and on the loser side it is the floor a successor's marker must
+//     exceed before the release gate opens - see Releasable).
 //     Zero while Acquiring (the open has not completed).
 //
 // Under the pending-ranges model (v0.8 Phase 2e) there is NO predecessor field:
@@ -156,7 +152,7 @@ func NextOnDrain(from HandoffState) (HandoffState, error) {
 
 // NextOnRelease advances the LOSER side from Draining to Releasing once the new
 // owner is proven Ready (the release decision itself is the controller's, gated
-// by Releasable + the readiness re-verify; this only encodes the legal phase
+// by Releasable + the serving-marker read; this only encodes the legal phase
 // edge). The only legal predecessor phase is PhaseDraining; releasing from any
 // other phase is illegal (the gainer side never releases, and a position
 // releases exactly once - a second Releasing edge is rejected here, though the
@@ -168,38 +164,26 @@ func NextOnRelease(from HandoffState) (HandoffState, error) {
 	return HandoffState{Phase: PhaseReleasing, OpenEpoch: from.OpenEpoch}, nil
 }
 
-// CanRelease encodes the release BOUNDARY rule for the durable-epoch liveness
-// hint: a loser draining a position MAY consider releasing only once the
-// position's durable writer-epoch has advanced STRICTLY ABOVE the epoch the
-// loser itself opened at (durable > open), i.e. someone has fenced it at a
-// higher epoch.
+// Releasable is the release predicate the controller consults: a position may
+// proceed toward Releasing only when it is in PhaseDraining AND a positive
+// readiness has been established (ready == true).
 //
-// This is a NECESSARY-not-sufficient gate, and that distinction is the whole
-// point: a durable-epoch advance proves SOMEONE fenced, NOT that a live owner
-// is serving (a new owner can fence and then crash mid-mount, advancing the
-// epoch without ever serving). So CanRelease being true only makes the loser
-// PROBE the new owner's readiness; the actual release fires on a POSITIVE
-// readiness (the ReplicaHandoffReady RPC, or the epoch-hint-plus-probe), never
-// on this bare epoch compare. The controller wires that; this pure predicate is
-// just the boundary "is the epoch hint even tripped yet."
+// ready is the SERVING-MARKER gate. The controller (the cluster's drainCheck)
+// computes it by reading the position's durable serving marker and requiring
+// the marker's epoch to be STRICTLY ABOVE this node's own open epoch
+// (markerEpoch > s.OpenEpoch). A marker is written only on mount-complete, so
+// its presence proves a successor is actually SERVING, not merely that it
+// fenced. The compare is strict so a draining node cannot read back its OWN
+// gain-marker (written at exactly its open epoch) and release while the real
+// successor is still mid-mount; a genuine successor opens at durable+1 and
+// therefore marks strictly higher.
 //
-// Boundary: durable == open is NOT releasable (the loser's own open is what set
-// the durable epoch to open in the first place; no higher writer has fenced).
-// durable < open cannot occur for a position the loser holds, but is treated as
-// not-releasable for safety.
-func CanRelease(open, durable Epoch) bool {
-	return durable > open
-}
-
-// Releasable is the higher-level release predicate the controller consults: a
-// position may proceed toward Releasing only when it is in PhaseDraining AND a
-// positive readiness has been established (ready == true). ready encodes the
-// AUTHORITATIVE readiness signal - either the ReplicaHandoffReady RPC arrived,
-// or the durable-epoch hint (CanRelease) tripped AND a readiness probe to the
-// new owner confirmed it is serving. A bare epoch advance with ready == false
-// is NEVER releasable: that is the crash-case-1 protection (a new owner that
-// fenced then crashed advances the epoch but never serves, so its readiness
-// probe fails and ready stays false).
+// The bare durable writer-epoch is NOT the gate and must never be used as one:
+// the epoch bumps at open-START, before the mount, so a successor that fences
+// then crashes mid-mount advances it without ever serving. Gating on the epoch
+// alone would release the last serving copy to a node that never came up. That
+// is why ready comes from the marker and why ready == false always keeps the
+// loser Draining and serving.
 func Releasable(s HandoffState, ready bool) bool {
 	return s.Phase == PhaseDraining && ready
 }

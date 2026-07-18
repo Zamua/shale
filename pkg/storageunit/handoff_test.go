@@ -27,14 +27,16 @@ func TestHandoffPhase_sides(t *testing.T) {
 		p      HandoffPhase
 		gainer bool
 		loser  bool
-		valid  bool
 	}{
-		{PhaseAcquiring, true, false, true},
-		{PhaseReady, true, false, true},
-		{PhaseDraining, false, true, true},
-		{PhaseReleasing, false, true, true},
-		{HandoffPhase(0), false, false, false},
-		{HandoffPhase(42), false, false, false},
+		{PhaseAcquiring, true, false},
+		{PhaseReady, true, false},
+		{PhaseDraining, false, true},
+		{PhaseReleasing, false, true},
+		// The zero value and any out-of-range byte belong to NEITHER side: the
+		// enum starts at 1 so a zero-initialized HandoffState reads as
+		// steady-state Owned, not as a real in-flight phase.
+		{HandoffPhase(0), false, false},
+		{HandoffPhase(42), false, false},
 	}
 	for _, c := range cases {
 		if got := c.p.IsGainer(); got != c.gainer {
@@ -42,9 +44,6 @@ func TestHandoffPhase_sides(t *testing.T) {
 		}
 		if got := c.p.IsLoser(); got != c.loser {
 			t.Errorf("%s.IsLoser() = %v, want %v", c.p, got, c.loser)
-		}
-		if got := c.p.phaseValid(); got != c.valid {
-			t.Errorf("%s.phaseValid() = %v, want %v", c.p, got, c.valid)
 		}
 	}
 }
@@ -119,30 +118,6 @@ func TestNextOnRelease(t *testing.T) {
 		t.Run("illegal from "+p.String(), func(t *testing.T) {
 			_, err := NextOnRelease(HandoffState{Phase: p})
 			assertIllegalEdge(t, err)
-		})
-	}
-}
-
-// TestCanRelease pins the durable-epoch boundary: release-hint trips only when
-// durable is STRICTLY above the loser's own open epoch.
-func TestCanRelease(t *testing.T) {
-	cases := []struct {
-		name          string
-		open, durable Epoch
-		want          bool
-	}{
-		{"durable below open", 5, 4, false},
-		{"durable equals open (boundary, not releasable)", 5, 5, false},
-		{"durable one above open (boundary, releasable)", 5, 6, true},
-		{"durable far above open", 5, 99, true},
-		{"both zero", 0, 0, false},
-		{"open zero, durable one", 0, 1, true},
-	}
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			if got := CanRelease(c.open, c.durable); got != c.want {
-				t.Errorf("CanRelease(open=%d, durable=%d) = %v, want %v", c.open, c.durable, got, c.want)
-			}
 		})
 	}
 }
