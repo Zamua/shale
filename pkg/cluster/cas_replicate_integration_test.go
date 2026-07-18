@@ -13,10 +13,22 @@ package cluster_test
 //     (read it from a surviving replica), which is the whole point of
 //     replicating the write-set;
 //   - the WriteConsistency knob gates the CAS commit the same way it gates a
-//     single-key Put (Quorum tolerates one replica down; All does not);
+//     single-key Put (Quorum tolerates one replica down);
 //   - LWW resolves a CAS commit against a later single-key Put by stamp;
 //   - replication does NOT break OCC: the no-lost-update invariant still
 //     holds under contention at R=3.
+//
+// Two neighbouring properties are pinned elsewhere and deliberately NOT
+// duplicated here:
+//
+//   - the under-W (WriteAll with a replica down) commit outcome lives in
+//     cas_replicate_test.go's TestCASReplicate_WriteAll_UnderReplicated-
+//     CommitSucceeds, which selects the owner through the CAS-designated-
+//     owner predicate (OwnsCASPin) rather than the plain ring owner;
+//   - the no-lost-update invariant under ReadQuorum (where read-repair is
+//     in play) lives in lww_on_write_test.go's TestLWWOnWrite_NoLostUpdate_
+//     ReadQuorum, alongside its ReadAll sibling. TestCASReplicate_R3_
+//     NoLostUpdate below is the ReadNearest (no read-repair) variant.
 //
 // Helpers decodeReplica / seedConverged / eachReplicaEventually live in
 // cas_replicate_test.go (same cluster_test package); reused here.
@@ -177,62 +189,6 @@ func TestCASReplicate_R3_WriteQuorum_ToleratesOneReplicaDown(t *testing.T) {
 	}
 }
 
-// TestCASReplicate_R3_WriteAll_UnderReplicatedCommitSucceeds pins
-// requirement (3) under the ROOT fix: R=3 + WriteAll (W=3). With one replica
-// down the CAS commit cannot collect 3 acks, but the owner-local commit has
-// ALREADY landed durably (replication is best-effort-to-W AFTER the local tx
-// commits), so the shortfall is a SUCCESS with degraded replication (outcome
-// (c)), NOT an error. The commit returns nil, fn runs exactly once (no re-run
-// / re-commit amplification), and the value is durable on the owner's backend.
-// This is the intended behavioral change: under-W no longer surfaces as a
-// retryable error the Transact loop re-commits. See docs/SPEC.md "The four
-// commit outcomes".
-func TestCASReplicate_R3_WriteAll_UnderReplicatedCommitSucceeds(t *testing.T) {
-	// Shrink the retryable window + zero the backoff so a REGRESSION (under-W
-	// surfacing retryable again) fails FAST instead of spinning for the
-	// production 30s.
-	prevTO := cluster.SetTransactUnavailableTimeout(500 * time.Millisecond)
-	defer cluster.SetTransactUnavailableTimeout(prevTO)
-	prevBK := cluster.SetCASBaseBackoffZero()
-	defer cluster.RestoreCASBaseBackoff(prevBK)
-
-	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadQuorum)
-
-	key := []byte("all-cas")
-	owner := ownerIndex(nodes, key)
-	if owner < 0 {
-		t.Fatalf("no owner for %q", key)
-	}
-	down := (owner + 1) % 3
-	nodes[down].stopGRPC()
-
-	fnRuns := 0
-	err := nodes[owner].cluster.Transact(key, func(tx backend.Transaction) error {
-		fnRuns++
-		if _, gerr := tx.Get(key); gerr != nil && !errors.Is(gerr, backend.ErrNotFound) {
-			return gerr
-		}
-		return tx.Put(key, []byte("av"))
-	})
-	if err != nil {
-		t.Fatalf("under-W WriteAll CAS commit must SUCCEED (durable on owner); got %v", err)
-	}
-	if fnRuns != 1 {
-		t.Fatalf("a committed-under-replicated commit must run fn exactly once (no re-run); ran %d", fnRuns)
-	}
-
-	// Local commit landed despite the under-W fan-out: the owner's backend
-	// holds the stamped envelope. The write is durable on the owner, just not
-	// on W replicas.
-	env, ok := decodeReplica(t, nodes[owner], key)
-	if !ok {
-		t.Fatalf("owner backend should hold the locally-committed envelope after under-W")
-	}
-	if !bytes.Equal(env.Payload, []byte("av")) {
-		t.Errorf("owner envelope payload %q want av", env.Payload)
-	}
-}
-
 // TestCASReplicate_R3_ReadAfterCommit_SurvivesOwnerLoss pins
 // requirement (4): the durability payoff. After a CAS commit on a 3-node
 // R=3 cluster, a cluster Get returns the committed value. Then we close the
@@ -356,43 +312,6 @@ func TestCASReplicate_R3_LWW_LaterCASCommitWinsOverPut(t *testing.T) {
 	}
 }
 
-// TestCASReplicate_R1_StoresRawNotEnvelope pins requirement (6): the R=1
-// path is unchanged. A single-node CAS commit stores the RAW value bytes,
-// NOT an envelope. A regression to envelope-wrapping at R=1 would corrupt
-// every existing single-node deploy. (Complements R1_StaysRaw in
-// cas_replicate_test.go with an explicit no-magic-prefix check.)
-func TestCASReplicate_R1_StoresRawNotEnvelope(t *testing.T) {
-	c := newSingleNode(t)
-
-	if err := c.Transact([]byte("k"), func(tx backend.Transaction) error {
-		if _, err := tx.Get([]byte("k")); err != nil && !errors.Is(err, backend.ErrNotFound) {
-			return err
-		}
-		return tx.Put([]byte("k"), []byte("rawval"))
-	}); err != nil {
-		t.Fatalf("Transact: %v", err)
-	}
-
-	raw, err := c.LocalGet([]byte("k"))
-	if err != nil {
-		t.Fatalf("LocalGet: %v", err)
-	}
-	// The stored bytes are EXACTLY the raw value (no envelope framing).
-	if !bytes.Equal(raw, []byte("rawval")) {
-		t.Fatalf("R=1 stored bytes %q want raw rawval (envelope leaked into R=1)", raw)
-	}
-	// And the stored bytes must NOT decode as a valid envelope carrying the
-	// value as a payload (an envelope of "rawval" would be longer + framed).
-	// A raw 6-byte value is too short to be a valid framed envelope, so a
-	// successful Decode whose payload equals the raw value would be the
-	// regression signal. We assert the bytes equal the raw value exactly
-	// (above) which already excludes framing; this is the explicit length
-	// guard that the value was not wrapped.
-	if len(raw) != len("rawval") {
-		t.Fatalf("R=1 stored %d bytes, want %d (no framing)", len(raw), len("rawval"))
-	}
-}
-
 // TestCASReplicate_R3_NoLostUpdate pins requirement (7): the write-set
 // replication step must NOT break OCC. N goroutines each increment a shared
 // counter via Transact on a 3-node R=3 cluster; the final value must equal
@@ -406,8 +325,9 @@ func TestCASReplicate_R1_StoresRawNotEnvelope(t *testing.T) {
 // would now ALSO pass under ReadQuorum / ReadAll: a stale async read-
 // repair can no longer clobber a newer owner-local value, because the
 // replica-receiving write paths reject any envelope carrying an older-or-
-// equal stamp. TestCASReplicate_R3_NoLostUpdate_ReadQuorum pins that
-// stronger guarantee directly. Keeping this variant on ReadNearest is
+// equal stamp. lww_on_write_test.go's TestLWWOnWrite_NoLostUpdate_ReadQuorum
+// and _ReadAll pin that stronger guarantee directly, on the same workload.
+// Keeping this variant on ReadNearest is
 // purely for isolation (no repair traffic in the trace) and determinism;
 // it is no longer REQUIRED for correctness the way it was pre-v0.7. The
 // write path is full R=3 replication in both variants.
@@ -466,77 +386,6 @@ func TestCASReplicate_R3_NoLostUpdate(t *testing.T) {
 
 	// Durability: the final total must (eventually) land on every replica as
 	// a stamped envelope carrying the counter value.
-	want := fmt.Appendf(nil, "%d", workers)
-	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
-		return present && bytes.Equal(env.Payload, want)
-	})
-}
-
-// TestCASReplicate_R3_NoLostUpdate_ReadQuorum is the regression test for
-// the apply-if-newer (LWW-on-write) fix. It runs the EXACT same N-worker
-// concurrent-increment workload as TestCASReplicate_R3_NoLostUpdate, but
-// under ReadQuorum (not ReadNearest). Under ReadQuorum the OCC read-
-// modify-write read schedules an async read-repair on every Get.
-//
-// Pre-v0.7 (replica writes verbatim), a read-repair scheduled with the
-// counter at value V could fire AFTER a later commit had landed V+1 on
-// the owner-local backend, clobbering it back to V; the next CAS
-// validate-and-apply would then read the stale V on the owner's LOCAL
-// copy and MISS the conflict, committing a stale-based increment. The
-// observed symptom was a final count of 17-19 instead of 20.
-//
-// With apply-if-newer on the replica-receiving write paths, the stale
-// repair carries an older stamp than the V+1 the owner already holds, so
-// it is rejected (a no-op). The owner-local copy is never clobbered, the
-// conflict is always seen, and the final count is exactly N.
-func TestCASReplicate_R3_NoLostUpdate_ReadQuorum(t *testing.T) {
-	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadQuorum)
-
-	key := []byte("counter")
-	owner := ownerIndex(nodes, key)
-	if owner < 0 {
-		t.Fatalf("no owner for %q", key)
-	}
-	oc := nodes[owner].cluster
-	if err := transactPut(nodes, key, []byte("0")); err != nil {
-		t.Fatalf("seed: %v", err)
-	}
-
-	const workers = 20
-	var wg sync.WaitGroup
-	wg.Add(workers)
-	errs := make(chan error, workers)
-	for range workers {
-		go func() {
-			defer wg.Done()
-			err := oc.Transact(key, func(tx backend.Transaction) error {
-				cur, err := tx.Get(key)
-				if err != nil {
-					return err
-				}
-				var n int
-				_, _ = fmt.Sscanf(string(cur), "%d", &n)
-				return tx.Put(key, fmt.Appendf(nil, "%d", n+1))
-			})
-			if err != nil {
-				errs <- err
-			}
-		}()
-	}
-	wg.Wait()
-	close(errs)
-	for err := range errs {
-		t.Errorf("Transact increment: %v", err)
-	}
-
-	got, err := oc.Get(key)
-	if err != nil {
-		t.Fatalf("final Get: %v", err)
-	}
-	if string(got) != fmt.Sprintf("%d", workers) {
-		t.Fatalf("counter: got %q want %d (lost update: a stale read-repair clobbered the owner-local copy and a CAS commit missed the conflict)", got, workers)
-	}
-
 	want := fmt.Appendf(nil, "%d", workers)
 	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
 		return present && bytes.Equal(env.Payload, want)
