@@ -72,14 +72,30 @@ func TestScan_FencedMount_RecodedToTransient_AndEvicted(t *testing.T) {
 		}
 	}
 
-	// mountFenced seeds one fenced mount into a white-box R=2 cluster. closed is
-	// set so the post-evict scheduleReconcile (not under test here) no-ops rather
-	// than leaking a debounced AfterFunc; the scan + recode + evict paths do not
-	// gate on closed, so the behavior under test is unchanged.
+	// mountFenced builds a FULLY MOUNTED white-box R=2 cluster and then swaps ONE
+	// position's handle for the fenced double. Mounting everything first matters
+	// for two reasons. It is the realistic shape (a superseded handle among
+	// otherwise-healthy mounts, which is what a membership change produces), and
+	// it keeps this test on the path it is about: a node holding an owned
+	// position UNMOUNTED is refused earlier by the scan coverage guard
+	// (scanCoverageErr), which would short-circuit the scan before it ever
+	// touched the fenced handle. The two guards are complementary - coverage
+	// catches a position that is missing, this one catches a position that is
+	// present but stale - and the fixture has to isolate the second.
+	//
+	// closed is set so the post-evict scheduleReconcile (not under test here)
+	// no-ops rather than leaking a debounced AfterFunc; the scan + recode +
+	// evict paths do not gate on closed, so the behavior under test is unchanged.
 	mountFenced := func(t *testing.T) *Cluster {
 		t.Helper()
 		backing := sharedfactory.NewBacking()
 		c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+		if err := c.mountReplicaUnits(); err != nil {
+			t.Fatalf("mountReplicaUnits: %v", err)
+		}
+		if r := c.MountReadiness(); r.PendingUnits != 0 {
+			t.Fatalf("fixture must be fully mounted so the coverage guard does not pre-empt the fence path: %+v", r)
+		}
 		c.mountMap[target] = fenceScanBackend{Backend: memory.New()}
 		c.closed.Store(true)
 		return c

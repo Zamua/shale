@@ -1983,6 +1983,24 @@ type AggregateResult struct {
 // gRPC (via the admin-only LocalScan RPC, which bypasses ring
 // routing) into a transient in-memory backend snapshot that fn sees.
 // The local node runs fn against its own backend directly.
+//
+// REFUSALS ARRIVE THROUGH TWO CHANNELS, and a caller must check both.
+// AggregateResult.Err carries a peer shale could not run fn for at all.
+// A refusal raised once fn is ALREADY RUNNING instead surfaces from the
+// iterator fn holds, so it leaves fn as whatever fn returns - a VALUE,
+// not an error - and a caller that inspects only Err will consume it as
+// data. Carry it out of fn and match it there. Both channels deliver a
+// real error, so one errors.Is covers them; see ErrAcquiring (reason.go)
+// for the transient handoff case and the worked example.
+//
+// COMPLETENESS IS PART OF THE CONTRACT. A fan-out either covers the whole
+// keyspace or REFUSES; it never quietly returns the subset it could reach.
+// A node holding a position it owns but has not mounted refuses its own
+// leg (scanCoverageErr) rather than omitting those keys, because a caller
+// that acts on what is ABSENT from the result - a referenced-set driving
+// GC is the canonical case - would read the gap as an authoritative
+// absence and delete live data. Retry the WHOLE call on a refusal: the
+// missing slice is not available from any other peer's result either.
 func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 	if c.notReady() {
 		return nil
