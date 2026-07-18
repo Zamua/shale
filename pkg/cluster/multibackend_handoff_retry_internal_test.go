@@ -191,14 +191,14 @@ func TestRetryWriteThroughHandoff_TinyBudgetDegradesGracefully(t *testing.T) {
 // classifyWriteAttempt: acks>=w -> success; acks<w & no errs -> retryable
 // (acquiring); acks<w & errs -> hard (not retryable).
 func TestClassifyWriteAttempt(t *testing.T) {
-	if got := classifyWriteAttempt(2, 2, nil); got.err != nil {
+	if got := classifyWriteAttempt(2, 2, nil, nil); got.err != nil {
 		t.Fatalf("acks==w should succeed, got err %v", got.err)
 	}
-	if got := classifyWriteAttempt(3, 2, nil); got.err != nil {
+	if got := classifyWriteAttempt(3, 2, nil, nil); got.err != nil {
 		t.Fatalf("acks>w should succeed, got err %v", got.err)
 	}
 
-	transient := classifyWriteAttempt(1, 2, nil)
+	transient := classifyWriteAttempt(1, 2, nil, nil)
 	if transient.err == nil || !transient.retryable {
 		t.Fatalf("acks<w with no errs must be a RETRYABLE shortfall, got %+v", transient)
 	}
@@ -206,7 +206,7 @@ func TestClassifyWriteAttempt(t *testing.T) {
 		t.Fatalf("retryable shortfall should be Unavailable, got %v", status.Code(transient.err))
 	}
 
-	hard := classifyWriteAttempt(1, 2, []error{errors.New("peer down")})
+	hard := classifyWriteAttempt(1, 2, []error{errors.New("peer down")}, nil)
 	if hard.err == nil || hard.retryable {
 		t.Fatalf("acks<w WITH errs must be a HARD (non-retryable) shortfall, got %+v", hard)
 	}

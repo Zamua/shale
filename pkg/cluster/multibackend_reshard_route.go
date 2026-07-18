@@ -108,12 +108,12 @@ func (c *Cluster) putReshardDualWrite(ctx context.Context, legs reshardLegs, key
 		return writeAttempt{err: errUnitAcquiring("Put")}
 	}
 	w := c.writeAckBar(legs.stableR)
-	acks, errs, ch := fanout(ctx, authMembers, w,
+	acks, errs, transient, ch := fanout(ctx, authMembers, w,
 		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchReplicaPutUnit(opCtx, replica, legs.auth[idx].ru, key, envBytes)
 		})
 	go drainResults(ch)
-	return classifyWriteAttempt(acks, w, errs)
+	return classifyWriteAttempt(acks, w, errs, transient)
 }
 
 // fireSupplementary dispatches the supplementary legs and drains their results
@@ -128,7 +128,7 @@ func (c *Cluster) fireSupplementary(ctx context.Context, legs []routedReplica, k
 	if len(members) == 0 {
 		return
 	}
-	_, _, ch := fanout(ctx, members, 1, // requiredAcks clamped to 1 by fanout; ignored
+	_, _, _, ch := fanout(ctx, members, 1, // requiredAcks clamped to 1 by fanout; ignored
 		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchReplicaPutUnit(opCtx, replica, legs[idx].ru, key, envBytes)
 		})
