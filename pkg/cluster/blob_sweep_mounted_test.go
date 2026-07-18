@@ -38,8 +38,8 @@ import (
 //     though it is old + unreferenced, because the node cannot see that unit's
 //     pointers in its local scan (mis-classifying them as orphans is the P0).
 //
-// Reverting SweepOrphans to enumerate all desired/owned tokens (the old
-// OwnedUnits) instead of MountedUnits does NOT regress this test on its own
+// Reverting SweepOrphans to enumerate all desired/owned tokens (the
+// desired-from-ring set) instead of MountedUnits does NOT regress this test on its own
 // (a single node mounts everything it desires); the loss only manifests when the
 // listing view and the pointer-scan view diverge. To pin THAT divergence
 // directly, the bogus token stands in for "a prefix the node lists but whose

@@ -102,7 +102,7 @@ func TestBackendFactory_OpenReturnsUsableBackend(t *testing.T) {
 }
 
 // TestBackendFactory_OpenUnitsTracksMountedSet pins the enumerator the
-// anti-entropy reconcile diffs against OwnedUnits: OpenUnits returns exactly
+// anti-entropy reconcile diffs its desired set against: OpenUnits returns exactly
 // the currently-mounted units, ascending, and CloseUnit removes one without
 // disturbing the rest.
 func TestBackendFactory_OpenUnitsTracksMountedSet(t *testing.T) {

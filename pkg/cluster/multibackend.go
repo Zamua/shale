@@ -163,9 +163,10 @@ func (c *Cluster) genUnitOwner(gu storageunit.GenUnit) (storageunit.NodeID, bool
 // unit whose GenUnit the ring assigns to self. Mid-reshard a unit that has
 // already cut over is resolved at the NEW generation (its gen-(g+1) children),
 // so the desired set is the union of the not-yet-cut-over gen-g units and the
-// cut-over units' gen-(g+1) children that this node owns. This is the
-// generation-aware analogue of storageunit.OwnedUnits; the Phase 3 reconcile
-// diffs it against the factory's OpenUnits() to decide acquire / release.
+// cut-over units' gen-(g+1) children that this node owns. It is the
+// generation-aware, ring-backed derivation of the desired mount set (at R=1;
+// desiredReplicaUnits is its R>1 sibling); the Phase 3 reconcile diffs it
+// against the factory's OpenUnits() to decide acquire / release.
 func (c *Cluster) desiredGenUnits() []storageunit.GenUnit {
 	gs := c.genSnapshot()
 	want := make(map[storageunit.GenUnit]struct{})
