@@ -172,13 +172,17 @@ type Backing struct {
 // NewBacking validates the shared-bucket config and writes the AWS_*
 // process env vars the slatedb object_store crate reads. Because every
 // unit in this process shares ONE bucket + ONE set of credentials, the
-// env writes are identical across units and are set ONCE here. Two
-// Backings in one process pointing at DIFFERENT buckets is unsupported
-// (the env writes would collide) and is not a configuration the cluster
-// produces - a node has exactly one Backing. A second construction whose
-// endpoint/region/credentials/SSL mode CONFLICTS with what this process
-// already applied fails fast here with a config-conflict error
-// (envguard.go) rather than silently clobbering the earlier env.
+// env writes are identical across units and are set ONCE here. A second
+// construction whose endpoint/region/credentials/SSL mode CONFLICTS with
+// what this process already applied fails fast here with a config-conflict
+// error (envguard.go) rather than silently clobbering the earlier env.
+// The BUCKET is deliberately NOT part of that guarded tuple: it travels
+// in the s3:// URL, not the env, so a second Backing differing only by
+// bucket cannot collide in env and registers cleanly (the cluster design
+// still gives a node exactly ONE Backing; the guard just has nothing to
+// enforce for that case). The guard is write-once per process: the env
+// vars are never unset (Close does not un-apply them), so changing the
+// object-store config requires a process restart - see registerEnvConfig.
 func NewBacking(cfg BackingConfig) (*Backing, error) {
 	if err := cfg.validate(); err != nil {
 		return nil, err

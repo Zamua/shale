@@ -246,8 +246,10 @@ Two parents `K`, `K+N` (gen g) collapse into survivor `K` (gen g+1, `Halve()`).
   mount/marker write is a CAS (`If-None-Match`) so a membership flap cannot create
   two live survivor writers; the monotone marker floor alone is insufficient.
 - **Stamp ordering across two parents** (closes merge major hole): LWW across two
-  originators uses wall-clock stamps with no HLC, so a clock-skew loser is possible
-  at the merge boundary. Mitigate by carrying the higher-resolution `(TimestampNanos,
+  originators uses per-node monotone stamps (`max(wall clock, last issued/observed + 1)`,
+  ratcheted by every stamp the node observes) with no full HLC, so a clock-skew loser
+  remains possible at the merge boundary when an originator's high-water mark trails
+  the other's stamps. Mitigate by carrying the higher-resolution `(TimestampNanos,
   NodeID)` stamp already in the envelope and, if skew proves real on staging,
   promoting the stamp to a hybrid logical clock (a separate, scoped change).
 
