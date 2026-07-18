@@ -54,6 +54,22 @@ func (c *Cluster) Aggregate(fn func(backend.Backend) any) []AggregateResult
 func (c *Cluster) MountReadiness() MountReadiness
 func (c *Cluster) Ready(minMountedFraction float64) bool
 
+// Refusal reasons: why an op was refused, matchable UNIFORMLY whether the
+// refusal came from a locally-mounted position or was forwarded from a peer.
+// See "Refusal reasons" under the v0.8 section for the full contract.
+//
+//	if errors.Is(err, cluster.ErrAcquiring) { /* bounded retry */ }
+//
+// ErrAcquiring is TRANSIENT and SAFE TO RETRY (the op was not applied; the
+// window is bounded by a mount). It is NOT a peer-down signal, though it
+// shares codes.Unavailable with one - which is why the code cannot be
+// branched on. First slice of the taxonomy; siblings join by adding a row.
+var ErrAcquiring error
+
+type RefusalReason string
+
+const ReasonAcquiring RefusalReason = "ACQUIRING"
+
 // AggregateResult separates "fn ran + here's its return value" from
 // "shale couldn't even run fn here" (snapshot fetch failed, peer
 // unreachable). Exactly one of Value / Err is meaningful per entry.
@@ -1297,6 +1313,36 @@ Phase 2b mounts a node's replica copies on the INITIAL convergence and then assu
 **THE R>1 WRITE-AVAILABILITY-THROUGH-MEMBERSHIP-CHANGE GATE (the new acceptance test).** A new in-process loss-oracle test (`tests/integration/membership_change_write_availability_test.go`, in-process, sharedfactory + memory backend, NO slatedb tag, NO MinIO) is the acceptance bar for Phase 2d. It: (1) stands up an N-node multi-backend cluster at R=2 on the per-replica shared-backing factory and writes a recorded BASELINE; (2) starts a CONTINUOUS WRITER that keeps acking a tracked keyset through the routed surface, recording a key ONLY once its Put returns nil, and counting attempted-vs-acked; (3) BEGINS A MEMBERSHIP CHANGE (adds nodes / triggers a scale event) WHILE the writer runs, so writes land on units mid-reconcile; (4) asserts BOTH (a) THE ORACLE - every baseline key and every ACKED probe key is readable with its exact value from every node, ZERO acked loss; AND (b) THE ACK RATE - acked / attempted is HIGH (>95%; the bar the staging chaos expects to jump to ~100%). The test is kept honest by demonstrating it FAILS on the pre-fix code: with the retry removed (or `errUnitAcquiring` left counting as a failure), the same membership change drives the ack rate WELL below the threshold (matching the measured ~50-64%), so the gate proves the fix rather than rubber-stamping it. The oracle's record-only-acked discipline is what makes the two assertions independent: durability (a) must hold even at a low ack rate (the old behavior was lossless-but-unavailable), and the fix is the ack-rate (b) climbing to >95% WITHOUT regressing (a).
 
 **IN SCOPE: write availability through an R>1 (and R=1) multi-backend membership change, via a `WriteTimeout`-bounded retry-on-acquiring** (layer 1 makes the acquiring refusal a true fan-out transient; layer 2 retries the whole op when W is momentarily unreachable). The handoff-window refusal becomes bounded LATENCY, not an error. **SUPERSEDED FOR THE BIG-CHURN CASE by Phase 2e (pending ranges) below:** Option A's availability is bounded by mount-time-vs-`WriteTimeout`. Measured on real 3-node staging: incremental scale 3 -> 4 stays ~100% (few units remount, fast), but big-bang 3 -> 12 (about 16 slatedb databases remounting at once, real MinIO mounts exceeding the 5s budget) drops to ~54% as the retry budget exhausts. Phase 2e removes that bound: during a transition the routed replica set is the UNION of the current owners (which still have the data mounted) and the pending owners, so a write/read always reaches a node that physically holds the position, and availability no longer depends on mount time at all. Option A is RETAINED as the safety net for the residual unserved instant Phase 2e leaves (a node crash mid-handoff, the pure-new-mount initial convergence); A and B compose (A is the belt, B shrinks the window A waits on to near zero). Also out of scope (unchanged from Phase 2b): re-replicating a unit's BYTES onto a newly-joined replica position that has no durable copy yet (the copy-free case - a node taking over an EXISTING replica position - is what 2d and 2e handle; standing up a brand-new R-th copy after a permanent node loss is the separate anti-entropy re-replication phase).
+
+
+### Refusal reasons: the consumer-facing error taxonomy
+
+shale is embedded IN-PROCESS by library consumers (open a `Cluster`, then call `Transact` / `Get` / `ScanPrefix` / `Aggregate`). Routing and peer forwarding both happen INSIDE the cluster, BELOW that seam. A refusal raised by a locally-mounted position and one forwarded from a peer therefore return through the SAME call site, and the consumer has no way to tell them apart. That is a real blocker, not a cosmetic one: a consumer that wants to retry the transient handoff blip but NOT a genuine outage cannot express the difference, because the gRPC status code alone is far too coarse (the acquiring-window refusal and a dead peer are BOTH `codes.Unavailable`) and a message-string match is not a contract anyone should ship. Refusal reasons close that gap.
+
+**The contract.** Each reason has exactly ONE exported sentinel, and matching it is PATH-INDEPENDENT:
+
+```go
+if errors.Is(err, cluster.ErrAcquiring) {
+    // bounded retry with backoff; the handoff will finish
+}
+```
+
+`errors.Is(err, cluster.ErrAcquiring)` holds whether (a) the position is owned by THIS node and mid-acquire (in-process dispatch), or (b) the op was FORWARDED to a peer that was mid-acquire (over gRPC). The consumer does not know, and must not need to know, which path produced the error. That path-independence is the whole deliverable.
+
+`ErrAcquiring` documents its retry contract: the refusal is TRANSIENT and SAFE TO RETRY, because it is EXPLICIT (the op was not applied, no partial state was written, no stale result was served) and BOUNDED by the handoff window (a mount, not an outage). It is NOT a peer-down signal: it shares `codes.Unavailable` with genuine unreachability, which is exactly why the code is the wrong thing to branch on.
+
+**How the reason survives gRPC.** The identity is carried in two halves that read ONE shared table (`reasonSentinels`), so a reason can never be encodable but undecodable:
+
+  - **Encode.** Where the refusal is serialized (`errUnitAcquiring`), the status gains a machine-readable `google.rpc.ErrorInfo` detail: a stable `Reason` string under a shale-owned `Domain`. Details from a foreign domain are ignored on decode, so a reason string minted by another service sharing the deployment can never be mistaken for shale's.
+  - **Decode.** The peer client applies unary + stream client INTERCEPTORS, so every cluster-internal RPC is covered by ONE decode site rather than each call-site wrapper having to remember. A decoded error re-wraps the exported sentinel; an error carrying NO shale reason detail (notably a genuine peer-down `Unavailable`, which carries no details at all) passes through completely untouched and therefore matches no sentinel.
+
+**What reasons deliberately do NOT change.** The reason is ADDITIVE identity layered on top of the existing signals; every classification boundary Phase 2d established stays exactly where it was:
+
+  - **The client-facing status CODE is unchanged.** An acquiring refusal still travels as `codes.Unavailable`. The existing retry and forwarding shapes key off it, and moving it is out of scope.
+  - **The INTERNAL replica-leg recode is unchanged.** `recodeForwardedReplicaErr` still converts a forwarded replica-leg acquiring refusal to `codes.ResourceExhausted`, which is what keeps a cross-node mid-acquire replica out of the fan-out FAILURE budget. The reason detail is a parallel mechanism for the CLIENT-facing refusal, not a replacement for that recode.
+  - **The private classifier tag keeps its own identity, and the WRAPPING DIRECTION is what guarantees it.** The package-private `errAcquiringSentinel` now UNWRAPS to the exported `ErrAcquiring`, so every existing `errors.Is` call site against the private tag still matches and `isTransientReplicaErr` / `isAcquiringErr` behave identically. Crucially, the arrow points only that way: a WIRE-DECODED acquiring refusal wraps `ErrAcquiring` WITHOUT wrapping the private tag. The private tag means specifically "a LOCAL in-process mid-acquire replica" to the fan-out ack-vs-failure budget and to the read-leg classes; widening it to wire-arrived errors would silently move a remote acquiring refusal out of the fan-out's accounting and jump a read leg from the capped unreachable re-poll to the full handoff re-poll. Neither is in scope, so decoding attaches the EXPORTED sentinel only.
+
+**FIRST SLICE, not a one-off.** `ReasonAcquiring` is the only reason implemented. The shape is built so siblings (fenced, frozen, migration-guard, conflict) join by adding a constant, an exported sentinel, and one row in `reasonSentinels` - no redesign, and no change to the encode/decode plumbing, which is why the round-trip test iterates the table rather than naming a single reason.
 
 ### v0.8 Phase 2e: pending ranges (graceful membership transition, R>1)
 

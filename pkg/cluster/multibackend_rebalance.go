@@ -400,7 +400,18 @@ func (c *Cluster) TestingClearMount(u storageunit.UnitID) {
 // gRPC: only the status code travels the wire, so the cross-node forwarded
 // replica leg re-codes the acquiring refusal to codes.ResourceExhausted
 // (recodeForwardedReplicaErr) which isTransientReplicaErr already skips.
-var errAcquiringSentinel = errors.New("cluster: unit acquiring (handoff window)")
+//
+// It UNWRAPS to the exported ErrAcquiring (see reason.go), which is what makes
+// the acquiring window matchable by a library consumer. The wrapping direction
+// matters: this tag keeps its OWN identity, so errors.Is against it still means
+// exactly what it has always meant - a LOCAL in-process mid-acquire replica -
+// and no classifier's behavior moves. A wire-decoded acquiring refusal wraps
+// ErrAcquiring WITHOUT wrapping this tag, so the fan-out and read-leg budgets
+// classify remote errors exactly as they did before reasons existed.
+var errAcquiringSentinel error = &localReason{
+	msg:      "cluster: unit acquiring (handoff window)",
+	sentinel: ErrAcquiring,
+}
 
 // acquiringError is the HANDOFF-WINDOW refusal value: it carries
 // codes.Unavailable ON THE WIRE (via GRPCStatus, so the client / forwarding
@@ -435,10 +446,17 @@ func (e *acquiringError) Unwrap() error { return errAcquiringSentinel }
 // and NEVER lose a write during this window. The returned value also wraps
 // errAcquiringSentinel (Phase 2d) so the fan-out's isTransientReplicaErr
 // treats a local-self acquiring replica as transient, not as a failure.
+//
+// The status additionally carries the ReasonAcquiring ErrorInfo detail
+// (reason.go). That detail is what lets the identity SURVIVE gRPC: the peer
+// client decodes it back into a value wrapping ErrAcquiring, so a consumer's
+// errors.Is(err, cluster.ErrAcquiring) holds on the forwarded path exactly as
+// it does here. The code stays codes.Unavailable; the detail is purely
+// additive, so nothing that reads the code is affected.
 func errUnitAcquiring(op string) error {
 	st := status.Newf(codes.Unavailable,
 		"cluster: %s: unit for key is handing off to this node; retry shortly", op)
-	return &acquiringError{st: st}
+	return &acquiringError{st: withReason(st, ReasonAcquiring)}
 }
 
 // isAcquiringErr reports whether err is (or wraps) the Phase 2d acquiring-

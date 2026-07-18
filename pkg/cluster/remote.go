@@ -53,7 +53,43 @@ func peerDialOptions() []grpc.DialOption {
 			Timeout:             10 * time.Second,
 			PermitWithoutStream: true,
 		}),
+		// Decode shale refusal REASONS (reason.go) back into their exported
+		// sentinels. Installed as interceptors so EVERY cluster-internal RPC is
+		// covered by ONE decode site rather than each peerClient wrapper having
+		// to remember; a new RPC gets the behavior for free.
+		grpc.WithChainUnaryInterceptor(reasonUnaryInterceptor),
+		grpc.WithChainStreamInterceptor(reasonStreamInterceptor),
 	}
+}
+
+// reasonUnaryInterceptor re-attaches the exported sentinel for any refusal
+// reason a unary peer RPC came back with. Errors carrying no shale reason
+// detail (a genuine peer-down Unavailable, a deadline, a context cancel) pass
+// through byte-identical.
+func reasonUnaryInterceptor(ctx context.Context, method string, req, reply any, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+	return decodeRefusalReason(invoker(ctx, method, req, reply, cc, opts...))
+}
+
+// reasonStreamInterceptor is the streaming counterpart. A refusal can surface
+// EITHER when the stream is opened or on a later Recv (a server-streaming
+// handler that rejects after the header), so both are decoded: the stream
+// itself is wrapped so RecvMsg gets the same treatment. io.EOF (normal stream
+// end) carries no reason detail and so passes through untouched.
+func reasonStreamInterceptor(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	s, err := streamer(ctx, desc, cc, method, opts...)
+	if err != nil {
+		return s, decodeRefusalReason(err)
+	}
+	return &reasonClientStream{ClientStream: s}, nil
+}
+
+// reasonClientStream decodes refusal reasons off a client stream's per-message
+// errors. Only RecvMsg is overridden: SendMsg's error is a local transport
+// fault, never a server-minted refusal.
+type reasonClientStream struct{ grpc.ClientStream }
+
+func (s *reasonClientStream) RecvMsg(m any) error {
+	return decodeRefusalReason(s.ClientStream.RecvMsg(m))
 }
 
 // peerClient is the cluster-internal gRPC client used for inter-node
