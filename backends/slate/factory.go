@@ -146,16 +146,12 @@ func (c *BackingConfig) applyDefaults() {
 	}
 }
 
-// dbName maps a GenUnit to its deterministic slatedb DbName (the key-prefix
-// within the shared bucket). Delegates to the PURE dbNameFor so the encoding
-// is shared with the tagless unit tests (dbname.go) and cannot drift.
-func (c BackingConfig) dbName(gu storageunit.GenUnit) string {
-	return dbNameFor(c.KeyPrefix, gu)
-}
-
 // dbNameReplica maps a ReplicaUnit to its deterministic slatedb DbName (R>1
 // multi-backend). Delegates to the PURE dbNameReplicaFor (dbname.go); see
-// that function for the prefix-disjointness durability guarantee.
+// that function for the prefix-disjointness durability guarantee. The
+// production paths resolve through dbNameRef (the single R=1/R>1 encoding
+// switch); this spelling survives only for the `slatedb && integration`
+// bench harness, which addresses a replica prefix directly.
 func (c BackingConfig) dbNameReplica(ru storageunit.ReplicaUnit) string {
 	return dbNameReplicaFor(c.KeyPrefix, ru)
 }
@@ -760,17 +756,6 @@ func (b *Backing) fenceEpochRef(r unitRef, intended storageunit.Epoch) (storageu
 	return opened, nil
 }
 
-// fenceEpoch is the R=1 spelling of fenceEpochRef, kept for the R=1 call sites
-// and tests that pin the factory's epoch arithmetic directly.
-func (b *Backing) fenceEpoch(gu storageunit.GenUnit, intended storageunit.Epoch) (storageunit.Epoch, error) {
-	return b.fenceEpochRef(refUnit(gu), intended)
-}
-
-// fenceEpochReplica is the R>1 spelling of fenceEpochRef.
-func (b *Backing) fenceEpochReplica(ru storageunit.ReplicaUnit, intended storageunit.Epoch) (storageunit.Epoch, error) {
-	return b.fenceEpochRef(refReplica(ru), intended)
-}
-
 // openSlateRef opens the slatedb instance for r at its resolved DbName with the
 // backing's Settings/Cache. Because the DbName encodes the position, the
 // instance's WAL/LSM/manifest live at a prefix disjoint from every other unit's
@@ -796,7 +781,10 @@ func (b *Backing) openSlateRef(r unitRef) (*Slate, error) {
 	if err != nil {
 		return nil, err
 	}
-	awaitDurable := !(r.replicated && b.cfg.RelaxedReplicaDurability)
+	// Relaxed durability is reachable ONLY on the R>1 path; at R=1 there is no
+	// peer memtable to act as the safety net, so the operator's flag is ignored.
+	relaxed := r.replicated && b.cfg.RelaxedReplicaDurability
+	awaitDurable := !relaxed
 	wopts := &slatedb.WriteOptions{AwaitDurable: awaitDurable}
 	db, err := buildDb(b.cfg.dbNameRef(r), store, b.cfg.Settings, b.cfg.Cache)
 	if err != nil {
