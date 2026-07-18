@@ -61,6 +61,14 @@ type minioFixture struct {
 func startMinIO(t *testing.T) *minioFixture {
 	t.Helper()
 
+	// Each test gets its OWN MinIO container on an ephemeral host port, so
+	// this process sees a DIFFERENT object-store env tuple per test. Clear
+	// the per-process env-config guard (envguard.go) so this fixture's
+	// config registers afresh instead of conflicting with the previous
+	// test's; the guard's fail-fast contract still protects a REAL process
+	// (one Backing, one config, write-once).
+	slate.ResetEnvGuardForTest()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
