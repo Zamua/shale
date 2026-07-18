@@ -440,6 +440,17 @@ func TestCASReplicate_R1_StaysRaw(t *testing.T) {
 	if !bytes.Equal(raw, []byte("rawval")) {
 		t.Fatalf("R=1 stored bytes: got %q want raw rawval (envelope leaked into R=1 path?)", raw)
 	}
+	// Spelled-out no-framing guard. The byte-equality above already implies
+	// it, but stating the two framing signals explicitly keeps the intent
+	// legible: an Encode'd envelope leads with the magic byte and is longer
+	// than its payload by the header (magic + timestamp + nodeID length +
+	// nodeID). Either one appearing here is the regression.
+	if len(raw) > 0 && raw[0] == 0xE0 {
+		t.Fatalf("R=1 stored bytes lead with the envelope magic byte 0xE0: %q", raw)
+	}
+	if len(raw) != len("rawval") {
+		t.Fatalf("R=1 stored %d bytes, want %d (no envelope framing)", len(raw), len("rawval"))
+	}
 }
 
 // TestCASReplicate_CommitSurvivesFutureStampedReadSet is the observed-
