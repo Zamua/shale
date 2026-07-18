@@ -76,13 +76,6 @@ func (c *Cluster) unitReplicas(gu storageunit.GenUnit) []ring.Member {
 	return c.ring.LocateKeyN(genUnitBytes(gu), c.replicationFactor())
 }
 
-// replicasForKey resolves a key to its unit's replica set. The unit is
-// generation-aware (genUnitForKey), so every key in a co-located set shares
-// one unit and therefore one replica set.
-func (c *Cluster) replicasForKey(key []byte) []ring.Member {
-	return c.unitReplicas(c.genUnitForKey(key))
-}
-
 // initReplicatedFactory wires the R>1 capability view of the factory. Called
 // from initMultiBackend. At R=1 (or legacy mode) it is a no-op: replicaFactory
 // stays nil and the single-mount paths run. validateBackendMode already
@@ -606,7 +599,7 @@ func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Membe
 
 // getReplicatedUnit fetches the LWW winner across N of the unit's R replica
 // nodes per ReadConsistency, read-repairing laggards. It mirrors getReplicated
-// verbatim except the replica set is the unit's (replicasForKey) and the
+// verbatim except the replica set is the unit's (routedReplicasForKey) and the
 // local-self read serves from the mounted unit backend (via the multi
 // dispatcher). Read-repair rides dispatchReplicaPutUnit, so a stale repair is
 // a never-clobber no-op against the mounted unit.

@@ -1,6 +1,6 @@
 // Pending-ranges routing core (v0.8 Phase 2e). This is the CORE of the
 // pending-ranges graceful-membership-transition model: the current / pending /
-// union replica-set computation that replicasForKey returns during a
+// union replica-set computation that routedReplicasForKey returns during a
 // transition, plus the stable-R ack bar the dual-write fan-out holds.
 //
 // THE MODEL (see docs/SPEC.md "v0.8 Phase 2e" + docs/design/overlap-handoff.md).
