@@ -18,10 +18,10 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
@@ -230,7 +230,7 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 			if err == nil {
 				break
 			}
-			if attempt < 4 && strings.Contains(err.Error(), "address already in use") {
+			if attempt < 4 && clustertest.IsBindConflict(err) {
 				bindPorts[i] = freePort(t)
 				cfg.BindAddr = hostPort(bindPorts[i])
 				continue

@@ -17,11 +17,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/ring"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // perNodeKeyCount returns a map nodeID -> physical key count by
@@ -154,34 +153,15 @@ func putN(t *testing.T, c *cluster.Cluster, prefix string, n int) []string {
 }
 
 // putWithRetry retries Put up to 50 times (~5s wall-clock at 100ms
-// backoff) on the v0.4 transient codes -- ResourceExhausted for the
-// migration-window write rejection (docs/SPEC.md "Cutover") +
-// FailedPrecondition for the forwarding loop-guard (docs/SPEC.md
-// "Failure handling"). Any other error surfaces immediately.
-// Mirrors the bounded-retry behavior an SDK client would implement.
-//
-// Note: Unavailable is NOT retried here. It is reserved for genuine
-// peer-down failures in v0.4 (so the fanout's failure budget can
-// short-circuit on dead nodes). Migration-guard rejections moved to
-// ResourceExhausted so the fanout can distinguish "this replica is
-// mid-handoff" (skip) from "this replica is dead" (count as failure).
+// backoff) on the v0.4 transient codes, delegating the code
+// CLASSIFICATION to the shared harness package (see
+// internal/clustertest.PutWithTransientRetry) so it cannot drift from
+// pkg/cluster's equivalent. Mirrors the bounded-retry behavior an SDK
+// client would implement. The 50-attempt / 100ms budget is this tree's
+// own; pkg/cluster's external tests budget their retry window
+// differently.
 func putWithRetry(c *cluster.Cluster, key, value []byte) error {
-	var lastErr error
-	for range 50 {
-		err := c.Put(key, value)
-		if err == nil {
-			return nil
-		}
-		if st, ok := status.FromError(err); ok {
-			if st.Code() == codes.ResourceExhausted || st.Code() == codes.FailedPrecondition {
-				lastErr = err
-				time.Sleep(100 * time.Millisecond)
-				continue
-			}
-		}
-		return err
-	}
-	return lastErr
+	return clustertest.PutWithTransientRetry(c, key, value, 50, 100*time.Millisecond)
 }
 
 // expectedValue is the canonical {key -> value} mapping used by every
