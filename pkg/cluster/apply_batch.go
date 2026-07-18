@@ -84,40 +84,12 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 		}
 	}
 
-	c.applyMu.Lock()
-	defer c.applyMu.Unlock()
-
-	tx, err := c.backend.Begin(backend.SnapshotIsolation)
-	if err != nil {
-		return err
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	for _, w := range writes {
-		incoming, derr := Decode(w.Envelope)
-		if derr != nil {
-			return derr
-		}
-		apply, aerr := txApplyIfNewer(tx, w.Key, incoming.Stamp)
-		if aerr != nil {
-			return aerr
-		}
-		if !apply {
-			continue
-		}
-		if err := tx.Put(w.Key, w.Envelope); err != nil {
-			return err
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	committed = true
-	return nil
+	// Legacy single-backend site: the shared apply-if-newer transaction
+	// body (applyEnvelopesTx) with raw errors on both surfaces (c.backend
+	// is not a mounted unit, so there is no fence recode and no mount to
+	// evict).
+	_, err := c.applyEnvelopesTx(c.backend, writes, rawApplyErr, rawApplyErr)
+	return err
 }
 
 // txApplyIfNewer reports whether an incoming envelope carrying

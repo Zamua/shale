@@ -178,38 +178,9 @@ func (c *Cluster) applyEnvelopeIfNewerToBackend(b backend.Backend, ru storageuni
 // uses the bool to detect a CLEAN re-scan pass (applied nothing == the child
 // already holds everything the parent holds at this instant).
 func (c *Cluster) applyEnvelopeIfNewerToBackendReport(b backend.Backend, ru storageunit.ReplicaUnit, key, incomingEnvBytes []byte) (applied bool, err error) {
-	incoming, err := Decode(incomingEnvBytes)
-	if err != nil {
+	if _, _, err := decodeStamp(incomingEnvBytes); err != nil {
 		return false, err
 	}
-
-	c.applyMu.Lock()
-	defer c.applyMu.Unlock()
-
-	tx, err := b.Begin(backend.SnapshotIsolation)
-	if err != nil {
-		c.evictStaleMount(ru, b)
-		return false, errUnitAcquiring("Put")
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	apply, aerr := txApplyIfNewer(tx, key, incoming.Stamp)
-	if aerr != nil {
-		return false, c.fenceToTransient(ru, b, "Put", aerr)
-	}
-	if apply {
-		if err := tx.Put(key, incomingEnvBytes); err != nil {
-			return false, c.fenceToTransient(ru, b, "Put", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return false, c.fenceToTransient(ru, b, "Put", err)
-	}
-	committed = true
-	return apply, nil
+	mapBegin, mapTx := c.unitApplyErrMaps(ru, b, "Put")
+	return c.applyEnvelopesTx(b, []EnvelopeWrite{{Key: key, Envelope: incomingEnvBytes}}, mapBegin, mapTx)
 }

@@ -78,21 +78,61 @@ func (c *Cluster) applyEnvelopeIfNewerReport(key, incomingEnvBytes []byte) (appl
 	if c.notReady() {
 		return false, backend.ErrClosed
 	}
-
-	incoming, err := Decode(incomingEnvBytes)
-	if err != nil {
+	if _, _, err := decodeStamp(incomingEnvBytes); err != nil {
 		// Corrupt incoming envelope: refuse the write rather than store
 		// garbage. The originator Encode()d this, so a decode failure is
 		// a real bug, not v0.3 compat data.
 		return false, err
 	}
+	// Legacy single-backend site: raw errors on both surfaces (c.backend
+	// is not a mounted unit, so there is no fence recode and no mount to
+	// evict).
+	return c.applyEnvelopesTx(c.backend, []EnvelopeWrite{{Key: key, Envelope: incomingEnvBytes}}, rawApplyErr, rawApplyErr)
+}
 
+// rawApplyErr is the identity error mapper of the two legacy single-
+// backend apply sites (applyEnvelopeIfNewerReport and ApplyBatchLocal's
+// legacy tail): no fence recode, no mount eviction - the raw backend
+// error is those sites' contract.
+func rawApplyErr(err error) error { return err }
+
+// applyEnvelopesTx is the ONE apply-if-newer transaction body every
+// replica-receiving apply path shares (the single-key envelope applies
+// and the CAS write-set batches; a single key is a batch of one). It owns
+// the c.applyMu critical section and the transaction lifecycle: ONE
+// transaction on b at SnapshotIsolation, APPLY-IF-NEWER per entry
+// (txApplyIfNewer: write the incoming envelope verbatim only when its
+// stamp strictly beats the stored one, or there is no stored value;
+// an older-or-equal entry is a committed no-op that leaves the stored
+// value intact), then commit the whole batch together, rolling back on
+// any error. The lock - not the tx - is what serializes concurrent
+// appliers on the same key (the memory backend's tx has snapshot-
+// isolation reads but no write-write conflict detection), and it is held
+// across the WHOLE batch. On the all-no-op path the empty tx is still
+// committed; commit-without-put keeps the backend's tx lifecycle clean
+// (a Rollback would be equally correct since nothing was written).
+//
+// The error surface differs per call site, so the caller passes two
+// mappers: mapBeginErr recodes a Begin failure (the mounted-unit sites
+// evict the stale mount and report the transient acquiring-window
+// refusal; the legacy sites return it raw) and mapTxErr recodes an
+// in-transaction failure from txApplyIfNewer, Put, or Commit (the
+// mounted-unit sites fence-recode via fenceToTransient; the legacy sites
+// return it raw). A corrupt entry envelope is always returned raw,
+// bypassing both mappers: the originator Encode()d it, so a parse
+// failure is a real bug, not a condition to recode.
+//
+// applied reports whether ANY entry won its stamp compare and was
+// written; for a batch of one that is exactly the single key's decision
+// (the report the migration receive and the online split copy consume).
+// On error applied is false and nothing is committed.
+func (c *Cluster) applyEnvelopesTx(b backend.Backend, writes []EnvelopeWrite, mapBeginErr, mapTxErr func(error) error) (applied bool, err error) {
 	c.applyMu.Lock()
 	defer c.applyMu.Unlock()
 
-	tx, err := c.backend.Begin(backend.SnapshotIsolation)
-	if err != nil {
-		return false, err
+	tx, berr := b.Begin(backend.SnapshotIsolation)
+	if berr != nil {
+		return false, mapBeginErr(berr)
 	}
 	committed := false
 	defer func() {
@@ -100,23 +140,26 @@ func (c *Cluster) applyEnvelopeIfNewerReport(key, incomingEnvBytes []byte) (appl
 			_ = tx.Rollback()
 		}
 	}()
-
-	apply, aerr := txApplyIfNewer(tx, key, incoming.Stamp)
-	if aerr != nil {
-		return false, aerr
-	}
-	if apply {
-		if err := tx.Put(key, incomingEnvBytes); err != nil {
-			return false, err
+	for _, w := range writes {
+		stamp, _, derr := decodeStamp(w.Envelope)
+		if derr != nil {
+			return false, derr
 		}
+		apply, aerr := txApplyIfNewer(tx, w.Key, stamp)
+		if aerr != nil {
+			return false, mapTxErr(aerr)
+		}
+		if !apply {
+			continue
+		}
+		if perr := tx.Put(w.Key, w.Envelope); perr != nil {
+			return false, mapTxErr(perr)
+		}
+		applied = true
 	}
-	// On the no-apply path we commit the empty tx (no Put) so the newer
-	// stored value is left intact; commit-without-put keeps the backend's
-	// tx lifecycle clean. A Rollback would be equally correct since
-	// nothing was written.
-	if err := tx.Commit(); err != nil {
-		return false, err
+	if cerr := tx.Commit(); cerr != nil {
+		return false, mapTxErr(cerr)
 	}
 	committed = true
-	return apply, nil
+	return applied, nil
 }
