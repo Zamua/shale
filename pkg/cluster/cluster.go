@@ -1096,9 +1096,9 @@ func (c *Cluster) reconcileRingFromMembership() {
 		// OWNER in the ring - do NOT exclude it. The current/pending split is
 		// computed per-op inside routedReplicasForKey (current = ring INCLUDING
 		// draining members; pending = a ring genuinely REBUILT without the
-		// draining members), so the ring carries every alive
-		// member and the leaver keeps its positions + keeps serving the routed
-		// union until its successors are provably serving. (This REVERSES the
+		// draining members), so the ring carries every alive member and the
+		// leaver keeps its positions + keeps serving the routed union until
+		// its successors are provably serving. (This REVERSES the
 		// superseded draining-exclusion: dropping a draining member here is what
 		// collapsed its snapshot and stranded the hand-off.)
 		want[m.ID] = ring.Member{ID: m.ID, Addr: m.Addr}
