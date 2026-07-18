@@ -301,17 +301,16 @@ func (c *Cluster) logf(format string, args ...any) {
 // applyEnvelopeIfNewer: it applies an incoming LWW envelope APPLY-IF-NEWER
 // against the key's MOUNTED unit backend (resolved under the write-pause via
 // localWriteBackendForKey) instead of the single c.backend. The never-clobber
-// compare (txApplyIfNewer) runs in one transaction on that unit, under
-// c.applyMu, so two concurrent applies on the same key cannot race. ok=false
-// from the resolve (owner-but-unmounted, the static-topology window is only
-// the Open mount, so in practice always mounted here) yields the retryable
-// acquiring-window error the fan-out tolerates.
+// compare runs in one transaction on that unit, under c.applyMu (the shared
+// applyEnvelopesTx body), so two concurrent applies on the same key cannot
+// race. ok=false from the resolve (owner-but-unmounted, the static-topology
+// window is only the Open mount, so in practice always mounted here) yields
+// the retryable acquiring-window error the fan-out tolerates.
 func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error {
 	if c.notReady() {
 		return backend.ErrClosed
 	}
-	incoming, err := Decode(incomingEnvBytes)
-	if err != nil {
+	if _, _, err := decodeStamp(incomingEnvBytes); err != nil {
 		return err
 	}
 
@@ -321,35 +320,9 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 		return errUnitAcquiring("Put")
 	}
 
-	c.applyMu.Lock()
-	defer c.applyMu.Unlock()
-
-	tx, err := b.Begin(backend.SnapshotIsolation)
-	if err != nil {
-		c.evictStaleMount(ru, b)
-		return errUnitAcquiring("Put")
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-
-	apply, aerr := txApplyIfNewer(tx, key, incoming.Stamp)
-	if aerr != nil {
-		return c.fenceToTransient(ru, b, "Put", aerr)
-	}
-	if apply {
-		if err := tx.Put(key, incomingEnvBytes); err != nil {
-			return c.fenceToTransient(ru, b, "Put", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return c.fenceToTransient(ru, b, "Put", err)
-	}
-	committed = true
-	return nil
+	mapBegin, mapTx := c.unitApplyErrMaps(ru, b, "Put")
+	_, err := c.applyEnvelopesTx(b, []EnvelopeWrite{{Key: key, Envelope: incomingEnvBytes}}, mapBegin, mapTx)
+	return err
 }
 
 // fenceToTransient recodes a FENCED apply error (backend.ErrFenced, surfaced when
@@ -373,6 +346,22 @@ func (c *Cluster) fenceToTransient(ru storageunit.ReplicaUnit, b backend.Backend
 		return errUnitAcquiring(op)
 	}
 	return err
+}
+
+// unitApplyErrMaps returns the two applyEnvelopesTx error mappers every
+// mounted-unit apply site shares, closing over the resolved mount (ru, b)
+// and the op name carried by the transient refusal: a Begin failure
+// UNCONDITIONALLY evicts the (stale) mount and reports the retryable
+// acquiring-window error, and an in-transaction failure recodes a fence
+// to that same transient via fenceToTransient (a non-fence error passes
+// through unchanged, staying a hard failure).
+func (c *Cluster) unitApplyErrMaps(ru storageunit.ReplicaUnit, b backend.Backend, op string) (mapBeginErr, mapTxErr func(error) error) {
+	return func(error) error {
+			c.evictStaleMount(ru, b)
+			return errUnitAcquiring(op)
+		}, func(err error) error {
+			return c.fenceToTransient(ru, b, op, err)
+		}
 }
 
 // acquireReplicaUnit mounts replica position ru.Replica of unit ru.Unit via
@@ -492,45 +481,14 @@ func (c *Cluster) applyBatchToReplicaUnit(ru storageunit.ReplicaUnit, writes []E
 
 // applyBatchToBackend is the shared apply loop of applyBatchToUnit and
 // applyBatchToReplicaUnit: ONE transaction on the resolved mounted backend,
-// APPLY-IF-NEWER per key, under c.applyMu, with every error site fence-recoded
-// to the transient acquiring-window error (the fan-out classifies it as neither
-// ack nor failure).
+// APPLY-IF-NEWER per key, under c.applyMu (the shared applyEnvelopesTx body),
+// with every backend error site fence-recoded to the transient acquiring-
+// window error (the fan-out classifies it as neither ack nor failure). A
+// corrupt entry envelope stays a raw hard error.
 func (c *Cluster) applyBatchToBackend(b backend.Backend, ru storageunit.ReplicaUnit, writes []EnvelopeWrite) error {
-	c.applyMu.Lock()
-	defer c.applyMu.Unlock()
-
-	tx, err := b.Begin(backend.SnapshotIsolation)
-	if err != nil {
-		c.evictStaleMount(ru, b)
-		return errUnitAcquiring("ApplyBatch")
-	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = tx.Rollback()
-		}
-	}()
-	for _, w := range writes {
-		incoming, derr := Decode(w.Envelope)
-		if derr != nil {
-			return derr
-		}
-		apply, aerr := txApplyIfNewer(tx, w.Key, incoming.Stamp)
-		if aerr != nil {
-			return c.fenceToTransient(ru, b, "ApplyBatch", aerr)
-		}
-		if !apply {
-			continue
-		}
-		if err := tx.Put(w.Key, w.Envelope); err != nil {
-			return c.fenceToTransient(ru, b, "ApplyBatch", err)
-		}
-	}
-	if err := tx.Commit(); err != nil {
-		return c.fenceToTransient(ru, b, "ApplyBatch", err)
-	}
-	committed = true
-	return nil
+	mapBegin, mapTx := c.unitApplyErrMaps(ru, b, "ApplyBatch")
+	_, err := c.applyEnvelopesTx(b, writes, mapBegin, mapTx)
+	return err
 }
 
 // putReplicatedUnit stamps + envelopes + fans a write out to the R replica

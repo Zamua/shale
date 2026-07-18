@@ -115,30 +115,47 @@ func Encode(env Envelope) []byte {
 // past the end of the buffer). A magic-prefixed buffer with an empty
 // payload is valid (that's the tombstone shape).
 func Decode(b []byte) (Envelope, error) {
-	if len(b) == 0 || b[0] != envelopeMagic {
+	stamp, payloadStart, err := decodeStamp(b)
+	if err != nil {
+		return Envelope{}, err
+	}
+	if payloadStart == 0 {
 		// v0.3 compat: hand back the raw bytes as a zero-Stamp
 		// payload so the LWW comparator naturally prefers any
 		// stamped write. nil and empty both flow through unchanged.
 		return Envelope{Payload: b}, nil
 	}
+	// Copy the payload so callers can mutate it without scribbling
+	// into the source buffer (typical Backend.Get contract is "the
+	// caller owns the returned slice").
+	payload := append([]byte(nil), b[payloadStart:]...)
+	return Envelope{Stamp: stamp, Payload: payload}, nil
+}
+
+// decodeStamp parses ONLY the Stamp header of an encoded envelope (magic +
+// timestamp + nodeID), skipping the payload copy Decode makes. It returns
+// exactly what Decode would for the same bytes: a zero Stamp for a v0.3
+// bare value (no magic), the identical corruption errors for a truncated
+// or self-inconsistent magic-prefixed header. payloadStart is the offset
+// the payload begins at; 0 means the no-magic v0.3 case (the whole buffer
+// is the payload; a magic-prefixed header is always >= 11 bytes, so 0 is
+// unambiguous). The apply-if-newer write paths use this: the stamp compare
+// is all they need, since the envelope bytes are written verbatim on
+// apply.
+func decodeStamp(b []byte) (stamp Stamp, payloadStart int, err error) {
+	if len(b) == 0 || b[0] != envelopeMagic {
+		return Stamp{}, 0, nil
+	}
 	// Magic present: header MUST parse cleanly. A truncated envelope
 	// is corruption, not v0.3 data.
 	if len(b) < 1+8+2 {
-		return Envelope{}, errors.New("cluster: envelope header truncated")
+		return Stamp{}, 0, errors.New("cluster: envelope header truncated")
 	}
 	ts := binary.BigEndian.Uint64(b[1:9])
 	idLen := int(binary.BigEndian.Uint16(b[9:11]))
 	headerEnd := 11 + idLen
 	if headerEnd > len(b) {
-		return Envelope{}, fmt.Errorf("cluster: envelope nodeID length %d overruns buffer of %d bytes", idLen, len(b))
+		return Stamp{}, 0, fmt.Errorf("cluster: envelope nodeID length %d overruns buffer of %d bytes", idLen, len(b))
 	}
-	nodeID := string(b[11:headerEnd])
-	// Copy the payload so callers can mutate it without scribbling
-	// into the source buffer (typical Backend.Get contract is "the
-	// caller owns the returned slice").
-	payload := append([]byte(nil), b[headerEnd:]...)
-	return Envelope{
-		Stamp:   Stamp{TimestampNanos: ts, NodeID: nodeID},
-		Payload: payload,
-	}, nil
+	return Stamp{TimestampNanos: ts, NodeID: string(b[11:headerEnd])}, headerEnd, nil
 }
