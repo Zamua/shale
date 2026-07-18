@@ -135,3 +135,30 @@ func TestRegisterEnvConfig_ConcurrentRegistration(t *testing.T) {
 		t.Errorf("register of losing tuple after race: want error, got nil")
 	}
 }
+
+// TestResetEnvGuardForTest_ExportedHookClearsRegistry pins the exported
+// test-only reset hook (export_test.go) the TAGGED integration fixtures
+// depend on: each tagged test stands up its OWN MinIO (an ephemeral
+// endpoint per test), so without a reset the FIRST fixture's registration
+// would make every later test's construction fail with the config-conflict
+// error and the tagged suite (the Phase 2e release gate among it) could
+// never run green in one process. The hook must clear a registration so a
+// previously-conflicting tuple registers cleanly.
+func TestResetEnvGuardForTest_ExportedHookClearsRegistry(t *testing.T) {
+	resetEnvConfigForTest()
+	first := guardBaseTuple()
+	if err := registerEnvConfig(first); err != nil {
+		t.Fatalf("first registerEnvConfig: %v", err)
+	}
+	second := guardBaseTuple()
+	second.endpoint = "http://127.0.0.1:53287" // a different per-test mapped port
+	if err := registerEnvConfig(second); err == nil {
+		t.Fatalf("conflicting register before reset: want error, got nil (fixture precondition broken)")
+	}
+
+	ResetEnvGuardForTest()
+
+	if err := registerEnvConfig(second); err != nil {
+		t.Fatalf("register after ResetEnvGuardForTest: unexpected error: %v (the exported hook did not clear the registry)", err)
+	}
+}

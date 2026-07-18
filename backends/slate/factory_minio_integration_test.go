@@ -63,6 +63,13 @@ func env(key, def string) string {
 func startFactoryMinIO(t *testing.T) *factoryFixture {
 	t.Helper()
 
+	// The tagged suite mixes fixtures with DIFFERENT per-process env
+	// tuples in one test binary (this fixture's fixed SLATE_MINIO_ENDPOINT
+	// vs startMinIO's per-test ephemeral testcontainers port). Clear the
+	// per-process env-config guard (envguard.go) so this test's config
+	// registers afresh instead of conflicting with a previous test's.
+	slate.ResetEnvGuardForTest()
+
 	endpoint := env("SLATE_MINIO_ENDPOINT", "http://localhost:9000")
 	access := env("SLATE_MINIO_ACCESS", "admin")
 	secret := env("SLATE_MINIO_SECRET", "supersecret")

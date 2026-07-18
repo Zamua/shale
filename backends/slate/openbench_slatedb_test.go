@@ -312,6 +312,10 @@ func newObFixture(t *testing.T) *obFixture {
 	// slatedb open in this process points at the proxy (single Backing
 	// per process, same constraint as production).
 	proxy := startObProxy(t, endpoint)
+	// The proxy listens on an ephemeral per-test port, so this Backing's
+	// env tuple differs from any earlier fixture's in the same process.
+	// Clear the per-process env-config guard so it registers afresh.
+	resetEnvConfigForTest()
 	b, err := NewBacking(BackingConfig{
 		Bucket:    bucket,
 		Endpoint:  proxy.url,
