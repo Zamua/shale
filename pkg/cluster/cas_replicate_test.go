@@ -441,3 +441,74 @@ func TestCASReplicate_R1_StaysRaw(t *testing.T) {
 		t.Fatalf("R=1 stored bytes: got %q want raw rawval (envelope leaked into R=1 path?)", raw)
 	}
 }
+
+// TestCASReplicate_CommitSurvivesFutureStampedReadSet is the observed-
+// stamp-ratchet regression test: a validated CAS commit must never lose
+// the LWW compare to the very value it validated against and replaced,
+// even when that stored value carries a stamp from a clock far AHEAD of
+// the owner's.
+//
+// Setup: plant the SAME encoded envelope, stamped ~10 minutes in the
+// future by a fictitious node, directly on EVERY replica's backend. Then
+// run a CAS read-modify-write of that key through the cluster. Without
+// the monotone stamp source + ratchet, the owner's commit stamp (raw
+// wall clock) lands BELOW the planted stamp: the owner validates,
+// commits locally (authoritative), acks - but every replica's apply-if-
+// newer rejects the batch, a quorum read resurrects the OLD value, and
+// read-repair pushes it back over the owner's committed write. The
+// acked, validated commit is silently un-committed. With the ratchet,
+// the validate decode Observes the planted stamp before the commit
+// stamp is issued, so the commit stamp strictly exceeds it and the
+// write survives everywhere.
+func TestCASReplicate_CommitSurvivesFutureStampedReadSet(t *testing.T) {
+	nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadQuorum)
+
+	key := []byte("ratchet-k")
+	future := uint64(time.Now().Add(10 * time.Minute).UnixNano())
+	planted := cluster.Encode(cluster.Envelope{
+		Stamp:   cluster.Stamp{TimestampNanos: future, NodeID: "future-node"},
+		Payload: []byte("old"),
+	})
+	// Identical bytes on every replica: no laggards, so no read-repair
+	// noise from the setup itself.
+	for i, n := range nodes {
+		if err := n.mem.Put(key, planted); err != nil {
+			t.Fatalf("plant node %d: %v", i, err)
+		}
+	}
+
+	// CAS read-modify-write through the cluster: read "old" (recording
+	// it in the read-set), write "new".
+	err := nodes[0].cluster.Transact(key, func(tx backend.Transaction) error {
+		got, err := tx.Get(key)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(got, []byte("old")) {
+			t.Errorf("tx read: got %q want old", got)
+		}
+		return tx.Put(key, []byte("new"))
+	})
+	if err != nil {
+		t.Fatalf("Transact: %v", err)
+	}
+
+	// The validated commit must survive a quorum read. Pre-ratchet this
+	// returns "old": the commit stamp lost LWW to the planted future
+	// stamp on every non-owner replica, so the quorum winner is the old
+	// value (and the read schedules the repair that un-commits the
+	// owner's copy).
+	got, err := nodes[1].cluster.Get(key)
+	if err != nil {
+		t.Fatalf("post-commit Get: %v", err)
+	}
+	if !bytes.Equal(got, []byte("new")) {
+		t.Fatalf("post-commit Get: got %q want new (validated CAS commit lost LWW to the stamp it validated against)", got)
+	}
+
+	// And after replication + any read-repair settle, EVERY replica must
+	// hold the new payload under a stamp strictly above the planted one.
+	eachReplicaEventually(t, nodes, key, func(env cluster.Envelope, present bool) bool {
+		return present && bytes.Equal(env.Payload, []byte("new")) && env.Stamp.TimestampNanos > future
+	})
+}

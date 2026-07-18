@@ -97,21 +97,24 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 // true if there is no stored value OR incomingStamp strictly beats the
 // stored value's stamp; false otherwise (older-or-equal => no-op). A
 // stored value that fails to Decode is treated as a zero-Stamp legacy
-// value (any real incoming stamp wins). Callers hold c.applyMu so the
-// read here and the subsequent Put are atomic per key.
-func txApplyIfNewer(tx backend.Transaction, key []byte, incomingStamp Stamp) (bool, error) {
-	stored, gerr := tx.Get(key)
+// value (any real incoming stamp wins). stored is the stamp the compare
+// ran against (zero when the key is absent or legacy), returned so the
+// caller can Observe it into the node's stamp clock without a second
+// decode. Callers hold c.applyMu so the read here and the subsequent Put
+// are atomic per key.
+func txApplyIfNewer(tx backend.Transaction, key []byte, incomingStamp Stamp) (apply bool, stored Stamp, err error) {
+	storedBytes, gerr := tx.Get(key)
 	if gerr != nil {
 		if errors.Is(gerr, backend.ErrNotFound) {
-			return true, nil
+			return true, Stamp{}, nil
 		}
-		return false, gerr
+		return false, Stamp{}, gerr
 	}
-	storedEnv, derr := Decode(stored)
+	storedEnv, derr := Decode(storedBytes)
 	if derr != nil {
 		storedEnv = Envelope{}
 	}
-	return incomingStamp.Greater(storedEnv.Stamp), nil
+	return incomingStamp.Greater(storedEnv.Stamp), storedEnv.Stamp, nil
 }
 
 // replicateCASBatch fans the already-encoded write-set envelopes out to

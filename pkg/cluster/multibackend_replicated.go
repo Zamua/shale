@@ -506,7 +506,7 @@ func (c *Cluster) applyBatchToBackend(b backend.Backend, ru storageunit.ReplicaU
 // reassignment lands on the post-reassignment replica set once it settles.
 func (c *Cluster) putReplicatedUnit(key, value []byte) error {
 	stamp := Stamp{
-		TimestampNanos: uint64(time.Now().UnixNano()),
+		TimestampNanos: c.stamps.Next(),
 		NodeID:         c.cfg.NodeID,
 	}
 	envBytes := Encode(Envelope{Stamp: stamp, Payload: value})
@@ -744,6 +744,11 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 			winner = g
 		}
 	}
+
+	// Ratchet the node's stamp clock with the winning stamp (a no-op
+	// zero for a no-value winner); see stampclock.go and the single-
+	// backend getReplicated mirror.
+	c.stamps.Observe(winner.env.Stamp.TimestampNanos)
 
 	if rc != ReadNearest && winner.hadValue {
 		c.scheduleReadRepairUnit(key, winner.env, gathered)

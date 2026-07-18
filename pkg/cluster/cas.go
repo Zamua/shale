@@ -126,7 +126,7 @@ var transactCommit = func(tx *clusterTx) error { return tx.Commit() }
 // DECODES the stored envelope before each read-check compare (the
 // client's ExpectedVal is a decoded payload; a tombstone counts as not-
 // found), and it ENCODES each write-op into an Envelope under ONE shared
-// Stamp{now, owner NodeID} before tx.Put (Delete becomes an empty-payload
+// Stamp{stamps.Next(), owner NodeID} before tx.Put (Delete becomes an empty-payload
 // tombstone Put, NOT tx.Delete, so the LWW comparator on a replica sees a
 // stamped removal). After the local commit succeeds it fans the SAME
 // encoded envelopes out to the R-1 other replicas via ApplyBatch, waiting
@@ -230,8 +230,15 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 	var stamp Stamp
 	var encodedWrites []EnvelopeWrite
 	if replicated {
+		// The commit stamp is drawn AFTER the read-set validation above
+		// Observed every stored stamp it decoded (casReadPayload), so it
+		// strictly exceeds every stamp in the validated read-set: the
+		// committed write-set can never lose the LWW compare to the
+		// values it replaced (a raw wall clock behind a stored stamp
+		// would let replicas reject the commit and read-repair un-commit
+		// it; see stampclock.go).
 		stamp = Stamp{
-			TimestampNanos: uint64(time.Now().UnixNano()),
+			TimestampNanos: c.stamps.Next(),
 			NodeID:         c.cfg.NodeID,
 		}
 		encodedWrites = make([]EnvelopeWrite, 0, len(writes))
@@ -425,6 +432,13 @@ func (c *Cluster) casReadPayload(tx backend.Transaction, key []byte, replicated 
 	if derr != nil {
 		return nil, false, derr
 	}
+	// Ratchet the stamp clock with the stored stamp BEFORE the commit
+	// stamp is issued (the validate loop runs first in CommitCASApply),
+	// so the commit stamp strictly exceeds every stamp in the validated
+	// read-set. Without this, a stored stamp from a faster clock would
+	// beat the commit stamp and read-repair could un-commit the
+	// validated write (see stampclock.go).
+	c.stamps.Observe(env.Stamp.TimestampNanos)
 	if len(env.Payload) == 0 {
 		// Winning tombstone: the key the client saw is gone. Treat as
 		// not-found for both ExpectAbsent and value-match checks.

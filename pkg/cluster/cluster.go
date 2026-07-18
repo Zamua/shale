@@ -747,6 +747,17 @@ type Cluster struct {
 	// envelopes, no LWW).
 	applyMu sync.Mutex
 
+	// stamps is this node's monotone envelope-stamp source, initialized
+	// (zero-value ready) at Open. Every stamp the node ORIGINATES
+	// (putReplicated / putReplicatedUnit, their tombstone Delete
+	// shapes, and the CAS shared commit stamp) is drawn via
+	// stamps.Next(); every stamp the node OBSERVES (LWW read winners,
+	// CAS validate reads, replica-receiving applies) ratchets it via
+	// stamps.Observe(). See stampclock.go for why a raw wall clock is
+	// not sound here (a clock regression could un-commit a validated
+	// CAS write).
+	stamps stampClock
+
 	// peerClientsBlocked, when true, makes clientFor return an error
 	// instead of dialing. Test-only seam used by the destination-
 	// crash failure tests to guarantee a node cannot reach any peer
@@ -1589,7 +1600,8 @@ func (c *Cluster) evictClient(addr string) {
 // semantics so they must not be conflated.
 //
 // v0.4 replication: when ReplicationFactor > 1 the originator stamps
-// the payload (time.Now().UnixNano() + NodeID) once, wraps it in an
+// the payload (the node's monotone stamp source + NodeID; see
+// stampclock.go) once, wraps it in an
 // LWW envelope, and fans out to R replicas. The call returns once W
 // acks land per WriteConsistency. Migration-guard rejections from
 // individual replicas are treated as transient (don't count toward
