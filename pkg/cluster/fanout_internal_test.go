@@ -20,7 +20,7 @@ import (
 
 func TestFanout_AllSucceed(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
-	acks, errs, ch := fanout(context.Background(), reps, 2,
+	acks, errs, _, ch := fanout(context.Background(), reps, 2,
 		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			return []byte("ok"), nil
 		})
@@ -38,7 +38,7 @@ func TestFanout_AllSucceed(t *testing.T) {
 func TestFanout_FailureBudgetExhausted(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var nonAck int32
-	acks, errs, ch := fanout(context.Background(), reps, 2,
+	acks, errs, _, ch := fanout(context.Background(), reps, 2,
 		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			if atomic.AddInt32(&nonAck, 1) <= 2 {
 				return nil, errors.New("boom")
@@ -68,7 +68,7 @@ func TestFanout_FailureBudgetExhausted(t *testing.T) {
 func TestFanout_TransientDoesNotCount(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var seq int32
-	acks, errs, ch := fanout(context.Background(), reps, 2,
+	acks, errs, _, ch := fanout(context.Background(), reps, 2,
 		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			n := atomic.AddInt32(&seq, 1)
 			if n == 1 {
@@ -85,6 +85,36 @@ func TestFanout_TransientDoesNotCount(t *testing.T) {
 	drain(ch)
 }
 
+// TestFanout_TransientSurfacedAsEvidence pins the OTHER half of the transient
+// contract: a transient leg counts toward neither budget, but it is still
+// RETURNED, so a caller collapsing the pass into one terminal error can name the
+// reason the legs carried instead of guessing. Dropping it here is what made an
+// R>1 acquiring shortfall unattributable.
+func TestFanout_TransientSurfacedAsEvidence(t *testing.T) {
+	reps := []ring.Member{{ID: "a"}, {ID: "b"}}
+	var seq int32
+	acks, errs, transient, ch := fanout(context.Background(), reps, 2,
+		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
+			if atomic.AddInt32(&seq, 1) == 1 {
+				return nil, errUnitAcquiring("Put")
+			}
+			return nil, nil
+		})
+	if acks >= 2 {
+		t.Fatalf("acks: got %d want <2 (one leg was transient)", acks)
+	}
+	if len(errs) != 0 {
+		t.Fatalf("a transient leg must not enter the failure budget: %v", errs)
+	}
+	if len(transient) != 1 {
+		t.Fatalf("transient evidence: got %d legs want 1", len(transient))
+	}
+	if !errors.Is(transient[0], ErrAcquiring) {
+		t.Fatalf("transient leg lost its reason: %v", transient[0])
+	}
+	drain(ch)
+}
+
 // TestFanout_UnavailableCountsAsFailure pins the distinguishing
 // behavior between Unavailable (real peer down) + ResourceExhausted
 // (migration-guard transient). With R=3 + W=2, two Unavailables MUST
@@ -94,7 +124,7 @@ func TestFanout_TransientDoesNotCount(t *testing.T) {
 func TestFanout_UnavailableCountsAsFailure(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var seq int32
-	acks, errs, ch := fanout(context.Background(), reps, 2,
+	acks, errs, _, ch := fanout(context.Background(), reps, 2,
 		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			n := atomic.AddInt32(&seq, 1)
 			if n <= 2 {
@@ -117,7 +147,7 @@ func TestFanout_UnavailableCountsAsFailure(t *testing.T) {
 func TestFanout_SuccessAcksClampToRequired(t *testing.T) {
 	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	// Slow one replica so the other two ack first.
-	acks, _, ch := fanout(context.Background(), reps, 2,
+	acks, _, _, ch := fanout(context.Background(), reps, 2,
 		func(_ context.Context, _ int, m ring.Member) ([]byte, error) {
 			if m.ID == "c" {
 				time.Sleep(50 * time.Millisecond)
@@ -140,7 +170,7 @@ func TestFanout_SuccessAcksClampToRequired(t *testing.T) {
 // TestFanout_EmptyReplicas returns zero acks + an immediately-closed
 // channel without panicking.
 func TestFanout_EmptyReplicas(t *testing.T) {
-	acks, errs, ch := fanout(context.Background(), nil, 1,
+	acks, errs, _, ch := fanout(context.Background(), nil, 1,
 		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
 			return nil, nil
 		})

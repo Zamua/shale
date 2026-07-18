@@ -477,10 +477,23 @@ func isAcquiringErr(err error) bool {
 // miscounted as a down peer. The CLIENT-facing top-level refusal stays
 // codes.Unavailable; only this internal replica-to-replica leg re-codes.
 // A non-acquiring error passes through unchanged.
+//
+// The re-coded status still carries the ReasonAcquiring ErrorInfo detail
+// (reason.go). The CODE is what the fan-out's budget classifier reads, and that
+// is unchanged (ResourceExhausted, transient); the detail is additive identity
+// that lets the ORIGINATOR still tell "this leg was mid-acquire" apart from "this
+// leg hit the v0.3 migration guard", which both travel as ResourceExhausted.
+// Without it a remote mid-acquire replica is indistinguishable from any other
+// transient at the originator, and a write shortfall caused by it could not
+// honestly report ReasonAcquiring. The originator's peer client decodes the
+// detail into the EXPORTED ErrAcquiring only, never the private tag, so
+// isAcquiringErr / isTransientReplicaErr / isUnreachableLegErr all see exactly
+// what they saw before.
 func recodeForwardedReplicaErr(err error) error {
 	if err == nil || !isAcquiringErr(err) {
 		return err
 	}
-	return status.Error(codes.ResourceExhausted,
+	st := status.New(codes.ResourceExhausted,
 		"cluster: forwarded replica write: unit mid-acquire (handoff window); retry shortly")
+	return withReason(st, ReasonAcquiring).Err()
 }

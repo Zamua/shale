@@ -55,7 +55,8 @@ func (c *Cluster) MountReadiness() MountReadiness
 func (c *Cluster) Ready(minMountedFraction float64) bool
 
 // Refusal reasons: why an op was refused, matchable UNIFORMLY whether the
-// refusal came from a locally-mounted position or was forwarded from a peer.
+// refusal came from a locally-mounted position or was forwarded from a peer,
+// and at R=1 or R>1 alike (an R>1 write's fan-out collapse preserves it).
 // See "Refusal reasons" under the v0.8 section for the full contract.
 //
 //	if errors.Is(err, cluster.ErrAcquiring) { /* bounded retry */ }
@@ -1330,6 +1331,12 @@ if errors.Is(err, cluster.ErrAcquiring) {
 `errors.Is(err, cluster.ErrAcquiring)` holds whether (a) the position is owned by THIS node and mid-acquire (in-process dispatch), or (b) the op was FORWARDED to a peer that was mid-acquire (over gRPC). The consumer does not know, and must not need to know, which path produced the error. That path-independence is the whole deliverable.
 
 `ErrAcquiring` documents its retry contract: the refusal is TRANSIENT and SAFE TO RETRY, because it is EXPLICIT (the op was not applied, no partial state was written, no stale result was served) and BOUNDED by the handoff window (a mount, not an outage). It is NOT a peer-down signal: it shares `codes.Unavailable` with genuine unreachability, which is exactly why the code is the wrong thing to branch on.
+
+**The match is also REPLICATION-INDEPENDENT, and that takes a second mechanism.** The node boundary is not the only place a reason can be lost; the other is a FAN-OUT COLLAPSE. At R>1 a write is not one refusal but R legs, and falling short of W collapses them into a SINGLE freshly-minted status (`classifyWriteAttempt`), discarding every leg value. A contract that held only at R=1 would therefore be a FALSE NEGATIVE on exactly the configuration a replicated consumer runs - their writes unprotected while the gate appears to work - so the collapse has to preserve the reason too. It does: the retryable terminal is built by `reasonTerminal`, which carries BOTH halves (the in-process sentinel AND the wire detail, since the terminal is minted on whichever node the write entered, which for a forwarding consumer is a peer). `Put`, `Delete`, and `Transact`'s CAS commit all reach it.
+
+The terminal takes its reason from EVIDENCE, never from the branch it was minted in: `legsCarryReason` inspects the actual transient legs, so a shortfall caused only by v0.3 migration guards (a different reason) does not claim to be acquiring. For a leg that arrived from a PEER this depends on `recodeForwardedReplicaErr` carrying the reason detail on the re-coded `ResourceExhausted` - without it a remote mid-acquire replica is indistinguishable from any other transient at the originator, and the terminal could not honestly report it. The re-code's CODE, which is what the fan-out budget reads, is unchanged.
+
+**The MIXED CASE reports as a hard failure and does NOT match.** When W was missed with SOME legs mid-acquire and others GENUINELY DOWN, the terminal carries no reason. `ErrAcquiring` promises a window bounded by a mount, so a bounded retry is guaranteed to observe it end; once a real failure is in the mix that promise is false and the wait is bounded by whatever revives the peer. Matching there would send a consumer's bounded retry against a genuine outage - the precise false positive this taxonomy exists to prevent - and would contradict shale's own judgment, since that branch is the one that sets `retryable: false` and declines to retry internally. Likewise the zero-evidence timeout terminal (the budget was spent before any attempt completed) carries no reason: its message names acquiring, but no leg ever reported, and the sentinel is only ever attached to evidence.
 
 **How the reason survives gRPC.** The identity is carried in two halves that read ONE shared table (`reasonSentinels`), so a reason can never be encodable but undecodable:
 

@@ -551,7 +551,7 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 	// position, leaving the acquired slot unwritten - the during-leave
 	// write-availability gap. idx maps each fan-out goroutine to its exact
 	// routedReplica.
-	acks, errs, resultsCh := fanout(ctx, replicas, w,
+	acks, errs, transient, resultsCh := fanout(ctx, replicas, w,
 		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
 			return nil, c.dispatchReplicaPutUnit(opCtx, replica, routed[idx].ru, key, envBytes)
 		})
@@ -562,7 +562,7 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 		}
 	}()
 
-	return classifyWriteAttempt(acks, w, errs)
+	return classifyWriteAttempt(acks, w, errs, transient)
 }
 
 // dispatchReplicaPutUnit is the multi-backend analogue of dispatchReplicaPut:
@@ -662,7 +662,7 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 	// The fan-out shares the retry wrapper's overall wall-clock deadline, so
 	// attempts never stack budgets past ReadTimeout.
 	fanoutCtx, cancelFanout := context.WithDeadline(context.Background(), deadline)
-	_, _, resultsCh := fanout(fanoutCtx, queried, n,
+	_, _, _, resultsCh := fanout(fanoutCtx, queried, n,
 		func(ctx context.Context, idx int, replica ring.Member) ([]byte, error) {
 			return c.dispatchReplicaGetUnitAt(ctx, replica, routed[idx].ru, key)
 		})
