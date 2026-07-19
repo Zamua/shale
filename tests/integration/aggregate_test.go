@@ -35,23 +35,7 @@ func TestThreeNode_AggregateFansOutPerNode(t *testing.T) {
 	// actually hold?
 	groundTruth := make(map[string]int, 3)
 	for _, node := range f.Nodes() {
-		it, err := node.Backend.ScanPrefix(nil)
-		if err != nil {
-			t.Fatalf("backend scan on %s: %v", node.ID, err)
-		}
-		count := 0
-		for {
-			k, _, err := it.Next()
-			if err != nil {
-				t.Fatalf("backend scan next on %s: %v", node.ID, err)
-			}
-			if k == nil {
-				break
-			}
-			count++
-		}
-		_ = it.Close()
-		groundTruth[node.ID] = count
+		groundTruth[node.ID] = node.physicalKeyCount(t)
 	}
 
 	// Distribution sanity: keys should be spread across 2+ nodes,
@@ -140,23 +124,7 @@ func TestThreeNode_StatsKeysHeldIsPerNode(t *testing.T) {
 	// Ground truth per node.
 	truth := make(map[string]uint64, 3)
 	for _, node := range f.Nodes() {
-		it, err := node.Backend.ScanPrefix(nil)
-		if err != nil {
-			t.Fatalf("backend scan on %s: %v", node.ID, err)
-		}
-		var c uint64
-		for {
-			k, _, err := it.Next()
-			if err != nil {
-				t.Fatalf("backend next: %v", err)
-			}
-			if k == nil {
-				break
-			}
-			c++
-		}
-		_ = it.Close()
-		truth[node.ID] = c
+		truth[node.ID] = uint64(node.physicalKeyCount(t))
 	}
 	if len(truth) < 2 {
 		t.Fatalf("expected distribution across >=2 nodes, got %v", truth)

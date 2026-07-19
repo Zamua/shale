@@ -234,65 +234,6 @@ func otherMultiNode(owner, a, b *multiNode) *multiNode {
 	return a
 }
 
-// TestMBPhase2_LegacyPathUnchanged (scenario 3, co-existence). The legacy
-// single-Config.Backend path is opt-in's complement: a node started WITHOUT
-// a factory runs the per-node mode exactly as before. We run an
-// existing-style legacy 2-node round-trip + forwarding test alongside the
-// multi-backend tests and assert the legacy node is NOT in multi-backend
-// mode (multi-backend stays strictly opt-in). The behavior asserted here
-// is identical to the pre-v0.8 per-node forwarding contract: same Put/Get,
-// same physical placement on the owner's single backend.
-func TestMBPhase2_LegacyPathUnchanged(t *testing.T) {
-	// Two legacy nodes (memory backend per node, NO factory): the canonical
-	// pre-v0.8 shape. startTestNode builds exactly that. The legacy path
-	// runs the v0.3+ rebalance on join, so we wait for full quiescence
-	// (ring convergence + bootstrap-migration settle) before writing -
-	// exactly as the legacy threeNodeFixture does. (The multi-backend
-	// tests above only need waitForMembersAll because Phase 2 has no
-	// rebalance; this difference is itself part of the co-existence story.)
-	n1 := startTestNode(t, "legacy1", "")
-	n2 := startTestNode(t, "legacy2", n1.BindAddr)
-	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
-	waitForClusterReady(t, clusters, 15*time.Second)
-
-	// Forwarding still works exactly as pre-v0.8: a key owned by n2,
-	// written via n1, forwards and lands on n2's single backend.
-	key := findKeyNotOwnedBy(t, n1.Cluster, "legacy1", 1000)
-	owner := ownerOf(n1.Cluster, key)
-	if err := putWithRetry(n1.Cluster, []byte(key), []byte("legacy-val")); err != nil {
-		t.Fatalf("legacy Put: %v", err)
-	}
-	// Read back via BOTH nodes (one local, one forwarded).
-	for _, c := range clusters {
-		got, err := c.Get([]byte(key))
-		if err != nil {
-			t.Fatalf("legacy Get via %s: %v", c.NodeID(), err)
-		}
-		if !bytes.Equal(got, []byte("legacy-val")) {
-			t.Fatalf("legacy Get via %s = %q, want legacy-val", c.NodeID(), got)
-		}
-	}
-
-	// Physical placement on the OWNER's single backend (the per-node path:
-	// keys live in the one Config.Backend, not a unit map). Byte-for-byte
-	// the same as the pre-v0.8 behavior.
-	ownerNode := n1
-	if owner == n2.ID {
-		ownerNode = n2
-	}
-	if got, err := ownerNode.Backend.Get([]byte(key)); err != nil || !bytes.Equal(got, []byte("legacy-val")) {
-		t.Fatalf("legacy placement: owner %s backend has %q (err=%v), want legacy-val", ownerNode.ID, got, err)
-	}
-	// And ABSENT from the non-owner's single backend.
-	nonOwner := n2
-	if owner == n2.ID {
-		nonOwner = n1
-	}
-	if _, err := nonOwner.Backend.Get([]byte(key)); !errors.Is(err, backend.ErrNotFound) {
-		t.Fatalf("legacy placement: non-owner %s unexpectedly holds key (err=%v)", nonOwner.ID, err)
-	}
-}
-
 // TestMBPhase2_ConfigValidationAtOpen (scenario 4). The factory+unitcount
 // XOR backend rule, asserted at the REAL cluster.Open boundary (not just
 // the unexported validateBackendMode unit test): bad combos make Open fail
@@ -331,7 +272,17 @@ func TestMBPhase2_ConfigValidationAtOpen(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "legacy backend only: ok",
+			// The retired legacy multi-node shape: a plain Backend cannot
+			// open units, so it cannot fence a prior writer, so it cannot
+			// take part in a lease handoff. Accepting it would come up and
+			// serve traffic while silently never moving data on a topology
+			// change, so Open refuses it outright.
+			name:    "backend + bind addr (legacy multi-node): error",
+			cfg:     cluster.Config{NodeID: "x", Backend: memory.New(), BindAddr: "127.0.0.1:0", GRPCAddr: "127.0.0.1:1", LogOutput: io.Discard},
+			wantErr: true,
+		},
+		{
+			name:    "single-node backend only: ok",
 			cfg:     cluster.Config{NodeID: "x", Backend: memory.New(), LogOutput: io.Discard},
 			wantErr: false,
 		},

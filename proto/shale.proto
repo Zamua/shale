@@ -67,30 +67,6 @@ service ShaleNode {
   // `shale ping` subcommand + for inter-node health probes later.
   rpc Ping(PingRequest) returns (PingResponse);
 
-  // MigrateRange is the v0.3 rebalancing transport. The destination
-  // (the node whose ring now lists it as owner of the given partitions)
-  // initiates the call; the source streams every key/value pair whose
-  // shard key falls in any of the requested partitions, then closes
-  // with a MigrationDone marker carrying the total key count + a
-  // CRC32-based checksum of the concatenated key|value bytes.
-  //
-  // RangeSpec.ring_generation is carried on the wire for v0.4
-  // forward-compatibility (a cluster-wide generation lands with the
-  // gossip layer then); v0.3 nodes use per-node monotonic counters
-  // that are NOT comparable across peers, so the source does NOT
-  // enforce a freshness check on the value. Wrong-owner protection
-  // comes from the forwarding loop-guard + the per-key migration
-  // guards on the cluster's KV path.
-  rpc MigrateRange(RangeSpec) returns (stream MigrateChunk);
-
-  // ProposeRebalance is the operator-facing path for the
-  // `shale rebalance --dry-run | --apply | --cancel` subcommand. It
-  // returns the per-partition plan the local node would execute against
-  // the current ring (or the in-flight plan, if one is running). Exactly
-  // one of dry_run / apply / cancel must be true; the server returns
-  // InvalidArgument otherwise.
-  rpc ProposeRebalance(ProposeRebalanceRequest) returns (ProposeRebalanceResponse);
-
   // CommitCAS is the v0.6 optimistic-concurrency commit. The client reads
   // via normal Gets, computes locally with no writer held anywhere, then
   // ships a read-set (reads) + write-set (writes) in ONE unary call to the
@@ -325,86 +301,6 @@ message StatsResponse {
 message PingRequest {}
 
 message PingResponse {}
-
-// -- MigrateRange ----------------------------------------------------
-
-// RangeSpec identifies which partitions the destination claims it now
-// owns + the ring generation the destination is reasoning from. The
-// generation is monotonic + incremented per ring change so the source
-// can detect stale requests during the brief windows when peers
-// disagree about ownership.
-message RangeSpec {
-  // partition_ids the destination claims ownership of. The source
-  // iterates its local Backend over keys whose shard key falls into
-  // any of these partitions.
-  repeated uint64 partition_ids = 1;
-
-  // ring_generation is the destination's view of the ring at the
-  // moment it issued the request. v0.3 nodes use per-node monotonic
-  // counters that are NOT cluster-comparable, so the source does
-  // NOT enforce a freshness check on this value (every stream is
-  // accepted regardless). The field is carried on the wire for
-  // v0.4 forward-compatibility: a gossiped cluster-wide generation
-  // will land then + the source-side rejection of stale requests
-  // can become meaningful.
-  uint64 ring_generation = 2;
-}
-
-// MigrateChunk is one message in the server-streaming response. Each
-// message is either a key/value pair or, exactly once at the end, a
-// MigrationDone marker. Receivers MUST treat the stream as finished
-// when they see a done body, even if more messages appear after.
-message MigrateChunk {
-  oneof body {
-    KeyValue kv = 1;
-    MigrationDone done = 2;
-  }
-}
-
-// KeyValue carries one migrated pair. Keys are raw bytes as stored in
-// the source Backend; the destination writes them through its own
-// Backend.Put unchanged.
-message KeyValue {
-  bytes key = 1;
-  bytes value = 2;
-}
-
-// MigrationDone is the terminal marker. total_keys is the number of
-// KeyValue messages that preceded it on the stream; checksum is the
-// CRC32 (IEEE polynomial) of the concatenated key|value bytes in the
-// order they were sent. The destination recomputes the checksum as it
-// receives and rolls back the range on mismatch.
-message MigrationDone {
-  uint64 total_keys = 1;
-  bytes checksum = 2;
-}
-
-// -- ProposeRebalance ------------------------------------------------
-
-// ProposeRebalanceRequest carries the operator's intent. Exactly one
-// of dry_run / apply / cancel must be true; the server returns
-// InvalidArgument otherwise.
-message ProposeRebalanceRequest {
-  bool dry_run = 1;
-  bool apply = 2;
-  bool cancel = 3;
-}
-
-// ProposeRebalanceResponse returns the per-partition plan the local
-// node would execute (dry_run / apply) or has just cancelled (cancel).
-message ProposeRebalanceResponse {
-  repeated RangePlanItem ranges = 1;
-}
-
-// RangePlanItem is one row of the rebalance plan: which partition,
-// who owns it now, who would own it after the plan applies, and a
-// rough size hint for operators eyeballing cost.
-message RangePlanItem {
-  uint64 partition_id = 1;
-  string current_owner = 2;
-  string proposed_owner = 3;
-  uint64 estimated_key_count = 4;
-}
 
 // -- CommitCAS -------------------------------------------------------
 

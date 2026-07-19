@@ -45,7 +45,7 @@ func physicalHolders(t *testing.T, nodes []*testNode, keys []string) map[string]
 	for _, k := range keys {
 		holders := make(map[string]bool)
 		for _, n := range nodes {
-			v, err := n.Backend.Get([]byte(k))
+			v, err := n.physicalGet([]byte(k))
 			if err == nil && v != nil {
 				holders[n.ID] = true
 			}

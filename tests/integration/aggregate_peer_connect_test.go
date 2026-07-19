@@ -6,10 +6,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/memfactory"
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rpc"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 )
 
@@ -97,17 +98,16 @@ func TestThreeNode_AggregateWaitsForPeerGRPCColdStart(t *testing.T) {
 // nil stop).
 func startTestNodeGRPCDown(t *testing.T, id, seedAddr string) *testNode {
 	t.Helper()
-	mem := memory.New()
+	fac := memfactory.New()
 	grpcAddr := hostPort(freePort(t)) // reserve a port; do NOT listen yet
 	cfg := cluster.Config{
-		NodeID:                  id,
-		Backend:                 mem,
-		GRPCAddr:                grpcAddr,
-		LogOutput:               io.Discard,
-		RebalanceSettleDelay:    500 * time.Millisecond,
-		RebalanceGraceDuration:  3 * time.Second,
-		RebalanceHandoffTimeout: 4 * time.Second,
-		ReplicationFactor:       1,
+		NodeID:               id,
+		BackendFactory:       fac,
+		UnitCount:            storageunit.MustUnitCount(defaultTestUnitCount),
+		GRPCAddr:             grpcAddr,
+		LogOutput:            io.Discard,
+		RebalanceSettleDelay: 500 * time.Millisecond,
+		ReplicationFactor:    1,
 	}
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}
@@ -116,7 +116,7 @@ func startTestNodeGRPCDown(t *testing.T, id, seedAddr string) *testNode {
 	n := &testNode{
 		ID:       id,
 		Cluster:  c,
-		Backend:  mem,
+		Factory:  fac,
 		BindAddr: bindAddr,
 		GRPCAddr: grpcAddr,
 		// grpcServer + stop are nil until startNodeGRPC; testNode.Close handles nil.

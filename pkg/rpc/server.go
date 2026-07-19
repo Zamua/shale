@@ -12,7 +12,6 @@ package rpc
 import (
 	"context"
 	"errors"
-	"hash/crc32"
 	"sync/atomic"
 
 	"github.com/Zamua/shale/pkg/backend"
@@ -392,117 +391,6 @@ func (s *Server) Ping(_ context.Context, _ *pb.PingRequest) (*pb.PingResponse, e
 
 // -- Rebalancing RPCs (v0.3 scaffold) --------------------------------
 //
-// MigrateRange and ProposeRebalance carry the wire surface for the
-// v0.3 rebalancing protocol described in docs/SPEC.md. The handlers
-// here are intentional stubs: they return Unimplemented so the proto
-// registration is exercised by the existing build + test surface, and
-// so the cluster + rebalance packages can dial these methods once the
-// Core phase wires them up to real logic. Returning Unimplemented (not
-// a panic, not a silent no-op) keeps any premature caller honest:
-// they get the standard gRPC "this is registered but the body is not
-// yet provided" signal and can fall through to the not-yet-rebalanced
-// behavior path until the real implementation lands.
-
-// MigrateRange is the source-side handler of the v0.3 range-transfer
-// stream. The destination has sent a RangeSpec listing the partitions
-// it claims ownership of + the ring generation it computed against;
-// the source iterates its local Backend, streams every key whose
-// shard key falls in any of those partitions, and ends with a
-// MigrationDone marker carrying the CRC32-IEEE checksum + count.
-//
-// Stale-generation guard: if the destination's ring view is behind
-// ours, we return FailedPrecondition so the destination's next
-// Evaluate pass re-issues against the new ring rather than us
-// streaming data that will be discarded.
-//
-// Handoff signaling: the handler's return value carries the
-// destination-observed outcome of the stream. A nil return means
-// the gRPC runtime delivered every chunk (the final Send(Done)
-// succeeded and the destination read it before closing its end);
-// non-nil means the destination disconnected or the source's scan
-// errored. SignalMigrateRangeComplete threads that outcome back to
-// the Coordinator's source-side runSend, which only flips Sending
-// -> HandedOff on a clean return. Without this, the source flipped
-// HandedOff based on its own local scan + the sweep deleted keys
-// even when the destination crashed mid-stream. See
-// docs/SPEC.md "Cutover" + "Failure handling".
-func (s *Server) MigrateRange(req *pb.RangeSpec, stream grpc.ServerStreamingServer[pb.MigrateChunk]) (retErr error) {
-	pids := req.GetPartitionIds()
-	kvCh, errCh, err := s.c.MigrateRangeSource(pids, req.GetRingGeneration())
-	if err != nil {
-		s.c.SignalMigrateRangeComplete(pids, 0, err)
-		return err
-	}
-	hasher := crc32.NewIEEE()
-	var count uint64
-	defer func() {
-		// retErr captures the handler's return value. Nil iff every
-		// stream.Send (including the terminal Done) succeeded + the
-		// source scan finished without an error: that is the source
-		// observing the destination acked the full transfer. Any
-		// non-nil retErr keeps the partitions out of HandedOff at
-		// the Coordinator level.
-		s.c.SignalMigrateRangeComplete(pids, int(count), retErr)
-	}()
-	for kv := range kvCh {
-		if err := stream.Send(&pb.MigrateChunk{
-			Body: &pb.MigrateChunk_Kv{
-				Kv: &pb.KeyValue{Key: kv.Key, Value: kv.Value},
-			},
-		}); err != nil {
-			// Drain the source channel so the goroutine in
-			// localSource exits cleanly instead of blocking on
-			// an un-read send. errCh below will produce its
-			// terminal value regardless.
-			//nolint:revive // empty-block: idiomatic channel drain.
-			for range kvCh {
-			}
-			<-errCh
-			return err
-		}
-		hasher.Write(kv.Key)
-		hasher.Write(kv.Value)
-		count++
-	}
-	if scanErr := <-errCh; scanErr != nil {
-		return status.Errorf(codes.Internal, "shale: MigrateRange scan: %v", scanErr)
-	}
-	return stream.Send(&pb.MigrateChunk{
-		Body: &pb.MigrateChunk_Done{
-			Done: &pb.MigrationDone{
-				TotalKeys: count,
-				Checksum:  hasher.Sum(nil),
-			},
-		},
-	})
-}
-
-// ProposeRebalance is the operator-facing planner / applier / canceller.
-// Exactly one of dry_run / apply / cancel must be set; otherwise the
-// server returns InvalidArgument.
-//
-//   - dry_run: returns the plan the local node would execute against
-//     the current ring, without doing anything.
-//   - apply:   bypass the settle delay + Evaluate immediately; returns
-//     the queued plan.
-//   - cancel:  stop in-flight migrations; returns what was in flight.
-func (s *Server) ProposeRebalance(_ context.Context, req *pb.ProposeRebalanceRequest) (*pb.ProposeRebalanceResponse, error) {
-	items, err := s.c.ProposeRebalance(req.GetDryRun(), req.GetApply(), req.GetCancel())
-	if err != nil {
-		return nil, status.Errorf(codes.InvalidArgument, "shale: %v", err)
-	}
-	resp := &pb.ProposeRebalanceResponse{Ranges: make([]*pb.RangePlanItem, 0, len(items))}
-	for _, it := range items {
-		resp.Ranges = append(resp.Ranges, &pb.RangePlanItem{
-			PartitionId:       it.PartitionID,
-			CurrentOwner:      it.CurrentOwner,
-			ProposedOwner:     it.ProposedOwner,
-			EstimatedKeyCount: it.EstimatedKeyCount,
-		})
-	}
-	return resp, nil
-}
-
 // keysHeld counts via an empty-prefix scan of the LOCAL backend
 // (Cluster.LocalScanPrefix), not Cluster.ScanPrefix. The latter routes
 // the empty prefix through ownerOf, which in a multi-node cluster

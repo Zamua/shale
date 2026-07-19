@@ -76,17 +76,9 @@ func (c *Cluster) ApplyBatchLocal(writes []EnvelopeWrite) error {
 		// closed, never panic.
 		return errors.New("cluster: ApplyBatch unsupported in multi-backend mode (single-replica)")
 	}
-	if rb := c.rebalance.Load(); rb != nil {
-		for _, w := range writes {
-			if rb.IsMigrating(w.Key) || rb.IsReceiving(w.Key) {
-				return migrationGuardError(c.retryAfterMs())
-			}
-		}
-	}
-
-	// Legacy single-backend site: the shared apply-if-newer transaction
-	// body (applyEnvelopesTx) with raw errors on both surfaces (c.backend
-	// is not a mounted unit, so there is no fence recode and no mount to
+	// Single-node site: the shared apply-if-newer transaction body
+	// (applyEnvelopesTx) with raw errors on both surfaces (c.backend is
+	// not a mounted unit, so there is no fence recode and no mount to
 	// evict).
 	_, err := c.applyEnvelopesTx(c.backend, writes, rawApplyErr, rawApplyErr)
 	return err

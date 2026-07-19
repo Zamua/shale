@@ -1,170 +1,42 @@
 package cluster
 
-// rebalance.go: the cluster layer's integration with pkg/rebalance.
+// rebalance.go: the debounce + guards shared by the cluster's one
+// rebalancing engine.
 //
-// The rebalance package owns the per-range state machine + the pure
-// ComputePlan domain function (see docs/SPEC.md "Rebalancing"). This
-// file is the adapter that wires those into the running Cluster:
+// shale has a single coordination model. A multi-node cluster is
+// multi-backend: every key lives in a storage UNIT, and a unit moves
+// between nodes by LEASE HANDOFF, not by copying keys. The old owner
+// releases the unit (CloseUnit, flush) and the new owner acquires it
+// (OpenUnit at a higher epoch, fencing the old). The bytes never travel
+// through shale; they are already in the shared durable store the
+// storageunit.BackendFactory opens against. That engine lives in
+// multibackend_rebalance.go (R=1) and multibackend_overlap.go (R>1).
 //
-//   - watches membership events, increments a monotonic ring
-//     generation, and schedules a debounced Evaluate after the
-//     settle delay
-//   - snapshots the current ring on each Evaluate so ComputePlan
-//     has both an "old" (last evaluated) and a "new" (current) ring
-//   - implements rebalance.MigrateDestination by dialing peers over
-//     gRPC + consuming their MigrateRange stream (the source side
-//     lives in pkg/rpc/server.go)
+// What is left in THIS file is the part both of those share with the
+// membership layer:
 //
-// The settle-timer pattern is: every membership-event delivery into
-// the cluster increments c.ringGen + (re)schedules a timer for
-// settleDelay in the future. When that timer fires the cluster grabs
-// the current ring snapshot, hands (lastEvalRing, currentRing) to
-// the Coordinator, and stores currentRing as lastEvalRing for the
-// next tick. This collapses bursts of joins/leaves (e.g. a rolling
-// restart) into one Evaluate pass instead of thrashing the cluster
-// through every intermediate ring shape.
+//   - the settle-timer debounce, so a burst of joins/leaves (a rolling
+//     restart) collapses into one reconcile pass instead of thrashing
+//     the cluster through every intermediate ring shape
+//   - the ring generation counter every reconcile reasons from
+//   - the transient-rejection error a KV op returns when it lands on a
+//     unit that is mid-handoff
+//
+// Single-node mode reaches none of it: Open returns before membership
+// is built, so there is no ring to change and nothing to debounce.
 
 import (
-	"bytes"
 	"context"
-	"errors"
-	"fmt"
-	"hash/crc32"
-	"io"
 	"time"
 
-	"github.com/Zamua/shale/pkg/rebalance"
-	"github.com/Zamua/shale/pkg/ring"
-	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// defaultSettleDelay is the v0.3 rebalance debounce. Exposed as a var
-// so cluster_internal_test.go (and the in-process integration tests)
-// can shrink it to keep wall-clock under a few hundred ms.
+// defaultSettleDelay is the rebalance debounce. Exposed as a var so
+// cluster_internal_test.go (and the in-process integration tests) can
+// shrink it to keep wall-clock under a few hundred ms.
 var defaultSettleDelay = 5 * time.Second
-
-// initRebalance constructs the Coordinator + sweep goroutine, pins
-// lastEvalRing to the at-startup ring snapshot, and for joiners runs
-// a SYNCHRONOUS bootstrap Evaluate so the new node's share of the
-// existing keyspace is pulled from prior owners before Open returns.
-//
-// Two startup shapes need different handling, distinguished by
-// whether Config.Seeds was set:
-//
-//   - Founder (Seeds empty): we are the first node. The at-startup
-//     ring is {self}; pin lastEvalRing to that snapshot. Any future
-//     events that add peers correctly compute Sends from us to them.
-//
-//   - Joiner (Seeds non-empty): we joined an existing cluster.
-//     Memberlist's Join is synchronous so by the time Open returns,
-//     the at-startup ring lists every peer + self. Synthesize old =
-//     (current - self) - the "ring as it existed before I joined" -
-//     and call rebalance.Evaluate(old, current) inline. This
-//     registers the joiner's Receives from prior owners. We then
-//     pin lastEvalRing = current so the next ring change diffs
-//     properly. Blocking on WaitForIdle here would deadlock against
-//     the sweep + put-during-grace test scenarios; we settle for
-//     "registered" + let the sweep + retries race themselves out
-//     before the operator-facing API needs the data settled.
-//
-// In single-node mode there are no peers, no plan, no need to run
-// any of this.
-func (c *Cluster) initRebalance() {
-	self := rebalance.Member{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}
-	opts := rebalance.DefaultOptions()
-	opts.SettleDelay = c.settleDelay()
-	if c.cfg.RebalanceGraceDuration > 0 {
-		opts.GraceDuration = c.cfg.RebalanceGraceDuration
-	}
-	if c.cfg.RebalanceRetryAfterMs > 0 {
-		opts.RetryAfterMs = c.cfg.RebalanceRetryAfterMs
-	}
-	// Destination is the cluster's own gRPC-backed puller. Source is
-	// left nil so Coordinator.Evaluate auto-wires a NewLocalSource
-	// against the backend on first run (we want the partition function
-	// to come from the same ring snapshot the plan was computed
-	// against).
-	opts.Destination = &clusterDestination{c: c}
-	// ReplicationFactor makes the legacy single-backend Coordinator
-	// replica-aware: at R>1 a node that hands off PRIMARY of a partition
-	// but is still a successor replica RETAINS its keys (sweep skips the
-	// delete) and a node newly in a partition's replica set RECEIVES them
-	// (reconcile backfills). At R<=1 this is the v0.3/v0.4 single-owner
-	// behavior unchanged. See pkg/rebalance Options.ReplicationFactor +
-	// docs/SPEC.md "Replica-set placement."
-	opts.ReplicationFactor = c.replicationFactor()
-	// ShardKeyFn makes the auto-wired partition function compute
-	// partitions on the same shard key the cluster routes reads with.
-	// Without it, an app with a custom ShardKeyFn scatters one logical
-	// subject's keys across partitions and the founder-grows handoff
-	// strands them (see rebalance.ringPartitionFn). Nil when the app
-	// uses no ShardKeyFn, which keeps the default (whole-key, hash-tag)
-	// path identical.
-	opts.ShardKeyFn = c.cfg.ShardKeyFn
-	// AwaitHandoffSignal gates the source's Sending -> HandedOff flip
-	// on the destination acknowledging the stream. Without it, the
-	// source's local scan independently triggers the flip + the
-	// sweep deletes the keys on grace, even if the destination
-	// crashed mid-stream. With it, MarkSendComplete (called by the
-	// gRPC handler in pkg/rpc/server.go) carries the only signal that
-	// flips the source state.
-	opts.AwaitHandoffSignal = true
-	opts.HandoffTimeout = c.handoffTimeout()
-	rb := rebalance.New(self, c.backend, opts)
-	c.rebalance.Store(rb)
-
-	startup := c.snapshotRing()
-
-	// Background sweep handles post-handoff cleanup. The Coordinator's
-	// stop channel cuts this loop on Close.
-	c.loopWG.Add(1)
-	c.rebalanceCtx, c.rebalanceCancel = context.WithCancel(context.Background())
-	go func() {
-		defer c.loopWG.Done()
-		rb.RunSweep(c.rebalanceCtx)
-	}()
-
-	// settleMu publishes c.lastEvalRing to the runEvaluate reader. We
-	// hold it for the assignment even though Open hasn't spawned the
-	// reader goroutine yet, so any future code that grows another
-	// reader path can't trip the race detector on a now-unguarded
-	// write. The bootstrap Evaluate below is fine to run outside the
-	// lock: it touches Coordinator state only.
-	if len(c.cfg.Seeds) > 0 && len(startup.Members()) > 1 {
-		// Joiner: synthesize "ring before I joined" baseline +
-		// fire the bootstrap Evaluate inline so the pull is
-		// dispatched before Open returns. Receives proceed
-		// asynchronously: callers that want to observe a fully
-		// primed joiner use WaitForRebalanceIdle.
-		//
-		// We intentionally do NOT block Open here. Blocking
-		// hides the StateReceiving window from observers + makes
-		// it impossible for tests to assert the v0.3 cutover
-		// behavior (destination returns try_other_owner on reads,
-		// FailedPrecondition on writes) for the pull duration.
-		// A later settle-timer Evaluate that arrives mid-receive
-		// can't introduce a NEW Move for the same partition
-		// (current ring is unchanged), so there's no
-		// tryRegister conflict to worry about.
-		//
-		bootstrapOld := ringMinus(startup, c.cfg.NodeID)
-		c.settleMu.Lock()
-		c.lastEvalRing = startup
-		c.settleMu.Unlock()
-		rb.Evaluate(bootstrapOld, startup, c.ringGen.Load())
-	} else {
-		// Founder (or joiner with no peers yet visible): pin
-		// lastEvalRing to the init-time snapshot. Subsequent
-		// membership events diff against this baseline; if peers
-		// only become visible later, that diff produces the
-		// correct Sends.
-		c.settleMu.Lock()
-		c.lastEvalRing = startup
-		c.settleMu.Unlock()
-	}
-}
 
 // settleDelay returns the configured settle delay, falling back to
 // the package default if Config.RebalanceSettleDelay is zero.
@@ -175,210 +47,41 @@ func (c *Cluster) settleDelay() time.Duration {
 	return defaultSettleDelay
 }
 
-// handoffTimeout returns the configured handoff timeout, falling
-// back to the rebalance package default (5 minutes) when
-// Config.RebalanceHandoffTimeout is zero. The Coordinator's New()
-// also applies its own default if we pass zero, but propagating the
-// cluster-level config here lets the replaceCoordinator path honor
-// the same value without re-reading rebalance defaults.
-func (c *Cluster) handoffTimeout() time.Duration {
-	if c.cfg.RebalanceHandoffTimeout > 0 {
-		return c.cfg.RebalanceHandoffTimeout
-	}
-	return 5 * time.Minute
-}
-
 // bumpRingGen records that the ring shape has changed + schedules the
 // debounced response at settleDelay from now. Subsequent calls within the
 // window reset the timer rather than fire multiple passes. Called from the
-// membership events loop AND from the reconcile loop AND from
-// ProposeRebalance(apply) (the latter bypasses the timer; see
-// runEvaluateNow).
+// membership events loop AND from the reconcile loop.
 //
-// The debounced response differs by mode. In the legacy per-node mode it is
-// the v0.3 Coordinator Evaluate (ring-vs-ring plan + key copy). In
-// multi-backend mode (v0.8 Phase 3) it is instead the COPY-FREE unit
-// reconcile (acquire newly-owned units / release no-longer-owned units; see
-// multibackend_rebalance.go). A cluster runs in exactly one mode, so exactly
-// one of these arms the shared settle timer.
+// The debounced response is the COPY-FREE unit reconcile: acquire
+// newly-owned units, release no-longer-owned ones (see
+// multibackend_rebalance.go). Only a multi-node cluster reaches here, and
+// every multi-node cluster is multi-backend, so there is exactly one
+// response to arm.
 func (c *Cluster) bumpRingGen() {
 	c.ringGen.Add(1)
-	if c.multi {
-		c.scheduleReconcile()
-		return
-	}
-	c.scheduleEvaluate()
-}
-
-// scheduleEvaluate (re)arms the settle timer. Holds settleMu only
-// long enough to swap the timer reference.
-func (c *Cluster) scheduleEvaluate() {
-	if c.rebalance.Load() == nil {
-		return
-	}
-	c.settleMu.Lock()
-	defer c.settleMu.Unlock()
-	if c.settleTimer != nil {
-		// Re-arm: a still-live timer (or one whose callback already
-		// began) already owns a pending obligation, so do NOT
-		// double-count. The replacement timer inherits that same
-		// obligation. (A callback that has already started running
-		// captures-and-clears c.settleTimer under settleMu at its top,
-		// so if we observe a non-nil timer here it is one whose pending
-		// obligation has not yet been released.)
-		c.settleTimer.Stop()
-	} else {
-		// Fresh arm: this evaluation is now pending until runEvaluate's
-		// defer releases it.
-		c.settlePending.Add(1)
-	}
-	d := c.settleDelay()
-	c.settleTimer = time.AfterFunc(d, c.runEvaluate)
-}
-
-// runEvaluate fires when the settle timer elapses. Snapshots the
-// current ring, computes the plan against lastEvalRing, hands it
-// to the Coordinator, and stores the new snapshot as lastEvalRing
-// for next time. lastEvalRing is pinned at init time (per the
-// founder/joiner branches in initRebalance), so by the time
-// runEvaluate first runs there is always a valid baseline.
-func (c *Cluster) runEvaluate() {
-	// Release the pending obligation this callback owns when it returns.
-	// By the time we decrement, rb.Evaluate (below) has synchronously
-	// registered every move in the Coordinator's range table in a
-	// non-terminal state (see Coordinator.Evaluate's contract), so a
-	// WaitForRebalanceIdle poller never sees a gap between "pending"
-	// dropping to zero and the in-flight ranges appearing: the handoff
-	// from settlePending to the Coordinator's non-terminal ranges is
-	// seamless. The defer also balances the count on the early-return
-	// paths (closed / single-node) where no Evaluate runs.
-	defer c.settlePending.Add(-1)
-
-	// Capture-and-clear the timer reference so a concurrent
-	// scheduleEvaluate (whose own re-arm Stop() raced this firing) sees
-	// settleTimer == nil and treats itself as a FRESH arm with its own
-	// pending increment. This callback still owns the increment it was
-	// armed with and releases it via the defer above; the freshly-armed
-	// timer owns a new one. Two pending obligations may briefly coexist,
-	// which is correct: there genuinely are two evaluations a waiter
-	// must see through.
-	c.settleMu.Lock()
-	if c.settleTimer != nil {
-		c.settleTimer = nil
-	}
-	c.settleMu.Unlock()
-
-	if c.closed.Load() {
-		return
-	}
-	rb := c.rebalance.Load()
-	if rb == nil {
-		return
-	}
-	current := c.snapshotRing()
-	gen := c.ringGen.Load()
-
-	c.settleMu.Lock()
-	old := c.lastEvalRing
-	c.lastEvalRing = current
-	c.settleMu.Unlock()
-
-	rb.Evaluate(old, current, gen)
-}
-
-// ringMinus returns a fresh ring containing every member of src
-// except the one with id == omit. Used by the bootstrap path so a
-// new node Evaluating for the first time computes its plan against
-// "ring without me" as the synthetic prior state, surfacing the
-// correct From peers on Receives instead of the empty-Member
-// first-rebalance sentinel.
-func ringMinus(src *ring.Ring, omit string) *ring.Ring {
-	out := ring.New()
-	if src == nil {
-		return out
-	}
-	for _, m := range src.Members() {
-		if m.ID == omit {
-			continue
-		}
-		out.Add(m)
-	}
-	return out
-}
-
-// runEvaluateNow bypasses the settle timer and Evaluates immediately.
-// Used by the operator-facing ProposeRebalance(apply) path: the human
-// has already decided they want the migration, no need to wait the
-// debounce window.
-func (c *Cluster) runEvaluateNow() {
-	// runEvaluate's defer always decrements settlePending once, so this
-	// path must hand it exactly one obligation to release. If a live
-	// settle timer is pending we adopt ITS obligation (stop the timer so
-	// its callback never fires + double-decrements); otherwise we mint a
-	// fresh one. Either way a concurrent WaitForRebalanceIdle stays
-	// blocked across the immediate evaluate.
-	c.settleMu.Lock()
-	if c.settleTimer != nil {
-		if !c.settleTimer.Stop() {
-			// Callback already fired and owns its own decrement; mint a
-			// fresh obligation for this immediate evaluate.
-			c.settlePending.Add(1)
-		}
-		// else: the stopped live timer's pending obligation is now ours.
-		c.settleTimer = nil
-	} else {
-		c.settlePending.Add(1)
-	}
-	c.settleMu.Unlock()
-	c.runEvaluate()
-}
-
-// snapshotRing returns a fresh *ring.Ring populated with the members
-// the live ring currently knows about. ComputePlan diffs two rings;
-// taking a snapshot lets the next Evaluate compare "what membership
-// was at the last tick" vs "what it is now" without holding the live
-// ring stable across the call.
-func (c *Cluster) snapshotRing() *ring.Ring {
-	r := ring.New()
-	if c.ring == nil {
-		return r
-	}
-	for _, m := range c.ring.Members() {
-		r.Add(m)
-	}
-	return r
+	c.scheduleReconcile()
 }
 
 // WaitForRebalanceIdle blocks until this node is rebalance-idle or ctx
-// is canceled. Per docs/SPEC.md "Trigger", a node is rebalance-idle
-// only when BOTH hold:
+// is canceled. Per docs/SPEC.md "Trigger", a node is rebalance-idle when
+// no settle-timer reconcile is pending (settlePending == 0): nothing is
+// armed-but-unrun and no reconcile callback is mid-flight.
 //
-//   - no settle-timer evaluation is pending (settlePending == 0): no
-//     debounce-scheduled Evaluate/reconcile is armed-but-unrun or
-//     mid-callback. This is the Cluster's debounce-quiescence half.
-//   - every tracked migration has reached a terminal state: the
-//     Coordinator's range-quiescence half (Coordinator.Idle).
+// Including the pending half is what closes the race where a caller polls
+// immediately after a membership change, BEFORE the debounce fires. The
+// wait blocks through the debounce, so an observed idle guarantees the
+// reconcile has run AND drained: scheduleReconcile holds the obligation
+// from arm through the applied mounts (see multibackend_rebalance.go), so
+// there is no gap between "pending" dropping to zero and the unit moves
+// being visible.
 //
-// Tightening "idle" to include the pending half closes the race where a
-// caller polls immediately after a membership change, BEFORE the
-// debounce fires: the Coordinator's range table is still empty so the
-// old pass-through returned "idle" prematurely and the evaluation then
-// fired mid-assertion. Now the wait blocks through the debounce so an
-// observed idle guarantees the evaluation has run AND drained.
-//
-// Used by tests + by the operator-facing --apply path so callers can
-// report "rebalance complete" with confidence.
-//
-// Single-node mode has no Coordinator (rb == nil) and never schedules
-// an evaluation, so settlePending stays 0 and Idle() is trivially true:
-// the call returns on the first poll. Multi-backend mode also has no
-// Coordinator but DOES schedule reconciles, so the settlePending half
-// still blocks correctly through a pending unit-reconcile.
+// Single-node mode never schedules a reconcile, so settlePending stays 0
+// and the call returns on the first poll.
 func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if c.settlePending.Load() == 0 && c.coordinatorIdle() {
+		if c.settlePending.Load() == 0 {
 			return nil
 		}
 		select {
@@ -389,31 +92,17 @@ func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
 	}
 }
 
-// coordinatorIdle reports whether the legacy single-backend Coordinator
-// has no in-flight (non-terminal) ranges. Returns true when there is no
-// Coordinator (single-node or multi-backend mode): in those modes range
-// quiescence is not the Coordinator's concern, and WaitForRebalanceIdle
-// relies on the settlePending half instead.
-func (c *Cluster) coordinatorIdle() bool {
-	rb := c.rebalance.Load()
-	if rb == nil {
-		return true
-	}
-	return rb.Idle()
-}
-
 // migrationGuardError builds the error returned to a Put/Delete that
-// lands on a key whose partition is currently sending out. Carries
-// codes.ResourceExhausted + a retry-after-ms hint per docs/SPEC.md
-// "Cutover" so clients know the failure is transient + how long to
-// back off.
+// lands on a unit currently mid-handoff. Carries codes.ResourceExhausted
+// + a retry-after-ms hint per docs/SPEC.md "Cutover" so clients know the
+// failure is transient + how long to back off.
 //
-// Three reserved codes carry distinct retry semantics in the v0.4+
-// model and must not be conflated:
+// Three reserved codes carry distinct retry semantics and must not be
+// conflated:
 //
-//   - ResourceExhausted: in-flight migration. Retry after the
-//     hinted backoff; the partition is mid-handoff and the next
-//     attempt may land on a different owner.
+//   - ResourceExhausted: in-flight handoff. Retry after the hinted
+//     backoff; the unit is moving and the next attempt may land on a
+//     different owner.
 //   - FailedPrecondition: forwarding loop-guard (docs/SPEC.md
 //     "Failure handling"). The receiving node disagrees with the
 //     originator about ownership; client must refresh ring + retry.
@@ -422,31 +111,21 @@ func (c *Cluster) coordinatorIdle() bool {
 //     against the fanout's failure budget so a genuinely-down node
 //     short-circuits the call rather than blocking for every peer.
 //
-// Migration-guard rejections must be distinguishable from a real
-// down peer so isTransientReplicaErr can treat them differently:
-// migration-guard responses do NOT count against the failure budget,
-// so the fanout keeps waiting on other replicas instead of failing
-// the whole call when a single replica is mid-handoff. Conversely,
-// Unavailable from a dead peer MUST count, so (R - W + 1) such
-// failures fail-fast instead of waiting for every replica's
-// transport timeout.
-//
-// NB the message says "migrating out" but the guard is emitted from
-// BOTH ends of a handoff, and on the R=1 single-backend path the
-// caller is normally the DESTINATION's IsReceiving check in
-// LocalReplicaPut, not the source's IsMigrating check in Put: ring
-// ownership flips to the destination before the source's
-// settle-delayed Evaluate registers StateSending, so a client write
-// is already being forwarded to the destination by the time the
-// source considers itself migrating. See docs/SPEC.md "Cutover".
+// Handoff rejections must be distinguishable from a real down peer so
+// isTransientReplicaErr can treat them differently: handoff responses do
+// NOT count against the failure budget, so the fanout keeps waiting on
+// other replicas instead of failing the whole call when a single replica
+// is mid-handoff. Conversely, Unavailable from a dead peer MUST count, so
+// (R - W + 1) such failures fail-fast instead of waiting for every
+// replica's transport timeout.
 func migrationGuardError(retryAfterMs int) error {
 	return status.Errorf(codes.ResourceExhausted,
 		"shale: key is migrating out; retry after %dms", retryAfterMs)
 }
 
-// retryAfterMs reads the configured retry-after hint from the
-// Coordinator's options. 50ms is the default in
-// rebalance.DefaultOptions.
+// retryAfterMs reads the configured retry-after hint, defaulting to 50ms.
+// It is the base of the Layer-2 handoff retry backoff as well as the hint
+// handed to the client (see multibackend_handoff_retry.go).
 func (c *Cluster) retryAfterMs() int {
 	if c.cfg.RebalanceRetryAfterMs > 0 {
 		return c.cfg.RebalanceRetryAfterMs
@@ -454,401 +133,6 @@ func (c *Cluster) retryAfterMs() int {
 	return 50
 }
 
-// IsMigrating returns whether the given key's partition is currently
-// migrating out from this node. The cluster layer calls this before
-// dispatching a Put/Delete to the local backend; if true, the op is
-// rejected with a transient FailedPrecondition.
-//
-// Safe in single-node mode: returns false (no Coordinator).
-func (c *Cluster) IsMigrating(key []byte) bool {
-	rb := c.rebalance.Load()
-	if rb == nil {
-		return false
-	}
-	return rb.IsMigrating(key)
-}
-
-// -- clusterDestination ----------------------------------------------
-//
-// clusterDestination implements rebalance.MigrateDestination. Each
-// FetchRange call dials the source peer's gRPC service, opens a
-// MigrateRange stream, and writes each KV to the local backend. The
-// terminal MigrationDone message carries the source's CRC32; the
-// destination compares and rolls back on mismatch.
-
-type clusterDestination struct {
-	c *Cluster
-}
-
-func (d *clusterDestination) FetchRange(ctx context.Context, peer rebalance.Member, partitionIDs []uint64, gen uint64) (int, error) {
-	if peer.Addr == "" {
-		// Empty From means "no prior source" (first-rebalance case
-		// in ComputePlan). Nothing to fetch; treat as a zero-key
-		// success so the Coordinator flips the range to Done.
-		return 0, nil
-	}
-	// Test-only receive gate (Config.TestingReceiveGate): hold the range
-	// in StateReceiving until the test releases it. Placed before the
-	// dial so nothing is in flight while we wait. The ctx arm is
-	// load-bearing, not defensive: runReceive cancels this ctx from
-	// Coordinator.Stop, so Close never wedges on a gate a failing test
-	// forgot to release (goleak would otherwise fail the whole binary).
-	if gate := d.c.cfg.TestingReceiveGate; gate != nil {
-		select {
-		case <-gate:
-		case <-ctx.Done():
-			return 0, ctx.Err()
-		}
-	}
-	cli, err := d.c.clientFor(peer.Addr)
-	if err != nil {
-		return 0, fmt.Errorf("rebalance: dial source %s: %w", peer.ID, err)
-	}
-	// Stamp the destination's CURRENT ringGen on the wire (not the
-	// Coordinator-captured value, which may be stale by the time the
-	// stream opens). The source's freshness check is "destination's
-	// gen < source's own current"; using the dest's latest counter
-	// avoids spurious rejection when ringGen on this node has caught
-	// up to a fresher ring shape between Evaluate + the gRPC dial.
-	if cur := d.c.ringGen.Load(); cur > gen {
-		gen = cur
-	}
-	stream, err := cli.api.MigrateRange(ctx, &pb.RangeSpec{
-		PartitionIds:   partitionIDs,
-		RingGeneration: gen,
-	})
-	if err != nil {
-		return 0, fmt.Errorf("rebalance: open MigrateRange: %w", err)
-	}
-
-	// At R>1 every migrated value is an LWW Envelope (the identical
-	// bytes a replicated Put fans out), so the apply must route through
-	// applyEnvelopeIfNewer: a reconcile pull that arrives out of order
-	// relative to a live concurrent putReplicated loses the per-key
-	// Stamp compare and is a committed no-op, never a clobber (see
-	// docs/SPEC.md "LWW on write" + the v0.4 R>1 reconcile passage). At
-	// R<=1 there are no envelopes and no live cross-replica writers for
-	// the same partition, so the apply is the unchanged raw Put.
-	//
-	// Rollback (on a bad terminal CRC32 / count) Deletes the keys this
-	// stream landed. It must record ONLY the keys it actually wrote: a
-	// no-op apply-if-newer left a NEWER concurrent value in place, and
-	// deleting that key on rollback would clobber the newer write - the
-	// exact LWW violation apply-if-newer prevents. So under R>1 we add a
-	// key to the rollback set only when applyEnvelopeIfNewerReport says
-	// it applied. The raw R<=1 Put always writes, so it always records.
-	lww := d.c.replicationFactor() > 1
-
-	hasher := crc32.NewIEEE()
-	applied := make([][]byte, 0)
-	rollback := func() {
-		for _, k := range applied {
-			_ = d.c.backend.Delete(k)
-		}
-	}
-
-	count := 0
-	for {
-		msg, err := stream.Recv()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				// Source closed without a Done marker: treat as
-				// failure + roll back. A clean termination uses
-				// Done; an EOF before Done means the stream was
-				// interrupted.
-				rollback()
-				return 0, errors.New("rebalance: source EOF before MigrationDone")
-			}
-			rollback()
-			return 0, fmt.Errorf("rebalance: stream recv: %w", err)
-		}
-		switch body := msg.GetBody().(type) {
-		case *pb.MigrateChunk_Kv:
-			kv := body.Kv
-			wrote := true
-			var aerr error
-			if lww {
-				wrote, aerr = d.c.applyEnvelopeIfNewerReport(kv.GetKey(), kv.GetValue())
-			} else {
-				aerr = d.c.backend.Put(kv.GetKey(), kv.GetValue())
-			}
-			if aerr != nil {
-				rollback()
-				return 0, fmt.Errorf("rebalance: apply key: %w", aerr)
-			}
-			if wrote {
-				applied = append(applied, append([]byte(nil), kv.GetKey()...))
-			}
-			// The checksum + count are over the bytes the SOURCE streamed,
-			// independent of whether this node's apply-if-newer accepted
-			// each one. A no-op apply still counts toward the terminal
-			// total (the source sent it); the destination's CRC32 must
-			// match the source's CRC32 over the same wire bytes regardless
-			// of local LWW outcomes.
-			hasher.Write(kv.GetKey())
-			hasher.Write(kv.GetValue())
-			count++
-		case *pb.MigrateChunk_Done:
-			if uint64(count) != body.Done.GetTotalKeys() {
-				rollback()
-				return 0, fmt.Errorf("rebalance: count mismatch: got %d, source reported %d",
-					count, body.Done.GetTotalKeys())
-			}
-			got := hasher.Sum(nil)
-			want := body.Done.GetChecksum()
-			if len(want) > 0 && !bytes.Equal(got, want) {
-				rollback()
-				return 0, fmt.Errorf("rebalance: checksum mismatch: got %x, want %x", got, want)
-			}
-			return count, nil
-		default:
-			// Unknown oneof variant: defensive. Treat as protocol
-			// error + roll back.
-			rollback()
-			return 0, errors.New("rebalance: unknown chunk body")
-		}
-	}
-}
-
-// -- ProposeRebalance -------------------------------------------------
-
-// ProposeRebalance is the operator-facing planner / applier /
-// canceller, invoked by the `shale rebalance --dry-run | --apply |
-// --cancel` CLI subcommand via the ProposeRebalance gRPC method.
-//
-// Exactly one of dryRun / apply / cancel must be true.
-//
-//   - dryRun: compute the plan against the current ring + return it
-//     without executing.
-//   - apply:  Evaluate immediately (bypass the settle delay) +
-//     return the plan that was just queued.
-//   - cancel: stop in-flight migrations + return the plan we were
-//     working on (now aborted).
-//
-// Returns an error if invariants are violated (e.g. multiple flags
-// set, or called in single-node mode).
-func (c *Cluster) ProposeRebalance(dryRun, apply, cancel bool) ([]RebalanceItem, error) {
-	if c.closed.Load() {
-		return nil, errors.New("cluster: closed")
-	}
-	if c.rebalance.Load() == nil {
-		return nil, errors.New("cluster: rebalance not available in single-node mode")
-	}
-	flags := 0
-	if dryRun {
-		flags++
-	}
-	if apply {
-		flags++
-	}
-	if cancel {
-		flags++
-	}
-	if flags != 1 {
-		return nil, errors.New("cluster: ProposeRebalance requires exactly one of dryRun/apply/cancel")
-	}
-
-	switch {
-	case cancel:
-		if rb := c.rebalance.Load(); rb != nil {
-			rb.Stop()
-		}
-		// Replace the Coordinator so a subsequent ring change picks
-		// up a fresh state machine. The cancel call is a "stop
-		// everything in flight"; if the operator changes their mind
-		// they can trigger another --apply.
-		c.replaceCoordinator()
-		return c.snapshotRebalanceItems(), nil
-
-	case apply:
-		c.runEvaluateNow()
-		return c.snapshotRebalanceItems(), nil
-
-	default: // dryRun
-		return c.computeRebalanceItems(), nil
-	}
-}
-
-// RebalanceItem is one row of the operator-facing plan: which
-// partition would move, from whom to whom. The estimated key count
-// is best-effort: zero for receives (we don't have a count until the
-// stream completes) and the in-progress count for sends pulled from
-// the Coordinator snapshot.
-type RebalanceItem struct {
-	PartitionID       uint64
-	CurrentOwner      string
-	ProposedOwner     string
-	EstimatedKeyCount uint64
-}
-
-// computeRebalanceItems runs ComputePlan against the current ring +
-// returns the plan as operator-readable rows. Used by --dry-run.
-func (c *Cluster) computeRebalanceItems() []RebalanceItem {
-	current := c.snapshotRing()
-	c.settleMu.Lock()
-	old := c.lastEvalRing
-	c.settleMu.Unlock()
-	self := rebalance.Member{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}
-	plan := rebalance.ComputePlan(self, old, current, c.ringGen.Load())
-
-	out := make([]RebalanceItem, 0, len(plan.Sends)+len(plan.Receives))
-	for _, mv := range plan.Sends {
-		out = append(out, RebalanceItem{
-			PartitionID:   mv.PartitionID,
-			CurrentOwner:  mv.From.ID,
-			ProposedOwner: mv.To.ID,
-		})
-	}
-	for _, mv := range plan.Receives {
-		out = append(out, RebalanceItem{
-			PartitionID:   mv.PartitionID,
-			CurrentOwner:  mv.From.ID,
-			ProposedOwner: mv.To.ID,
-		})
-	}
-	return out
-}
-
-// snapshotRebalanceItems returns the Coordinator's current
-// per-range view as operator-readable rows. Used by --apply +
-// --cancel (both want to surface "this is what was queued / what was
-// in flight"). Sorted by partition id for stable iteration.
-func (c *Cluster) snapshotRebalanceItems() []RebalanceItem {
-	rb := c.rebalance.Load()
-	if rb == nil {
-		return nil
-	}
-	snap := rb.Snapshot()
-	out := make([]RebalanceItem, 0, len(snap))
-	for _, s := range snap {
-		out = append(out, RebalanceItem{
-			PartitionID:       s.PartitionID,
-			CurrentOwner:      s.From.ID,
-			ProposedOwner:     s.To.ID,
-			EstimatedKeyCount: uint64(s.KeyCount),
-		})
-	}
-	return out
-}
-
-// replaceCoordinator stops the existing Coordinator + creates a
-// fresh one bound to the same backend. Used by --cancel: callers
-// want the in-flight migrations gone, but they may still trigger
-// future Evaluates as the cluster topology evolves.
-func (c *Cluster) replaceCoordinator() {
-	self := rebalance.Member{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}
-	opts := rebalance.DefaultOptions()
-	opts.SettleDelay = c.settleDelay()
-	if c.cfg.RebalanceGraceDuration > 0 {
-		opts.GraceDuration = c.cfg.RebalanceGraceDuration
-	}
-	if c.cfg.RebalanceRetryAfterMs > 0 {
-		opts.RetryAfterMs = c.cfg.RebalanceRetryAfterMs
-	}
-	opts.Destination = &clusterDestination{c: c}
-	opts.ReplicationFactor = c.replicationFactor()
-	opts.ShardKeyFn = c.cfg.ShardKeyFn
-	opts.AwaitHandoffSignal = true
-	opts.HandoffTimeout = c.handoffTimeout()
-	c.rebalance.Store(rebalance.New(self, c.backend, opts))
-
-	// Reset the lastEvalRing baseline to the current ring so the
-	// next Evaluate sees the current shape as the steady state. The
-	// alternative ("keep the old lastEvalRing so the next Evaluate
-	// re-issues the plan we just cancelled") would defeat the
-	// purpose of --cancel.
-	c.settleMu.Lock()
-	c.lastEvalRing = c.snapshotRing()
-	c.settleMu.Unlock()
-}
-
-// MigrateRangeSource exposes the Coordinator's source for the
-// rpc.Server's MigrateRange handler to iterate. Returns the channel
-// pair from the underlying MigrateSource. Held in this file rather
-// than in cluster.go so the import of pkg/rebalance stays local to
-// the integration adapter.
-//
-// Stale-generation guard: per docs/SPEC.md "Wire", ring_generation
-// is per-node best-effort freshness, not a cluster-wide consistency
-// check. v0.3 uses per-node monotonic counters that diverge during
-// normal join/leave races (a node that joined later starts at 0 +
-// has fewer NotifyJoin events to count). Enforcing a strict <
-// comparison against the source's own counter spuriously rejects
-// mid-bootstrap streams even after the FetchRange path stamps the
-// dest's CURRENT ringGen on the wire. We accept the value as-is
-// + lean on the forwarding loop-guard + per-key migration guards
-// for the wrong-owner protection the spec ultimately calls for.
-// A real freshness check lands when the gossip layer carries a
-// cluster-wide generation (v0.4 or later).
-func (c *Cluster) MigrateRangeSource(partitionIDs []uint64, ringGen uint64) (<-chan rebalance.KeyValue, <-chan error, error) {
-	if c.rebalance.Load() == nil {
-		return nil, nil, status.Error(codes.FailedPrecondition,
-			"shale: rebalance not available in single-node mode")
-	}
-
-	// Use a freshly-built localSource bound to the local backend +
-	// the current ring's partition function. We don't reuse the
-	// Coordinator's auto-wired source because that source's
-	// partition function is pinned to the ring snapshot used at
-	// Evaluate time; the destination-asked partitions are talking
-	// about THIS source's current ring view.
-	//
-	// The partition function MUST apply c.shardKey first, so the keys
-	// this source streams for partition P are exactly the keys the ring
-	// routes to P (the destination asked for P because the ring assigns
-	// it; P's keys are those whose shardKey hashes into P). Computing on
-	// the raw key here would stream a different key set than the one the
-	// reconcile/handoff destination expects for P, stranding a
-	// multi-key subject's keys whenever the app uses a ShardKeyFn. This
-	// is the source-side half of the founder-grows multi-key fix.
-	partFn := func(k []byte) uint64 { return c.ring.PartitionID(c.shardKey(k)) }
-	source := rebalance.NewLocalSource(c.backend, partFn)
-	kvCh, errCh := source.OpenRange(partitionIDs, ringGen)
-	return kvCh, errCh, nil
-}
-
-// SignalMigrateRangeComplete is the gRPC handler's callback after a
-// MigrateRange stream returns. It threads the destination-observed
-// outcome (totalKeys + terminal err) back to the Coordinator so the
-// source-side runSend can flip Sending -> HandedOff only on a clean
-// completion. The handler in pkg/rpc/server.go calls this in a defer
-// with the stream's return value.
-//
-// One MigrateRange call may cover multiple partitions; the same
-// signal is delivered to each, so a partial-stream failure rolls
-// every partition in the call back to Done-with-error together.
-//
-// No-op in single-node mode (no Coordinator). Safe to call after
-// Close: the Coordinator's stop channel cuts pending waiters; this
-// just drops the signal.
-func (c *Cluster) SignalMigrateRangeComplete(partitionIDs []uint64, totalKeys int, err error) {
-	rb := c.rebalance.Load()
-	if rb == nil {
-		return
-	}
-	for _, pid := range partitionIDs {
-		rb.MarkSendComplete(pid, totalKeys, err)
-	}
-}
-
-// -- internals shared with cluster.go --------------------------------
-//
-// The fields below live on Cluster (see cluster.go). They are
-// referenced from this file via c.foo.
-
-// RingGeneration returns this node's current ring generation
-// counter. Exposed for the rpc.Server's MigrateRange handler +
-// for observability tooling.
+// RingGeneration returns this node's current ring generation counter.
+// Exposed for observability tooling.
 func (c *Cluster) RingGeneration() uint64 { return c.ringGen.Load() }
-
-// RebalanceSnapshot returns the Coordinator's full per-range view
-// (every partition the Coordinator has ever tracked, with its
-// current State). Exposed for observability tooling + tests.
-// Returns nil in single-node mode.
-func (c *Cluster) RebalanceSnapshot() []rebalance.RangeStatus {
-	rb := c.rebalance.Load()
-	if rb == nil {
-		return nil
-	}
-	return rb.Snapshot()
-}

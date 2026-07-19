@@ -61,11 +61,11 @@ func keyOwnedBy(t *testing.T, c *cluster.Cluster, wantOwner string, maxProbes in
 func ownerBackendGet(t *testing.T, f *twoNodeFixture, key string) ([]byte, bool) {
 	t.Helper()
 	owner := ownerOf(f.N1.Cluster, key)
-	var be = f.N1.Backend
+	var node = f.N1
 	if owner == "n2" {
-		be = f.N2.Backend
+		node = f.N2
 	}
-	v, err := be.Get([]byte(key))
+	v, err := node.physicalGet([]byte(key))
 	if errors.Is(err, backend.ErrNotFound) {
 		return nil, false
 	}
@@ -106,7 +106,7 @@ func TestCAS_RemoteCommit_DurableOnOwner(t *testing.T) {
 		t.Fatalf("owner backend (N2): want remote-v present, got %q ok=%v", v, ok)
 	}
 	// (b) Did NOT leak onto N1's physical backend.
-	if v, err := f.N1.Backend.Get([]byte(remoteKey)); !errors.Is(err, backend.ErrNotFound) {
+	if v, err := f.N1.physicalGet([]byte(remoteKey)); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("originator backend (N1): want absent, got %q err=%v", v, err)
 	}
 	// (c) Routable from N1 via a normal Get.
@@ -377,10 +377,10 @@ func TestCAS_LocalPath_NoRegression(t *testing.T) {
 	}
 	// Durable on N1's physical backend (the local fast-path target), NOT
 	// on N2's.
-	if v, err := f.N1.Backend.Get([]byte(localKey)); err != nil || !bytes.Equal(v, []byte("local-v")) {
+	if v, err := f.N1.physicalGet([]byte(localKey)); err != nil || !bytes.Equal(v, []byte("local-v")) {
 		t.Fatalf("N1 backend after local commit: want local-v, got %q err=%v", v, err)
 	}
-	if _, err := f.N2.Backend.Get([]byte(localKey)); !errors.Is(err, backend.ErrNotFound) {
+	if _, err := f.N2.physicalGet([]byte(localKey)); !errors.Is(err, backend.ErrNotFound) {
 		t.Fatalf("N2 backend after local commit: want absent, got err=%v", err)
 	}
 }

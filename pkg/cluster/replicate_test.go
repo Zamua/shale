@@ -212,7 +212,6 @@ func startThreeNodeReplicatedCluster(t *testing.T, replicationFactor int, wc clu
 			// the 30s production grace default before WaitForRebalanceIdle clears,
 			// making every R>1 test in this helper take ~40s. The grace only needs
 			// to outlast the (empty) bootstrap handoff here.
-			RebalanceGraceDuration: 1500 * time.Millisecond,
 		}
 		if i > 0 {
 			cfg.Seeds = []string{hostPort(bindPorts[0])}

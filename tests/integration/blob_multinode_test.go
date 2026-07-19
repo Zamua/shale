@@ -56,15 +56,13 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 	serveDone := make(chan struct{})
 
 	cfg := cluster.Config{
-		NodeID:                  id,
-		Backend:                 memory.New(),
-		BlobStore:               store,
-		GRPCAddr:                grpcAddr,
-		LogOutput:               io.Discard,
-		RebalanceSettleDelay:    500 * time.Millisecond,
-		RebalanceGraceDuration:  3 * time.Second,
-		RebalanceHandoffTimeout: 4 * time.Second,
-		ReplicationFactor:       1,
+		NodeID:               id,
+		Backend:              memory.New(),
+		BlobStore:            store,
+		GRPCAddr:             grpcAddr,
+		LogOutput:            io.Discard,
+		RebalanceSettleDelay: 500 * time.Millisecond,
+		ReplicationFactor:    1,
 	}
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}

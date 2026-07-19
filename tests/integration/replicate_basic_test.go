@@ -62,7 +62,7 @@ func TestReplicate_R2_KeyLandsOnBothReplicas(t *testing.T) {
 			if !ok {
 				t.Fatalf("unknown replica node %s", rep.ID)
 			}
-			raw, err := nd.Backend.Get(key)
+			raw, err := nd.physicalGet(key)
 			if err != nil {
 				t.Fatalf("replica %s missing key %s: %v", rep.ID, key, err)
 			}
@@ -82,7 +82,7 @@ func TestReplicate_R2_KeyLandsOnBothReplicas(t *testing.T) {
 			if nd.ID == replicas[0].ID || nd.ID == replicas[1].ID {
 				continue
 			}
-			if _, err := nd.Backend.Get(key); err == nil {
+			if _, err := nd.physicalGet(key); err == nil {
 				t.Errorf("non-replica %s unexpectedly holds key %s", nd.ID, key)
 			}
 		}

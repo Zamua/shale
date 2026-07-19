@@ -44,16 +44,13 @@
 package main
 
 import (
-	"context"
 	"crypto/rand"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
-	"net"
 	"os"
 	"slices"
-	"strconv"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -62,8 +59,6 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/rpc"
-	"google.golang.org/grpc"
 )
 
 func main() {
@@ -193,16 +188,15 @@ Flags:
 		return 2
 	}
 	if *mode == "cluster" {
-		if *nodes < 1 {
-			_, _ = fmt.Fprintf(stderr, "shale-bench: --nodes must be >= 1\n")
-			return 2
-		}
-		if *rf < 1 {
-			_, _ = fmt.Fprintf(stderr, "shale-bench: --rf must be >= 1\n")
-			return 2
-		}
-		if *rf > *nodes {
-			_, _ = fmt.Fprintf(stderr, "shale-bench: --rf (%d) must be <= --nodes (%d)\n", *rf, *nodes)
+		// The harness measures the cluster layer's cost over ONE embedded
+		// backend, so it runs a single node. Multi-node scenarios used to
+		// run over Config.Backend + a bind address, which is the retired
+		// per-node coordination model; a multi-node cluster is now
+		// multi-backend and needs a fencing-capable BackendFactory, which
+		// neither of this harness's backends (memory, pebble) can provide.
+		if *nodes != 1 || *rf != 1 {
+			_, _ = fmt.Fprintf(stderr, "shale-bench: --mode=cluster is single-node (--nodes=1 --rf=1); "+
+				"multi-node requires a BackendFactory-capable backend, which this harness does not wire\n")
 			return 2
 		}
 	}
@@ -399,30 +393,25 @@ var makeSlateWriteOptions = func(_ bool) any { return nil }
 // builtCluster captures the state we have to tear down at end of run.
 type builtCluster struct {
 	clusters []*cluster.Cluster
-	servers  []*grpc.Server
 	backends []backend.Backend
-	doneChs  []chan struct{}
 }
 
-// buildCluster spins up sc.Nodes shale nodes in-process, joins them
-// over loopback memberlist, waits for ring convergence, and returns
-// the head node wrapped in a putGetter. The bench loop drives only
-// the head; gRPC forwarding handles owner-routing for the other nodes.
-// All cleanup is bundled into the returned func so callers don't have
-// to think about teardown order (gRPC GracefulStop -> Cluster.Close
-// -> Backend.Close).
+// buildCluster spins up ONE shale node in-process over the scenario's
+// backend and returns it wrapped in a putGetter, so the bench measures
+// what the cluster layer costs on top of the raw backend.
+//
+// Single-node by construction: no memberlist, no ring, no gRPC. A
+// multi-node bench would need a BackendFactory (the only distributed model
+// shale has is the unit lease handoff, and that requires opening a unit and
+// fencing the prior writer); memory and pebble cannot satisfy that, and
+// wiring the one backend that can (slate) would put MinIO on the critical
+// path of every run, which this harness deliberately avoids.
 func buildCluster(sc scenario, _ io.Writer) (putGetter, func(), error) {
-	if sc.Nodes < 1 {
-		return nil, nil, fmt.Errorf("nodes must be >= 1")
+	if sc.Nodes != 1 || sc.R != 1 {
+		return nil, nil, fmt.Errorf("cluster mode is single-node (nodes=1, rf=1); got nodes=%d rf=%d", sc.Nodes, sc.R)
 	}
 	bc := &builtCluster{}
 	cleanup := func() {
-		for _, s := range bc.servers {
-			s.GracefulStop()
-		}
-		for _, ch := range bc.doneChs {
-			<-ch
-		}
 		for _, c := range bc.clusters {
 			_ = c.Close()
 		}
@@ -431,166 +420,24 @@ func buildCluster(sc scenario, _ io.Writer) (putGetter, func(), error) {
 		}
 	}
 
-	wc := cluster.WriteQuorum
-	rc := cluster.ReadNearest
-	if sc.R == 1 {
-		// With one replica there's no quorum to wait for; force the
-		// "one ack" path so the cluster-with-R=1 scenarios isolate the
-		// gRPC + ring + routing cost from any replication accounting.
-		wc = cluster.WriteOne
+	be, err := openBackend(sc.Backend, sc.PebbleDir, "n1")
+	if err != nil {
+		return nil, nil, err
 	}
-	if sc.R > 1 {
-		// At R>1 the only realistic read pattern is ReadQuorum: a
-		// Put returns once floor(R/2)+1 replicas have acked, so the
-		// laggard replica may still be missing the key when a Get
-		// arrives milliseconds later. ReadNearest would route that
-		// Get to the primary (which may BE the laggard if the quorum
-		// was "two non-primary replicas"), and the bench would race
-		// against "key not found". This is the same intermediate-
-		// state hole the v0.4 spec calls out for read-your-writes
-		// under R>1; ReadQuorum + LWW closes it at the cost of one
-		// extra fan-out per Get.
-		rc = cluster.ReadQuorum
-	}
+	bc.backends = append(bc.backends, be)
 
-	seedAddr := ""
-	for i := 0; i < sc.Nodes; i++ {
-		id := fmt.Sprintf("n%d", i+1)
-		be, err := openBackend(sc.Backend, sc.PebbleDir, id)
-		if err != nil {
-			cleanup()
-			return nil, nil, err
-		}
-		bc.backends = append(bc.backends, be)
-
-		bindPort, err := freePort()
-		if err != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("freePort (memberlist): %w", err)
-		}
-		bindAddr := "127.0.0.1:" + strconv.Itoa(bindPort)
-
-		// gRPC: reserve the listener BEFORE Cluster.Open so the
-		// GRPCAddr we publish to peers matches the actually-bound port.
-		lis, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("listen gRPC: %w", err)
-		}
-		grpcAddr := lis.Addr().String()
-
-		cfg := cluster.Config{
-			NodeID:                  id,
-			Backend:                 be,
-			BindAddr:                bindAddr,
-			GRPCAddr:                grpcAddr,
-			LogOutput:               io.Discard,
-			ReplicationFactor:       sc.R,
-			WriteConsistency:        wc,
-			ReadConsistency:         rc,
-			RebalanceSettleDelay:    500 * time.Millisecond,
-			RebalanceGraceDuration:  3 * time.Second,
-			RebalanceHandoffTimeout: 4 * time.Second,
-		}
-		if seedAddr != "" {
-			cfg.Seeds = []string{seedAddr}
-		}
-
-		c, err := cluster.Open(cfg)
-		if err != nil {
-			_ = lis.Close()
-			cleanup()
-			return nil, nil, fmt.Errorf("cluster.Open(%s): %w", id, err)
-		}
-		bc.clusters = append(bc.clusters, c)
-
-		srv := grpc.NewServer()
-		rpc.NewServer(c).Register(srv)
-		done := make(chan struct{})
-		go func() {
-			defer close(done)
-			_ = srv.Serve(lis)
-		}()
-		bc.servers = append(bc.servers, srv)
-		bc.doneChs = append(bc.doneChs, done)
-
-		if i == 0 {
-			seedAddr = bindAddr
-		}
-	}
-
-	// Ring convergence: every node has to see every peer before the
-	// bench starts hitting Put/Get, otherwise the first batch routes
-	// against a stale ring + the latency tail spikes for reasons that
-	// aren't really part of the steady-state we're measuring.
-	if err := waitForMembers(bc.clusters, sc.Nodes, 15*time.Second); err != nil {
+	c, err := cluster.Open(cluster.Config{
+		NodeID:    "n1",
+		Backend:   be,
+		LogOutput: io.Discard,
+	})
+	if err != nil {
 		cleanup()
-		return nil, nil, fmt.Errorf("ring convergence: %w", err)
+		return nil, nil, fmt.Errorf("cluster.Open(n1): %w", err)
 	}
-	// Sleep past the rebalance Coordinator's settle-delay debounce
-	// (500ms in this fixture; matches integration tests). If we call
-	// WaitForRebalanceIdle BEFORE the Evaluate timer has fired, the
-	// Coordinator has nothing pending + returns idle immediately --
-	// then the bootstrap Evaluate fires while the bench is already
-	// putting, and the migration-guard ResourceExhausted's start
-	// landing as "transient" replica errors that get counted out of
-	// the ack budget. See tests/integration/helpers_test.go
-	// waitForClusterReady for the same gate; this code mirrors it.
-	time.Sleep(700 * time.Millisecond)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-	for _, c := range bc.clusters {
-		if err := c.WaitForRebalanceIdle(ctx); err != nil {
-			cleanup()
-			return nil, nil, fmt.Errorf("rebalance idle (%s): %w", c.NodeID(), err)
-		}
-	}
-	// Post-idle drain: lets any async side effects (sweep ticks,
-	// ring-rebuild fan-outs, peer client cache invalidations) settle
-	// before the bench starts writing. 100ms is well under any
-	// measurement budget but consistently clears the post-idle backlog.
-	time.Sleep(100 * time.Millisecond)
+	bc.clusters = append(bc.clusters, c)
 
 	return &clusterAdapter{c: bc.clusters[0]}, cleanup, nil
-}
-
-// waitForMembers polls every cluster until each reports `want` members
-// or the deadline fires.
-func waitForMembers(cs []*cluster.Cluster, want int, timeout time.Duration) error {
-	deadline := time.Now().Add(timeout)
-	for time.Now().Before(deadline) {
-		allOK := true
-		for _, c := range cs {
-			if len(c.Members()) != want {
-				allOK = false
-				break
-			}
-		}
-		if allOK {
-			return nil
-		}
-		time.Sleep(50 * time.Millisecond)
-	}
-	sizes := make([]int, len(cs))
-	for i, c := range cs {
-		sizes[i] = len(c.Members())
-	}
-	return fmt.Errorf("nodes did not converge to %d members; got sizes=%v", want, sizes)
-}
-
-// freePort grabs an OS-assigned ephemeral TCP port and releases the
-// listener so the caller can bind it. The race between release + rebind
-// is harmless under loopback.
-func freePort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	if err := l.Close(); err != nil {
-		return 0, err
-	}
-	return port, nil
 }
 
 // runPhase issues exactly `total` operations with `concurrency` workers,

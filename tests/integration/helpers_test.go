@@ -13,6 +13,7 @@ package integration
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -22,11 +23,12 @@ import (
 
 	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/internal/goleakignore"
-	"github.com/Zamua/shale/pkg/backend/memory"
+	"github.com/Zamua/shale/internal/memfactory"
+	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"go.uber.org/goleak"
 	"google.golang.org/grpc"
 )
@@ -46,18 +48,9 @@ import (
 // flicker on a fast CI box.
 //
 // This file is helpers_test.go (not helpers.go) because TestMain is
-// only honored in _test.go files; an earlier helpers.go landed the
-// setter where go test silently ignored it, leaving every sweep
-// running at the 10s production interval + masking timing bugs in
-// rebalance tests. Renaming the file fixes that without changing
-// content (testNode + friends are test-only anyway).
+// only honored in _test.go files (testNode + friends are test-only
+// anyway).
 func TestMain(m *testing.M) {
-	rebalance.SetSweepInterval(50 * time.Millisecond)
-	// Shorten the handed-off-range grace binary-wide so fixtures that do not set
-	// their own RebalanceGraceDuration do not eat the 30s production default on
-	// bootstrap (the same speedup pkg/cluster's init applies). Fixtures that DO
-	// set grace are unaffected; production never calls this setter.
-	rebalance.SetDefaultGraceDuration(500 * time.Millisecond)
 	// Share the ONE canonical ignore set with pkg/cluster's TestMain via
 	// internal/goleakignore so the two lists can never drift. The drift
 	// this closes was real: the integration list used to be a hand-copied
@@ -69,20 +62,88 @@ func TestMain(m *testing.M) {
 	goleak.VerifyTestMain(m, goleakignore.Options()...)
 }
 
+// defaultTestUnitCount is the unit count every shared multi-node fixture
+// opens with. 8 units over 2-3 nodes gives each node several units, so a
+// membership change actually moves some without emptying anyone.
+const defaultTestUnitCount = 8
+
 // testNode is the bundle of state behind one node in an integration
-// fixture: the cluster handle the test drives, the in-memory backend
-// the test peers at to confirm physical placement, and the gRPC server
-// that other nodes forward requests to. Tests almost always interact
-// via the Cluster; the backend handle is escape-hatch only.
+// fixture: the cluster handle the test drives, the unit factory the test
+// peers at to confirm physical placement, and the gRPC server that other
+// nodes forward requests to. Tests almost always interact via the
+// Cluster; the factory handle is escape-hatch only.
+//
+// Every multi-node fixture is multi-backend, because that is the only
+// distributed model shale has: a key lives in a storage UNIT, and the
+// factory is what opens units. "What does this node physically hold" is
+// therefore a question about its MOUNTED UNITS, which is what
+// physicalGet / physicalKeyCount answer.
 type testNode struct {
 	ID       string
 	Cluster  *cluster.Cluster
-	Backend  *memory.Memory
+	Factory  *memfactory.Factory
 	BindAddr string
 	GRPCAddr string
 
 	stop       func()
 	grpcServer *grpc.Server
+}
+
+// physicalGet reads key from whichever of this node's OPEN units holds
+// it, bypassing all routing. It is the multi-backend spelling of "peek
+// under the cluster layer at this node's own bytes": a miss means no
+// unit this node has mounted holds the key.
+func (n *testNode) physicalGet(key []byte) ([]byte, error) {
+	for _, gu := range n.Factory.OpenUnits() {
+		be, ok := n.Factory.UnitBackend(gu)
+		if !ok {
+			continue
+		}
+		v, err := be.Get(key)
+		if err == nil {
+			return v, nil
+		}
+		if !errors.Is(err, backend.ErrNotFound) {
+			return nil, err
+		}
+	}
+	return nil, backend.ErrNotFound
+}
+
+// physicalKeyCount totals the keys across every unit this node has open.
+func (n *testNode) physicalKeyCount(t *testing.T) int {
+	t.Helper()
+	return n.physicalKeyCountPrefix(t, nil)
+}
+
+// physicalKeyCountPrefix totals the keys under prefix across every unit
+// this node has open. A nil prefix counts everything.
+func (n *testNode) physicalKeyCountPrefix(t *testing.T, prefix []byte) int {
+	t.Helper()
+	total := 0
+	for _, gu := range n.Factory.OpenUnits() {
+		be, ok := n.Factory.UnitBackend(gu)
+		if !ok {
+			continue
+		}
+		it, err := be.ScanPrefix(prefix)
+		if err != nil {
+			t.Fatalf("scan unit %v on %s: %v", gu, n.ID, err)
+		}
+		for {
+			k, _, err := it.Next()
+			if err != nil {
+				_ = it.Close()
+				t.Fatalf("scan next unit %v on %s: %v", gu, n.ID, err)
+			}
+			if k == nil {
+				break
+			}
+			total++
+		}
+		_ = it.Close()
+	}
+	return total
 }
 
 // Close tears the node down: shuts the gRPC server, closes the cluster
@@ -113,101 +174,6 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 	return startTestNodeWithReplication(t, id, seedAddr, 1, 0, 0)
 }
 
-// startBlockedDestTestNode brings up a node identical to startTestNode
-// but with TestingBlockPeerDials enabled BEFORE Open returns. The block
-// has to be in place before the bootstrap Evaluate (which runs inline
-// inside Open for any joiner with visible peers) so the destination's
-// FetchRange goroutines hit the closed-fd path on their very first
-// clientFor call. Used by the destination-crash failure tests to make
-// the wired-handoff assertion robust to fast loopbacks: post-Open
-// setters race the FetchRange goroutines and let some streams complete
-// before the block engages.
-func startBlockedDestTestNode(t *testing.T, id, seedAddr string) *testNode {
-	t.Helper()
-	return startSeamTestNode(t, id, seedAddr, func(cfg *cluster.Config) {
-		cfg.TestingBlockPeerDials = true
-	})
-}
-
-// startGatedDestTestNode brings up a node identical to startTestNode but
-// with TestingReceiveGate wired BEFORE Open returns, so every
-// destination-side FetchRange parks until the caller closes gate. The
-// range is already registered StateReceiving by then, so the receive
-// window stays open for exactly as long as the test holds the gate.
-//
-// Same construction-time requirement as startBlockedDestTestNode: the
-// bootstrap Evaluate runs inline inside Open and launches the
-// FetchRange goroutines immediately, so a post-Open setter would race
-// them. Callers MUST arrange to close the gate on every exit path
-// (defer a release closure BEFORE starting the node) so a failing
-// assertion cannot wedge teardown.
-func startGatedDestTestNode(t *testing.T, id, seedAddr string, gate <-chan struct{}) *testNode {
-	t.Helper()
-	return startSeamTestNode(t, id, seedAddr, func(cfg *cluster.Config) {
-		cfg.TestingReceiveGate = gate
-	})
-}
-
-// startSeamTestNode is the shared body behind the Testing*-seam node
-// fixtures: startTestNode's setup with one hook, so a caller can flip a
-// test-only Config seam that MUST be set at construction time. Kept as
-// one function rather than a copy per seam so the fixture tunables
-// (settle delay, grace, handoff timeout) cannot drift between them.
-func startSeamTestNode(t *testing.T, id, seedAddr string, seam func(*cluster.Config)) *testNode {
-	t.Helper()
-
-	mem := memory.New()
-
-	lis, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("startSeamTestNode %s: listen gRPC: %v", id, err)
-	}
-	grpcAddr := lis.Addr().String()
-	grpcSrv := grpc.NewServer()
-	serveDone := make(chan struct{})
-
-	cfg := cluster.Config{
-		NodeID:                  id,
-		Backend:                 mem,
-		GRPCAddr:                grpcAddr,
-		LogOutput:               io.Discard,
-		RebalanceSettleDelay:    500 * time.Millisecond,
-		RebalanceGraceDuration:  3 * time.Second,
-		RebalanceHandoffTimeout: 4 * time.Second,
-		ReplicationFactor:       1,
-	}
-	seam(&cfg)
-	if seedAddr != "" {
-		cfg.Seeds = []string{seedAddr}
-	}
-
-	// openClusterRetryBind sets cfg.BindAddr (re-rolling a fresh port and
-	// retrying if memberlist hits the release-rebind port race) and returns
-	// the address actually bound, which the node advertises as its seed.
-	c, bindAddr := openClusterRetryBind(t, cfg)
-
-	rpc.NewServer(c).Register(grpcSrv)
-	go func() {
-		defer close(serveDone)
-		_ = grpcSrv.Serve(lis)
-	}()
-
-	n := &testNode{
-		ID:         id,
-		Cluster:    c,
-		Backend:    mem,
-		BindAddr:   bindAddr,
-		GRPCAddr:   grpcAddr,
-		grpcServer: grpcSrv,
-		stop: func() {
-			grpcSrv.GracefulStop()
-			<-serveDone
-		},
-	}
-	t.Cleanup(n.Close)
-	return n
-}
-
 // startTestNodeWithReplication is the replication-aware variant. R=1
 // + zero-valued consistency knobs reproduce startTestNode exactly (the
 // Cluster's normalizeConfig fills in WriteQuorum + ReadNearest at
@@ -216,7 +182,7 @@ func startSeamTestNode(t *testing.T, id, seedAddr string, seam func(*cluster.Con
 func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replicationFactor int, wc cluster.WriteConsistency, rc cluster.ReadConsistency) *testNode {
 	t.Helper()
 
-	mem := memory.New()
+	fac := memfactory.New()
 
 	// The gRPC listener has to exist BEFORE cluster.Open so we know the
 	// address to advertise via memberlist Meta. Same two-phase pattern
@@ -230,27 +196,19 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	serveDone := make(chan struct{})
 
 	cfg := cluster.Config{
-		NodeID:    id,
-		Backend:   mem,
-		GRPCAddr:  grpcAddr,
-		LogOutput: io.Discard,
-		// Shrunken rebalance tunables: keep integration tests
-		// snappy without changing protocol semantics. Settle delay
-		// is short so the eval kicks fast on membership changes;
-		// grace is long enough for the destination's pull to
-		// complete (a few hundred keys over loopback gRPC), then
-		// the sweep fires + the post-test assertions see clean
-		// per-node ownership. HandoffTimeout shrunk from the
-		// 5-minute default so the failure-mode test that wedges a
-		// source-side runSend (destination never asks) fails fast
-		// + the integration suite stays under its wall-clock
-		// budget; production keeps the wide default.
-		RebalanceSettleDelay:    500 * time.Millisecond,
-		RebalanceGraceDuration:  3 * time.Second,
-		RebalanceHandoffTimeout: 4 * time.Second,
-		ReplicationFactor:       replicationFactor,
-		WriteConsistency:        wc,
-		ReadConsistency:         rc,
+		NodeID:         id,
+		BackendFactory: fac,
+		UnitCount:      storageunit.MustUnitCount(defaultTestUnitCount),
+		GRPCAddr:       grpcAddr,
+		LogOutput:      io.Discard,
+		// Shrunken settle delay keeps integration tests snappy without
+		// changing protocol semantics: the unit reconcile kicks fast on
+		// a membership change instead of waiting the 5s production
+		// debounce.
+		RebalanceSettleDelay: 500 * time.Millisecond,
+		ReplicationFactor:    replicationFactor,
+		WriteConsistency:     wc,
+		ReadConsistency:      rc,
 	}
 	if seedAddr != "" {
 		cfg.Seeds = []string{seedAddr}
@@ -270,7 +228,7 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	n := &testNode{
 		ID:         id,
 		Cluster:    c,
-		Backend:    mem,
+		Factory:    fac,
 		BindAddr:   bindAddr,
 		GRPCAddr:   grpcAddr,
 		grpcServer: grpcSrv,

@@ -78,21 +78,7 @@ func TestThreeNode_PutGetForwarding(t *testing.T) {
 	// "across-the-cluster" guarantee, so assert the spread here.
 	totals := make(map[string]int)
 	for _, n := range f.Nodes() {
-		it, err := n.Backend.ScanPrefix(nil)
-		if err != nil {
-			t.Fatalf("backend scan on %s: %v", n.ID, err)
-		}
-		for {
-			k, _, err := it.Next()
-			if err != nil {
-				t.Fatalf("backend scan next on %s: %v", n.ID, err)
-			}
-			if k == nil {
-				break
-			}
-			totals[n.ID]++
-		}
-		_ = it.Close()
+		totals[n.ID] = n.physicalKeyCount(t)
 	}
 	if len(totals) < 2 {
 		t.Fatalf("expected at least two nodes to hold keys, got distribution=%v", totals)
@@ -128,22 +114,7 @@ func TestThreeNode_HashTagLocality(t *testing.T) {
 	// Count via each backend directly. All n keys should be on the
 	// expected owner; zero on the others.
 	for _, node := range f.Nodes() {
-		it, err := node.Backend.ScanPrefix([]byte("{" + tag + "}/"))
-		if err != nil {
-			t.Fatalf("backend scan on %s: %v", node.ID, err)
-		}
-		count := 0
-		for {
-			k, _, err := it.Next()
-			if err != nil {
-				t.Fatalf("backend scan next on %s: %v", node.ID, err)
-			}
-			if k == nil {
-				break
-			}
-			count++
-		}
-		_ = it.Close()
+		count := node.physicalKeyCountPrefix(t, []byte("{"+tag+"}/"))
 
 		want := 0
 		if node.ID == expectedOwner {
