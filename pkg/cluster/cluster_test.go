@@ -196,14 +196,9 @@ func (h *grpcHarness) register(c *cluster.Cluster) {
 	h.started = true
 }
 
-// waitForWriteReady, isTransientWarmupErr and waitForRingSize delegate
-// to the shared harness package so this tree and the integration tree
-// gate on identical readiness semantics. See internal/clustertest.
-func waitForWriteReady(t *testing.T, clusters []*cluster.Cluster, deadline time.Duration) {
-	t.Helper()
-	clustertest.WaitForWriteReady(t, clusters, deadline)
-}
-
+// waitForRingSize delegates to the shared harness package so this tree
+// and the integration tree gate on identical readiness semantics. See
+// internal/clustertest.
 func waitForRingSize(c *cluster.Cluster, want int, timeout time.Duration) error {
 	return clustertest.WaitForRingSize(c, want, timeout)
 }

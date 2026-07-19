@@ -28,9 +28,6 @@ package cluster
 import (
 	"context"
 	"time"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // defaultSettleDelay is the rebalance debounce. Exposed as a var so
@@ -90,37 +87,6 @@ func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
-}
-
-// migrationGuardError builds the error returned to a Put/Delete that
-// lands on a unit currently mid-handoff. Carries codes.ResourceExhausted
-// + a retry-after-ms hint per docs/SPEC.md "Cutover" so clients know the
-// failure is transient + how long to back off.
-//
-// Three reserved codes carry distinct retry semantics and must not be
-// conflated:
-//
-//   - ResourceExhausted: in-flight handoff. Retry after the hinted
-//     backoff; the unit is moving and the next attempt may land on a
-//     different owner.
-//   - FailedPrecondition: forwarding loop-guard (docs/SPEC.md
-//     "Failure handling"). The receiving node disagrees with the
-//     originator about ownership; client must refresh ring + retry.
-//   - Unavailable: a peer's gRPC channel is gone (server killed,
-//     connection refused, deadline canceled). The replica counts
-//     against the fanout's failure budget so a genuinely-down node
-//     short-circuits the call rather than blocking for every peer.
-//
-// Handoff rejections must be distinguishable from a real down peer so
-// isTransientReplicaErr can treat them differently: handoff responses do
-// NOT count against the failure budget, so the fanout keeps waiting on
-// other replicas instead of failing the whole call when a single replica
-// is mid-handoff. Conversely, Unavailable from a dead peer MUST count, so
-// (R - W + 1) such failures fail-fast instead of waiting for every
-// replica's transport timeout.
-func migrationGuardError(retryAfterMs int) error {
-	return status.Errorf(codes.ResourceExhausted,
-		"shale: key is migrating out; retry after %dms", retryAfterMs)
 }
 
 // retryAfterMs reads the configured retry-after hint, defaulting to 50ms.
