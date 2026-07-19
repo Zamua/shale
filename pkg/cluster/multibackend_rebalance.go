@@ -187,7 +187,7 @@ func (c *Cluster) runReconcile() {
 // running concurrently could release those mid-bisect. mountMap mutations
 // inside acquireUnit / releaseUnit take mountMu.
 func (c *Cluster) reconcileUnits() {
-	if c.replicaFactory != nil {
+	if c.replicaLayout() {
 		// v0.9 decentralized online reshard: when an Arbiter is wired (opt-in via
 		// ConditionalStore), drive this node's share of any in-flight split FIRST -
 		// enter/finalize the generation, copy owned parents into their children,
@@ -299,7 +299,7 @@ func (c *Cluster) reconcileUnits() {
 // Caller MUST hold reconcileMu. mountMap mutation takes mountMu.
 func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 	epoch := c.nextEpochFor(gu)
-	b, err := c.factory.OpenUnit(gu, epoch)
+	b, _, err := c.factory.OpenUnit(storageunit.SoleMount(gu), epoch)
 	if err != nil {
 		// Leaving gu unmounted is safe: routed ops get the retryable
 		// acquiring-window error and the next reconcile retries. Do not
@@ -317,7 +317,7 @@ func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 		// this freshly-opened backend past shutdown (and risk a write after
 		// Close). Release it instead of mounting.
 		c.mountMu.Unlock()
-		_ = c.factory.CloseUnit(gu)
+		_ = c.factory.CloseUnit(storageunit.SoleMount(gu))
 		return
 	}
 	c.storeMount(replica0(gu), b)
@@ -345,7 +345,7 @@ func (c *Cluster) releaseUnit(gu storageunit.GenUnit) {
 	// CloseUnit is idempotent + best-effort: a close error does not change
 	// ownership (the ring already moved gu off this node), and the new
 	// owner's higher-epoch open fences any writer this close failed to stop.
-	_ = c.factory.CloseUnit(gu)
+	_ = c.factory.CloseUnit(storageunit.SoleMount(gu))
 }
 
 // nextEpochFor computes the INTENDED epoch to open gu at: one above the
@@ -357,7 +357,7 @@ func (c *Cluster) releaseUnit(gu storageunit.GenUnit) {
 // of truth, which is exactly why the factory - not this function - performs
 // the real fence.
 func (c *Cluster) nextEpochFor(gu storageunit.GenUnit) storageunit.Epoch {
-	if cur, ok := c.factory.CurrentEpoch(gu); ok {
+	if cur, ok := c.factory.CurrentEpoch(storageunit.SoleMount(gu)); ok {
 		return cur + 1
 	}
 	return acquireBaseEpoch

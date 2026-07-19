@@ -114,11 +114,11 @@ func nodeMountsExpectedGen1(t *testing.T, n *sharedNode, members []ring.Member, 
 	if !waitUntil(12*time.Second, func() bool {
 		open := n.Handle.OpenUnits()
 		got := make(map[storageunit.UnitID]struct{})
-		for _, gu := range open {
-			if gu.Gen != 1 {
+		for _, m := range open {
+			if m.Unit().Gen != 1 {
 				return false // a gen-0 unit still mounted: not settled / not retired
 			}
-			got[gu.ID] = struct{}{}
+			got[m.Unit().ID] = struct{}{}
 		}
 		if len(got) != len(expected) {
 			return false

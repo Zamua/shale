@@ -12,12 +12,13 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/clustertest"
+	"github.com/Zamua/shale/internal/memfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 )
 
@@ -70,43 +71,13 @@ func TestClosed(t *testing.T) {
 // owns the key, only that the routing decision is correct + the data
 // crosses the gRPC boundary when it has to.
 func TestTwoNode_PutRoutesToOwner(t *testing.T) {
-	n1Mem := memory.New()
-	n2Mem := memory.New()
+	n1Bind := hostPort(freePort(t))
+	n2Bind := hostPort(freePort(t))
 
-	n1MemberPort := freePort(t)
-	n2MemberPort := freePort(t)
-
-	n1GRPC, n1stop := startGRPC(t)
-	defer n1stop()
-	n2GRPC, n2stop := startGRPC(t)
-	defer n2stop()
-
-	c1, err := cluster.Open(cluster.Config{
-		NodeID:    "n1",
-		Backend:   n1Mem,
-		BindAddr:  hostPort(n1MemberPort),
-		GRPCAddr:  n1GRPC.addr,
-		LogOutput: io.Discard,
-	})
-	if err != nil {
-		t.Fatalf("open n1: %v", err)
-	}
-	defer func() { _ = c1.Close() }()
-	n1GRPC.register(c1)
-
-	c2, err := cluster.Open(cluster.Config{
-		NodeID:    "n2",
-		Backend:   n2Mem,
-		BindAddr:  hostPort(n2MemberPort),
-		GRPCAddr:  n2GRPC.addr,
-		Seeds:     []string{hostPort(n1MemberPort)},
-		LogOutput: io.Discard,
-	})
-	if err != nil {
-		t.Fatalf("open n2: %v", err)
-	}
-	defer func() { _ = c2.Close() }()
-	n2GRPC.register(c2)
+	c1, stop1 := openMultiBackendNodeAt(t, "n1", n1Bind, "")
+	defer stop1()
+	c2, stop2 := openMultiBackendNodeAt(t, "n2", n2Bind, n1Bind)
+	defer stop2()
 
 	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
 		t.Fatalf("n1 ring: %v", err)
@@ -115,10 +86,9 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 		t.Fatalf("n2 ring: %v", err)
 	}
 
-	// v0.3 + joiner-bootstrap: c2 may be in StateReceiving for the
-	// partitions it picked up at Open time. Wait for both nodes to
-	// settle before exercising the routing/forwarding path; the
-	// rebalance behavior itself is covered by dedicated tests.
+	// The joiner's arrival re-assigns units; wait for the debounced
+	// reconcile to run AND apply its mounts before exercising routing, so
+	// a write cannot land mid-handoff.
 	for _, c := range []*cluster.Cluster{c1, c2} {
 		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
 		if err := c.WaitForRebalanceIdle(ctx); err != nil {
@@ -128,11 +98,10 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 		cancel()
 	}
 
-	// Find a key owned by n2 + write it via n1 (forces forwarding).
-	// Then find a key owned by n1 + write it via n2 (forwarding in
-	// the other direction). The static partition assignment is
-	// deterministic across both processes since both compute the
-	// same ring from the same membership.
+	// Find a key whose UNIT is owned by n2 + write it via n1 (forces
+	// forwarding). Then the same in the other direction. Unit placement is
+	// deterministic across both nodes since both compute the same ring from
+	// the same membership.
 	keyOwnedByN2 := findKeyOwnedBy(t, c1, "n2", 1000)
 	keyOwnedByN1 := findKeyOwnedBy(t, c2, "n1", 1000)
 
@@ -143,27 +112,26 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 		t.Fatalf("c2.Put(n1-key): %v", err)
 	}
 
-	// Read DIRECTLY from each backend to confirm the data physically
-	// landed on the owning node (not just that the cluster Get
-	// round-tripped back).
-	got, err := n2Mem.Get([]byte(keyOwnedByN2))
+	// Read from each owner's LOCAL mount to confirm the data physically
+	// landed on the owning node, not merely that a routed Get round-tripped.
+	got, err := c2.LocalGet([]byte(keyOwnedByN2))
 	if err != nil {
-		t.Fatalf("n2 backend.Get(n2-key): %v", err)
+		t.Fatalf("n2 local get(n2-key): %v", err)
 	}
 	if string(got) != "from-n1" {
-		t.Fatalf("n2 backend: want from-n1, got %q", got)
+		t.Fatalf("n2 local: want from-n1, got %q", got)
 	}
 
-	got, err = n1Mem.Get([]byte(keyOwnedByN1))
+	got, err = c1.LocalGet([]byte(keyOwnedByN1))
 	if err != nil {
-		t.Fatalf("n1 backend.Get(n1-key): %v", err)
+		t.Fatalf("n1 local get(n1-key): %v", err)
 	}
 	if string(got) != "from-n2" {
-		t.Fatalf("n1 backend: want from-n2, got %q", got)
+		t.Fatalf("n1 local: want from-n2, got %q", got)
 	}
 
-	// Round-trip via cluster Get on the OTHER node also works
-	// (covers Get-forwarding too, not just Put-forwarding).
+	// Round-trip via cluster Get on the OTHER node also works (covers
+	// Get-forwarding, not just Put-forwarding).
 	val, err := c2.Get([]byte(keyOwnedByN2))
 	if err != nil {
 		t.Fatalf("c2.Get(n2-key) forwarded: %v", err)
@@ -228,14 +196,9 @@ func (h *grpcHarness) register(c *cluster.Cluster) {
 	h.started = true
 }
 
-// waitForWriteReady, isTransientWarmupErr and waitForRingSize delegate
-// to the shared harness package so this tree and the integration tree
-// gate on identical readiness semantics. See internal/clustertest.
-func waitForWriteReady(t *testing.T, clusters []*cluster.Cluster, deadline time.Duration) {
-	t.Helper()
-	clustertest.WaitForWriteReady(t, clusters, deadline)
-}
-
+// waitForRingSize delegates to the shared harness package so this tree
+// and the integration tree gate on identical readiness semantics. See
+// internal/clustertest.
 func waitForRingSize(c *cluster.Cluster, want int, timeout time.Duration) error {
 	return clustertest.WaitForRingSize(c, want, timeout)
 }
@@ -374,42 +337,14 @@ func TestCloseRace(t *testing.T) {
 // (no leave event yet) so Aggregate fans out to it; the snapshot
 // transport fails; the per-peer result lands in .Err.
 func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
-	n1Mem := memory.New()
-	n2Mem := memory.New()
+	n1Bind := hostPort(freePort(t))
+	n2Bind := hostPort(freePort(t))
 
-	n1MemberPort := freePort(t)
-	n2MemberPort := freePort(t)
-
-	n1GRPC, n1stop := startGRPC(t)
-	defer n1stop()
-	n2GRPC, _ := startGRPC(t)
-
-	c1, err := cluster.Open(cluster.Config{
-		NodeID:    "n1",
-		Backend:   n1Mem,
-		BindAddr:  hostPort(n1MemberPort),
-		GRPCAddr:  n1GRPC.addr,
-		LogOutput: io.Discard,
-	})
-	if err != nil {
-		t.Fatalf("open n1: %v", err)
-	}
-	defer func() { _ = c1.Close() }()
-	n1GRPC.register(c1)
-
-	c2, err := cluster.Open(cluster.Config{
-		NodeID:    "n2",
-		Backend:   n2Mem,
-		BindAddr:  hostPort(n2MemberPort),
-		GRPCAddr:  n2GRPC.addr,
-		Seeds:     []string{hostPort(n1MemberPort)},
-		LogOutput: io.Discard,
-	})
-	if err != nil {
-		t.Fatalf("open n2: %v", err)
-	}
-	defer func() { _ = c2.Close() }()
-	n2GRPC.register(c2)
+	c1, stop1 := openMultiBackendNodeAt(t, "n1", n1Bind, "")
+	defer stop1()
+	c2, stop2, n2GRPC := openMultiBackendNodeAtWithHarness(t, "n2", n2Bind, n1Bind)
+	defer stop2()
+	_ = c2
 
 	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
 		t.Fatalf("ring: %v", err)
@@ -462,132 +397,34 @@ func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
 	}
 }
 
-// TestFounderGrows_RebalanceReachesEveryKey exercises the founder-grows
-// (1 -> 2) topology that the v0.3 ring-vs-ring plan was blind to:
-//
-//  1. Open a SINGLE founder node and load 100 keys into it while it is
-//     the only member (it owns every partition).
-//  2. Join a 2nd node. The converged ring advances ownership of ~half
-//     the partitions to the joiner. Under the old code, a partition the
-//     joiner owns in both its (possibly self-only) bootstrap snapshot
-//     and the converged ring produced NO Receive -- the keys stayed on
-//     the founder, unreachable from the new owner.
-//  3. WaitForRebalanceIdle on both nodes, then let the reconcile pass +
-//     sweep settle.
-//  4. Read every key directly off the ring-owner's backend: no key may
-//     be orphaned on the founder while the ring routes to the joiner.
-//
-// This is the cluster-level companion to the rebalance package's
-// TestReconcile_RepairsOwnedButMissing: the reconcile pass keyed on
-// physical placement must pull every owned-but-missing partition so
-// physical placement matches ring assignment.
-func TestFounderGrows_RebalanceReachesEveryKey(t *testing.T) {
-	rebalance.SetSweepInterval(50 * time.Millisecond)
-
-	founderMem := memory.New()
-	joinerMem := memory.New()
-
-	founderBind := hostPort(freePort(t))
-	joinerBind := hostPort(freePort(t))
-
-	// Founder comes up ALONE and takes all 100 keys before any peer
-	// exists. This is the load-then-grow ordering the 2 -> 3 test never
-	// hits (that test joins every node before writing).
-	founder, founderStop := openClusterNodeAt(t, "fg-founder", founderBind, "", founderMem)
-	defer founderStop()
-
-	if err := waitForRingSize(founder, 1, 5*time.Second); err != nil {
-		t.Fatalf("founder solo ring: %v", err)
-	}
-
-	keys := make([]string, 100)
-	for i := range 100 {
-		k := fmt.Sprintf("fg-%04d", i)
-		if err := putWithMigrationRetry(founder, []byte(k), []byte("v")); err != nil {
-			t.Fatalf("Put %s: %v", k, err)
-		}
-		keys[i] = k
-	}
-	if got := countBackend(t, founderMem); got != 100 {
-		t.Fatalf("founder pre-growth key count = %d, want 100", got)
-	}
-
-	// Now grow: a 2nd node joins the founder.
-	joiner, joinerStop := openClusterNodeAt(t, "fg-joiner", joinerBind, founderBind, joinerMem)
-	defer joinerStop()
-
-	for _, c := range []*cluster.Cluster{founder, joiner} {
-		if err := waitForRingSize(c, 2, 5*time.Second); err != nil {
-			t.Fatalf("2-node ring on %s: %v", c.NodeID(), err)
-		}
-	}
-
-	// Drive a couple of settle-timer Evaluates worth of wall clock so
-	// the reconcile pass (folded into Evaluate) runs against the
-	// converged ring on the joiner and pulls every owned-but-missing
-	// partition. WaitForRebalanceIdle bounds the wait per node.
-	for _, c := range []*cluster.Cluster{founder, joiner} {
-		ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
-		if err := c.WaitForRebalanceIdle(ctx); err != nil {
-			cancel()
-			t.Fatalf("%s did not idle: %v", c.NodeID(), err)
-		}
-		cancel()
-	}
-
-	// Verify physical placement matches the 2-node ring: every key must
-	// be physically present on the backend of the node the ring routes
-	// it to. A key the ring sends to the joiner that still lives only on
-	// the founder is the founder-grows orphan this fix closes. The
-	// reconcile pass + ring-vs-ring plan can be re-armed by a late
-	// membership reconcile tick, so we poll the placement check rather
-	// than asserting once: the loop returns the instant every owned key
-	// has landed on its owner, and only burns the budget if a partition
-	// is genuinely stranded.
-	r := ring.New()
-	for _, m := range founder.Members() {
-		r.Add(m)
-	}
-	backends := map[string]*memory.Memory{
-		"fg-founder": founderMem,
-		"fg-joiner":  joinerMem,
-	}
-	missing := 0
-	var firstMissing string
-	placed := pollUntil(5*time.Second, 50*time.Millisecond, func() bool {
-		missing, firstMissing = 0, ""
-		for _, k := range keys {
-			owner := r.LocateKey([]byte(k)).ID
-			if _, err := backends[owner].Get([]byte(k)); err != nil {
-				if missing == 0 {
-					firstMissing = fmt.Sprintf("%s -> owner %s", k, owner)
-				}
-				missing++
-			}
-		}
-		return missing == 0
-	})
-	if !placed {
-		t.Fatalf("%d/%d keys missing on the ring-owner's backend (first: %s); founder-grows orphan not repaired",
-			missing, len(keys), firstMissing)
-	}
-}
-
-// openClusterNodeAt brings up a Cluster + gRPC server at known
-// bind + gRPC addresses, registers it for cleanup, and returns
+// openMultiBackendNodeAt brings up a multi-backend Cluster + its gRPC
+// server at a known bind address, registers it for cleanup, and returns
 // the cluster + teardown closure. Caller supplies bindAddr so
 // peer-discovery seeds are predictable.
-func openClusterNodeAt(t *testing.T, id, bindAddr, seedBindAddr string, mem *memory.Memory) (*cluster.Cluster, func()) {
+//
+// The gRPC server is REAL and registered before the joiner dials: a
+// multi-backend joiner asks a live seed for the cluster's unit generation
+// during Open (learnGenerationFromSeed), so a fixture that advertises an
+// address nothing serves makes the joiner's Open burn its whole
+// gen-learn budget and fail.
+func openMultiBackendNodeAt(t *testing.T, id, bindAddr, seedBindAddr string) (*cluster.Cluster, func()) {
+	c, stop, _ := openMultiBackendNodeAtWithHarness(t, id, bindAddr, seedBindAddr)
+	return c, stop
+}
+
+// openMultiBackendNodeAtWithHarness is openMultiBackendNodeAt plus the gRPC
+// harness, for tests that need to kill one node's server mid-test.
+func openMultiBackendNodeAtWithHarness(t *testing.T, id, bindAddr, seedBindAddr string) (*cluster.Cluster, func(), *grpcHarness) {
 	t.Helper()
 	grpcHarness, stop := startGRPC(t)
 	cfg := cluster.Config{
-		NodeID:                 id,
-		Backend:                mem,
-		BindAddr:               bindAddr,
-		GRPCAddr:               grpcHarness.addr,
-		LogOutput:              io.Discard,
-		RebalanceSettleDelay:   500 * time.Millisecond,
-		RebalanceGraceDuration: 1500 * time.Millisecond,
+		NodeID:               id,
+		BackendFactory:       memfactory.New(),
+		UnitCount:            storageunit.MustUnitCount(8),
+		BindAddr:             bindAddr,
+		GRPCAddr:             grpcHarness.addr,
+		LogOutput:            io.Discard,
+		RebalanceSettleDelay: 100 * time.Millisecond,
 	}
 	if seedBindAddr != "" {
 		cfg.Seeds = []string{seedBindAddr}
@@ -595,41 +432,44 @@ func openClusterNodeAt(t *testing.T, id, bindAddr, seedBindAddr string, mem *mem
 	c, err := cluster.Open(cfg)
 	if err != nil {
 		stop()
-		t.Fatalf("openClusterNodeAt %s: %v", id, err)
+		t.Fatalf("openMultiBackendNodeAt %s: %v", id, err)
 	}
 	grpcHarness.register(c)
 	return c, func() {
 		_ = c.Close()
 		stop()
-	}
+	}, grpcHarness
 }
 
-// putWithMigrationRetry wraps Put with a bounded retry on the v0.4
-// transient codes, delegating the code CLASSIFICATION to the shared
-// harness package (see internal/clustertest.PutWithTransientRetry) so it
-// cannot drift from the integration tree's equivalent. The 50-attempt /
-// 50ms budget (~2.5s wall-clock) is this tree's own; the integration
-// tree budgets its retry window differently.
-func putWithMigrationRetry(c *cluster.Cluster, key, value []byte) error {
-	return clustertest.PutWithTransientRetry(c, key, value, 50, 50*time.Millisecond)
-}
+// TestOpen_MountsBeforeEventsLoop pins the publish ordering in Open: the
+// mount map must be initialized (initMultiBackend) BEFORE the events /
+// reconcile goroutines spawn. Starting the goroutines first means the
+// very first membership join calls bumpRingGen -> scheduleReconcile,
+// which reads mount state while Open is concurrently writing it.
+//
+// With the race detector enabled (this binary always runs -race in CI),
+// the regression surfaces as a data race when the first NotifyJoin
+// arrives. The test drives that shape: open a seed, then join nodes to it
+// so the events / reconcile loops are doing real work the moment they
+// start, and verify each joiner reaches a coherent post-Open state
+// without -race complaining.
+//
+// It lives in the EXTERNAL test package because a multi-backend joiner
+// dials its seed's gRPC during Open, and pkg/rpc imports pkg/cluster, so
+// an in-package test cannot stand up a server to answer.
+func TestOpen_MountsBeforeEventsLoop(t *testing.T) {
+	seedBind := hostPort(freePort(t))
+	_, seedStop := openMultiBackendNodeAt(t, "race-seed", seedBind, "")
+	defer seedStop()
 
-func countBackend(t *testing.T, be *memory.Memory) int {
-	t.Helper()
-	it, err := be.ScanPrefix(nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer func() { _ = it.Close() }()
-	n := 0
-	for {
-		k, _, err := it.Next()
-		if err != nil {
-			t.Fatal(err)
+	// Join a few nodes in a row. With the bug, even one is enough for
+	// -race to fire; the loop shortens the odds on a quiet machine.
+	for i := range 3 {
+		joiner, joinerStop := openMultiBackendNodeAt(t,
+			fmt.Sprintf("race-joiner-%d", i), hostPort(freePort(t)), seedBind)
+		if err := waitForRingSize(joiner, 2, 5*time.Second); err != nil {
+			t.Fatalf("joiner %d never saw the seed: %v", i, err)
 		}
-		if k == nil {
-			return n
-		}
-		n++
+		joinerStop()
 	}
 }

@@ -68,7 +68,7 @@ func TestLeave_DrainForLeave_ReleasesAllWhenSuccessorsReady(t *testing.T) {
 	// polls to release.
 	h := backing.Handle()
 	for _, target := range owned {
-		if err := h.WriteServingMarker(target, 2); err != nil {
+		if err := h.WriteServingMarker(storageunit.ReplicaMount(target), 2); err != nil {
 			t.Fatalf("write serving marker %v: %v", target, err)
 		}
 	}

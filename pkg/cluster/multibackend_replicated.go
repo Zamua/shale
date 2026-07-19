@@ -76,18 +76,44 @@ func (c *Cluster) unitReplicas(gu storageunit.GenUnit) []ring.Member {
 	return c.ring.LocateKeyN(genUnitBytes(gu), c.replicationFactor())
 }
 
-// initReplicatedFactory wires the R>1 capability view of the factory. Called
-// from initMultiBackend. At R=1 (or legacy mode) it is a no-op: replicaFactory
-// stays nil and the single-mount paths run. validateBackendMode already
-// guaranteed the factory implements ReplicaBackendFactory when R>1, so the
-// assertion here cannot fail in a validated cluster.
-func (c *Cluster) initReplicatedFactory() {
-	if !c.multi || c.replicationFactor() <= 1 {
-		return
+// replicaLayout reports whether this cluster addresses storage BY REPLICA
+// POSITION, i.e. whether every mount it opens is a storageunit.ReplicaMount
+// rather than a storageunit.SoleMount. It is THE LAYOUT SELECTOR, and it is the
+// one thing that decides which of the two on-disk encodings this cluster's
+// bytes live at.
+//
+// IT IS NOT multiReplicated(), and substituting one for the other CORRUPTS
+// ADDRESSING. multiReplicated() additionally requires a populated ring, so on a
+// SINGLE-NODE R>1 cluster (nil ring) the two disagree: such a cluster mounts by
+// replica position (this predicate, true) while serving reads and writes
+// through the single-owner path (multiReplicated(), false). That divergence is
+// deliberate and pre-existing; see the package doc. Addressing storage through
+// multiReplicated() would make a single-node R>1 cluster resolve its mounts to
+// the SOLE encoding while its own earlier boots wrote them to the REPLICA
+// encoding, which reads as total data loss.
+//
+// It replaces the old "does this factory implement ReplicaBackendFactory"
+// question. That question was the leak: it asked the adapter what it could do.
+// This asks only what THIS CLUSTER is, which is fixed at Open by config.
+func (c *Cluster) replicaLayout() bool {
+	return c.multi && c.replicationFactor() > 1
+}
+
+// mountRefFor is the ONE place a ReplicaUnit the cluster tracks becomes the
+// MountRef the storage port is keyed by. Every mount this cluster holds is
+// tracked as a ReplicaUnit (mountMap is ReplicaUnit-keyed, with the R=1 paths
+// using position 0), but the PORT needs the layout selector too, so the
+// conversion has to go through the cluster's own layout.
+//
+// Route every ReplicaUnit-keyed factory call through this rather than calling
+// storageunit.ReplicaMount or storageunit.SoleMount at the call site: a call
+// site that picks the wrong one addresses the wrong bytes, and the failure mode
+// is a silently-empty mount rather than an error.
+func (c *Cluster) mountRefFor(ru storageunit.ReplicaUnit) storageunit.MountRef {
+	if c.replicaLayout() {
+		return storageunit.ReplicaMount(ru)
 	}
-	if rf, ok := c.factory.(storageunit.ReplicaBackendFactory); ok {
-		c.replicaFactory = rf
-	}
+	return storageunit.SoleMount(ru.Unit)
 }
 
 // desiredReplicaUnits returns the units this node should have mounted at R>1,
@@ -165,7 +191,7 @@ func memberNodeIDs(set []ring.Member) []storageunit.NodeID {
 // position into the mount map, via the per-replica factory (independent
 // durable databases). It is the R>1 analogue of initMultiBackend's mount
 // loop. On any open error it rolls back what it already mounted so Open fails
-// cleanly. Caller (initMultiBackend) has already wired replicaFactory.
+// cleanly. Caller is initMultiBackend, on the replicaLayout() branch.
 func (c *Cluster) mountReplicaUnits() error {
 	units := c.desiredReplicaUnits()
 
@@ -208,14 +234,14 @@ func (c *Cluster) mountReplicaUnits() error {
 			// SHOULD take over), so a genuine cold start (no markers) still mounts
 			// everything, and a true sole-survivor re-acquires a stale-marked position
 			// once the ring converges.
-			if epoch, ok, merr := c.replicaFactory.ReadServingMarker(ru); merr == nil && ok && epoch > 0 {
+			if epoch, ok, merr := c.factory.ReadServingMarker(storageunit.ReplicaMount(ru)); merr == nil && ok && epoch > 0 {
 				c.lastAcquireErr.Store(ru, fmt.Sprintf("boot-deferred: a peer is serving this position (serving marker epoch %d); not fenced - reconcile hands off after convergence", epoch))
 				c.logf("shale: boot defer - NOT opening replica %s: a peer is serving it (marker epoch %d); "+
 					"avoiding a fence; reconcile will acquire it after ring convergence", ru, epoch)
 				deferred.Add(1)
 				return nil
 			}
-			b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
+			b, openedEpoch, err := c.factory.OpenUnit(storageunit.ReplicaMount(ru), epochAtOpen)
 			if err != nil {
 				// DEGRADED BOOT (Phase 2f): a replica position whose backing store
 				// cannot be opened - a corrupt/truncated durable database, or an open
@@ -376,7 +402,7 @@ func (c *Cluster) unitApplyErrMaps(ru storageunit.ReplicaUnit, b backend.Backend
 // pure new mount (no draining leaver) is a harmless no-op observer-wise.
 func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	epoch := acquireBaseEpoch
-	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, epoch)
+	b, openedEpoch, err := c.factory.OpenUnit(storageunit.ReplicaMount(ru), epoch)
 	if err != nil {
 		// SELF-HEAL a factory/cluster desync (the mass-restart auto-recovery wedge,
 		// #408): this path only runs for a DESIRED-but-UNMOUNTED position, so the
@@ -387,8 +413,8 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 		// reopen ONCE. The close is safe: there is no mountMap entry pointing at it,
 		// so no routed op can be reading it. If the reopen still fails (a genuine
 		// open failure, e.g. a peer holds the durable db), record it + retry next tick.
-		_ = c.replicaFactory.CloseReplicaUnit(ru)
-		b, openedEpoch, err = c.replicaFactory.OpenReplicaUnit(ru, epoch)
+		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
+		b, openedEpoch, err = c.factory.OpenUnit(storageunit.ReplicaMount(ru), epoch)
 		if err != nil {
 			c.lastAcquireErr.Store(ru, err.Error())
 			return
@@ -402,7 +428,7 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	if c.closed.Load() {
 		c.mountMu.Unlock()
 		c.myOpenEpoch.Delete(ru)
-		_ = c.replicaFactory.CloseReplicaUnit(ru)
+		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 		return
 	}
 	c.storeMount(ru, b)
@@ -413,7 +439,7 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	// a re-read of the climbing durable). This is the poll-observable release
 	// signal a DRAINING predecessor reads (drainCheck); without it a clean-cut
 	// successor of a leaving node never releases that node's drain.
-	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), openedEpoch)
 }
 
 // releaseReplicaUnit unmounts the ReplicaUnit ru via the per-replica factory.
@@ -424,7 +450,7 @@ func (c *Cluster) releaseReplicaUnit(ru storageunit.ReplicaUnit) {
 	delete(c.mountMap, ru)
 	c.mountMu.Unlock()
 	c.myOpenEpoch.Delete(ru) // a re-acquire records a fresh open epoch.
-	_ = c.replicaFactory.CloseReplicaUnit(ru)
+	_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 }
 
 // applyBatchToUnit is the multi-backend analogue of ApplyBatchLocal's apply

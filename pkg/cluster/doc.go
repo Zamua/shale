@@ -36,10 +36,9 @@
 //	                           (BackendFactory + UnitCount BOTH unset)  cluster.go
 //	multi-backend R=1          BackendFactory != nil && !UnitCount      validateBackendMode -> multi=true
 //	                           .IsZero() && ReplicationFactor <= 1      cluster.go
-//	multi-backend R>1          the same, with ReplicationFactor > 1;    validateBackendMode (mode) +
-//	                           the factory MUST also implement          initReplicatedFactory
-//	                           storageunit.ReplicaBackendFactory        multibackend_replicated.go
-//	                           (validated at Open, not at first use)
+//	multi-backend R>1          the same, with ReplicationFactor > 1     validateBackendMode (mode) +
+//	                                                                    replicaLayout()
+//	                                                                    multibackend_replicated.go
 //
 // Setting Backend AND (BackendFactory or UnitCount) is an Open error, as is
 // setting only one of BackendFactory / UnitCount. ReplicationFactor 0 is
@@ -53,8 +52,8 @@
 //
 //	PREDICATE                 DEFINED IN                    TRUE WHEN
 //	------------------------- ----------------------------- -----------------------------------------
-//	c.replicaFactory != nil   initReplicatedFactory         multi && ReplicationFactor > 1
-//	                          multibackend_replicated.go    (says nothing about the ring)
+//	c.replicaLayout()         multibackend_replicated.go    multi && ReplicationFactor > 1
+//	                                                        (says nothing about the ring)
 //	c.multiReplicated()       multibackend_replicated.go    multi && ReplicationFactor > 1
 //	                                                        && ring != nil && !ring.Empty()
 //
@@ -62,7 +61,7 @@
 // set, cluster.go), so on a SINGLE-NODE cluster at R>1 the ring is nil and the
 // two predicates diverge:
 //
-//   - the MOUNT + RECONCILE side keys off replicaFactory, so it takes the R>1
+//   - the MOUNT + RECONCILE side keys off replicaLayout(), so it takes the R>1
 //     replica-position path (mountReplicaUnits, reconcileReplicaUnitsOverlap);
 //   - the READ/WRITE side keys off multiReplicated(), so it takes the R=1
 //     single-mount path (one node is one replica, which is the correct answer).
@@ -70,6 +69,12 @@
 // So a single-node R>1 cluster mounts by ReplicaUnit but serves by single
 // ownership. This is intentional, not a bug, but it means "is this cluster R>1?"
 // has two answers and you must pick the one for the side you are on.
+//
+// replicaLayout() is additionally the ON-DISK LAYOUT SELECTOR: it is what
+// mountRefFor turns each ReplicaUnit into, and therefore what decides whether
+// this cluster's bytes live at the unit's own location or at a per-replica
+// child of it. Substituting multiReplicated() there would make a single-node
+// R>1 cluster address mounts its own earlier boots wrote somewhere else.
 //
 // A THIRD spelling of the same idea exists for the LEGACY path: "R>1 on the
 // legacy per-node backend" is casReplicated() (cas.go), whose body is
@@ -82,8 +87,8 @@
 //
 //	CONCERN            LEGACY                 MULTI R=1                    MULTI R>1
 //	------------------ ---------------------- ---------------------------- ------------------------------
-//	predicate          !c.multi               c.multi, replicaFactory==nil c.multiReplicated() (r/w) or
-//	                                                                       replicaFactory!=nil (mount)
+//	predicate          !c.multi               c.multi, !replicaLayout()    c.multiReplicated() (r/w) or
+//	                                                                       replicaLayout() (mount)
 //	Put / Delete       c.backend directly     ownerOf + forward, freeze    putReplicatedUnit
 //	                   (+ legacy R>1 replicate)  gate applies              multibackend_replicated.go
 //	                   cluster.go, replicate.go  cluster.go                cluster.go entry
@@ -97,7 +102,7 @@
 //	                                          (release then acquire)       gated by a serving marker
 //
 // The reconcile dispatch lives in one place, reconcileUnits
-// (multibackend_rebalance.go): it branches on replicaFactory != nil into the
+// (multibackend_rebalance.go): it branches on replicaLayout() into the
 // R>1 half (declarative target, decentralized reshard step, overlap reconcile,
 // drain checks, joining-state maintenance) and otherwise falls through to the
 // R=1 GenUnit loop. Config.TestingForceCleanCut is a break-demo escape hatch in
@@ -117,7 +122,7 @@
 //	coordinated freeze barrier Cluster.Reshard()           multi && ring != nil &&          multibackend_reshard_barrier.go
 //	                           -> reshardCoordinated()     len(ring.Members()) > 1
 //	                                                       (NO R check, NO arbiter check)
-//	decentralized arbiter      reconcileUnits() tick       replicaFactory != nil (R>1) &&   multibackend_reshard_driver.go
+//	decentralized arbiter      reconcileUnits() tick       replicaLayout() (R>1) &&         multibackend_reshard_driver.go
 //	                           -> observeReshard()         c.arbiter != nil, which needs    (+ _arbiter, _declared,
 //	                                                       Config.ConditionalStore != nil   _copy, _marker, _route)
 //

@@ -83,7 +83,7 @@ func mountParentAndChildren(t *testing.T, c *Cluster, k storageunit.UnitID, oldC
 		storageunit.NewReplicaUnit(storageunit.NewGenUnit(1, high), 0),
 	}
 	for _, ru := range rus {
-		b, _, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
+		b, _, err := c.factory.OpenUnit(storageunit.ReplicaMount(ru), epochAtOpen)
 		if err != nil {
 			t.Fatalf("open %v: %v", ru, err)
 		}
@@ -194,7 +194,7 @@ func TestCopyParentIntoSurvivor_ForwardsToLocalSurvivor(t *testing.T) {
 	}
 
 	for _, ru := range []storageunit.ReplicaUnit{parentRU, survivorRU} {
-		b, _, err := c.replicaFactory.OpenReplicaUnit(ru, epochAtOpen)
+		b, _, err := c.factory.OpenUnit(storageunit.ReplicaMount(ru), epochAtOpen)
 		if err != nil {
 			t.Fatalf("open %v: %v", ru, err)
 		}

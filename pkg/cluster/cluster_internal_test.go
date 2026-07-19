@@ -5,7 +5,6 @@ package cluster
 // behavior the public-API tests cannot reach.
 
 import (
-	"bytes"
 	"context"
 	"io"
 	"net"
@@ -13,14 +12,12 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Zamua/shale/pkg/backend/memory"
+	"github.com/Zamua/shale/internal/memfactory"
 	"github.com/Zamua/shale/pkg/membership"
-	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
 )
 
 // freeTCPPort returns an OS-assigned ephemeral TCP port. Mirrors the
@@ -58,6 +55,27 @@ func waitForLocalInRing(c *Cluster, timeout time.Duration) bool {
 	return false
 }
 
+// forceReconcileNow bypasses the settle-timer debounce and runs the
+// pending reconcile immediately, adopting whatever pending obligation is
+// outstanding so settlePending accounting stays balanced: if a live timer
+// is armed we stop it and take ITS obligation (its callback will never
+// fire), otherwise we mint a fresh one for this drive. Either way
+// runScheduledReconcile's defer releases exactly one.
+func forceReconcileNow(c *Cluster) {
+	c.settleMu.Lock()
+	if c.settleTimer != nil {
+		if !c.settleTimer.Stop() {
+			// Callback already fired and owns its own decrement.
+			c.settlePending.Add(1)
+		}
+		c.settleTimer = nil
+	} else {
+		c.settlePending.Add(1)
+	}
+	c.settleMu.Unlock()
+	c.runScheduledReconcile()
+}
+
 // quiesceInitialSelfJoin drains the evaluation the local node's OWN
 // self-join schedules, so a test can establish a deterministic at-rest
 // baseline.
@@ -89,7 +107,7 @@ func quiesceInitialSelfJoin(t *testing.T, c *Cluster) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	c.runEvaluateNow()
+	forceReconcileNow(c)
 	if got := c.settlePending.Load(); got != 0 {
 		t.Fatalf("self-join evaluation did not drain; settlePending=%d", got)
 	}
@@ -121,11 +139,12 @@ func TestReconcileRingFromMembership_RestoresMissingLocal(t *testing.T) {
 
 	port := freeTCPPort(t)
 	c, err := Open(Config{
-		NodeID:    "solo",
-		Backend:   memory.New(),
-		BindAddr:  hp(port),
-		GRPCAddr:  "127.0.0.1:1",
-		LogOutput: io.Discard,
+		NodeID:         "solo",
+		BackendFactory: memfactory.New(),
+		UnitCount:      storageunit.MustUnitCount(2),
+		BindAddr:       hp(port),
+		GRPCAddr:       "127.0.0.1:1",
+		LogOutput:      io.Discard,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -189,11 +208,12 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 
 	port := freeTCPPort(t)
 	c, err := Open(Config{
-		NodeID:    "solo",
-		Backend:   memory.New(),
-		BindAddr:  hp(port),
-		GRPCAddr:  "127.0.0.1:1",
-		LogOutput: io.Discard,
+		NodeID:         "solo",
+		BackendFactory: memfactory.New(),
+		UnitCount:      storageunit.MustUnitCount(2),
+		BindAddr:       hp(port),
+		GRPCAddr:       "127.0.0.1:1",
+		LogOutput:      io.Discard,
 	})
 	if err != nil {
 		t.Fatalf("Open: %v", err)
@@ -279,230 +299,6 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 		gotAddr, newAddr, stillCached)
 }
 
-// TestPut_DuringMigrationReturnsUnavailable pins the v0.3
-// "Cutover" contract end-to-end on the cluster.Put guard: when the
-// local Coordinator says a key's partition is mid-migration
-// (StateSending), Put returns codes.FailedPrecondition with a
-// retry-after hint, so SDK clients can back off + retry instead of
-// silently dropping the write.
-//
-// White-box because the deterministic path goes through the
-// cluster's own Coordinator: directly invoking
-// c.rebalance.Evaluate (against a synthetic outgoing ring) puts
-// the partitions in StateSending without needing a second real
-// node or a timing-race against memberlist convergence. The
-// blockingMigrateSource holds the partitions there so the guard
-// window stays open long enough for the assertion to run.
-func TestPut_DuringMigrationReturnsUnavailable(t *testing.T) {
-	port := freeTCPPort(t)
-	be := memory.New()
-	c, err := Open(Config{
-		NodeID:                 "rb-source",
-		Backend:                be,
-		BindAddr:               hp(port),
-		GRPCAddr:               "127.0.0.1:1",
-		LogOutput:              io.Discard,
-		RebalanceSettleDelay:   500 * time.Millisecond,
-		RebalanceGraceDuration: 10 * time.Second,
-		RebalanceRetryAfterMs:  77,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-
-	if !waitForLocalInRing(c, 2*time.Second) {
-		t.Fatalf("local member never landed in ring")
-	}
-
-	// Seed enough keys that any randomly migrating partition holds
-	// at least one. 200 spreads across 271 partitions ~uniformly.
-	var keys [][]byte
-	for i := range 200 {
-		k := []byte("rb-" + strconv.Itoa(i))
-		if err := c.Put(k, []byte("v")); err != nil {
-			t.Fatalf("seed put: %v", err)
-		}
-		keys = append(keys, k)
-	}
-
-	// Build the old + new ring shapes: old = current ring (only
-	// rb-source); new = current + a synthetic peer. ~half the
-	// partitions become Sends from us to the peer.
-	old := ring.New()
-	for _, m := range c.ring.Members() {
-		old.Add(m)
-	}
-	next := ring.New()
-	for _, m := range c.ring.Members() {
-		next.Add(m)
-	}
-	next.Add(ring.Member{ID: "rb-elsewhere", Addr: "127.0.0.1:65535"})
-
-	// Swap the cluster's Coordinator for one whose source blocks
-	// indefinitely. Every Send goroutine pins its partition in
-	// StateSending until we release the block, which keeps the
-	// guard window open across the assertion.
-	src := &blockingTestSource{released: make(chan struct{})}
-	opts := rebalance.DefaultOptions()
-	opts.GraceDuration = 10 * time.Second
-	opts.Source = src
-	opts.Destination = &clusterDestination{c: c}
-	c.rebalance.Load().Stop()
-	rb := rebalance.New(rebalance.Member{ID: "rb-source"}, be, opts)
-	c.rebalance.Store(rb)
-	rb.Evaluate(old, next, c.ringGen.Load())
-	defer close(src.released)
-
-	// Wait until at least one of our seeded keys' partitions is
-	// reported migrating by the cluster's Coordinator.
-	var movingKey []byte
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		for _, k := range keys {
-			if rb.IsMigrating(k) {
-				movingKey = k
-				break
-			}
-		}
-		if movingKey != nil {
-			break
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	if movingKey == nil {
-		t.Fatalf("no seeded key entered StateSending; coordinator snapshot=%+v", rb.Snapshot())
-	}
-
-	// Put against the migrating key MUST return ResourceExhausted per
-	// docs/SPEC.md "Cutover" (FailedPrecondition is reserved for the
-	// forwarding loop-guard in "Failure handling"; Unavailable is
-	// reserved for genuine peer-down failures so the fanout's failure
-	// budget can short-circuit on dead nodes; conflating any of the
-	// three breaks the client's ability to distinguish them).
-	err = c.Put(movingKey, []byte("post"))
-	if err == nil {
-		t.Fatalf("Put for migrating key returned nil; want ResourceExhausted")
-	}
-	st, ok := status.FromError(err)
-	if !ok {
-		t.Fatalf("Put error is not a gRPC status: %v", err)
-	}
-	if st.Code() != codes.ResourceExhausted {
-		t.Fatalf("Put for migrating key: want ResourceExhausted, got %s (%v)", st.Code(), err)
-	}
-	if !bytes.Contains([]byte(st.Message()), []byte("retry")) {
-		t.Fatalf("Migration-guard error %q lacks a retry hint; SDK clients need it to back off", st.Message())
-	}
-}
-
-// TestOpen_RebalanceInitBeforeEventsLoop pins the v0.3 race fix:
-// Open() must finish initRebalance() (which publishes c.rebalance +
-// c.lastEvalRing) BEFORE spawning the events / reconcile goroutines.
-// The earlier ordering started the goroutines first; the first
-// membership join would call bumpRingGen -> scheduleEvaluate -> read
-// c.rebalance while initRebalance was concurrently writing it.
-//
-// With the race detector enabled (this binary always runs -race in
-// CI), the regression would surface as a "data race on c.rebalance"
-// failure when the first NotifyJoin arrives. The test drives the
-// same shape: open a multi-node-mode Cluster, immediately inject a
-// stream of membership-shaped activity (additional joiners + a
-// reconcile tick) so the events/reconcile loops are doing real work
-// the moment they start, and verify the cluster reaches a coherent
-// post-Open state without -race complaining.
-func TestOpen_RebalanceInitBeforeEventsLoop(t *testing.T) {
-	// Force the reconcile loop to fire fast so the test is sure to
-	// race a tick against Open. Keep the global setting restored on
-	// exit so other tests in the same binary see the default.
-	saved := reconcileInterval
-	reconcileInterval = 5 * time.Millisecond
-	t.Cleanup(func() { reconcileInterval = saved })
-
-	// Spin up a seed first so the second Open has a real peer to
-	// gossip with on bootstrap, generating events into runEventsLoop
-	// concurrently with the Coordinator publish path.
-	seed := startInternalNode(t, "race-seed", "")
-	t.Cleanup(seed.close)
-
-	// Hammer Open a few times in a row. With the bug, even one of
-	// these is enough for -race to fire; the loop just shortens the
-	// odds when run on a quiet machine.
-	for i := range 3 {
-		joiner := startInternalNode(t, "race-joiner-"+strconv.Itoa(i), seed.bindAddr)
-		// Wait for the joiner to converge on the seed's membership so
-		// any race in the bootstrap Evaluate has a fair chance to fire.
-		deadline := time.Now().Add(3 * time.Second)
-		for time.Now().Before(deadline) {
-			if len(joiner.cluster.Members()) >= 2 {
-				break
-			}
-			time.Sleep(10 * time.Millisecond)
-		}
-		if got := len(joiner.cluster.Members()); got < 2 {
-			t.Fatalf("joiner %d never saw the seed: members=%d", i, got)
-		}
-		joiner.close()
-	}
-}
-
-// internalTestNode is the local mirror of integration/testNode kept
-// in this package so cluster_internal_test.go can spin up real
-// multi-node-mode Clusters without dragging in the integration
-// package's gRPC scaffolding.
-type internalTestNode struct {
-	cluster  *Cluster
-	bindAddr string
-	close    func()
-}
-
-func startInternalNode(t *testing.T, id, seedAddr string) *internalTestNode {
-	t.Helper()
-	bindAddr := hp(freeTCPPort(t))
-	cfg := Config{
-		NodeID:                 id,
-		Backend:                memory.New(),
-		BindAddr:               bindAddr,
-		GRPCAddr:               "127.0.0.1:1", // never dialed in this test
-		LogOutput:              io.Discard,
-		RebalanceSettleDelay:   50 * time.Millisecond,
-		RebalanceGraceDuration: 1 * time.Second,
-	}
-	if seedAddr != "" {
-		cfg.Seeds = []string{seedAddr}
-	}
-	c, err := Open(cfg)
-	if err != nil {
-		t.Fatalf("startInternalNode %s: Open: %v", id, err)
-	}
-	return &internalTestNode{
-		cluster:  c,
-		bindAddr: bindAddr,
-		close: func() {
-			_ = c.Close()
-		},
-	}
-}
-
-// blockingTestSource holds OpenRange's data channel open until
-// released is closed. Used to pin Coordinator partitions in
-// StateSending for the duration of an assertion.
-type blockingTestSource struct {
-	released chan struct{}
-}
-
-func (s *blockingTestSource) OpenRange(_ []uint64, _ uint64) (<-chan rebalance.KeyValue, <-chan error) {
-	out := make(chan rebalance.KeyValue)
-	errCh := make(chan error, 1)
-	go func() {
-		defer close(out)
-		defer close(errCh)
-		<-s.released
-		errCh <- nil
-	}()
-	return out, errCh
-}
-
 // TestWaitForRebalanceIdle_BlocksWhileDebouncePending pins the
 // pending-aware contract added for the test-sync rework: a node with a
 // settle-timer evaluation SCHEDULED-but-not-yet-fired is NOT
@@ -521,13 +317,13 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 	t.Cleanup(func() { reconcileInterval = saved })
 
 	port := freeTCPPort(t)
-	be := memory.New()
 	c, err := Open(Config{
-		NodeID:    "rb-pending",
-		Backend:   be,
-		BindAddr:  hp(port),
-		GRPCAddr:  "127.0.0.1:1",
-		LogOutput: io.Discard,
+		NodeID:         "rb-pending",
+		BackendFactory: memfactory.New(),
+		UnitCount:      storageunit.MustUnitCount(2),
+		BindAddr:       hp(port),
+		GRPCAddr:       "127.0.0.1:1",
+		LogOutput:      io.Discard,
 		// Long delay: the armed timer must NOT fire on its own during
 		// the test. We drive the firing explicitly below.
 		RebalanceSettleDelay: time.Hour,
@@ -559,12 +355,12 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 		t.Fatalf("quiescent node should be idle immediately, got %v", err)
 	}
 
-	// Arm a pending evaluation directly (mirrors what a membership event
-	// does via bumpRingGen -> scheduleEvaluate). The long settle delay
+	// Arm a pending reconcile directly (mirrors what a membership event
+	// does via bumpRingGen -> scheduleReconcile). The long settle delay
 	// means the AfterFunc will not fire during the test window.
-	c.scheduleEvaluate()
+	c.scheduleReconcile()
 	if got := c.settlePending.Load(); got != 1 {
-		t.Fatalf("expected settlePending==1 after scheduleEvaluate, got %d", got)
+		t.Fatalf("expected settlePending==1 after scheduleReconcile, got %d", got)
 	}
 
 	// WaitForRebalanceIdle MUST block now: the evaluation is scheduled
@@ -581,17 +377,17 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 
 	// Re-arming a still-live timer must NOT double-count the pending
 	// obligation.
-	c.scheduleEvaluate()
+	c.scheduleReconcile()
 	if got := c.settlePending.Load(); got != 1 {
 		t.Fatalf("expected settlePending to stay 1 on re-arm, got %d", got)
 	}
 
-	// Force the pending evaluation to run + drain. runEvaluateNow stops
-	// the live timer, adopts its pending obligation, runs the evaluate,
-	// and the runEvaluate defer releases it. With a single-node ring the
-	// plan is empty, so the Coordinator registers no in-flight ranges
-	// and settles immediately.
-	c.runEvaluateNow()
+	// Force the pending reconcile to run + drain. forceReconcileNow stops
+	// the live timer, adopts its pending obligation, runs the reconcile,
+	// and runScheduledReconcile's defer releases it. With a single-node
+	// ring this node already owns every unit, so the reconcile applies no
+	// moves and settles immediately.
+	forceReconcileNow(c)
 
 	// Now the node is idle: pending drained AND no non-terminal range.
 	ctxIdle, cancelIdle := context.WithTimeout(context.Background(), 2*time.Second)

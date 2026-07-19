@@ -55,14 +55,22 @@ func dbNameReplicaFor(keyPrefix string, ru storageunit.ReplicaUnit) string {
 	return dbNameFor(keyPrefix, ru.Unit) + fmt.Sprintf("/r%d", ru.Replica)
 }
 
-// unitRef is the internal, single-sourced identity the factory's Backing/Handle
-// helpers work over, so the fence arithmetic, the open sequence and the release
-// sequence each exist ONCE instead of in an R=1 copy and an R>1 copy that can
-// drift apart. It is a ReplicaUnit PLUS the one bit that selects which of the
-// TWO encodings above the position's bytes live at:
+// unitRef is the identity the factory's Backing/Handle helpers work over, so
+// the fence arithmetic, the open sequence and the release sequence each exist
+// ONCE instead of in an R=1 copy and an R>1 copy that can drift apart.
 //
-//	replicated == false (R=1) -> dbNameFor(kp, ru.Unit)   = "<kp>u/g<gen>/u<id>"
-//	replicated == true  (R>1) -> dbNameReplicaFor(kp, ru) = "<kp>u/g<gen>/u<id>/r<rep>"
+// It is now an ALIAS for storageunit.MountRef, the identity shale's one storage
+// port is keyed by. The shape did not change: a ReplicaUnit PLUS the one bit
+// selecting which of the TWO encodings above the mount's bytes live at.
+//
+//	Replicated() == false -> dbNameFor(kp, Unit())        = "<kp>u/g<gen>/u<id>"
+//	Replicated() == true  -> dbNameReplicaFor(kp, ru)     = "<kp>u/g<gen>/u<id>/r<rep>"
+//
+// The shape MOVED because the collapse deleted the second port. Before it, the
+// selector was carried by which method the cluster called (OpenUnit versus
+// OpenReplicaUnit); one port has one method, so the bit had to become part of
+// the identity that crosses the seam. This adapter kept its derivation
+// byte-for-byte; only where the bit is spelled changed.
 //
 // THE FLAG IS LOAD-BEARING, NOT COSMETIC, AND THE TWO ENCODINGS DO NOT MEET AT
 // REPLICA 0. A deployed R=1 cluster's bytes live at the R=1 prefix; the R>1
@@ -70,38 +78,30 @@ func dbNameReplicaFor(keyPrefix string, ru storageunit.ReplicaUnit) string {
 // DIFFERENT string. Resolving the R=1 path through the replica-0 encoding would
 // point every existing unit at an empty prefix and silently orphan its data.
 //
-// This type + dbNameForRef live in this PURE, TAGLESS file precisely so that
-// disjointness is pinned by dbname_test.go without the heavy slatedb cgo build:
-// dbNameForRef is the ONLY place the R=1 / R>1 encoding choice is made, and
+// dbNameForRef lives in this PURE, TAGLESS file precisely so that disjointness
+// is pinned by dbname_test.go without the heavy slatedb cgo build: it is the
+// ONLY place the encoding choice is made, and
 // TestDbNameForRef_R1AndReplica0DoNotAlias is the guard on it.
 //
 // Because the flag is part of the value, refUnit(gu) and refReplica(gu, 0) are
-// also DISTINCT map keys, which is what lets the factory's Handle track R=1 and
-// R>1 mounts in ONE map without aliasing them.
-type unitRef struct {
-	ru         storageunit.ReplicaUnit
-	replicated bool
-}
+// also DISTINCT map keys, which is what lets the factory's Handle track both
+// families of mounts in ONE map without aliasing them.
+type unitRef = storageunit.MountRef
 
-// refUnit is the R=1 identity for gu (the storageunit.BackendFactory surface).
-func refUnit(gu storageunit.GenUnit) unitRef {
-	return unitRef{ru: storageunit.NewReplicaUnit(gu, 0)}
-}
+// refUnit is the sole-mount identity for gu, what an R=1 cluster opens.
+func refUnit(gu storageunit.GenUnit) unitRef { return storageunit.SoleMount(gu) }
 
-// refReplica is the R>1 identity for replica position ru (the
-// storageunit.ReplicaBackendFactory surface).
-func refReplica(ru storageunit.ReplicaUnit) unitRef {
-	return unitRef{ru: ru, replicated: true}
-}
+// refReplica is the identity of replica position ru, what an R>1 cluster opens.
+func refReplica(ru storageunit.ReplicaUnit) unitRef { return storageunit.ReplicaMount(ru) }
 
 // dbNameForRef resolves a unitRef to its slatedb DbName. It is the SINGLE
-// place the R=1 / R>1 on-disk encoding split is decided; see unitRef for why
-// collapsing the two would orphan a deployed R=1 cluster's data.
+// place the sole / per-replica on-disk encoding split is decided; see unitRef
+// for why collapsing the two would orphan a deployed R=1 cluster's data.
 func dbNameForRef(keyPrefix string, r unitRef) string {
-	if r.replicated {
-		return dbNameReplicaFor(keyPrefix, r.ru)
+	if r.Replicated() {
+		return dbNameReplicaFor(keyPrefix, r.ReplicaUnit())
 	}
-	return dbNameFor(keyPrefix, r.ru.Unit)
+	return dbNameFor(keyPrefix, r.Unit())
 }
 
 // servingMarkerKeyFor maps a ReplicaUnit to the object key of its durable
@@ -124,4 +124,20 @@ func dbNameForRef(keyPrefix string, r unitRef) string {
 // ignores it (a "serving" tail is not a slatedb object root either way).
 func servingMarkerKeyFor(keyPrefix string, ru storageunit.ReplicaUnit) string {
 	return dbNameReplicaFor(keyPrefix, ru) + "/serving"
+}
+
+// servingMarkerKeyForRef is servingMarkerKeyFor over the MOUNT identity, so the
+// marker follows the SAME sole / per-replica split as the mount's database
+// rather than being pinned to the replica encoding:
+//
+//	servingMarkerKeyForRef(p, r) = dbNameForRef(p, r) + "/serving"
+//
+// For a replicated ref this is byte-for-byte servingMarkerKeyFor(p, ru), which
+// is what every marker written to date used and what
+// TestServingMarkerKeyForRef_MatchesReplicaEncoding pins. For a sole ref it is
+// a DIFFERENT key, which is the point: deriving both through the replica
+// encoding would alias a sole mount's marker onto replica 0's, the same class
+// of aliasing dbNameForRef exists to prevent.
+func servingMarkerKeyForRef(keyPrefix string, r unitRef) string {
+	return dbNameForRef(keyPrefix, r) + "/serving"
 }

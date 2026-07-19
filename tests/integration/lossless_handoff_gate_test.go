@@ -266,8 +266,8 @@ func TestLosslessHandoffGate(t *testing.T) {
 			return false
 		}
 		have := make(map[storageunit.UnitID]bool, len(open))
-		for _, gu := range open {
-			have[gu.ID] = true
+		for _, m := range open {
+			have[m.Unit().ID] = true
 		}
 		for _, u := range movedUnits {
 			if !have[u] {
@@ -473,7 +473,7 @@ func assertStaleHandleFenced(t *testing.T, backing *sharedfactory.Backing, u sto
 	gu := gu0(u)
 	// "stale" handle: open u at the current durable epoch via a fresh handle.
 	stale := backing.Handle()
-	staleBk, err := stale.OpenUnit(gu, backing.DurableEpoch(gu))
+	staleBk, _, err := stale.OpenUnit(storageunit.SoleMount(gu), backing.DurableEpoch(gu))
 	if err != nil {
 		t.Fatalf("FENCING setup: stale handle OpenUnit(%d): %v", u, err)
 	}
@@ -483,7 +483,7 @@ func assertStaleHandleFenced(t *testing.T, backing *sharedfactory.Backing, u sto
 	}
 	// A higher-epoch owner acquires (the next handoff): durable epoch advances.
 	newer := backing.Handle()
-	if _, err := newer.OpenUnit(gu, backing.DurableEpoch(gu)+1); err != nil {
+	if _, _, err := newer.OpenUnit(storageunit.SoleMount(gu), backing.DurableEpoch(gu)+1); err != nil {
 		t.Fatalf("FENCING setup: newer handle OpenUnit(%d): %v", u, err)
 	}
 	// The stale handle is now fenced: its write MUST fail.
@@ -534,10 +534,10 @@ func (a *atomicUnit) get() (storageunit.UnitID, bool) {
 // armed unit, so the next OpenUnit lands an empty store and every acked write
 // in that unit is lost. This models the data-loss failure mode the gate is the
 // safety net for.
-func (h *brokenHandle) CloseUnit(gu storageunit.GenUnit) error {
-	err := h.Handle.CloseUnit(gu)
-	if target, ok := h.breakUnit.get(); ok && gu.ID == target {
-		h.backing.WipeUnit(gu)
+func (h *brokenHandle) CloseUnit(m storageunit.MountRef) error {
+	err := h.Handle.CloseUnit(m)
+	if target, ok := h.breakUnit.get(); ok && m.Unit().ID == target {
+		h.backing.WipeUnit(m.Unit())
 	}
 	return err
 }
@@ -637,8 +637,8 @@ func TestGateCatchesLostWrite(t *testing.T) {
 	// (the shared store for breakUnit drained to zero keys).
 	if !waitUntil(12*time.Second, func() bool {
 		mounted := false
-		for _, gu := range n2.Handle.OpenUnits() {
-			if gu.ID == breakUnit {
+		for _, m := range n2.Handle.OpenUnits() {
+			if m.Unit().ID == breakUnit {
 				mounted = true
 				break
 			}

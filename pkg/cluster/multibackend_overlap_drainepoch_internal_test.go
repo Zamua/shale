@@ -66,7 +66,7 @@ func TestOverlap_beginDrain_GatesOnOwnOpenEpoch_ReleasesAfterSuccessorMarker(t *
 	if succEpoch != 2 {
 		t.Fatalf("precondition: successor open epoch should be 2, got %d", succEpoch)
 	}
-	if err := hSucc.WriteServingMarker(target, succEpoch); err != nil {
+	if err := hSucc.WriteServingMarker(storageunit.ReplicaMount(target), succEpoch); err != nil {
 		t.Fatalf("successor marker: %v", err)
 	}
 
@@ -121,7 +121,7 @@ func TestOverlap_beginDrain_RealMountPath_CapturesOwnOpenEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("successor open: %v", err)
 	}
-	if err := hSucc.WriteServingMarker(target, succEpoch); err != nil {
+	if err := hSucc.WriteServingMarker(storageunit.ReplicaMount(target), succEpoch); err != nil {
 		t.Fatalf("successor marker: %v", err)
 	}
 
@@ -165,7 +165,7 @@ func TestOverlap_beginDrain_EscalationImmunity_MultiOpenCascade(t *testing.T) {
 		if err != nil {
 			t.Fatalf("successor %d open: %v", i, err)
 		}
-		if err := h.WriteServingMarker(target, ep); err != nil {
+		if err := h.WriteServingMarker(storageunit.ReplicaMount(target), ep); err != nil {
 			t.Fatalf("successor %d marker: %v", i, err)
 		}
 		lastMarker = ep
@@ -226,7 +226,7 @@ func TestOverlap_allOwnedPositionsHandedOff_GatesOnOwnOpenEpoch(t *testing.T) {
 		if err != nil {
 			t.Fatalf("successor %d open: %v", i, err)
 		}
-		if err := h.WriteServingMarker(target, ep); err != nil {
+		if err := h.WriteServingMarker(storageunit.ReplicaMount(target), ep); err != nil {
 			t.Fatalf("successor %d marker: %v", i, err)
 		}
 		lastMarker = ep

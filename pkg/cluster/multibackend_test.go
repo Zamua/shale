@@ -67,9 +67,17 @@ func TestValidateBackendMode(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name:    "multi-backend with R>1 is rejected in phase 2",
-			cfg:     Config{BackendFactory: fac, UnitCount: uc, ReplicationFactor: 3},
-			wantErr: true,
+			// R>1 is NOT a capability question any more. shale declares ONE
+			// storage port; a factory that compiles against it has stated it
+			// meets the contract, so there is nothing left to assert at Open
+			// and nothing to refuse. The predecessor of this case pinned the
+			// opposite (R>1 rejected unless the factory also implemented a
+			// second ReplicaBackendFactory interface), which was exactly the
+			// "ask the adapter what it can do" branch the port collapse
+			// removed.
+			name:     "multi-backend with R>1 is allowed: no capability check",
+			cfg:      Config{BackendFactory: fac, UnitCount: uc, ReplicationFactor: 3},
+			wantMode: true,
 		},
 		{
 			name:     "multi-backend with R=1 is allowed",
@@ -363,11 +371,11 @@ type failingFactory struct {
 	failOn storageunit.UnitID
 }
 
-func (f *failingFactory) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
-	if gu.ID == f.failOn {
-		return nil, errors.New("failingFactory: injected open failure")
+func (f *failingFactory) OpenUnit(m storageunit.MountRef, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	if m.Unit().ID == f.failOn {
+		return nil, 0, errors.New("failingFactory: injected open failure")
 	}
-	return f.Factory.OpenUnit(gu, epoch)
+	return f.Factory.OpenUnit(m, epoch)
 }
 
 // TestMultiBackendTransact_CrossUnitSameNodeRejected pins the multi-backend

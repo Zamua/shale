@@ -476,7 +476,8 @@ func (c *inProcCluster) WaitSettled(expectedUnits int, timeout time.Duration) {
 					// restarted node that has not taken its units yet): not settled.
 					mountOK = false
 				}
-				for _, gu := range open {
+				for _, m := range open {
+					gu := m.Unit()
 					gens[gu.Gen] = struct{}{}
 					if _, seen := mountOwner[gu.ID]; seen {
 						dup = true

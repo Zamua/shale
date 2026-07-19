@@ -12,7 +12,6 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/blob"
 	"github.com/Zamua/shale/pkg/membership"
-	"github.com/Zamua/shale/pkg/rebalance"
 	"github.com/Zamua/shale/pkg/reshard"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -182,32 +181,17 @@ type Config struct {
 	LogOutput io.Writer
 
 	// RebalanceSettleDelay is how long the cluster waits after a
-	// membership event before kicking off Evaluate. Each subsequent
-	// event in the window resets the timer (debounce). Zero falls
-	// back to the package default (5s; matches docs/SPEC.md).
+	// membership event before running the unit reconcile. Each
+	// subsequent event in the window resets the timer (debounce). Zero
+	// falls back to the package default (5s; matches docs/SPEC.md).
 	RebalanceSettleDelay time.Duration
 
 	// RebalanceRetryAfterMs is the hint returned in the
-	// FailedPrecondition error when a Put / Delete lands on a key
-	// whose partition is migrating out. Clients SHOULD wait this
-	// many ms before retrying. Zero falls back to 50ms (matches
-	// rebalance.DefaultOptions).
+	// ResourceExhausted error when a Put / Delete lands on a unit that
+	// is mid-handoff. Clients SHOULD wait this many ms before
+	// retrying. It is also the base of the Layer-2 handoff retry
+	// backoff. Zero falls back to 50ms.
 	RebalanceRetryAfterMs int
-
-	// RebalanceGraceDuration is how long a HandedOff range stays on
-	// the source before the sweep deletes its now-foreign keys. Zero
-	// falls back to rebalance.DefaultOptions (30s, matching
-	// docs/SPEC.md "Cutover" T_drain). Integration tests + faster-
-	// feedback fixtures pass small values.
-	RebalanceGraceDuration time.Duration
-
-	// RebalanceHandoffTimeout bounds how long the source's runSend
-	// waits for the destination to ack the gRPC stream. Past the
-	// timeout the partition transitions Done-with-error (the next
-	// Evaluate retries). Zero falls back to the package default
-	// (rebalance.DefaultOptions, 5 minutes). Integration tests
-	// shrink it so a "destination never asks" scenario fails fast.
-	RebalanceHandoffTimeout time.Duration
 
 	// ReplicationFactor is the number of nodes that hold a copy of
 	// each key. Zero is normalized to 1 by Open (v0.3 behavior:
@@ -318,25 +302,6 @@ type Config struct {
 	// code path reads this.
 	TestingBlockPeerDials bool
 
-	// TestingReceiveGate, when non-nil, blocks every destination-side
-	// FetchRange until the channel is closed, HOLDING the range's
-	// StateReceiving window open for as long as the test wants. Must be
-	// set at construction time (not after) for the same reason
-	// TestingBlockPeerDials must: the bootstrap Evaluate runs inline
-	// inside Open for a joiner and launches the FetchRange goroutines
-	// immediately. The gate is honored BEFORE the peer dial, after the
-	// Coordinator has already registered the range StateReceiving, so
-	// IsReceiving stays true for the entire hold.
-	//
-	// It exists because the migration-guard rejection is otherwise
-	// unobservable without a race: on the R=1 path the rejection comes
-	// from the DESTINATION's IsReceiving guard (see LocalReplicaPut in
-	// replicate.go), and that window is single-digit milliseconds wide
-	// on a loopback fixture. A test that hammers Puts hoping to land
-	// inside it is bimodal, not slow-but-correct. Test-only; no
-	// production code path reads this.
-	TestingReceiveGate <-chan struct{}
-
 	// TestingMountDelay, when >0, sleeps for that long inside Open right before
 	// the unit mount, SIMULATING a slow cold-start mount (a loaded object store
 	// taking tens of seconds). Because the caller starts this node's gRPC server
@@ -411,18 +376,26 @@ type Config struct {
 	GracefulLeaveDrainTimeout time.Duration
 }
 
-// validateBackendMode enforces the legacy-vs-multi-backend XOR and
-// returns whether the cluster runs in multi-backend mode (v0.8 Phase 2).
+// validateBackendMode enforces the single-node-vs-multi-backend XOR and
+// returns whether the cluster runs in multi-backend mode.
 //
 // Exactly one mode must be selected:
-//   - legacy per-node: Backend set, BackendFactory + UnitCount unset.
-//   - multi-backend:   BackendFactory + UnitCount set, Backend unset.
+//   - single-node:   Backend set, BackendFactory + UnitCount unset, no BindAddr.
+//   - multi-backend: BackendFactory + UnitCount set, Backend unset.
 //
 // Setting both, or neither, is an error (fail closed: an operator who
 // half-configures multi-backend mode must hear about it, not silently get
-// the legacy path). Multi-backend mode additionally requires
-// ReplicationFactor in {0, 1}: the per-unit replication interplay is out
-// of Phase 2 scope, so a multi-backend cluster is single-replica.
+// a degenerate one).
+//
+// Backend WITH a BindAddr is rejected. It used to select a second
+// coordination engine (plan key ranges, stream them between peers, verify,
+// sweep) which no longer exists: shale has ONE distributed model, the
+// unit lease handoff, and that needs a BackendFactory. Accepting the
+// combination would be worse than failing: the cluster would come up,
+// gossip, build a ring and serve reads and writes, but nothing would move
+// data on a topology change, so keys would silently become unreachable the
+// moment the ring reassigned them to a node that never held their bytes.
+// A refused Open turns that into a failed startup instead.
 func validateBackendMode(cfg *Config) (multi bool, err error) {
 	hasFactory := cfg.BackendFactory != nil
 	hasUnitCount := !cfg.UnitCount.IsZero()
@@ -430,20 +403,19 @@ func validateBackendMode(cfg *Config) (multi bool, err error) {
 
 	switch {
 	case hasBackend && (hasFactory || hasUnitCount):
-		return false, errors.New("cluster: set EITHER Backend (legacy per-node) OR BackendFactory+UnitCount (multi-backend), not both")
+		return false, errors.New("cluster: set EITHER Backend (single-node) OR BackendFactory+UnitCount (multi-backend), not both")
+	case hasBackend && cfg.BindAddr != "":
+		return false, errors.New("cluster: Config.Backend is single-node only; multi-node (BindAddr set) requires BackendFactory + UnitCount")
 	case hasFactory != hasUnitCount:
 		return false, errors.New("cluster: multi-backend mode requires BOTH BackendFactory and UnitCount")
 	case hasFactory && hasUnitCount:
-		// Multi-backend mode. At R>1 (replicated multi-backend, v0.8 Phase 2b)
-		// the factory MUST be a ReplicaBackendFactory: a unit's R replicas are
-		// independent durable databases keyed by replica position, which the
-		// base BackendFactory cannot open. A single-replica factory at R>1 is a
-		// configuration error caught here, not a runtime nil-deref.
-		if cfg.ReplicationFactor > 1 {
-			if _, ok := cfg.BackendFactory.(storageunit.ReplicaBackendFactory); !ok {
-				return false, fmt.Errorf("cluster: multi-backend mode at ReplicationFactor %d requires a ReplicaBackendFactory (the per-replica independent durable databases R>1 needs)", cfg.ReplicationFactor)
-			}
-		}
+		// Multi-backend mode, at any ReplicationFactor. There is no capability
+		// check here and there must never be one again: shale declares ONE
+		// storage port, and an adapter that compiles against it has stated it
+		// meets the contract. Asking a factory at Open which subset of the
+		// contract it supports is the leak this collapse removed; R>1 is not a
+		// different port, only a different mount identity (a replica position
+		// instead of a sole unit).
 		return true, nil
 	case hasBackend:
 		return false, nil
@@ -633,15 +605,6 @@ type Cluster struct {
 	// is driven through membership.SetJoining alongside this flag.
 	selfJoining atomic.Bool
 
-	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
-	// capability view of factory: non-nil iff the factory implements
-	// ReplicaBackendFactory AND R>1. The replicated paths open each owned unit
-	// at its replica POSITION (an independent durable database) through this.
-	// Nil at R=1 and in legacy mode. The per-unit replica POSITION is the
-	// mountMap key's Replica field (Phase 2e re-keying); there is no separate
-	// replicaPos map.
-	replicaFactory storageunit.ReplicaBackendFactory
-
 	// genState is the generation-aware routing state (v0.8 Phase 4): the
 	// CURRENT generation, the unit count at that generation, the doubled
 	// count at the next generation, and the per-old-unit cut-over set. A key
@@ -793,20 +756,14 @@ type Cluster struct {
 	// loser falls through to the closed CAS and waits on loopWG.
 	drainOnce sync.Once
 
-	// Rebalance state (multi-node only; rebalance is empty in
-	// single-node mode). rebalance is the per-range Coordinator, held
-	// behind an atomic.Pointer so the events / reconcile loops can
-	// observe a coherent value without serializing against the rare
-	// replaceCoordinator path (--cancel). ringGen is the monotonic
-	// generation counter bumped on every membership-driven ring
-	// change (events loop + reconcile loop both call bumpRingGen).
-	// lastEvalRing is the ring snapshot from the most recent
-	// Evaluate, paired with the live ring on the next tick to compute
-	// the delta plan. settleMu + settleTimer drive the debounce:
+	// Rebalance state (multi-node only; unused in single-node mode,
+	// which builds no ring and so never sees one change). ringGen is
+	// the monotonic generation counter bumped on every
+	// membership-driven ring change (events loop + reconcile loop both
+	// call bumpRingGen). settleMu + settleTimer drive the debounce:
 	// every ring change (re)arms the timer; when it fires,
-	// runEvaluate computes the plan. rebalanceCtx / rebalanceCancel
-	// drive the background sweep loop.
-	rebalance   atomic.Pointer[rebalance.Coordinator]
+	// runScheduledReconcile acquires newly-owned units and releases
+	// no-longer-owned ones.
 	ringGen     atomic.Uint64
 	settleMu    sync.Mutex
 	settleTimer *time.Timer
@@ -818,13 +775,10 @@ type Cluster struct {
 	// the Coordinator's range table may still be empty. Incremented when
 	// arming a FRESH timer (decided under settleMu so the "was there a
 	// live timer" read pairs atomically with the increment), decremented
-	// in a defer at the end of the runEvaluate / runReconcile callback
-	// once the Coordinator has registered its ranges. A re-arm of a
+	// in a defer at the end of the runScheduledReconcile callback once
+	// the unit moves it computed have been applied. A re-arm of a
 	// still-live timer does NOT double-count. See docs/SPEC.md "Trigger".
-	settlePending   atomic.Int64
-	lastEvalRing    *ring.Ring
-	rebalanceCtx    context.Context
-	rebalanceCancel context.CancelFunc
+	settlePending atomic.Int64
 
 	// repairCtx / repairCancel govern the lifetime of async read-
 	// repair goroutines. Close cancels repairCtx so any in-flight
@@ -951,36 +905,17 @@ func Open(cfg Config) (*Cluster, error) {
 		c.ring.Add(ring.Member{ID: m.ID, Addr: m.Addr})
 	}
 
-	if multi {
-		// Multi-backend mode (v0.8). Derive the owned units from the
-		// now-seeded ring + mount them at Open. On every later membership
-		// change the events / reconcile loops below call bumpRingGen, which
-		// in multi mode arms the COPY-FREE lease-handoff reconcile (Phase 3,
-		// multibackend_rebalance.go) instead of the v0.3 Coordinator: a unit
-		// whose owner moved is released by the old owner (CloseUnit, flush)
-		// and acquired by the new owner (OpenUnit at a higher epoch,
-		// fencing the old). The v0.3 Coordinator is intentionally NOT
-		// started here (c.rebalance stays nil); the reconcile is its
-		// multi-backend replacement.
-		if err := c.initMultiBackend(); err != nil {
-			_ = mem.Close()
-			return nil, err
-		}
-		c.loopWG.Add(2)
-		go c.runEventsLoop()
-		go c.runReconcileLoop()
-		return c, nil
+	// Derive the owned units from the now-seeded ring + mount them at
+	// Open. On every later membership change the events / reconcile loops
+	// below call bumpRingGen, which arms the COPY-FREE lease-handoff
+	// reconcile (multibackend_rebalance.go): a unit whose owner moved is
+	// released by the old owner (CloseUnit, flush) and acquired by the new
+	// owner (OpenUnit at a higher epoch, fencing the old). The bytes stay
+	// put in the shared durable store; only the lease moves.
+	if err := c.initMultiBackend(); err != nil {
+		_ = mem.Close()
+		return nil, err
 	}
-
-	// Rebalance machinery: Coordinator + settle-timer + sweep.
-	// initRebalance MUST run BEFORE the events / reconcile goroutines
-	// spawn. Both of those call bumpRingGen -> scheduleEvaluate, which
-	// reads c.rebalance + (under settleMu) c.lastEvalRing. Initializing
-	// after the spawn races on those fields the very first time a
-	// membership event arrives. initRebalance only touches local fields
-	// from the calling goroutine, so doing it here is the safest
-	// publish point.
-	c.initRebalance()
 
 	// Run the events loop so future joins / leaves keep the ring in
 	// sync with membership. Also run a slower reconciliation loop
@@ -1409,17 +1344,6 @@ func (c *Cluster) Close() error {
 	}
 	c.settleMu.Unlock()
 
-	// Stop the Coordinator + cancel the sweep context. Coordinator.Stop
-	// closes its internal stopCh which terminates in-flight FetchRange
-	// goroutines; cancel of rebalanceCtx terminates the sweep loop. Both
-	// are idempotent.
-	if rb := c.rebalance.Load(); rb != nil {
-		rb.Stop()
-	}
-	if c.rebalanceCancel != nil {
-		c.rebalanceCancel()
-	}
-
 	// Cancel any in-flight read-repair goroutines + wait for them to
 	// exit BEFORE tearing down the peer-client cache. A repair that's
 	// mid-PutForwarded against a cached peerClient would deadlock /
@@ -1681,21 +1605,8 @@ func (c *Cluster) Put(key, value []byte) error {
 		}
 		return c.putForwarded(cli, key, value)
 	}
-	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
-		return c.putReplicated(key, value)
-	}
-	owner, local := c.ownerOf(key)
-	if local {
-		if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
-			return migrationGuardError(c.retryAfterMs())
-		}
-		return c.backend.Put(key, value)
-	}
-	cli, err := c.clientFor(owner.Addr)
-	if err != nil {
-		return err
-	}
-	return c.putForwarded(cli, key, value)
+	// Single-node: no ring, no peers, no units. The write is local.
+	return c.backend.Put(key, value)
 }
 
 // Get returns the value for key, routing to the owning node.
@@ -1739,19 +1650,8 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 		}
 		return c.forwardGet(owner.Addr, key)
 	}
-	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
-		return c.getReplicated(key)
-	}
-	owner, local := c.ownerOf(key)
-	if local {
-		if rb := c.rebalance.Load(); rb != nil {
-			if mv, ok := rb.ReceivingMove(key); ok && mv.From.Addr != "" {
-				return c.forwardGet(mv.From.Addr, key)
-			}
-		}
-		return c.backend.Get(key)
-	}
-	return c.forwardGet(owner.Addr, key)
+	// Single-node: no ring, no peers, no units. The read is local.
+	return c.backend.Get(key)
 }
 
 // forwardGet dials addr (a peer's gRPC address) + issues a Get with
@@ -1839,21 +1739,8 @@ func (c *Cluster) Delete(key []byte) error {
 		}
 		return c.deleteForwarded(cli, key)
 	}
-	if c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty() {
-		return c.putReplicated(key, nil)
-	}
-	owner, local := c.ownerOf(key)
-	if local {
-		if rb := c.rebalance.Load(); rb != nil && (rb.IsMigrating(key) || rb.IsReceiving(key)) {
-			return migrationGuardError(c.retryAfterMs())
-		}
-		return c.backend.Delete(key)
-	}
-	cli, err := c.clientFor(owner.Addr)
-	if err != nil {
-		return err
-	}
-	return c.deleteForwarded(cli, key)
+	// Single-node: no ring, no peers, no units. The delete is local.
+	return c.backend.Delete(key)
 }
 
 // ScanPrefix returns an iterator over keys with the given prefix on

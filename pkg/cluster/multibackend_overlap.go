@@ -328,7 +328,7 @@ func (c *Cluster) desiresUnitElsewhereUnmounted(
 // availability costs one reconcile tick, failing toward release can destroy
 // the last copy.
 func (c *Cluster) heldForMissingSuccessorMarker(ru storageunit.ReplicaUnit) bool {
-	if c.replicaFactory == nil {
+	if !c.replicaLayout() {
 		return false
 	}
 	gs := c.genSnapshot()
@@ -347,7 +347,7 @@ func (c *Cluster) heldForMissingSuccessorMarker(ru storageunit.ReplicaUnit) bool
 		return false // index outside the unit's live placement: never re-marked.
 	}
 	own := c.ownOpenEpoch(ru)
-	epoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
+	epoch, ok, err := c.factory.ReadServingMarker(storageunit.ReplicaMount(ru))
 	if err != nil {
 		return true // cannot prove a successor serves: hold, re-check next pass.
 	}
@@ -433,7 +433,7 @@ func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
 	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at THIS
 	// node's EXACT open epoch (the recorded factory return) - exactly what the
 	// in-goroutine flip would have written, NOT a re-read of the climbing durable.
-	_ = c.replicaFactory.WriteServingMarker(ru, c.ownOpenEpoch(ru))
+	_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), c.ownOpenEpoch(ru))
 }
 
 // ownOpenEpoch returns the EXACT epoch this node opened ru at (recorded from
@@ -761,10 +761,10 @@ func (c *Cluster) reclaimDrainingPosition(ru storageunit.ReplicaUnit) {
 // marker existence + epoch>=0 still gates correctly because a marker is only
 // written by a Ready new owner). Reads durable state without the lock.
 func (c *Cluster) openEpochForReplica(ru storageunit.ReplicaUnit) storageunit.Epoch {
-	if c.replicaFactory == nil {
+	if !c.replicaLayout() {
 		return 0
 	}
-	e, err := c.replicaFactory.DurableEpochReplica(ru)
+	e, err := c.factory.DurableEpoch(storageunit.ReplicaMount(ru))
 	if err != nil {
 		return 0
 	}
@@ -933,15 +933,15 @@ const (
 // is private to this call, so neither confusion is expressible.
 func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) error {
 	openStart := time.Now()
-	b, openedEpoch, err := c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
+	b, openedEpoch, err := c.factory.OpenUnit(storageunit.ReplicaMount(ru), acquireBaseEpoch)
 	if err != nil {
 		// SELF-HEAL the same factory/cluster desync as the clean-cut path (#408):
 		// this position is mid-acquire with no mount installed yet, so if the
 		// factory refuses because it still holds ru open on this handle ("already
 		// open"), that handle state is stale - close it to re-sync, then reopen
 		// once. Safe: no mount entry points at the stale handle.
-		_ = c.replicaFactory.CloseReplicaUnit(ru)
-		b, openedEpoch, err = c.replicaFactory.OpenReplicaUnit(ru, acquireBaseEpoch)
+		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
+		b, openedEpoch, err = c.factory.OpenUnit(storageunit.ReplicaMount(ru), acquireBaseEpoch)
 		if err != nil {
 			// Mount still failing; stay Acquiring. The position is not stranded: the
 			// old owner is still a routed current owner serving via the union.
@@ -966,7 +966,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	if c.closed.Load() {
 		c.mountMu.Unlock()
 		c.myOpenEpoch.Delete(ru) // no mount installed; don't leak the recorded epoch.
-		_ = c.replicaFactory.CloseReplicaUnit(ru)
+		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 		return nil // Close superseded this attempt; nothing to retry.
 	}
 	cur := c.handoffPhase[ru]
@@ -977,7 +977,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		c.storeMount(ru, b)
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
-		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+		_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), openedEpoch)
 		return nil // Mounted (the phase entry was already resolved elsewhere).
 	}
 	ready, err := storageunit.NextOnReady(cur, openedEpoch)
@@ -987,7 +987,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 		c.storeMount(ru, b)
 		delete(c.handoffPhase, ru)
 		c.mountMu.Unlock()
-		_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+		_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), openedEpoch)
 		return nil // Mounted (illegal FSM edge converged to Owned).
 	}
 	c.storeMount(ru, b)
@@ -1003,7 +1003,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	// lock: it is shared-storage I/O). This is the durable, poll-observable release
 	// signal the old owner's drainCheck polls. No RPC is sent.
 	markStart := time.Now()
-	_ = c.replicaFactory.WriteServingMarker(ru, openedEpoch)
+	_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), openedEpoch)
 	c.logf("shale: mounted %s at epoch %d: open %s, serving-mark %s",
 		ru, openedEpoch, markStart.Sub(openStart).Round(time.Millisecond), time.Since(markStart).Round(time.Millisecond))
 	return nil
@@ -1051,7 +1051,7 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	c.mountMu.Unlock()
 
 	// I/O OUTSIDE the lock: poll the durable serving marker.
-	markerEpoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
+	markerEpoch, ok, err := c.factory.ReadServingMarker(storageunit.ReplicaMount(ru))
 	if err != nil {
 		return
 	}
@@ -1113,7 +1113,7 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 
 	// CloseReplicaUnit OUTSIDE the lock (the entry is already removed). Idempotent
 	// + belt-and-suspenders for acked writes (durable-before-ack).
-	_ = c.replicaFactory.CloseReplicaUnit(ru)
+	_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 }
 
 // runDrainChecks polls every Draining position once on the settle / self-heal

@@ -53,8 +53,6 @@ import (
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
-
-	"github.com/Zamua/shale/pkg/rebalance"
 )
 
 // env returns the value of key, or def when unset/empty.
@@ -189,12 +187,7 @@ func TestChaosSoakSlate(t *testing.T) {
 
 	// The package-level TestMain (chaos_soak_test.go, built under -tags chaos)
 	// already wraps the whole run in goleak.VerifyTestMain, so a leaked Cluster
-	// goroutine surfaces at process exit. We re-assert the reconcile tick here so a
-	// `-run TestChaosSoakSlate` in isolation still settles handoffs sub-second
-	// within the per-event budgets (TestMain sets it too; setting it again is
-	// idempotent).
-	rebalance.SetSweepInterval(50 * time.Millisecond)
-
+	// goroutine surfaces at process exit.
 	bucket := makeSlateBucket(t, endpoint, access, secret)
 	provider, err := newSlateFactoryProvider(slateProviderConfig{
 		Endpoint:  endpoint,

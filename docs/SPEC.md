@@ -244,7 +244,6 @@ github.com/Zamua/shale                       core module (go.mod at repo root)
   pkg/ring/                                  consistent hash ring
   pkg/membership/                            memberlist wrapper
   pkg/rpc/                                   gRPC server/client for inter-node ops
-  pkg/rebalance/                             v0.3 handoff protocol
   cmd/shale/                                 the CLI
   cmd/shaled/                                the standalone-node binary (thin shell; see below)
 
@@ -631,171 +630,91 @@ This complements LWW-on-read: where read-repair pulls laggards forward, apply-if
   - **Per-key replication factor**: every key in the cluster uses the same R. Per-key overrides are out of scope; operators who need per-prefix replication policy should run separate clusters.
   - **Rebalance-with-replication**: a separate workflow (planned post-v0.4) that integrates the v0.3 rebalance protocol with the v0.4 replication overlay so live writes flow via replication during the bulk copy and the per-range write-rejection window collapses to the ownership swap.
 
-### Rebalancing (v0.3+)
+### Rebalancing
 
-v0.2 ships the gossip ring but does not migrate data: when membership changes, the ring redirects lookups to a node that does not hold the key, so reads against the new owner return not-found and writes land on the wrong shard. v0.3 closes that gap by physically migrating keys when membership changes, so the data state catches up to the ring state.
+shale has ONE distributed coordination model, and rebalancing is part of it.
 
-The design optimizes for an implementation small enough to reason about end to end, on the assumption that shale is embedded in apps run by individual developers and small teams (not Google-scale operators). It accepts brief per-range unavailability (tens of seconds for the streaming copy, milliseconds at the ownership swap) in exchange for: no coordinator election, no per-Backend WAL-tailing requirement, no five-state-machine recovery protocol. v0.4 adds replication (R>1), which is the natural place to recover read availability during migration by serving reads off a replica that already holds the range; trying to engineer that into v0.3 at R=1 buys little and complicates a lot.
+A multi-node cluster is multi-backend: every key belongs to a storage UNIT, and
+a unit is a self-contained database in shared durable storage. Ownership of a
+unit is a LEASE. When membership changes, a unit whose owner moved is handed
+off COPY-FREE: the old owner flushes and releases it, the new owner opens it at
+a higher epoch (fencing the old writer), and the bytes never travel through
+shale at all. They were already in the shared store; only the lease moved.
 
-This section reads most simply at R=1 (one owner per key), and the wire protocol, cutover, and reconcile machinery are first described in those terms. The generalization to R>1 is not deferred work: the rebalance is **replica-set aware** at every R. The single rule that makes both cases one mechanism is stated up front in "Replica-set placement (the rule for all R)" below, and the R>1 behavior of each pass is flagged inline and gathered at the end ("What v0.4 changes"). The mental model: at R=1 a key's desired holder set is the single owner `ring.LocateKey(shardKeyFn(k))`; at R>1 it is the R-node replica set `ring.LocateKeyN(shardKeyFn(k), R)`. R=1 is the degenerate one-element case of the R>1 rule, not a separate code path.
+That is the whole mechanism. There is no second engine that plans key ranges,
+streams them between peers, verifies a checksum and sweeps the source. Such an
+engine existed through v0.12 as the fallback for backends that cannot open a
+unit and fence a prior writer (`memory`, `pebble`), and carrying it meant shale
+selected a coordination model based on which backend it had been handed. That
+is the leak this design removed: shale should not know or care whether an
+adapter has that capability. An adapter either satisfies
+`storageunit.BackendFactory` or it does not; if it does not, it is a
+single-node backend.
 
-#### Replica-set placement (the rule for all R)
-
-The single invariant the whole rebalance enforces, at every ReplicationFactor:
-
-> On the current ring, every key is physically resident on **exactly** the nodes in `ring.LocateKeyN(shardKeyFn(k), R)` (its **replica set**): the R nodes that must hold a copy. No more, no fewer, once the cluster has settled.
-
-Every placement decision below derives from that one rule:
-
-  - **A node DELETES a key in the post-handoff sweep ONLY when it is no longer in that key's replica set.** A node that handed off the *primary* role for a key but is still one of the R replica-owners RETAINS its copy. Deleting a key the node still replica-owns is the bug this design fixes (see "The replica-aware invariant" below); the sweep is gated on replica-set membership, not on whether the primary moved.
-  - **A node that is newly in a key's replica set, but does not yet hold the key, RECEIVES it** from any current holder (any peer already in the replica set). "Newly a replica-owner" is the deliver-side trigger, exactly mirroring the delete-side gate.
-
-At R=1 these collapse to today's behavior with no change: `LocateKeyN(k, 1)` is the single-element set `{LocateKey(k)}`, so after a primary moves the old owner is NOT in the new replica set and DELETES (identical to the v0.3 single-owner sweep), and the new owner is the only newly-added replica and RECEIVES. R=1 stays byte-for-byte the v0.3 path. At R=2 on a 2-node cluster every key's replica set is BOTH nodes, so when a node joins the founder RETAINS every key (it is still a replica) and the joiner RECEIVES every key (it is newly a replica of all of them): both nodes end up holding all keys, which is what R=2 requires.
-
-The Coordinator is therefore parameterized by `ReplicationFactor` and a replica-set predicate (the current ring plus R), not just a single-owner ring view. The cluster wires `Config.ReplicationFactor` and the ring into it the same way it wires `Config.ShardKeyFn`. At R=1 the predicate degenerates to the single-owner comparison the v0.3 Coordinator already made.
+The full mechanism is specified under "v0.8 Phase 3: lease-handoff rebalance"
+(R=1), "v0.8 Phase 2e: pending ranges" (R>1 overlap handoff) and "v0.9
+Decentralized reshard" below. What follows here is only the part shared with
+the membership layer.
 
 #### Trigger
 
-Migration is driven by membership change, with a settling delay.
+Rebalancing is driven by membership change, with a settling delay.
 
-When `Membership` reports a join or leave, the node records the event and schedules a `rebalance.Evaluate()` for `T_settle` seconds in the future (default 5s, configurable via `Config.RebalanceSettleDelay`). Any further membership event inside the window resets the timer. When the timer fires, the node snapshots the current ring and proceeds.
+When `Membership` reports a join or leave, the node bumps a monotonic ring
+generation and schedules a reconcile pass for `T_settle` in the future (default
+5s, configurable via `Config.RebalanceSettleDelay`). Any further membership
+event inside the window resets the timer. When the timer fires, the node
+diffs the units it owns on the current ring against the units it has mounted,
+and acquires or releases the difference.
 
-The settling delay collapses bursts (rolling restart, several nodes joining within a second, a flapping peer) into one rebalance pass instead of thrashing the cluster through intermediate ring shapes. It also gives the existing membership reconciler (~5s) time to absorb missed events, so by the time `Evaluate` runs, every node tends to have the same view of who is in the cluster.
+The settling delay collapses bursts (a rolling restart, several nodes joining
+within a second, a flapping peer) into one reconcile pass instead of thrashing
+the mount map through intermediate ring shapes. It also gives the membership
+reconciler time to absorb missed events, so by the time the pass runs, nodes
+tend to agree on who is in the cluster.
 
-A node is considered *rebalance-idle* only when no settle-timer evaluation is pending (scheduled but not yet fired) and every tracked migration has reached a terminal state. `WaitForRebalanceIdle` blocks until both hold, so a caller that observes idle immediately after a membership change is guaranteed the debounced evaluation has already run and drained, not merely that nothing has been scheduled yet. A pending debounce timer therefore counts as not-idle even while the Coordinator's range table is still empty.
+A node is *rebalance-idle* when no settle-timer reconcile is pending: nothing
+is armed-but-unrun and no reconcile callback is mid-flight.
+`WaitForRebalanceIdle` blocks until that holds, so a caller that observes idle
+immediately after a membership change is guaranteed the debounced pass has
+already run and applied its unit moves, not merely that nothing has been
+scheduled yet. Single-node mode never schedules a pass, so it is trivially
+idle.
 
-There is no consensus and no coordinator election. Each node independently decides what to send and what to receive based on its local view of membership. Because memberlist converges in bounded time and each node uses the same ring algorithm against the same member list, peers reach the same migration decisions without negotiation. Disagreement during convergence is handled by the existing forwarding loop-guard plus the per-range cutover below.
+#### Rejecting a write to a unit mid-handoff
 
-An operator can also trigger evaluation explicitly:
+A Put or Delete that lands on a unit currently between owners is refused with
+`codes.ResourceExhausted` plus a retry-after hint (`Config.RebalanceRetryAfterMs`,
+default 50ms). That is a TRANSIENT refusal with defined retry semantics, and it
+is deliberately distinct from the two other reserved codes:
 
-  - `shale rebalance --dry-run` prints the plan the local node would execute against the current ring without doing the migration.
-  - `shale rebalance --apply` runs `Evaluate` immediately, bypassing the settling delay. Useful for planned topology changes (node decommission) where the operator wants to watch the plan before pulling the trigger.
+  - `ResourceExhausted`: in-flight handoff. Retry after the hinted backoff; the
+    next attempt may land on a different owner.
+  - `FailedPrecondition`: forwarding loop-guard. The receiving node disagrees
+    with the originator about ownership; the client must refresh its ring.
+  - `Unavailable`: a peer's gRPC channel is gone. This one counts against the
+    fan-out's failure budget so a genuinely-down node short-circuits the call.
 
-#### Plan
+Keeping handoff refusals out of the failure budget is what lets a fan-out wait
+for the other replicas instead of failing the whole call because one replica is
+mid-handoff. The same retry-after value is the base of the Layer-2 handoff
+retry backoff (see "v0.8 Phase 2d").
 
-Each node computes its plan locally from two inputs:
+#### `Config.Backend`: single-node only
 
-  - the previous ring snapshot (cached from the last evaluation, or empty on first run)
-  - the new ring snapshot
+`Config.Backend` is the local-only embedding of one backend: no membership, no
+ring, every operation local. ANY backend satisfies it, because the mode imposes
+no requirement on the adapter beyond `backend.Backend`. This is the shape a
+toolkit should have: the simple case stays simple.
 
-The unit of migration is the **key range**, defined as the contiguous arc of the hash ring between two adjacent virtual nodes. `buraksezer/consistent` exposes enough state to enumerate ranges. For each range, the node compares its **old replica-set membership** against its **new replica-set membership** (at R=1 the replica set is the single owner, so this is exactly the old-owner-vs-new-owner comparison):
-
-  - was-replica, no-longer-replica: schedule **send** to a peer that newly needs the range (the new copy must exist somewhere before the local copy is dropped); the local copy is deleted only by the post-handoff sweep, and only after confirming the node is no longer in the range's replica set.
-  - not-replica, now-replica: schedule **receive** from a current holder (passive; the source is the one who initiates the stream).
-  - replica in both: **retain**. The node keeps its copy. At R=1 this is the old=self/new=self no-op; at R>1 it is the case the v0.3 single-owner diff got wrong (it would delete a key whose primary moved even though the node is still a replica) and is now an explicit RETAIN.
-  - replica in neither: no-op for this node; the peers that do hold or need the range handle it between themselves.
-
-The delete-side and deliver-side decisions are therefore symmetric and both keyed on replica-set membership: a node sheds a range only when it leaves the range's replica set, and pulls a range only when it enters it. Both sides of any (send, receive) pair derive the plan from the same ring inputs (current ring plus R), so they agree on who sends what without explicit negotiation. The plan is held in memory; there is no persisted plan object and no plan ID. A crash mid-migration is recovered by the next `Evaluate` run on restart: the node observes the current ring versus what it actually holds and re-issues whatever migrations are still needed. This recovery path is the same code path as the steady-state one.
-
-#### Reconcile (owned-but-missing repair)
-
-The ring-vs-ring `ComputePlan` above is correct but incomplete on its own: it can only see ownership transitions that show up as a *difference between two ring snapshots it actually observed*. It is blind to a partition this node owns but never physically received, because that partition looks stable (old owner = new owner = self) in both snapshots the node holds. That blind spot is the **founder-grows (1 -> 2) data-loss path** and it arises from a ring-convergence race at the joiner's bootstrap:
-
-  - A joiner's `Membership.Join` returns once it has *contacted* a seed, but memberlist's push/pull state transfer and the `NotifyJoin` callbacks that populate the local member list may not have completed. Under slow gossip (real gRPC + an object-store backend), the at-startup ring snapshot the joiner pins as its `lastEvalRing` baseline can be self-only: `{joiner}`.
-  - When the founder later becomes visible, the joiner runs `ComputePlan(joiner, old={joiner}, new={founder, joiner})`. For every partition the consistent-hash ring assigns to the joiner in *both* rings (old owner self, new owner self), the diff is a no-op. No `Receive` is scheduled. The keys for those partitions physically live on the founder and are never streamed across, so a routed `Get` to the new owner (the joiner) finds nothing. The bytes survive on the founder but are unreachable from the cluster: data loss by un-reachability, not destruction.
-
-Ring-vs-ring diffing cannot close this because the joiner's two snapshots agree; the only authority that disagrees is **physical placement**. So `Evaluate` runs a second, independent pass keyed on what this node actually holds, not on ring history:
-
-  - For each partition `p` whose **replica set on the current ring includes self** (at R=1: self is `p`'s owner; at R>1: self is one of the R nodes `LocateKeyN` assigns `p`), the node asks: do I physically hold any of `p`'s keys? It answers by consulting the same local scan + partition function the source/sweep already use (`Coordinator.partFn`). A partition the ring assigns self a replica slot for, but for which the local backend holds **zero** keys, is an *owned-but-missing* partition.
-  - For each owned-but-missing partition, the node schedules a **Receive from a peer that already holds `p`** (at R=1: the partition's previous owner, the node the *current* ring would have placed `p` on before self joined; at R>1: any current replica that holds a copy, not necessarily the prior primary). That `From` is a peer `ComputePlan` would have named had the joiner seen the converged ring at bootstrap. The Receive is registered through the *identical* `tryRegister` -> `runReceive` -> `FetchRange` path the ring-vs-ring plan uses; there is no second migration mechanism.
-
-This pass is folded into the existing settle-timer `Evaluate` (it runs on every tick, after the ring-vs-ring plan), and is also reachable from the ~5s membership reconciler that already re-arms the settle timer. So convergence is self-healing on a bounded schedule: even if the bootstrap snapshot was self-only, the first settle-timer `Evaluate` after the founder becomes visible repairs every owned-but-missing partition. No new wire message, no persisted state, no operator action.
-
-Two guards keep the reconcile pass from over-firing:
-
-  - **Hold-detection, not count-matching.** A partition is owned-but-missing only when the node holds *zero* keys for it. A partition the node already received (or always held) is skipped, so a settled cluster issues no reconcile Receives and the pass is idle in steady state. (A partition that legitimately holds zero keys because no key has ever hashed into it is indistinguishable from missing, but pulling an empty range from its prior owner is a harmless zero-key `FetchRange` that flips straight to `Done`.)
-  - **No double-register.** `tryRegister` already refuses to register a partition that is in a non-terminal state, so a reconcile Receive scheduled while the ring-vs-ring plan already has that partition in `Receiving` is dropped. The two passes can name the same partition without racing.
-
-**The convergence invariant.** Once the ring has settled (membership stable, every in-flight migration terminal), every node physically holds every partition the current ring assigns it a replica slot for (at R=1: every partition it owns; at R>1: every partition in whose replica set it appears), and no committed key is under-replicated or unreachable: a routed `Get` to any key reaches a replica that holds it, and every key is physically resident on exactly the R nodes `LocateKeyN(key, R)` returns. The ring-vs-ring plan moves data across replica-set *transitions* the node witnessed; the reconcile pass repairs replica slots the node holds but never witnessed a transition for. Together they make physical placement match the ring's replica-set assignment, which is the property the founder-grows gate test asserts at R=1 and the membership-change-at-R2 gate test asserts at R>1.
-
-**The replica-aware invariant (the bug this fixes).** Two properties the replica-set rule guarantees that the v0.3 single-owner diff violated at R>1:
-
-  - **A node must never delete a key it still replica-owns.** The v0.3 sweep deleted from a node every key whose ring-*primary* moved to a joiner, with no check for whether the node was still one of the R replica-owners. At N=2,R=2 that deleted from the founder the roughly-half of keys whose primary moved to the joiner even though the founder is still a replica of all of them. The corrected sweep deletes a key only when the node is no longer in `LocateKeyN(key, R)`, so a node that remains a replica RETAINS its copy.
-  - **The cluster must not lose an acked key across a membership change at R>1.** The v0.3 plan also never delivered to the joiner the keys whose primary STAYED on the founder, even though the joiner is a replica of those too at R=2: the joiner settled holding only the keys whose primary moved, never reaching full replication. The corrected deliver side schedules a Receive for every key the node is newly a replica of, so at N=2,R=2 the joiner ends up holding ALL keys and the cluster preserves R=2 (every key on both nodes) with no acked write lost. The combination - delete only on leaving the replica set, receive on entering it - is copy-before-delete at the granularity of the replica set rather than the single owner.
-
-**The delete side is symmetric to reconcile: evict replica slots the node holds but no longer owns.** The post-handoff sweep (the "Swap"/"Post-migration" cutover steps below) deletes a node's local copy of a partition it *handed off as primary*, gated on the node having left the partition's replica set. At R>1 that sweep alone is incomplete in the same way `ComputePlan` is incomplete on the deliver side: a node can hold a partition it was never the *primary* of (it was a successor replica), and a membership change can drop it OUT of that partition's replica set without producing any handoff event for it to sweep. Example: grow 2 -> 3 at R=2. Both original nodes hold every key. After the third node joins, each key's replica set is only 2 of the 3 nodes, so for the keys whose replica set no longer includes it, a node that was a *non-primary* replica must shed its copy - but it never sent those keys, so there is no `StateHandedOff` range for the sweep to act on. Left unaddressed, the cluster over-retains: it converges to N x nodes physical copies instead of N x R, an unbounded leak as the cluster grows. So `Evaluate` runs an **evict pass** symmetric to reconcile, keyed on physical placement: it scans local keys, buckets them by partition, and for every partition the node physically holds but is NOT in `ReplicasForPartition(p, R)` of the current ring, it registers the partition straight into the handed-off state so the existing grace sweep deletes it after `T_drain`. The grace delay is load-bearing: it gives any node newly in the replica set time to pull its copy (the reconcile Receive is a pull) before the evicting node drops it, and at R>1 the data is in any case still resident on the other R-1 replicas, so an eviction can never drop a key below its replica count. At R<=1 the evict pass is a no-op: the single-owner `ComputePlan` already emits a Send (and thus a sweep delete) for every partition the sole owner sheds, so there is no held-but-never-primary class to evict. Reconcile (deliver) and evict (delete) are the two physical-placement passes that, together with the ring-vs-ring plan, make a node's local holdings exactly its replica-set assignment.
-
-**Both physical-placement passes run on a bounded periodic schedule, not just the one post-event `Evaluate`.** A membership change bumps the node's ring generation once and fires one settle-timer `Evaluate`. That single pass is not always enough to converge at R>1: a reconcile Receive can come back *empty* when its chosen source was itself still settling (a source-not-ready race - on a shrink, two survivors can each newly enter a partition's replica set and briefly race over who holds the data first). A zero-key pull is ambiguous (genuinely-empty partition vs source-not-ready), so the node retries a zero-key pull a small bounded number of times before accepting it as empty, and re-runs both the reconcile and evict passes on the existing grace-sweep ticker (against the ring captured by the last `Evaluate`). This makes convergence self-healing on a bounded schedule with no extra membership event required: a transient race resolves within a tick or two, while a settled cluster (every owned partition held, no stale-replica partition held) runs both passes as cheap no-ops.
-
-The empty-pull retry is **bounded**: a zero-key pull is retried a small fixed number of times (the empty-retry cap) before the partition is accepted as clean-empty and skipped, so a genuinely-empty partition does not retry forever. Correctness of placement does NOT depend on this repair path. Live replicated writes always reach every replica directly via the `putReplicated` fan-out (the originator writes its own replica copy and forwards to the other R-1 replicas), so a node that is a replica of a partition receives that partition's live writes whether or not its reconcile pull ever found a non-empty source. The reconcile pull is purely the catch-up / repair path for data written before the node entered the replica set; the bounded empty-retry only governs how aggressively that one-time catch-up probes a possibly-still-settling source. Full anti-entropy (periodic Merkle-tree reconciliation that re-checks every replica assignment indefinitely, including re-pulling a partition the node was earlier told is empty) is explicitly v0.4.1+ future work; the v0.4 reconcile pass is bounded catch-up, not continuous anti-entropy.
-
-**The partition function MUST match routing (honor `ShardKeyFn`).** The reconcile pass, the source-side handoff scan, and the grace sweep all bucket a backend's keys into partitions via `Coordinator.partFn`. For the convergence invariant to hold, that partition function MUST compute the partition on the **same shard key the cluster routes reads with**: `partition(k) = ring.PartitionID(shardKeyFn(k))`, where `shardKeyFn` is the app's `Config.ShardKeyFn` (identity when unset). Routing places a key on `ring.LocateKey(shardKeyFn(k))`, which is the owner of `ring.PartitionID(shardKeyFn(k))`; if rebalance instead bucketed on the raw key, the two would disagree for any app with a non-identity `ShardKeyFn`. The concrete failure: an app that co-locates one logical subject across many raw keys (e.g. `pastes/<slug>` plus `versions/<slug>/<n>` all shard-keyed to `<slug>`) has those keys hash to ONE partition under routing but SCATTER across many partitions under a raw-key bucketing. The reconcile pass on a joiner would then repair only whichever raw-key partition happened to land on it and strand the subject's remaining keys on the founder, while the ring routes the subject's reads to the joiner: the multi-key founder-grows loss. So `Config.ShardKeyFn` governs not just Put/Get/Delete routing but also where the rebalance machinery places a key. The Coordinator takes the `ShardKeyFn` as an option and the cluster wires `Config.ShardKeyFn` into it; the source-side `MigrateRange` handler applies the same extraction so the keys streamed for a requested partition are exactly the keys routing assigns to it.
-
-#### Interaction with the existing 2 -> 3 growth path
-
-The reconcile pass is additive and changes nothing about a node that *did* see the ring transition. In the established 2 -> 3 path, the third node joins a ring whose two members are already gossiped + converged; its bootstrap snapshot lists all three, the synthesized `old = current - self` baseline is `{n1, n2}`, and `ComputePlan` emits the correct Receives directly. Hold-detection then finds those partitions already in flight (or, after they land, physically held) and the reconcile pass issues nothing further. The 2 -> 3 case never depended on the blind spot, so repairing the blind spot leaves it untouched. The danger the founder-grows case exposes is specifically the *founder's* self-only bootstrap snapshot under slow gossip; the reconcile pass closes that without perturbing the snapshot-was-converged case.
-
-#### Wire
-
-A single server-streaming gRPC method:
-
-```
-rpc MigrateRange(RangeSpec) returns (stream MigrateChunk)
-```
-
-`RangeSpec` identifies the arc of the ring being transferred (start + end hash values, plus a `ring_generation` freshness field). `MigrateChunk` carries either a `(key, value)` pair or a terminal marker with the count + checksum of all keys sent.
-
-`ring_generation` is the destination's per-node monotonic ring-change counter at the moment it opened the stream. v0.3 carries this on the wire for future use, but the counter is NOT cluster-wide (each node bumps its own on every NotifyJoin/NotifyLeave + a node that joined later naturally has a lower count than a longer-lived peer), so the source CANNOT meaningfully compare the destination's value against its own. A strict less-than rejection spuriously cancels legitimate streams during normal join/leave races. v0.3 therefore accepts every stream regardless of the destination's reported generation; wrong-owner protection comes from the forwarding loop-guard + the per-key Put/Get migration guards instead. A cluster-wide ring generation (and the strict freshness check the field was originally designed for) lands when the gossip layer carries one in v0.4 or later.
-
-The destination initiates the call (it is the node whose ring says "I am the new owner"). The source iterates its local Backend over keys whose hashed shard key falls in the range, streams `(key, value)` pairs, then closes with the terminal marker. The destination writes each pair to its local Backend as it arrives. Backpressure is gRPC flow control; no per-key acknowledgement is needed.
-
-One range per RPC. Multiple ranges between the same source and destination run sequentially to keep the resource footprint predictable and the per-peer protocol single-threaded.
-
-If the source's Backend does not support a range-bounded scan, it falls back to a full `ScanPrefix("")` with a range filter applied per key. This is wasteful but correct; backend authors are encouraged to implement a faster path.
-
-#### Cutover
-
-Each range has a lifecycle:
-
-1. **Pre-migration**: source owns the range. Source serves reads and writes. Destination's ring already lists destination as the new owner, but `MigrateRange` has not started or is queued behind earlier ranges.
-2. **Migrating**: destination opens `MigrateRange`. Source marks the range as migrating-out, destination marks it as migrating-in. While in this state:
-   - **Reads** for keys in the range are served by the **source**. The forwarding loop-guard ensures that a read landing on the destination via stale ring is forwarded back to the source.
-   - **Writes** for keys in the range are **rejected with a transient error** (`ResourceExhausted` with retry hint). Both ends carry the guard: the source refuses a write it still routes locally (`IsMigrating`, i.e. `StateSending` / `StateHandedOff`), and the destination refuses a write that arrives via the new ring (`IsReceiving`, i.e. `StateReceiving`). Which end actually fires depends on where the ring points at the moment of the write, and on the R=1 single-backend path it is normally the **destination**: ring ownership flips to the destination the instant memberlist gossips the join, which is well before the source's settle-delayed `Evaluate` registers `StateSending`, so the source no longer routes the key locally and never reaches its own guard. A write arriving at the source from a node with a STALE ring does not slip through either: the RPC handler's `OwnsReplica` check refuses it with `FailedPrecondition` (the forwarding loop-guard) before the migration guard is consulted, so it is refused rather than silently accepted. The source-side term is what covers the R>1 fan-out and multi-backend paths, where a replica can be mid-handoff while still routed. The destination-side term is the load-bearing one at R=1, because the destination's migration apply is a raw backend `Put` with no LWW compare: a write accepted into the destination mid-stream really would be clobbered by the in-flight copy. Clients retry with backoff; the SDK's client wrapper handles this transparently with a bounded retry budget. `ResourceExhausted` (not `Unavailable`) is the chosen code so the v0.4 replication fanout's failure budget can distinguish "this replica is mid-handoff, try another" from "this replica is dead, count it as failure"; conflating the two would force the fanout to wait on every peer instead of failing fast on real peer-down.
-   - This is the chosen cutover semantics. Rejecting writes during the streaming copy is what avoids the "did this write make it across the cutover" problem without a WAL-tailing catch-up phase. The write-unavailability window per range is bounded by streaming time for that range's data.
-3. **Swap**: source completes the stream by sending the terminal `MigrationDone{total_keys, checksum}` chunk. The destination validates the checksum against its own running CRC32 and ack's implicitly by reading + draining the stream to a clean EOF (the gRPC stream return value IS the ack; there is no separate `MigrateAck` message). The source's `MigrateRange` handler returns successfully only after the destination has consumed `MigrationDone`. The coordinator observes that successful return and flips ownership state for the range from "owner" to "former owner, forwards reads". This flip is atomic per range.
-4. **Post-migration**: destination is authoritative for reads and writes. Source forwards any straggler read it receives for the range to the destination via the standard forwarding path. Once the source observes that all peers' rings agree the destination owns the range (or after a grace period of `T_drain`, default 30s), the source's grace sweep deletes its local copy of the range's keys **only if the source is no longer in the range's replica set** on the current ring. At R=1 the source is never in the new replica set after handing off the primary, so it always deletes (identical to v0.3). At R>1 a source that handed off the primary role but remains one of the R replica-owners RETAINS its copy: the sweep skips any key for which the node is still in `LocateKeyN(key, R)`. This is the per-key gate that keeps a node from deleting data it still replica-owns.
-
-The write-rejection window is the price paid for avoiding WAL-tailing. At hostthis-scale workloads (tens of thousands of keys per range, small values), the streaming copy completes in well under a minute on a local network; clients retrying with exponential backoff over that window do not see user-visible errors.
-
-#### Why reconcile cannot itself lose data
-
-The reconcile pass (above) only ever schedules **Receives**: it *pulls* a partition's keys onto the node that owns it but is missing them. It never schedules a Send and never deletes anything. The copy-before-delete safety that protects the existing handoff is therefore preserved verbatim:
-
-  - **A Receive is a non-destructive copy.** `FetchRange` writes the pulled keys into the destination's local backend and never touches the source. The only code path that deletes a source's local copy is the grace sweep (`StateHandedOff -> StateDone` after `T_drain`), and the sweep fires only after the source's `runSendWired` has observed a successful destination ack via `MarkSendComplete` (gated by `AwaitHandoffSignal`, which the cluster always sets). The reconcile pass does not produce Sends, so it never arms the sweep on the prior owner. The prior owner keeps its copy until (and only until) it has independently received its own ack-gated Send for that partition. There is no path by which scheduling a reconcile Receive causes any node to delete the only copy of a key.
-  - **The destination's atomicity is unchanged.** A reconcile Receive uses the same `FetchRange` that validates the terminal CRC32 + count and rolls back its partial writes on any mid-stream failure (source EOF before `MigrationDone`, checksum mismatch, transport error). A failed reconcile pull leaves the destination exactly as it was (no partial range made authoritative) and the prior owner still holds the data, so the next settle-timer `Evaluate` re-detects the partition as owned-but-missing and retries. The failure mode is "retry," never "loss."
-  - **Idempotent and convergent.** Re-pulling a partition that is actually already held is prevented by hold-detection (the node skips partitions for which it holds any key) and by `tryRegister` (no double-register of an in-flight partition). In the worst case a benign empty-range pull flips straight to `Done`. The pass quiesces once every owned partition is physically held, which is exactly the invariant below.
-
-#### Failure handling
-
-  - **Source crashes mid-stream**: destination's `MigrateRange` call returns an error. Destination discards what it received (the partial range is not authoritative). On the next `Evaluate` pass, if the source comes back, migration retries. If the source does not come back, the range is owned by no one at R=1; reads return not-found, writes are rejected. This is the unavoidable R=1 failure mode and is the central motivation for v0.4 replication.
-  - **Destination crashes mid-stream**: source's stream returns an error. Source remains the owner. On next `Evaluate`, migration retries to whichever node the new ring assigns.
-  - **Checksum mismatch on `MigrationDone`**: destination errors its stream (does not drain it cleanly), the source's handler returns that error rather than success, and the coordinator does NOT flip state. Destination rolls back its writes for the range; source remains owner; migration retries on the next `Evaluate`. Checksum is computed over the sorted `(key, value)` byte stream.
-  - **Ring divergence during cutover**: handled by the existing loop-guard. A read or write landing on the wrong node gets one forward; if the forwarded-to node also disagrees, the request returns `FailedPrecondition` and the client retries after the rings converge.
-  - **Operator cancellation**: `shale rebalance --cancel` aborts in-progress streams. Source remains owner of any range not yet swapped; destination discards any partial state.
-  - **Owned-but-missing after a bootstrap race**: a node that pinned a self-only ring snapshot at join (slow gossip) owns partitions it never received. The reconcile pass detects each such partition (owned by self, zero keys held) and pulls it from its prior owner. The pull is a non-destructive Receive; on failure the prior owner still holds the data and the next `Evaluate` retries. This is the founder-grows path and it self-heals within one settle interval; no data is destroyed because no Send (and therefore no sweep delete) is ever scheduled by the reconcile pass.
-
-#### Observability
-
-  - `shale topology` shows each range's state (`stable | migrating-out | migrating-in | draining`) and, for in-flight migrations, the source, destination, bytes streamed so far, and elapsed time.
-  - Per-node counters: `rebalance_ranges_migrated_total`, `rebalance_bytes_streamed_total`, `rebalance_writes_rejected_total`, `rebalance_failures_total`.
-  - Structured log line per range transition with `range_id`, `from`, `to`, `key_count`, `bytes`, `duration_ms`.
-
-#### What v0.4 changes
-
-With R>1, the read-unavailability problem largely disappears: reads can be served from any replica, including ones not currently sending or receiving. The migration unit becomes a (range, replica-position) pair rather than just a range. The write-rejection window can shrink to the duration of the ownership swap rather than the entire streaming copy, because the destination can receive writes via the replication path while the bulk copy is in flight and the conflict resolver (LWW, v0.4) reconciles. The wire protocol stays the same shape; the cutover protocol gains a "live writes also flow via replication" overlay.
-
-What is NOT deferred is correct placement at R>1: the rebalance is replica-set aware in every pass, per "Replica-set placement (the rule for all R)" above. The delete side is gated on leaving `LocateKeyN(key, R)` (a node still in the replica set RETAINS its copy through the sweep), and the deliver side fires for every key the node is newly a replica of. That is what makes a membership change at R=2 settle with every key resident on both nodes rather than split single-owner. The read-availability and shrunken-write-window optimizations layered on top are the parts the cutover overlay still adds; placement correctness is already in place.
-
-The v0.3 design does not preclude any of the optimization work. It deliberately leaves the per-range cutover as the only place where the v0.4 availability overlay needs to intervene.
-
-The reconcile pass generalizes cleanly to R>1: the unit becomes a (partition, replica-position) pair, and "owned-but-missing" means this node holds a replica slot the ring assigns to it but has not yet received. The pull is the same non-destructive `FetchRange` from a peer that already holds a copy (any current replica, not necessarily the prior primary). At R>1 a reconcile pull is itself a replica-receiving write, so it applies through the SAME apply-if-newer path as a live replicated Put rather than a raw `Put`: each streamed (key, value) pair carries an LWW Envelope (the identical bytes a replicated write fans out), and the receiving node lands it via `applyEnvelopeIfNewer` (see "LWW on write (apply-if-newer)"), which decodes the incoming Stamp, compares it against the Stamp already stored under that key, and writes only if the incoming Stamp strictly beats the stored one. This makes "never a clobber" a literal property of the migration apply, not just an aspiration: at R>1 the joiner reconcile-pulls partitions that have LIVE writers on the other replicas (the pull reads from a writable replica with no write-rejection lock), so an in-flight migration stream can carry an OLDER value for some key K while a concurrent `putReplicated` of K lands a NEWER value on the receiving node. The older streamed value loses the per-key Stamp compare and is a committed no-op; the newer concurrent write survives. A reordered or stale reconcile pull is therefore a silent no-op, never an overwrite of a newer concurrent write, exactly as the read-repair and CAS fan-out paths self-resolve under the same rule. At R<=1 there are no envelopes (raw values), no live cross-replica writers for the same partition, and no apply-if-newer: the migration apply is the unchanged raw `Put`. Because the pass only copies and never deletes, it is also the natural seed for the v0.4.1+ anti-entropy / Merkle-tree repair: founder-grows is the degenerate, zero-key-held case of the same "make my physical holdings match my ring assignment" reconciliation. The `FetchRange` stream still validates the terminal CRC32 + key count and rolls back its partial writes on a bad stream; routing each apply through apply-if-newer does not change that failure/rollback contract (a rolled-back stream leaves no apply-if-newer side effect, since each apply runs in its own committed-or-rolled-back local transaction).
-
-#### Known limitations in v0.3
-
-  - **Write-unavailability window per migrating range** is proportional to the size of that range. A range with millions of small keys can stall writes for tens of seconds. Operators with hot ranges should plan topology changes during low-traffic windows or wait for v0.4.
-  - **No live progress streaming**: the source streams to one destination; if the operator wants finer-grained progress than the per-range chunk counter, they can watch the gRPC stream metrics directly, but there is no built-in real-time per-key progress feed.
-  - **Backend scan efficiency varies**: backends without range-bounded scans pay an O(total keys) cost per migrating range. The memory backend is fine; SlateDB's range scan is efficient; future backend authors should implement bounded range scans for production workloads.
-  - **No throttling of concurrent migrations**: if many ranges change owners at once (e.g. a 3-node cluster grows to 6 nodes), every node opens its `MigrateRange` calls in parallel against its peers. Object-store IO is the practical limiter today; an explicit per-node concurrency cap is a v0.3.x follow-up if hot-spotting shows up in practice.
+`Config.Backend` together with a `BindAddr` is REJECTED at `Open`. It used to
+select the retired second engine. Accepting it now would be worse than an
+error and worse than a panic: the cluster would come up, gossip, build a ring
+and serve reads and writes, but nothing would move data on a topology change,
+so keys would silently become unreachable the moment the ring reassigned them
+to a node that had never held their bytes. A three-node deployment would look
+healthy while losing reads. `Open` therefore fails with a message naming the
+actual requirement: multi-node needs `BackendFactory` + `UnitCount`.
 
 ---
 
@@ -1073,7 +992,6 @@ Subcommands shipped in v0.1:
 
 Subcommands shipped in later versions:
 
-  - v0.3+: `shale rebalance` - trigger immediate rebalance (normally automatic)
   - v0.3+: `shale migrate-from <backend-spec>` - one-shot migrator from an existing backend (e.g. raw SlateDB) into the shale cluster
   - v0.5+: `shale bench` - load tester; reads + writes at configurable rates
 
@@ -1907,11 +1825,226 @@ The slate factory review left two P2 + one P3; all are fixed here, since the fac
 
 ---
 
+## v0.13: one coordination engine, one storage port
+
+shale is a coordination layer and toolkit. One proper distributed
+implementation exists, over slate. A user could in theory build a distributed
+implementation over sqlite; we have not, and it would be a bit odd. What shale
+must NOT do is carry a separate implementation for some backends and a further
+one for others, selected by what it was handed. That is a leaky abstraction:
+shale should not know or care whether an adapter has certain limitations.
+
+### The diagnosis
+
+The `storageunit.BackendFactory` port is NOT the leak. It states an honest
+requirement (the new owner opens the unit at a higher epoch and fences the
+prior writer) and an adapter either satisfies it or does not. A contract some
+adapters cannot meet is a normal, non-leaky thing.
+
+The LEAK was the FALLBACK. Because `memory` and `pebble` cannot satisfy the
+fencing requirement, shale carried an entire SECOND coordination engine: plan
+key ranges, stream them over gRPC, verify a checksum, sweep the source. It then
+selected between the two engines based on which backend it was handed.
+Deleting the fallback un-leaks the abstraction; nothing else had to change for
+that statement to become true.
+
+The same diagnosis applied to R=1 versus R>1. Requiring a SECOND interface
+(`ReplicaBackendFactory`) was a second place shale asked what an adapter could
+do: `validateBackendMode` type-asserted it at `Open` and refused R>1 for a
+factory that did not implement it, and the cluster carried a `replicaFactory`
+capability view alongside `factory`. Collapsing the two ports removes that
+question.
+
+### One storage port
+
+`storageunit.BackendFactory` is now the ONLY storage interface shale declares.
+`ReplicaBackendFactory` is gone, the capability assertion at `Open` is gone, and
+there is no type assertion anywhere in shale that asks an adapter which subset
+of the contract it supports. An adapter either satisfies the contract or it does
+not, and that is a property of the adapter rather than a branch in the
+coordination layer.
+
+Every method is keyed by `storageunit.MountRef`, and R=1 is replica 0.
+
+#### The mount identity carries THREE components, not two
+
+This is the load-bearing decision, because the literal reading of the collapse
+is DATA-LOSS-UNSAFE.
+
+An adapter that derives a storage location from the mount identity does not
+derive the same location for "unit U" and "unit U, replica 0": the replica
+position is a CHILD segment, so the two are different strings. The slate
+encodings are the worked example:
+
+    sole    -> "<keyPrefix>u/g<gen>/u<id>"
+    replica -> "<keyPrefix>u/g<gen>/u<id>/r<replica>"
+
+An existing R=1 multi-backend deployment's bytes live at the FORMER. Resolving
+an R=1 open through the replica-0 encoding would mount an EMPTY database and
+report the unit fresh: silent total data loss presented as a healthy cluster.
+
+Before the collapse the selector was carried IMPLICITLY, by WHICH METHOD the
+cluster called (`OpenUnit` versus `OpenReplicaUnit`), with the cluster-side twin
+being `replicaFactory != nil`. One port has one method, so that carrier is gone
+and the bit has to become explicit. `MountRef` therefore carries:
+
+  - the generation-qualified unit,
+  - the replica position,
+  - the LAYOUT SELECTOR (`Replicated()`).
+
+It is built only through `SoleMount(gu)` or `ReplicaMount(ru)`; the fields are
+unexported, so there is no way to construct a ref whose layout is unset or to
+flip it on an existing one. `SoleMount(gu)` and `ReplicaMount(NewReplicaUnit(gu,
+0))` are DISTINCT values and DISTINCT map keys, exactly as their two locations
+are distinct strings, which also lets an adapter track both families of mounts
+in one map without aliasing.
+
+The un-leaking still holds: the layout is a property of the thing being opened,
+not a question shale asks the adapter about itself.
+
+Rejected alternatives: configuring the adapter with R at construction (one
+slate `Backing`/`Handle` serves both surfaces, and this moves a routing decision
+into adapter config, the leak wearing a different hat); and migrating R=1 data
+onto the replica-0 prefix (a data-movement event, not a refactor).
+
+#### The change is INTERFACE-ONLY
+
+No location derivation changed for either layout. The slate adapter already
+funnelled both surfaces through one internal `unitRef` plus `dbNameForRef`, "the
+SINGLE place the on-disk encoding split is decided"; that shape was LIFTED into
+`pkg/storageunit` as the exported `MountRef` and `unitRef` became an alias for
+it. The tagless pins in `backends/slate/dbname_test.go` still compile and pass
+UNCHANGED, including `TestDbNameForRef_R1AndReplica0DoNotAlias` (the explicit
+data-loss guard) and `TestUnitRef_R1AndReplica0AreDistinctMapKeys`. Having to
+EDIT any of them would have been the signal that the change had moved bytes.
+
+The serving-marker key moved from being addressed by `ReplicaUnit` to being
+addressed by the mount, deriving as `dbNameForRef(kp, ref) + "/serving"`. For a
+replica ref that is byte-for-byte the previous `dbNameReplicaFor(kp, ru) +
+"/serving"`, which is pinned by a new tagless test; for a sole ref it is a
+different key, which is the point (deriving both through the replica encoding
+would alias a sole mount's marker onto replica 0's).
+
+#### The port
+
+    OpenUnit(m MountRef, epoch Epoch) (backend.Backend, Epoch, error)
+    CloseUnit(m MountRef) error
+    CurrentEpoch(m MountRef) (Epoch, bool)
+    OpenUnits() []MountRef
+    DurableEpoch(m MountRef) (Epoch, error)
+    WriteServingMarker(m MountRef, epoch Epoch) error
+    ReadServingMarker(m MountRef) (Epoch, bool, error)
+
+Two signature changes beyond the key type. `OpenUnit` now RETURNS the exact
+epoch it opened at, which was previously only on the R>1 method and is what a
+caller must use as its open epoch rather than re-reading the durable epoch (a
+shared counter any node's later open bumps). `OpenUnits` returns mount refs, so
+it can enumerate replica mounts; the previous `[]GenUnit` signature could not
+name them, so an R>1 handle reported an empty set.
+
+#### The cluster side
+
+`c.replicaFactory` is gone; there is one `c.factory`. The capability predicate
+`replicaFactory != nil` became `c.replicaLayout()`, defined as `c.multi &&
+c.replicationFactor() > 1` -- the same expression `initReplicatedFactory` used,
+so the layout is unchanged for every configuration.
+
+`replicaLayout()` is NOT `multiReplicated()` and the two must not be
+substituted. `multiReplicated()` additionally requires a populated ring, so on a
+SINGLE-NODE R>1 cluster they disagree: such a cluster mounts by replica position
+while serving through the single-owner path. That divergence is pre-existing and
+deliberate, but it now also decides ADDRESSING, so using `multiReplicated()` for
+it would make a single-node R>1 cluster resolve mounts its own earlier boots
+wrote elsewhere. `c.mountRefFor(ru)` is the one place a tracked `ReplicaUnit`
+becomes a `MountRef`.
+
+#### Consequence: no configuration is refused for lacking a capability
+
+`Open` no longer rejects R>1 for a factory that cannot address replicas,
+because there is no longer a way to ask. A factory that compiles against the
+port has stated it meets the contract. This is the intended trade: the
+alternative is shale branching on adapter capability, which is the thing being
+removed.
+
+### What was retired (the fallback engine)
+
+`Config.Backend` WITH a `BindAddr` (legacy multi-node) and everything reachable
+only from it:
+
+  - `pkg/rebalance`, the range state machine, plan, execute, reconcile and
+    sweep.
+  - The cluster-side adapter: the Coordinator lifecycle, the settle-timer
+    Evaluate, the ring-snapshot diffing, and the gRPC-backed
+    `MigrateDestination`.
+  - The per-NODE replicated dispatchers (`putReplicated`, `getReplicated`,
+    their per-replica dispatch and the async read-repair scheduler). The
+    fan-out and quorum PRIMITIVES they were built on (`fanout`,
+    `requiredWriteAcks`, `requiredReadReplicas`, the transient-error
+    classifiers) are SHARED with the unit path and stayed.
+  - The `MigrateRange` and `ProposeRebalance` RPCs, their request/response
+    messages, and the `shale rebalance` subcommand.
+
+### What survives, and why
+
+  - **Single-node mode, untouched.** `Config.Backend` with an EMPTY `BindAddr`
+    is local-only embedding and keeps working with ANY backend. `Open` returns
+    for single-node before membership is built, so nothing removed here was
+    reachable from it.
+  - **The debounce.** `Config.RebalanceSettleDelay` governs the multi-backend
+    unit reconcile, not just the retired Evaluate.
+  - **The retry-after hint.** `Config.RebalanceRetryAfterMs` is both the client
+    hint and the base of the Layer-2 handoff retry backoff.
+  - **`WaitForRebalanceIdle`.** Now purely the debounce-quiescence predicate,
+    which is what multi-backend always relied on.
+  - **The R>1 CAS envelope format.** `casReplicated()` is live in
+    `CommitCASApply` and is TRUE for multi-backend R>1, so the envelope
+    encode/decode path is not dead and was kept.
+
+`Config.RebalanceGraceDuration` and `Config.RebalanceHandoffTimeout` fed only
+the retired Coordinator and were REMOVED from the public `Config`. shale is
+pre-v1; there is no migration path and no deprecation window.
+
+### Known gap: re-replicating an under-replicated unit
+
+A unit written while the cluster was too small to hold R replicas stays
+under-replicated after the cluster grows. Concretely: a solo founder at R=2
+writes into ONE replica position, because there is one node; when a second node
+joins it acquires the (empty) second-position databases and the ring is
+satisfied, but nothing copies position 0's bytes into position 1. The pair
+settles holding a PARTITION of the keys rather than each holding all of them.
+
+This is a consequence of the model, not a regression: the lease-handoff engine
+never copies bytes, which is exactly what makes it copy-free. The retired
+per-node engine papered over it by copying keys during its reconcile pass.
+Closing it properly needs an anti-entropy / re-replication pass that fills a
+newly-owned replica position from a peer that already holds one, which is a
+design question of its own.
+
+`tests/integration/rf2_membership_change_test.go` and
+`rf2_shrink_retention_test.go` carry skipped tests asserting the property, kept
+because it is one a replicated store should eventually hold. Note the SHRINK
+direction is fine and covered: a leave never drops a key below R
+(`TestRF2_NoKeyDropsBelowReplicationFactorOnLeave` passes), because the
+surviving replica databases already exist.
+
+### The binaries
+
+`shaled` and `shaled-pebble` are single-node demonstration and test daemons.
+`--bind-addr` is blanked in `shaled.Run` when a single `Backend` is configured
+and the operator did not explicitly supply one, so a bare invocation works out
+of the box; an EXPLICIT `--bind-addr` is honored and then refused by `Open`
+with a message naming the multi-backend requirement. A non-empty `--seeds` with
+an empty `--bind-addr` is a startup error, so an operator cannot silently get N
+independent single nodes where they asked for a cluster. The default is NOT
+changed in `BindStdFlags`, because that constructor is shared with
+`shaled-slate`, whose multi-backend mode is a legitimate multi-node
+configuration.
+
 ## Roadmap
 
 - [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.
 - [ ] **v0.2** - multi-node + memberlist + hash ring + gRPC forwarding. Static topology (no rebalance). `shale topology` now shows real membership + ring.
-- [ ] **v0.3** - rebalancing on join/leave. Atomic ownership swap. `shale rebalance` + `shale migrate-from` subcommands.
+- [ ] **v0.3** - rebalancing on join/leave. Atomic ownership swap. (Retired in v0.13: the per-node key-copy engine this shipped was replaced by the v0.8 unit lease handoff, and the `shale rebalance` subcommand went with it.)
 - [~] **v0.4** (in progress) - replication factor R + tunable consistency. LWW conflict resolution. Sub-tasks:
   - [ ] LWW value envelope (Stamp + Payload), encoded on Put / decoded on Get, transparent to Backend
   - [ ] v0.3-value compatibility: bare values decode as `Stamp{0, ""}`, re-stamped on next Put

@@ -195,7 +195,7 @@ func TestOverlap_Reconcile_SelfDraining_ReleasedPositionNotReacquired(t *testing
 		if err != nil {
 			t.Fatalf("successor open %v: %v", target, err)
 		}
-		if err := hs.WriteServingMarker(target, se); err != nil {
+		if err := hs.WriteServingMarker(storageunit.ReplicaMount(target), se); err != nil {
 			t.Fatalf("successor marker %v: %v", target, err)
 		}
 		c.drainCheck(target)

@@ -525,13 +525,13 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 	// are brand-new databases with no prior writer to fence). Mount them so
 	// the copy can write into them AND so the local routing fast-path resolves
 	// them once the cut-over flag flips (resolveGenUnit -> mountMap lookup).
-	lowBE, err := c.factory.OpenUnit(lowGU, epochAtOpen)
+	lowBE, _, err := c.factory.OpenUnit(storageunit.SoleMount(lowGU), epochAtOpen)
 	if err != nil {
 		return fmt.Errorf("open child %s: %w", lowGU, err)
 	}
-	highBE, err := c.factory.OpenUnit(highGU, epochAtOpen)
+	highBE, _, err := c.factory.OpenUnit(storageunit.SoleMount(highGU), epochAtOpen)
 	if err != nil {
-		_ = c.factory.CloseUnit(lowGU)
+		_ = c.factory.CloseUnit(storageunit.SoleMount(lowGU))
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
 	c.mountMu.Lock()
@@ -596,7 +596,7 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 	c.mountMu.Lock()
 	delete(c.mountMap, replica0(oldGU))
 	c.mountMu.Unlock()
-	_ = c.factory.CloseUnit(oldGU)
+	_ = c.factory.CloseUnit(storageunit.SoleMount(oldGU))
 	return nil
 }
 

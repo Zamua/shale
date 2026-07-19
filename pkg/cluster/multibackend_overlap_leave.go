@@ -133,7 +133,7 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 // gate. With no positions mounted, the gate is true (the leaver has handed off
 // everything).
 func (c *Cluster) allOwnedPositionsHandedOff() bool {
-	if c.replicaFactory == nil {
+	if !c.replicaLayout() {
 		return true
 	}
 	c.mountMu.RLock()
@@ -150,7 +150,7 @@ func (c *Cluster) allOwnedPositionsHandedOff() bool {
 		// strict marker > open) stay false forever - the leave would never complete
 		// and the preStop drain would run to its timeout (the #410 availability gap).
 		open := c.ownOpenEpoch(ru)
-		markerEpoch, ok, err := c.replicaFactory.ReadServingMarker(ru)
+		markerEpoch, ok, err := c.factory.ReadServingMarker(storageunit.ReplicaMount(ru))
 		if err != nil || !ok || markerEpoch <= open {
 			// No successor serving this position above the leaver's epoch yet: still
 			// handing off (or a transient marker-read error - retry next poll).

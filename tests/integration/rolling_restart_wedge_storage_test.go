@@ -86,7 +86,7 @@ func plantAllServingMarkers(t *testing.T, h *sharedfactory.Handle, unitCount, rf
 	for _, u := range storageunit.MustUnitCount(unitCount).IDs() {
 		for p := 0; p < rf; p++ {
 			ru := storageunit.NewReplicaUnit(storageunit.NewGenUnit(0, u), uint8(p))
-			if err := h.WriteServingMarker(ru, 1); err != nil {
+			if err := h.WriteServingMarker(storageunit.ReplicaMount(ru), 1); err != nil {
 				t.Fatalf("plant serving marker %s: %v", ru, err)
 			}
 		}

@@ -98,6 +98,21 @@ type StdConfig struct {
 	// Validate.
 	seedsRaw string
 
+	// fs is the FlagSet BindStdFlags bound into, retained so Run can ask
+	// whether a flag was EXPLICITLY supplied rather than defaulted. Only
+	// --bind-addr needs this today: a single-backend binary must blank a
+	// DEFAULTED bind address (so a bare `shaled` is a working single node)
+	// while still honoring an explicit one (so the operator gets the clear
+	// Open error instead of a silent downgrade). Nil when a caller built
+	// StdConfig by hand rather than through BindStdFlags.
+	fs *flag.FlagSet
+
+	// bindAddrEnvSet records that SHALE_BIND_ADDR carried a non-empty value.
+	// That is an explicit operator choice too, and flag.Visit cannot see it
+	// (the env value arrives as the flag's DEFAULT). An empty value does not
+	// count: envOr falls back to the flag default for it.
+	bindAddrEnvSet bool
+
 	// GracefulLeaveDrainTimeout, when > 0, makes a multi-backend overlap node
 	// drain its owned units to successors on shutdown (broadcast leave, keep
 	// serving until the successors are Ready) before closing, so a graceful
@@ -144,7 +159,9 @@ type StdConfig struct {
 // --unit-count power-of-two check) happens in StdConfig.Validate, which
 // the caller runs after fs.Parse.
 func BindStdFlags(fs *flag.FlagSet) *StdConfig {
-	std := &StdConfig{}
+	// An EMPTY SHALE_BIND_ADDR is not an explicit choice: envOr falls back
+	// to the flag default for it, so the resulting BindAddr is the default.
+	std := &StdConfig{fs: fs, bindAddrEnvSet: os.Getenv("SHALE_BIND_ADDR") != ""}
 	fs.StringVar(&std.NodeID, "node-id", envOr("SHALE_NODE_ID", ""),
 		"unique node identifier (required)")
 	fs.StringVar(&std.GRPCAddr, "grpc-addr", envOr("SHALE_GRPC_ADDR", ":7947"),
@@ -166,6 +183,38 @@ func BindStdFlags(fs *flag.FlagSet) *StdConfig {
 		envOr("SHALE_WRITE_TIMEOUT", ""),
 		"override the per-write wall-clock budget incl. transient-retry (e.g. 12s); empty/0 keeps the 5s default")
 	return std
+}
+
+// BindAddrExplicit reports whether the operator actually asked for this bind
+// address, as opposed to inheriting the flag default. True when --bind-addr
+// was passed on the command line or SHALE_BIND_ADDR was set in the
+// environment.
+//
+// It exists because the flag's DEFAULT and an explicit value must be treated
+// differently by a single-backend binary. A defaulted bind address is an
+// artifact of a shared flag constructor (shaled-slate needs the default,
+// because its multi-backend mode is a legitimate multi-node configuration);
+// blanking it lets a bare `shaled` come up as the single node it now is. An
+// EXPLICIT bind address is a real request for a cluster, and must reach
+// cluster.Open so the operator gets the error naming the multi-backend
+// requirement rather than a silently non-clustered node.
+//
+// Returns true when the FlagSet is unknown (a hand-built StdConfig), which
+// fails toward honoring the value the caller set.
+func (s *StdConfig) BindAddrExplicit() bool {
+	if s.bindAddrEnvSet {
+		return true
+	}
+	if s.fs == nil {
+		return true
+	}
+	explicit := false
+	s.fs.Visit(func(f *flag.Flag) {
+		if f.Name == "bind-addr" {
+			explicit = true
+		}
+	})
+	return explicit
 }
 
 // Validate enforces required fields and finalizes derived values
@@ -272,6 +321,17 @@ func Run(cfg RunConfig) error {
 	hasFactory, err := validateBackendXOR(cfg)
 	if err != nil {
 		return err
+	}
+	if !hasFactory {
+		// Single-backend binaries are single-node. Drop a DEFAULTED bind
+		// address so a bare invocation works, keep an explicit one so Open
+		// can refuse it loudly, and reject seeds-without-bind-addr outright.
+		bindAddr, err := resolveSingleBackendBindAddr(&cfg.Std)
+		if err != nil {
+			_ = closeBackendQuiet(cfg.CloseBackend)
+			return err
+		}
+		cfg.Std.BindAddr = bindAddr
 	}
 	logger := cfg.Logger
 
@@ -421,6 +481,42 @@ func validateBackendXOR(cfg RunConfig) (hasFactory bool, err error) {
 		return false, errors.New("shaled.Run: Backend or BackendFactory required")
 	}
 	return hasFactory, nil
+}
+
+// resolveSingleBackendBindAddr decides what bind address a SINGLE-BACKEND
+// binary should actually run with, and refuses the one configuration that
+// would otherwise fail silently.
+//
+// A single Backend is single-node only: it cannot open a storage unit, so it
+// cannot fence a prior writer, so it cannot take part in a lease handoff.
+// cluster.Open rejects Backend + BindAddr for exactly that reason. But the
+// shared flag constructor defaults --bind-addr to ":7946" (shaled-slate needs
+// that default, since its multi-backend mode IS a real multi-node
+// configuration), so a bare `shaled` would inherit a bind address it never
+// asked for and fail to start.
+//
+// Three cases, and only the middle one is a judgement call:
+//
+//   - seeds set, no explicit bind address: ERROR. Blanking here would come up
+//     as an isolated single node that silently ignored the seeds. Across a
+//     fleet that is N independent divergent stores, which is the same
+//     silent-failure class the Open rejection exists to close.
+//   - bind address DEFAULTED: blank it. The operator did not ask for a
+//     cluster; give them the working single node a bare invocation should be.
+//   - bind address EXPLICIT: keep it, and let cluster.Open refuse with the
+//     message naming the multi-backend requirement. An operator who typed
+//     --bind-addr wants a cluster and deserves to hear why they cannot have
+//     one with this backend, rather than getting a quiet downgrade.
+func resolveSingleBackendBindAddr(std *StdConfig) (string, error) {
+	if std.BindAddrExplicit() {
+		return std.BindAddr, nil
+	}
+	if len(std.Seeds) > 0 {
+		return "", errors.New("shaled: --seeds requires --bind-addr; a single Backend is single-node only, " +
+			"so seeds without a bind address would silently start an isolated node that joins nothing " +
+			"(multi-node requires BackendFactory + --unit-count)")
+	}
+	return "", nil
 }
 
 // clusterConfig maps a RunConfig (plus the resolved gRPC broadcast address)
