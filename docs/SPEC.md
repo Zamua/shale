@@ -64,7 +64,10 @@ func (c *Cluster) Ready(minMountedFraction float64) bool
 // ErrAcquiring is TRANSIENT and SAFE TO RETRY (the op was not applied; the
 // window is bounded by a mount). It is NOT a peer-down signal, though it
 // shares codes.Unavailable with one - which is why the code cannot be
-// branched on. First slice of the taxonomy; siblings join by adding a row.
+// branched on. Because the bound is a MOUNT and not an RPC, size the retry
+// budget in SECONDS, not milliseconds; see "Sizing the retry" in the
+// "Refusal reasons" section. First slice of the taxonomy; siblings join by
+// adding a row.
 var ErrAcquiring error
 
 type RefusalReason string
@@ -1331,6 +1334,10 @@ if errors.Is(err, cluster.ErrAcquiring) {
 `errors.Is(err, cluster.ErrAcquiring)` holds whether (a) the position is owned by THIS node and mid-acquire (in-process dispatch), or (b) the op was FORWARDED to a peer that was mid-acquire (over gRPC). The consumer does not know, and must not need to know, which path produced the error. That path-independence is the whole deliverable.
 
 `ErrAcquiring` documents its retry contract: the refusal is TRANSIENT and SAFE TO RETRY, because it is EXPLICIT (the op was not applied, no partial state was written, no stale result was served) and BOUNDED by the handoff window (a mount, not an outage). It is NOT a peer-down signal: it shares `codes.Unavailable` with genuine unreachability, which is exactly why the code is the wrong thing to branch on.
+
+**SIZING THE RETRY: the bound is a MOUNT, so the budget is in SECONDS.** "Bounded retry with backoff" says nothing about TIMESCALE, and a consumer with no other signal will reach for the sub-second policy that is right for an RPC blip. It is the wrong order of magnitude here. The window is the time to OPEN a per-`(unit, replica)` database from object storage, not a round trip, which puts it in the SECONDS-TO-TENS-OF-SECONDS range. Observed on a real 3-node cluster on object storage during a rolling restart: positions stayed owned-but-unmounted for roughly 17 to 21 seconds. That is an OBSERVATION under those conditions, NOT a guarantee and NOT a constant to hard-code - it moves with backend latency, units per node, and cluster size, so a consumer sizes its total budget against its own backend's mount time and confirms the figure by observation. The failure this prevents is a quiet one: a policy whose TOTAL budget is under a few seconds typically EXHAUSTS rather than absorbs the window, so a refusal shale classified as retryable surfaces to a user as a failure while the retry still looks like it is working. The window length is not discoverable from the API, which is why it is documented here and on the sentinel.
+
+**Where the budget is worth spending: the exposure is asymmetric.** Single-key REQUEST-PATH reads may not reach this retry at all - the read path's own in-budget re-poll absorbs the narrow window on a point op, and across measured rolling deploys such reads did not fire a consumer's retry once. The BACKGROUND CROSS-SHARD FAN-OUT (`Aggregate`) is where it actually bites, for the same reason it is the highest-exposure entry point generally (see the SHAPE-INDEPENDENT section below): a fan-out meets the window whenever ANY node holds ANY owned position unmounted, rather than only when the single addressed position is mid-mount. A background fan-out is also where a wide budget is affordable, since it is not bounded by a request deadline.
 
 **The match is also REPLICATION-INDEPENDENT, and that takes a second mechanism.** The node boundary is not the only place a reason can be lost; the other is a FAN-OUT COLLAPSE. At R>1 a write is not one refusal but R legs, and falling short of W collapses them into a SINGLE freshly-minted status (`classifyWriteAttempt`), discarding every leg value. A contract that held only at R=1 would therefore be a FALSE NEGATIVE on exactly the configuration a replicated consumer runs - their writes unprotected while the gate appears to work - so the collapse has to preserve the reason too. It does: the retryable terminal is built by `reasonTerminal`, which carries BOTH halves (the in-process sentinel AND the wire detail, since the terminal is minted on whichever node the write entered, which for a forwarding consumer is a peer). `Put`, `Delete`, and `Transact`'s CAS commit all reach it.
 

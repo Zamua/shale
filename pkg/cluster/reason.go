@@ -98,6 +98,28 @@ const reasonDomain = "shale.dev"
 // an outage), so a bounded retry with backoff will observe the acquire finish.
 // Retrying is the correct response; surfacing it to an end user is not.
 //
+// SIZING THE RETRY. The window is bounded by a MOUNT - opening the per-(unit,
+// replica) database from object storage - NOT by an RPC round trip, so it is
+// measured in SECONDS TO TENS OF SECONDS, not milliseconds. Observed on a
+// 3-node cluster on object storage during a rolling restart: positions were
+// held owned-but-unmounted for roughly 17 to 21 seconds. That is an
+// OBSERVATION under those conditions, not a guarantee and not a constant - it
+// moves with backend latency, units per node, and cluster size, so size the
+// total budget against the mount time of YOUR backend and verify it by
+// observation rather than hard-coding a number from this comment. A policy
+// whose TOTAL budget is under a few seconds will typically EXHAUST rather than
+// absorb the window, converting a retryable refusal into a user-visible
+// failure while still reading like a working retry.
+//
+// WHERE THE BUDGET IS WORTH SPENDING. The exposure is asymmetric, measured
+// rather than assumed. Single-key REQUEST-PATH reads may not reach this retry
+// at all across a rolling restart: shale's own in-budget re-poll absorbs the
+// narrow window on a point op. The BACKGROUND CROSS-SHARD FAN-OUT (Aggregate)
+// is where it bites, because a fan-out meets the window whenever ANY of N
+// shards holds an owned position unmounted, rather than only when the one
+// addressed position does. That is also where a wide budget is affordable,
+// since background fan-out is not bounded by a request deadline.
+//
 // NOT A PEER-DOWN SIGNAL. An acquiring refusal says the cluster is mid-
 // transition and healthy, NOT that a node is unreachable. It shares
 // codes.Unavailable with genuine peer-down errors, which is exactly why
@@ -115,7 +137,8 @@ const reasonDomain = "shale.dev"
 // the same match a single-copy one does.
 //
 //	if errors.Is(err, cluster.ErrAcquiring) {
-//	    // bounded retry with backoff; the handoff will finish
+//	    // bounded retry with backoff; the handoff will finish. Budget the
+//	    // whole sequence in seconds, not milliseconds - see SIZING THE RETRY.
 //	}
 //
 // WHERE TO MATCH ON A FAN-OUT OP (Aggregate). A point op returns one error and
