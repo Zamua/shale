@@ -26,6 +26,31 @@ package integration
 //
 // Every probe is a SINGLE attempt (no retry): the gate is transparency, not
 // eventual success. A probe failure is a client-visible read error.
+//
+// THE OBSERVATION WINDOW IS PART OF THE ASSERTION. Each gate here is only
+// meaningful while its transition is actually in flight, and none of these
+// windows stays open on its own: a modeled mount latency elapses, a drain
+// finishes. Both gates below previously let their window be closed by whatever
+// ran before the probes - a gossip convergence wait, most of all - and the two
+// failed in OPPOSITE, equally useless directions:
+//
+//   - the JOIN gate failed LOUDLY but vacuously ("rt-d mounted before any
+//     during-join probe ran"), reporting a fixture-window miss as a
+//     transparency verdict. That is the failure it produced in CI, on a merge
+//     that changed no executable code.
+//   - the LEAVE gate failed SILENTLY: nothing required the drain window to have
+//     been observed at all, so a fast drain left it asserting nothing while
+//     reporting a pass. Its own sibling pin (TestLeaveEntryServesWhileDraining)
+//     already had that guard; this one was simply missing it.
+//
+// So each gate now OPENS its window explicitly, PROVES it is open before issuing
+// a read, and CLOSES it itself. A window that a slow runner can close is not a
+// window; it is a race whose loss is reported as a result.
+//
+// Failure messages here report the MEASURED breakdown (refusals vs wrong or
+// absent values, and within refusals the transient acquiring-window class vs
+// anything else) and deliberately assert no cause. A gate that names a mechanism
+// it did not measure sends the next reader after the wrong thing.
 
 import (
 	"bytes"
@@ -164,6 +189,115 @@ func summarizeFails(t *testing.T, label string, fails []string, limit int) {
 	}
 }
 
+// readFailureBreakdown counts probe failures by the distinctions a reader has to
+// make before they can triage one, so a gate's message can report WHAT WAS
+// OBSERVED instead of restating the property that was violated.
+//
+// Two independent axes, and both matter:
+//
+//   - REFUSAL vs VALUE fault. A refusal is a liveness event (the read declined
+//     to answer, loudly); a wrong or absent value is a correctness event. No
+//     availability argument can excuse the second, so a message that renders
+//     them as one count ("N read failures") hides the only distinction that
+//     changes what to do next.
+//   - within refusals, the transient acquiring-window class (isAcquiringWindowErr:
+//     a mount is in progress and the read will succeed once it lands) vs
+//     anything else (a dial failure, a decode error, ResourceExhausted). The
+//     first is bounded by a mount, the second is not.
+type readFailureBreakdown struct {
+	Acquiring  int // refusal, transient acquiring-window class
+	OtherErr   int // refusal, outside that class
+	WrongValue int // Get returned bytes that are not the seeded value
+	EmptyScan  int // ScanPrefix yielded nothing for a seeded, acked key
+}
+
+func (b readFailureBreakdown) total() int {
+	return b.Acquiring + b.OtherErr + b.WrongValue + b.EmptyScan
+}
+
+// String renders the breakdown for a test message. It states counts only: the
+// classes are measured, the cause of any of them is not.
+func (b readFailureBreakdown) String() string {
+	return fmt.Sprintf("%d total = %d acquiring-window refusals, %d other errors, %d wrong values, %d empty scans",
+		b.total(), b.Acquiring, b.OtherErr, b.WrongValue, b.EmptyScan)
+}
+
+// classifyReadFailures counts fails onto the axes above. It is the single
+// counting implementation the read-transparency gates report through, so a
+// message in one of them cannot drift from a message in another.
+func classifyReadFailures(fails []readFailure) readFailureBreakdown {
+	var b readFailureBreakdown
+	for _, f := range fails {
+		switch {
+		case f.Kind == failWrongValue:
+			b.WrongValue++
+		case f.Kind == failEmptyScan:
+			b.EmptyScan++
+		case isAcquiringWindowErr(f.Err):
+			b.Acquiring++
+		default:
+			b.OtherErr++
+		}
+	}
+	return b
+}
+
+// summarizeReadFailures logs the measured breakdown plus up to limit failure
+// lines, and returns the breakdown so the caller's assertion can report the same
+// numbers it just logged.
+func summarizeReadFailures(t *testing.T, label string, fails []readFailure, limit int) readFailureBreakdown {
+	t.Helper()
+	b := classifyReadFailures(fails)
+	if len(fails) == 0 {
+		return b
+	}
+	t.Logf("%s: %s; first %d:", label, b, min(limit, len(fails)))
+	for i, f := range fails {
+		if i >= limit {
+			break
+		}
+		t.Logf("  %s", f)
+	}
+	return b
+}
+
+// waitMountWindowOpen blocks until c reports at least one desired-but-unmounted
+// position: the MEASURED form of "this node is mid-mount", which is the state
+// the during-transition probes have to run in for their result to mean anything.
+//
+// It exists because the alternative - assuming the window is open because a
+// modeled acquire latency was armed - is a race against everything that runs
+// between arming it and probing (a gossip convergence wait, most of all). Losing
+// that race produces a gate that fails having observed no reads at all, which is
+// a fixture-window miss reported as a transparency result.
+//
+// The two non-positive readings are separated deliberately: desiredButUnmounted
+// returns a NEGATIVE count when DebugState's summary line does not parse, which
+// makes the reading unusable rather than zero, and silently treating that as
+// "nothing pending" would skip the probes for a reason that has nothing to do
+// with mounts.
+func waitMountWindowOpen(t *testing.T, c *cluster.Cluster, who string, timeout time.Duration) int {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	last := 0
+	for time.Now().Before(deadline) {
+		last = desiredButUnmounted(c)
+		if last < 0 {
+			t.Fatalf("%s: desiredButUnmounted could not parse DebugState's summary line (got %d); the "+
+				"mount-window reading is unusable, so the probes below would be skipped for a reason "+
+				"unrelated to mounting. State:\n%s", who, last, c.DebugState())
+		}
+		if last > 0 {
+			return last
+		}
+		time.Sleep(25 * time.Millisecond)
+	}
+	t.Fatalf("%s: no desired-but-unmounted position appeared within %s, so the mount window this gate "+
+		"probes in never opened. OBSERVED: desiredButUnmounted=%d. This is a fixture-window miss, not a "+
+		"read-transparency result - no read was issued. State:\n%s", who, timeout, last, c.DebugState())
+	return 0
+}
+
 // TestJoinReadTransparent_GetScanEveryNode: a JOIN alone must not produce
 // client-visible read failures. A 4th node with serving markers planted
 // boot-defers everything (Joining bit) and slow-mounts via the overlap
@@ -213,33 +347,63 @@ func TestJoinReadTransparent_GetScanEveryNode(t *testing.T) {
 	}
 	t.Logf("%d of %d units get rt-d as PRIMARY on the 4-node ring", primaryMoves, uc)
 
-	const mountDelay = 8 * time.Second
+	// THE MOUNT WINDOW IS HELD OPEN, NOT TIMED. rt-d's modeled acquire latency is
+	// armed far longer than any convergence and is closed EXPLICITLY below, once
+	// the probes have run. Sizing it against wall clock instead raced the
+	// UNBOUNDED gossip-convergence wait that follows: on a slow runner the whole
+	// modeled mount elapses while the cluster is still converging, the probe loop
+	// then finds nothing outstanding and the gate fails HAVING ISSUED NO READ. That
+	// is a fixture-window miss reported as a transparency verdict, and it is the
+	// failure this test produced in CI (the previous 8s latency against a
+	// convergence wait that took longer). Holding the window open removes the race
+	// rather than widening it; a longer fixed latency would only move it.
+	//
+	// The armed latency only has to outlive the BOUNDED waits between arming it
+	// and the last probe: the 30s membership convergence, the 30s
+	// waitMountWindowOpen, and ~1.2s of probing - about 62s worst case, each of
+	// which fails loudly on its own timeout rather than silently eating the
+	// window. 5 minutes is that bound with room to spare. It is never actually
+	// slept: the probes take ~1.2s and the latency is released immediately after,
+	// so the test still runs in ~3s.
+	const mountDelay = 5 * time.Minute
 	n4 := startReplicatedNodeSlowAcquire(t, "rt-d", n1.BindAddr, uc, rf, backing, mountDelay, 2*time.Second)
 	all := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
 	if err := waitForMembersAll(all, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)
 	}
 
+	// Prove the window is open BEFORE issuing a read, so "no rounds ran" can never
+	// be silently reinterpreted as "the join was transparent".
+	pending := waitMountWindowOpen(t, n4.Cluster, "rt-d", 30*time.Second)
+	t.Logf("rt-d mid-mount with %d desired-but-unmounted positions; probing", pending)
+
 	// Probe while rt-d is provably mid-mount.
 	entries := []*sharedNode{n1, n2, n3, n4}
-	var fails []string
+	var fails []readFailure
+	const wantRounds = 4
 	rounds := 0
-	for r := 0; r < 4 && desiredButUnmounted(n4.Cluster) > 0; r++ {
-		fails = append(fails, probeReadsOnce(entries, uk, []byte("seed"))...)
+	for r := 0; r < wantRounds; r++ {
+		fails = append(fails, probeReadsOnceDetailed(entries, uk, []byte("seed"))...)
 		rounds++
+		if got := desiredButUnmounted(n4.Cluster); got <= 0 {
+			t.Fatalf("rt-d's mount window closed mid-probe after %d of %d rounds (desiredButUnmounted=%d) "+
+				"even though its acquire latency is held open until this loop finishes; the window is no "+
+				"longer under the fixture's control", rounds, wantRounds, got)
+		}
 		time.Sleep(300 * time.Millisecond)
 	}
+	// Close the window explicitly: everything above ran with rt-d mid-mount.
 	for _, n := range []*sharedNode{n1, n2, n3, n4} {
 		n.Handle.SetAcquireDelay(0)
 	}
-	if rounds == 0 {
-		t.Fatalf("rt-d mounted before any during-join probe ran; raise mountDelay")
-	}
 	t.Logf("probed %d rounds during rt-d's mount window", rounds)
-	summarizeFails(t, "JOIN", fails, 12)
+	b := summarizeReadFailures(t, "JOIN", fails, 12)
 	if len(fails) > 0 {
-		t.Fatalf("JOIN is not read-transparent: %d client-visible read failures during the newcomer's mount "+
-			"(reads must be served by the union's still-mounted holders)", len(fails))
+		t.Fatalf("OBSERVED during rt-d's mount, across %d probe rounds through every entry node: %s. "+
+			"A join must stay read-transparent - the union's still-mounted holders keep serving while the "+
+			"newcomer warms - so every one of these is client-visible. Reported as observation, not "+
+			"diagnosis: the counts above are measured, the cause is not. Measure before attributing one.",
+			rounds, b)
 	}
 }
 
@@ -276,9 +440,10 @@ func TestLeaveReadTransparent_GetScanEveryNode(t *testing.T) {
 	uk := oneKeyPerUnit(t, n1.Cluster, uc)
 
 	// Sanity: fully transparent before the transition.
-	if pre := probeReadsOnce([]*sharedNode{n1, n2, n3, n4}, uk, []byte("seed")); len(pre) > 0 {
-		summarizeFails(t, "PRE-LEAVE (steady state)", pre, 12)
-		t.Fatalf("reads failing before the transition; fixture broken")
+	if pre := probeReadsOnceDetailed([]*sharedNode{n1, n2, n3, n4}, uk, []byte("seed")); len(pre) > 0 {
+		b := summarizeReadFailures(t, "PRE-LEAVE (steady state)", pre, 12)
+		t.Fatalf("reads were already failing BEFORE the transition, at steady state: %s. The fixture cannot "+
+			"attribute anything to the leave from here", b)
 	}
 
 	// Slow the survivors' acquires so both the drain window and the post-exit
@@ -292,7 +457,7 @@ func TestLeaveReadTransparent_GetScanEveryNode(t *testing.T) {
 	time.Sleep(600 * time.Millisecond) // let the Draining bit gossip
 
 	survivors := []*sharedNode{n1, n2, n3}
-	var fails []string
+	var fails []readFailure
 	drainRounds := 0
 drainLoop:
 	for {
@@ -301,14 +466,32 @@ drainLoop:
 			break drainLoop
 		default:
 		}
-		fails = append(fails, probeReadsOnce(survivors, uk, []byte("seed"))...)
+		fails = append(fails, probeReadsOnceDetailed(survivors, uk, []byte("seed"))...)
 		drainRounds++
 		time.Sleep(300 * time.Millisecond)
 		if drainRounds > 100 {
 			break
 		}
 	}
-	summarizeFails(t, "LEAVE (drain window)", fails, 12)
+	// THE DRAIN WINDOW MUST HAVE BEEN OBSERVED. Nothing above forces the drain to
+	// outlast the probes: the loop exits the moment the leaver finishes, so a
+	// drain that completes quickly leaves drainRounds at 0 and this gate reports
+	// "LEAVE is read-transparent" having issued no read DURING the drain at all.
+	// A gate that can pass vacuously stops being a gate, and the failure is
+	// silent, which is worse than the loud kind. Its sibling pin
+	// TestLeaveEntryServesWhileDraining already requires its own window to have
+	// been observed; this one was missing the same guard.
+	if drainRounds < 3 {
+		t.Fatalf("the drain completed after only %d probe rounds, so the drain window was never "+
+			"meaningfully observed and a pass here would assert nothing. Widen the survivors' acquire "+
+			"delay (currently 2.5s) or the drain timeout for a provable window", drainRounds)
+	}
+	// Log the window on PASSING runs too: the size of the window a gate observed
+	// is the evidence that its pass means something, and a gate that reports it
+	// only when it fails is one whose silence cannot be distinguished from having
+	// looked at nothing.
+	t.Logf("observed %d drain rounds before the leaver exited", drainRounds)
+	drainB := summarizeReadFailures(t, "LEAVE (drain window)", fails, 12)
 
 	// Post-exit window: the leaver has left the ring; survivors converge to 3
 	// and reconcile toward the genuinely-rebuilt 3-node placement, which can
@@ -318,20 +501,25 @@ drainLoop:
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("post-leave convergence: %v", err)
 	}
-	var postFails []string
+	var postFails []readFailure
 	for r := 0; r < 6; r++ {
-		postFails = append(postFails, probeReadsOnce(survivors, uk, []byte("seed"))...)
+		postFails = append(postFails, probeReadsOnceDetailed(survivors, uk, []byte("seed"))...)
 		time.Sleep(300 * time.Millisecond)
 	}
 	for _, n := range survivors {
 		n.Handle.SetAcquireDelay(0)
 	}
-	summarizeFails(t, "LEAVE (post-exit window)", postFails, 12)
+	postB := summarizeReadFailures(t, "LEAVE (post-exit window)", postFails, 12)
 	fails = append(fails, postFails...)
 
 	if len(fails) > 0 {
-		t.Fatalf("LEAVE is not read-transparent: %d client-visible read failures (drain rounds=%d) - reads must be "+
-			"served by whoever in the union physically holds the position", len(fails), drainRounds)
+		t.Fatalf("OBSERVED across a leave: drain window (%d rounds) %s; post-exit window (6 rounds) %s. "+
+			"A graceful leave must stay read-transparent - whoever in the union physically holds the "+
+			"position keeps serving it - so every one of these is client-visible. Reported as observation, "+
+			"not diagnosis: the windows and classes above are measured, the cause is not. The two windows "+
+			"are reported separately because they fail for different reasons (the drain window is the "+
+			"leaver still serving; the post-exit window is the consistent-hash reshuffle moving survivors "+
+			"to positions they have not mounted).", drainRounds, drainB, postB)
 	}
 }
 

@@ -444,8 +444,50 @@ func (b *Backing) Handle() *Handle {
 // SetAcquireDelay sets the artificial OpenReplicaUnit acquire latency for this
 // handle (see acquireDelayNanos). Safe to call concurrently with mounts. A test
 // arms it before triggering a membership change to widen the acquiring window.
+//
+// LOWERING IT RELEASES OPENS THAT ARE ALREADY IN FLIGHT (see sleepAcquireDelay),
+// so SetAcquireDelay(0) is a prompt "let the mounts land", not merely a setting
+// that applies to the next open.
 func (h *Handle) SetAcquireDelay(d time.Duration) {
 	h.acquireDelayNanos.Store(int64(d))
+}
+
+// sleepAcquireDelay sleeps this handle's armed acquire latency, RE-READING it as
+// it goes, so that lowering (or zeroing) the delay releases opens already in
+// flight rather than only affecting later ones.
+//
+// WHY THE RE-READ IS LOAD-BEARING. This latency is the knob a test uses to hold a
+// mount window open while it probes that window. Latching it at open-start makes
+// the knob ONE-WAY: a test can widen a window but never close one, so the
+// duration has to be guessed in advance against everything that runs between
+// arming it and probing (a gossip convergence wait, most of all). Guess low and a
+// slow runner closes the window before the probes issue a single read; guess high
+// and teardown waits out the whole latency it armed - on the SAME slow runner,
+// because that is exactly when opens are in flight. Re-reading dissolves the
+// tradeoff: arm it far longer than any bounded wait, then release it the moment
+// the probing is done. The window stops being a race and becomes a thing the test
+// opens and closes.
+//
+// Cost is one atomic load per tick; a test that arms a delay and never lowers it
+// sleeps the same total duration it always did, to within a tick.
+func (h *Handle) sleepAcquireDelay() {
+	const tick = 5 * time.Millisecond
+	start := time.Now()
+	for {
+		d := time.Duration(h.acquireDelayNanos.Load())
+		if d <= 0 {
+			return
+		}
+		remaining := d - time.Since(start)
+		if remaining <= 0 {
+			return
+		}
+		if remaining < tick {
+			time.Sleep(remaining)
+			return
+		}
+		time.Sleep(tick)
+	}
 }
 
 // MaxConcurrentOpens reports the high-water mark of simultaneously in-flight
@@ -590,9 +632,7 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	// owner is ALREADY fenced and cannot serve the union.
 	if h.backing.eagerFence.Load() {
 		store, opened := h.backing.acquireReplica(ru, epoch)
-		if d := h.acquireDelayNanos.Load(); d > 0 {
-			time.Sleep(time.Duration(d))
-		}
+		h.sleepAcquireDelay()
 		h.mu.Lock()
 		h.openReplica[ru] = opened
 		h.mu.Unlock()
@@ -605,9 +645,7 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	// genuinely unmounted (a routed op gets the retryable acquiring-window error)
 	// for the whole delay AND the prior owner stays unfenced (the fence-timing
 	// fidelity gap the eager default closes).
-	if d := h.acquireDelayNanos.Load(); d > 0 {
-		time.Sleep(time.Duration(d))
-	}
+	h.sleepAcquireDelay()
 
 	store, opened := h.backing.acquireReplica(ru, epoch)
 	h.mu.Lock()
