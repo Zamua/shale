@@ -20,9 +20,19 @@ type Config struct {
 	// Bucket is the S3 bucket name. Required.
 	Bucket string
 
-	// DbName is the logical SlateDB instance name. Becomes the key
-	// prefix inside Bucket; lets multiple shale nodes share one
-	// bucket. Required.
+	// DbName is the logical SlateDB instance name, and becomes the key
+	// prefix inside Bucket. Required.
+	//
+	// IT IDENTIFIES A CLUSTER, NOT A NODE. Every node in one cluster
+	// MUST pass the SAME DbName: under the unit model the per-unit
+	// databases hang beneath this prefix ("<DbName>u/g<gen>/u<id>", see
+	// dbname.go), so two nodes given different DbNames address disjoint
+	// prefix trees. They will not error - each simply opens its own
+	// empty units and cannot see the other's data.
+	//
+	// Distinct DbNames therefore mean distinct logical CLUSTERS sharing
+	// one bucket, which is a supported way to isolate deployments. What
+	// it is NOT is a way to distinguish peers within a cluster.
 	DbName string
 
 	// Endpoint is the S3 endpoint URL (e.g. "http://minio:9000").
