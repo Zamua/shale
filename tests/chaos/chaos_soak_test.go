@@ -22,21 +22,17 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/goleakignore"
-	"github.com/Zamua/shale/pkg/rebalance"
 	"go.uber.org/goleak"
 )
 
-// TestMain shrinks the rebalance sweep tick so the in-process reconcile fires
-// sub-second (the soak needs handoffs to settle within the per-event budgets),
-// and wraps goleak so a regression that leaks a Cluster goroutine (events loop,
-// reconcile, reshard barrier, peer fanout) surfaces as a binary leak. Known
+// TestMain wraps goleak so a regression that leaks a Cluster goroutine (events
+// loop, reconcile, reshard barrier, peer fanout) surfaces as a binary leak. Known
 // third-party background goroutines are ignored via the shared canonical list,
 // plus extraGoleakOptions - which is EMPTY for the default (in-memory) build so
 // the in-memory soak's leak check stays tight, and is populated only under the
 // slatedb tag with the minio-go HTTP keep-alive + slatedb-go rust-runtime
 // background goroutines a real-backend run legitimately leaves at process exit.
 func TestMain(m *testing.M) {
-	rebalance.SetSweepInterval(50 * time.Millisecond)
 	opts := append(goleakignore.Options(), extraGoleakOptions...)
 	goleak.VerifyTestMain(m, opts...)
 }
