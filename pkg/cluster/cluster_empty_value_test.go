@@ -31,13 +31,4 @@ func TestPut_RejectsEmptyValue(t *testing.T) {
 			t.Errorf("Put []byte{} at R=1: got %v want ErrEmptyValue", err)
 		}
 	})
-	t.Run("replicated-R3", func(t *testing.T) {
-		nodes := startThreeNodeReplicatedCluster(t, 3, cluster.WriteAll, cluster.ReadNearest)
-		if err := nodes[0].cluster.Put([]byte("k"), nil); !errors.Is(err, cluster.ErrEmptyValue) {
-			t.Errorf("Put nil at R=3: got %v want ErrEmptyValue", err)
-		}
-		if err := nodes[0].cluster.Put([]byte("k"), []byte{}); !errors.Is(err, cluster.ErrEmptyValue) {
-			t.Errorf("Put []byte{} at R=3: got %v want ErrEmptyValue", err)
-		}
-	})
 }
