@@ -1907,6 +1907,490 @@ The slate factory review left two P2 + one P3; all are fixed here, since the fac
 
 ---
 
+## v0.13: one coordination engine, one storage port (PROPOSED)
+
+shale is a coordination layer and toolkit. One proper distributed implementation
+exists today, over slate. A user could in theory build a distributed
+implementation over sqlite; we have not, and it would be a bit odd. What shale
+must NOT do is carry a separate implementation for some backends and a further
+one for others, selected by what it was handed. That is a leaky abstraction:
+shale should not know or care whether an adapter has certain limitations.
+
+### The diagnosis this rests on
+
+The `storageunit.BackendFactory` port is NOT the leak. It states an honest
+requirement (the new owner opens the unit at a higher epoch and fences the prior
+writer) and an adapter either satisfies it or does not. That is a contract, and
+a contract that some adapters cannot meet is a normal, non-leaky thing.
+
+The LEAK is the FALLBACK. Because `memory` and `pebble` cannot satisfy the
+fencing requirement, shale carries an entire SECOND coordination engine: plan
+ranges, stream them over gRPC, verify a checksum, sweep the source. It then
+selects between the two engines based on which backend it was handed. Deleting
+the fallback un-leaks the abstraction. Nothing else has to change for that
+statement to become true.
+
+The same diagnosis applies to R=1 versus R>1. Requiring a SECOND interface
+(`ReplicaBackendFactory`) is a second place shale asks what this adapter can do.
+Collapsing the two ports removes that question.
+
+### Scope boundary: single-node mode survives untouched
+
+`Config.Backend` with an EMPTY `BindAddr` is local-only embedding. It must keep
+working with ANY backend (memory, pebble, slate), and nothing in this change
+touches it. What is retired is `Config.Backend` WITH a bind address, that is,
+legacy MULTI-NODE.
+
+The seam is verified, not assumed. In `pkg/cluster/cluster.go`, `Open` returns
+early for single-node at line 885 (`if cfg.BindAddr == ""`), and the
+multi-backend multi-node branch returns at line 972. `initRebalance` is not
+reached until line 983. Both surviving modes therefore return BEFORE the legacy
+machinery is constructed, so removing it cannot reach them.
+
+### Step 1: retire the legacy multi-node fallback
+
+#### Removal inventory (measured, not estimated)
+
+All counts are `wc -l` over the tree at the change baseline.
+
+| Item | Path | Lines |
+| --- | --- | --- |
+| The rebalance engine, non-test | `pkg/rebalance/{doc,execute,plan,reconcile,state,sweep}.go` | 1683 |
+| The rebalance engine, tests | `pkg/rebalance/*_test.go` (6 files) | 1315 |
+| Cluster-side adapter | `pkg/cluster/rebalance.go` | 854 |
+| Legacy per-NODE replicated dispatchers | `pkg/cluster/replicate.go`, 6 funcs (see below) | 340 |
+| CLI subcommand | `cmd/shale/cmd_rebalance.go` | 192 |
+| CLI subcommand tests | `cmd/shale/cmd_rebalance_test.go` | 313 |
+| `MigrateRange` server handler | `pkg/rpc/server.go` 405-478 | 74 |
+| `ProposeRebalance` server handler | `pkg/rpc/server.go` 479-504 | 26 |
+| `MigrateRange` + `ProposeRebalance` clients | `pkg/rpc/client.go` 95-125 | 31 |
+| Proto service methods + messages | `proto/shale.proto` 70-92, 329-407 | 102 |
+| Legacy integration tests | `tests/integration/rebalance_*_test.go` (6 files) | 1101 |
+
+Total measured: 6031 lines, of which 2729 are tests. Regenerated `pkg/rpc/proto/*.pb.go`
+shrinks correspondingly and is not counted (generated).
+
+The six legacy-only functions in `pkg/cluster/replicate.go`, with spans:
+
+| Function | Lines | Span |
+| --- | --- | --- |
+| `putReplicated` | 52 | 330-381 |
+| `putReplicatedAttempt` | 34 | 382-415 |
+| `dispatchReplicaPut` | 36 | 416-451 |
+| `getReplicated` | 117 | 452-568 |
+| `dispatchReplicaGet` | 46 | 569-614 |
+| `scheduleReadRepair` | 55 | 615-669 |
+
+The proto messages removed with their RPCs: `RangeSpec`, `MigrateChunk`,
+`KeyValue`, `MigrationDone`, `ProposeRebalanceRequest`,
+`ProposeRebalanceResponse`, `RangePlanItem`.
+
+The legacy dispatch arms in the public verbs are 8 call sites, each a few lines:
+`pkg/cluster/cluster.go` 1416, 1689, 1747, 1847; `pkg/cluster/replicate.go` 418,
+712, 745; `pkg/cluster/apply_batch.go` 79. Each is a `c.rebalance.Load()` guard
+or an inline `replicationFactor() > 1 && ring != nil && !ring.Empty()` test that
+becomes statically false once the Coordinator is never constructed.
+
+#### Legacy-only versus SHARED: how it was determined
+
+The fan-out and quorum engine in `replicate.go` is SHARED with the unit path and
+MUST STAY. This was not assumed. The method was: enumerate every function in
+`replicate.go`, grep each name across all non-test `.go` files, and classify by
+whether ANY surviving caller sits in a file that the multi-backend modes reach.
+The mode-to-file mapping is not guesswork either; `pkg/cluster/doc.go` carries a
+dispatch table derived from the predicates as written, and it is the reference
+used here.
+
+STAYS, with the multi-backend callers that keep it alive:
+
+| Symbol | Surviving callers |
+| --- | --- |
+| `fanout` | `apply_batch.go` 253, `multibackend_reshard_route.go` 111 and 131, `multibackend_reshard_copy.go` 157, `multibackend_replicated.go` 547 and 658 |
+| `requiredWriteAcks` | `apply_batch.go` 218, `multibackend_pending_route.go` 366 |
+| `requiredReadReplicas` | `multibackend_replicated.go` 649 |
+| `replicationFactor` | `apply_batch.go` 215, `multibackend_pending_route.go` 192 and 278, `cas.go` 24 |
+| `isTransientReadLegErr` | `multibackend_union_scan.go` 82 and 95, `multibackend_replicated.go` 676 |
+| `isUnreachableLegErr` | `multibackend_union_scan.go` 97 |
+| `isTransientReplicaErr`, `unreachableOnlyError` | `multibackend_handoff_retry.go` 265 and 272 |
+| `firstErr` | the surviving `fanout` consumers |
+
+Three exported functions are SHARED in a subtler way, and this is the trap in
+this step: `LocalReplicaPut`, `LocalReplicaDelete` and `OwnsReplica` each branch
+on `c.multi` FIRST and serve the multi-backend path from that branch, with the
+legacy behavior only in the tail. They are reached from `pkg/rpc/server.go` on
+the KEY-ONLY forwarded path, which multi-backend R=1 uses for every cross-node
+forward (`cluster.go` `Put` calls `c.putForwarded` for a non-local key, and the
+receiver has no `ru` to address). These functions STAY. Only their legacy tails
+are removed:
+
+- `LocalReplicaPut` (670-721): drop the `c.rebalance.Load()` guard at 712 and the
+  `casReplicated()` envelope branch at 715-718. KEEP the `c.backend.Put` tail at
+  720, which is the single-node forwarded-write path.
+- `LocalReplicaDelete` (727-749): drop the guard at 745, keep `c.backend.Delete`.
+- `OwnsReplica` (766-789): drop the `multiReplicated()` arm's legacy sibling,
+  keep the `c.multi` arm and the `ownsAsReplica` tail (single-node returns true
+  on a nil ring).
+
+`casReplicated()` (`cas.go` 23) is `replicationFactor() > 1 && ring != nil &&
+!ring.Empty()`. In single-node mode `c.ring` is nil, so it is always false there;
+after legacy multi-node is gone it is dead and its guarded branches go with it.
+`applyEnvelopeIfNewer` (the non-unit form, `apply_if_newer.go` 61) loses both its
+callers and is removed; `applyEnvelopeIfNewerToUnit` is the multi-backend form
+and stays.
+
+`ApplyBatch` STAYS in full. It is gated by `multiReplicated()` at
+`apply_batch.go` 62, 155 and 190, so it is the multi-backend R>1 CAS fan-out, not
+legacy machinery.
+
+#### What `Config.Backend` means afterwards
+
+Single-node only. It is the local-only embedding of one backend, with no
+membership, no ring, and every operation local. Any backend satisfies it. This is
+the shape a toolkit should have: the simple case stays simple and imposes no
+requirement on the adapter.
+
+#### `Config.Backend` AND a `BindAddr`: the natural outcome, and why it is not acceptable
+
+Operator ruling (2026-07-19, authoritative): shale is pre-v1 with no external
+users, breaking legacy-path consumers is fine, and no migration handling is
+wanted. So no migration path and no deprecation window are designed here. The
+only bar is that the result must not panic.
+
+The NATURAL outcome, traced rather than prescribed, is this. Deleting
+`initRebalance` and the dispatch arms does NOT stop `Open` from building
+membership and a ring: the membership block at `cluster.go` 903 runs for any
+non-empty `BindAddr`, and only the `multi` branch returns before it. So a
+`Backend` plus `BindAddr` cluster would still come up, still gossip, still build
+a ring, and `ownerOf` (`cluster.go` 1510-1522) would still route by
+`ring.LocateKey`. Reads and writes would work. What would silently stop existing
+is data movement on a topology change.
+
+That is worse than a panic. It does not crash and it does not error; keys simply
+become unreachable when the ring reassigns them to a node that never received
+their bytes. A three-node deployment would look healthy and be losing reads.
+
+Therefore this configuration MUST be rejected at `Open` with a clear error, in
+`validateBackendMode`. This is not a migration path; it is the minimum that
+satisfies the do-not-panic bar honestly, because the alternative is silent data
+stranding. The error should name the actual requirement, for example: `cluster:
+Config.Backend is single-node only; multi-node (BindAddr set) requires
+BackendFactory + UnitCount`.
+
+There is a concrete reason to insist on this rather than let it ride. hostthis
+selects its backend shape on `cfg.UnitCount > 0`
+(`internal/storage/shale_repo.go` 600), where `UnitCount` comes from
+`HOSTTHIS_SHALE_UNIT_COUNT` and DEFAULTS TO 0, while `BindAddr` is set
+independently from `HOSTTHIS_SHALE_BIND_ADDR`. Their production deployment sets a
+unit count, so it takes the factory branch and is unaffected. But the
+combination "unit count unset, bind address set" is reachable in their shipped
+code and is exactly the legacy path. A loud `Open` error turns a
+silent-data-stranding misconfiguration into a failed startup.
+
+#### The `shaled` and `shaled-pebble` binaries
+
+Both use `Config.Backend` (`shaled` opens `memory.New()`, `shaled-pebble` opens
+Pebble), and both take `--bind-addr` from `pkg/shaled.BindStdFlags`, which
+defaults it to `":7946"` via `envOr("SHALE_BIND_ADDR", ":7946")`
+(`pkg/shaled/runtime.go` 152). So TODAY a bare `shaled` with no flags is a legacy
+multi-node node. After this change that default configuration is exactly the
+configuration `Open` must reject.
+
+Neither single option is right on its own, and the trap is different on each
+side:
+
+- Default `--bind-addr` to `""` alone. The bare invocation keeps working as a
+  single node, which is good. The trap is `--seeds`: an operator who passes
+  seeds but no bind address gets a process that silently ignores them, comes up
+  single-node, and joins nothing. Across a fleet that is N independent divergent
+  stores, which is the same silent-failure class this step is trying to close.
+- Refuse to start whenever `Backend` and `BindAddr` are both set, keeping the
+  `":7946"` default. Loud and correct, but it breaks the bare `shaled` with no
+  arguments, which is the binary the integration tests and every quickstart
+  invoke.
+
+Decision: do both halves plus the seeds guard.
+
+1. Change the `--bind-addr` default to `""`. A bare `shaled` or `shaled-pebble`
+   is then a single node and works out of the box.
+2. Keep the `Open`-level rejection of `Backend` plus `BindAddr`. An operator who
+   explicitly passes `--bind-addr` gets a clear error naming the multi-backend
+   requirement, instead of a silently non-rebalancing cluster.
+3. Add a startup guard in `pkg/shaled`: a non-empty `--seeds` with an empty
+   `--bind-addr` is an error. This closes the one trap that changing the default
+   would otherwise open.
+
+Together these leave no configuration that is accepted and wrong. The binaries
+become single-node demonstration and test daemons, which is what they actually
+are once the fallback is gone: neither `memory` nor `pebble` can satisfy the
+fencing contract, so neither can host a distributed shale, and pretending
+otherwise via a default port was the leak in binary form.
+
+#### Proto discipline
+
+Never renumber. The precedent already in the file is `StatsResponse`, which
+carries `reserved 6, 7;` and `reserved "latency_ms_p50", "latency_ms_p99";` for
+two fields that were removed.
+
+Applied here, precisely:
+
+- The seven removed messages are deleted WHOLE. Proto has no field numbers left
+  to reserve once a message is gone, so there is nothing to mark inside them.
+  The rule that does apply is that their NAMES must never be reused for different
+  semantics.
+- No message that SURVIVES loses a field in this change, so no new `reserved`
+  entry is required. If a later revision removes a field from a surviving
+  message, it must reserve both the number and the name, as `StatsResponse` does.
+- The two removed SERVICE methods are a different case: gRPC dispatches on the
+  method NAME (`/shale.v1.ShaleNode/MigrateRange`), not a number, so proto has no
+  `reserved` syntax for them. Removing them is safe on the wire. A stale client
+  that calls one receives `codes.Unimplemented`, which is a clean, non-panicking
+  refusal. Those two names must not be reused either.
+
+#### Migration
+
+There is none, and this is deliberate. Anyone on the legacy multi-node path is
+on a break-and-bump: no tool, no converter, no compatibility shim. The release
+note states plainly that `Config.Backend` with a `BindAddr` is removed, that
+multi-node now requires `BackendFactory` plus `UnitCount`, and that a cluster
+holding data on the legacy path must be drained by the application before
+upgrading. shale is pre-v1 and this is a supported way to spend that budget.
+
+### Step 2: collapse the two factory ports
+
+#### The single port
+
+`storageunit.BackendFactory` and `storageunit.ReplicaBackendFactory` become ONE
+interface. Every method keys on a single mount identity covering (unit, replica),
+with R=1 being replica 0. `ReplicaBackendFactory` is deleted, and with it the
+type assertion in `validateBackendMode` (`cluster.go` 442-446) and
+`initReplicatedFactory` (`multibackend_replicated.go` 84-91). There is no longer
+any place where shale asks what an adapter can do.
+
+`OpenUnit` adopts the R>1 return shape `(backend.Backend, Epoch, error)`. The
+returned exact fence epoch is load-bearing at R>1 (it feeds the drain-release
+gate and the serving marker, and must not be re-read from the shared monotone
+durable counter), and it is strictly more information than the R=1 caller needs,
+so the R=1 path simply ignores it.
+
+#### THE ON-DISK CONSTRAINT
+
+This is the part most likely to cause silent data loss, and the literal reading
+of "keyed by (unit, replica), R=1 is replica 0" does NOT survive contact with it.
+
+`dbNameFor(GenUnit)` and `dbNameReplicaFor(ReplicaUnit)` produce DIFFERENT bucket
+prefixes, and they do not meet at replica 0:
+
+```
+R=1   dbNameFor(kp, gu)        = "<kp>u/g<gen>/u<id>"          e.g. "u/g1/u5"
+R>1   dbNameReplicaFor(kp, ru) = "<kp>u/g<gen>/u<id>/r<rep>"   e.g. "u/g1/u5/r0"
+```
+
+Any existing R=1 multi-backend deployment has its bytes at the FORMER. Resolving
+an R=1 open through the replica-0 encoding would point every existing unit at an
+empty prefix, mount an empty database, and report the unit as fresh. That is
+silent total data loss presented as a healthy cluster.
+
+The bit that selects between the two encodings is real and already named in the
+code. `backends/slate/dbname.go` carries `unitRef{ru ReplicaUnit; replicated bool}`
+and `dbNameForRef`, which is documented there as "the SINGLE place the R=1 / R>1
+on-disk encoding split is decided". Today that bit is carried by WHICH METHOD the
+cluster calls: `Handle.OpenUnit` goes through `refUnit(gu)` with
+`replicated=false`, and `Handle.OpenReplicaUnit` goes through `refReplica(ru)`
+with `replicated=true`. On the cluster side the same bit is
+`c.replicaFactory != nil`, used at `multibackend.go` 398-402 to choose
+`CloseReplicaUnit(ru)` over `CloseUnit(ru.Unit)`.
+
+Collapse the two methods into one keyed only by (unit, replica) and THAT BIT IS
+DESTROYED. The adapter can no longer distinguish an R=1 open from an R>1
+replica-0 open, because both arrive as `{gu, replica: 0}`.
+
+So the mount identity the collapsed port keys on MUST carry three components, not
+two: generation-qualified unit, replica position, and the on-disk layout
+selector. The proposal is to lift the already-proven `unitRef` shape out of
+`backends/slate` and into `pkg/storageunit` as an exported value type with two
+constructors mirroring today's `refUnit` and `refReplica`. This keeps ONE
+interface, which is the entire goal, while preserving both derivations
+byte-for-byte. The port stays honest: it is one port, and the layout selector is
+part of the mount's identity rather than a question shale asks the adapter.
+
+Two alternatives were considered and rejected:
+
+- Configure the adapter with R at construction and drop the per-call bit.
+  Rejected: one `Backing`/`Handle` serves both surfaces today, and this moves a
+  routing decision into adapter configuration, which is the leak wearing a
+  different hat.
+- Migrate R=1 data onto the replica-0 prefix so the encodings genuinely
+  converge. Rejected: the operator has ruled out migration handling, and this is
+  a data-movement event rather than a refactor.
+
+The collapse is therefore INTERFACE-ONLY. No on-disk path changes.
+
+How an implementation proves it: the encoding tests in
+`backends/slate/dbname_test.go` are deliberately TAGLESS (no slatedb cgo build)
+and pin the exact strings. They must pass UNCHANGED. In particular
+`TestDbNameFor_R1Encoding` and `TestDbNameReplicaFor_Encoding` pin the literal
+prefixes, `TestDbNameForRef_MatchesUnconsolidatedEncodings` pins that routing
+through the seam reproduces both hand-written encodings, and
+`TestDbNameForRef_R1AndReplica0DoNotAlias` is the explicit data-loss guard on
+exactly this mistake. `TestUnitRef_R1AndReplica0AreDistinctMapKeys` pins the
+matching property for the mount map. If any of these has to be EDITED to make the
+change compile, the change has moved bytes and must stop. They run without the
+heavy build:
+
+```
+go test ./backends/slate/... -run 'TestDbName|TestServingMarker|TestUnitRef' -count=1
+```
+
+#### `OpenUnits` and `CurrentEpoch`
+
+`OpenUnits()` should be DROPPED from the port. Its doc comment claims "the
+anti-entropy reconcile diffs this against the desired set", and that is STALE:
+the only caller anywhere in the tree is `tests/chaos/adapter_inproc.go` 473. The
+reconcile derives desired-versus-mounted from the cluster's OWN `mountMap`, not
+from the factory. Keeping a query the toolkit never asks is a third thing the
+port demands of an adapter for no reason, so removing it is part of the same
+un-leaking.
+
+`CurrentEpoch` STAYS, re-keyed to the new mount identity, with semantics
+unchanged: the LOCAL in-process view, explicitly not the cross-node source of
+truth. It has exactly one production caller, `nextEpochFor`
+(`multibackend_rebalance.go` 359-364), which uses it as a best-effort hint for
+the intended epoch while the factory remains authoritative and fences against the
+durable manifest. That is a legitimate use and it is live on the R=1 acquire
+path, so the method earns its place.
+
+The three R>1-only methods (`DurableEpochReplica`, `WriteServingMarker`,
+`ReadServingMarker`) move onto the single port and re-key to the mount identity.
+Their semantics are unchanged. One caution for the implementation: the serving
+marker key is derived from `dbNameReplicaFor` unconditionally
+(`servingMarkerKeyFor`), so it always lands under the REPLICA prefix. Today no
+marker is written at R=1 because the overlap handoff does not run there. Making
+these methods universal must NOT start writing markers for R=1 mounts, whose data
+lives under a different prefix. The cluster should keep calling them only from
+the overlap path, exactly as now.
+
+#### Is this breaking for an external implementor of the port?
+
+Yes, unambiguously, and the release note must say so without hedging. Any type
+that satisfies `BackendFactory` or `ReplicaBackendFactory` today stops compiling:
+the two interfaces merge into one, the key type changes, `OpenUnit` gains a
+return value, `OpenUnits` is removed, and the R>1 methods move.
+
+The known consumer was checked rather than trusted. hostthis assigns
+`clusterCfg.BackendFactory = handle` at `internal/storage/shale_repo.go` 626,
+where `handle` is a `*slate.Handle` obtained from `backing.Handle()`. They do NOT
+implement the port themselves, and a repo-wide grep for `OpenUnit`, `CloseUnit`,
+`CurrentEpoch`, `OpenUnits`, `ReplicaBackendFactory` and `OpenReplicaUnit`
+returns no implementation. They also have ZERO references to `backends/pebble` or
+`backend/memory`. So their call site keeps compiling, because `*slate.Handle` is
+shale's own type and shale updates it in lockstep, and because the `Config` field
+name does not change.
+
+There is one hard requirement on them, and it belongs in the release note:
+hostthis pins `github.com/Zamua/shale v0.12.0` and
+`github.com/Zamua/shale/backends/slate v0.10.0` as SEPARATE modules. Those must
+be bumped TOGETHER. A mismatched pair, new core with old slate, will not compile,
+because the old `*slate.Handle` does not satisfy the new port. A consumer who
+bumps only one gets a build failure rather than anything subtle, which is the
+right failure mode, but it must be called out.
+
+Release note text, minimum content:
+
+- `Config.Backend` with a non-empty `BindAddr` is REMOVED. Multi-node requires
+  `BackendFactory` plus `UnitCount`. `Config.Backend` remains fully supported for
+  single-node embedding with any backend.
+- `storageunit.ReplicaBackendFactory` is REMOVED and merged into
+  `storageunit.BackendFactory`. Implementors of the port must migrate.
+  `OpenUnits` is removed from the port. `OpenUnit` now returns the epoch it
+  opened at.
+- No on-disk format change. Both the R=1 and the R>1 prefixes are preserved
+  exactly.
+- Consumers who pass a `*slate.Handle` need only bump the core and
+  `backends/slate` modules together.
+- `shaled` and `shaled-pebble` now default to single-node. Passing `--seeds`
+  without `--bind-addr` is now an error.
+- No migration tool. A cluster holding data on the legacy multi-node path must be
+  drained by the application before upgrading.
+
+### Versioning
+
+This removes a supported configuration AND changes a public interface, so it is
+breaking on two counts. Under Go module semantics for a pre-v1 module, a breaking
+change bumps the MINOR.
+
+- `github.com/Zamua/shale`: v0.12.0 to **v0.13.0**.
+- `github.com/Zamua/shale/backends/slate`: v0.10.0 to **v0.11.0**. `Handle`
+  changes shape to satisfy the collapsed port.
+- `github.com/Zamua/shale/backends/pebble`: bump alongside. It has NO reference to
+  `pkg/storageunit` (verified by grep), so step 2 does not touch it; it changes
+  only because `shaled-pebble`'s bind-address default changes in step 1. This
+  module carries no published tag today.
+
+Both steps should land under ONE version. They are one argument, and shipping the
+port collapse separately would mean cutting a release in which the fallback is
+gone but shale still asks adapters what they can do, which is a state with no
+independent value.
+
+### Answered: does `OpenUnit` permit a long-running open?
+
+This decides whether a future step 3 admitting a copy-based adapter (minutes, not
+seconds) is cheap or a redesign. hostthis measures real opens at 17 to 21
+seconds. Read at the call sites, the answer is mostly yes, with two specific
+exceptions.
+
+**Permits a long open.**
+
+1. The R>1 overlap acquire. `acquireReplicaUnitOverlapBlocking`
+   (`multibackend_overlap.go` 934-936) calls `OpenReplicaUnit` with NO context
+   and NO deadline, from a background goroutine spawned by
+   `acquireReplicaUnitOverlap`. The old owner stays `Draining` and KEEPS SERVING
+   until it observes the successor's serving marker, so a slow open costs no
+   availability. This path was deliberately built to tolerate a slow mount.
+2. The permit watchdog is NOT a bound on the open, despite looking like one.
+   `defaultOpenPermitTimeout = 60 * time.Second` (`multibackend.go` 99) releases
+   the node-wide open SEMAPHORE so the queue unstarves; the comment at
+   `multibackend.go` 95-98 states explicitly that "the open itself keeps
+   running".
+3. The acquire re-drive backoff (`acquireRedriveBase` 250ms, `acquireRedriveCap`
+   2s, `multibackend_overlap.go` 911-914) bounds retries of a FAILED open, not
+   the duration of a running one.
+4. The boot mount. `mountReplicaUnits`, reached from `initMultiBackend` before
+   `Open` returns, runs opens through an errgroup limited to `openConcurrency()`
+   (default 1, sequential) with no per-open deadline. It ALREADY tolerates
+   minutes: at 17 to 21 seconds per open, N units serialize to roughly N times 20
+   seconds inside `Open`. There is even a boot-defer rule that SKIPS a position a
+   peer is already serving.
+
+**Does not permit a long open. These are the contract changes a future step would
+need.**
+
+5. The coordinated reshard freeze barrier. `reshardPhaseTimeout = 30 *
+   time.Second` (`multibackend_reshard_barrier.go` 110) bounds the coordinator's
+   wait for ANY single node's ack of ANY single phase; past it that node is
+   treated as failed and the coordinator ABORTS. The BISECT phase runs
+   `bisectUnitStatic` for EVERY unit the node owns, and each call performs TWO
+   `factory.OpenUnit` calls (`multibackend_reshard_barrier.go` 611 and 615) plus a
+   full key copy, all inside that one 30-second budget and under a CLUSTER-WIDE
+   WRITE FREEZE. The timeout's own doc at lines 107-109 says it is sized because
+   "the BISECT phase copies a node's units (bounded by their size), which
+   dominates", which is precisely the assumption that opens are negligible. The
+   children opened there are FRESH and empty, so opens are fast today; a
+   copy-based adapter inverts that and blows the budget, aborting the reshard.
+6. The R=1 reconcile holds `reconcileMu` ACROSS the open. `acquireUnit`
+   (`multibackend_rebalance.go` 300-302) calls `OpenUnit` synchronously, and its
+   contract at line 299 states "Caller MUST hold reconcileMu". A minutes-long
+   open there stalls every subsequent reconcile pass on that node, including
+   releases and reshard steps. Note the contrast: the R>1 overlap path was
+   already moved off this pattern into a background goroutine, so the fix shape
+   is known and precedented.
+
+So a future toolkit step admitting a copy-based adapter needs two changes, both
+scoped and neither a redesign: the barrier phase timeout must become a function
+of the work rather than a constant (or the barrier must stop opening units inside
+the frozen phase), and the R=1 acquire must move off `reconcileMu` the way the
+R>1 acquire already did. Everything else on the open path already tolerates a
+long open.
+
 ## Roadmap
 
 - [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.
