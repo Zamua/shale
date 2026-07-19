@@ -384,11 +384,11 @@ func TestLosslessReshardGate(t *testing.T) {
 			return false
 		}
 		seen := make(map[storageunit.UnitID]bool, newCount)
-		for _, gu := range open {
-			if gu.Gen != 1 {
+		for _, m := range open {
+			if m.Unit().Gen != 1 {
 				return false
 			}
-			seen[gu.ID] = true
+			seen[m.Unit().ID] = true
 		}
 		return len(seen) == newCount
 	}) {
@@ -437,17 +437,17 @@ type skipCatchupHandle struct {
 	*sharedfactory.Handle
 }
 
-func (h *skipCatchupHandle) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
-	be, err := h.Handle.OpenUnit(gu, epoch)
+func (h *skipCatchupHandle) OpenUnit(m storageunit.MountRef, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	be, opened, err := h.Handle.OpenUnit(m, epoch)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	// Only sabotage the gen-1 children (the bisect targets). The gen-0 old units
 	// and any post-reshard opens are left untouched.
-	if gu.Gen != 1 {
-		return be, nil
+	if m.Unit().Gen != 1 {
+		return be, opened, nil
 	}
-	return &skipCatchupBackend{Backend: be, bulk: make(map[string]struct{})}, nil
+	return &skipCatchupBackend{Backend: be, bulk: make(map[string]struct{})}, opened, nil
 }
 
 // skipCatchupBackend drops the catch-up re-Put of copy-window writes. See the

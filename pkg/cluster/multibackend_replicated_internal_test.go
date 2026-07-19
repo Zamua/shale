@@ -48,7 +48,6 @@ func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfa
 	}
 	c.genOwner = c.genUnitOwner
 	c.initGenState()
-	c.initReplicatedFactory()
 	// Terminate the fixture's background goroutines at test end exactly as a
 	// real Close does: flip closed, close closeCh, JOIN loopWG. The
 	// displaced-drain poller a beginDrain arms exits on closeCh (production
@@ -81,8 +80,8 @@ func TestMultiReplicated_PredicateGating(t *testing.T) {
 	if !c.multiReplicated() {
 		t.Fatalf("R=2 multi with populated ring should be replicated")
 	}
-	if c.replicaFactory == nil {
-		t.Fatalf("R>1 should wire replicaFactory")
+	if !c.replicaLayout() {
+		t.Fatalf("R>1 should address storage by replica position")
 	}
 
 	// R=1 multi: NOT replicated (single-mount path).
@@ -90,8 +89,8 @@ func TestMultiReplicated_PredicateGating(t *testing.T) {
 	if c1.multiReplicated() {
 		t.Fatalf("R=1 multi should not be replicated")
 	}
-	if c1.replicaFactory != nil {
-		t.Fatalf("R=1 should not wire replicaFactory")
+	if c1.replicaLayout() {
+		t.Fatalf("R=1 should address storage by sole mount, not replica position")
 	}
 }
 
@@ -371,7 +370,7 @@ func TestMountReplicaUnits_DoesNotFenceServingPeer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("peer open: %v", err)
 	}
-	if err := peer.WriteServingMarker(served, peerEpoch); err != nil {
+	if err := peer.WriteServingMarker(storageunit.ReplicaMount(served), peerEpoch); err != nil {
 		t.Fatalf("peer write serving marker: %v", err)
 	}
 	if err := pb.Put([]byte("k"), []byte("v")); err != nil {

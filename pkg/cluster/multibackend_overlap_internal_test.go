@@ -142,7 +142,7 @@ func TestOverlap_MarkerHold_Conditions(t *testing.T) {
 	}
 
 	// Marker at our own epoch: HELD (no successor has re-opened above us).
-	if err := h.WriteServingMarker(ru, opened); err != nil {
+	if err := h.WriteServingMarker(storageunit.ReplicaMount(ru), opened); err != nil {
 		t.Fatalf("mark: %v", err)
 	}
 	if !c.heldForMissingSuccessorMarker(ru) {
@@ -162,7 +162,7 @@ func TestOverlap_MarkerHold_Conditions(t *testing.T) {
 	c.genMu.Unlock()
 
 	// Marker strictly above our epoch: released (successor provably serving).
-	if err := h.WriteServingMarker(ru, opened+1); err != nil {
+	if err := h.WriteServingMarker(storageunit.ReplicaMount(ru), opened+1); err != nil {
 		t.Fatalf("mark above: %v", err)
 	}
 	if c.heldForMissingSuccessorMarker(ru) {
@@ -493,7 +493,7 @@ func TestOverlap_drainCheck_ReleasesOnServingMarker(t *testing.T) {
 	}
 
 	// A serving marker at a HIGHER epoch (the new owner became Ready): release.
-	if err := h.WriteServingMarker(target, 2); err != nil {
+	if err := h.WriteServingMarker(storageunit.ReplicaMount(target), 2); err != nil {
 		t.Fatalf("write marker: %v", err)
 	}
 	c.drainCheck(target)
@@ -527,7 +527,7 @@ func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed gain mount: %v", err)
 	}
-	if err := h.WriteServingMarker(target, E); err != nil {
+	if err := h.WriteServingMarker(storageunit.ReplicaMount(target), E); err != nil {
 		t.Fatalf("write self gain-marker: %v", err)
 	}
 
@@ -552,7 +552,7 @@ func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 	if _, _, err := h2.OpenReplicaUnit(target, E+1); err != nil {
 		t.Fatalf("successor open: %v", err)
 	}
-	if err := h2.WriteServingMarker(target, E+1); err != nil {
+	if err := h2.WriteServingMarker(storageunit.ReplicaMount(target), E+1); err != nil {
 		t.Fatalf("write successor marker: %v", err)
 	}
 	c.drainCheck(target)

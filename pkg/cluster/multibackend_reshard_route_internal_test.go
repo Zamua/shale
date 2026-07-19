@@ -131,11 +131,11 @@ func TestPutReshardDualWrite_LandsInBothGenerations(t *testing.T) {
 	parentRU := storageunit.NewReplicaUnit(storageunit.NewGenUnit(0, parent), 0)
 	childRU := storageunit.NewReplicaUnit(storageunit.NewGenUnit(1, child), 0)
 
-	pb, _, err := c.replicaFactory.OpenReplicaUnit(parentRU, epochAtOpen)
+	pb, _, err := c.factory.OpenUnit(storageunit.ReplicaMount(parentRU), epochAtOpen)
 	if err != nil {
 		t.Fatalf("open parent: %v", err)
 	}
-	cb, _, err := c.replicaFactory.OpenReplicaUnit(childRU, epochAtOpen)
+	cb, _, err := c.factory.OpenUnit(storageunit.ReplicaMount(childRU), epochAtOpen)
 	if err != nil {
 		t.Fatalf("open child: %v", err)
 	}

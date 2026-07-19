@@ -324,7 +324,7 @@ func plantServingMarkersAtDurable(t *testing.T, h *sharedfactory.Handle, unitCou
 			if err != nil || epoch < 1 {
 				epoch = 1
 			}
-			if err := h.WriteServingMarker(ru, epoch); err != nil {
+			if err := h.WriteServingMarker(storageunit.ReplicaMount(ru), epoch); err != nil {
 				t.Fatalf("plant serving marker %s: %v", ru, err)
 			}
 		}

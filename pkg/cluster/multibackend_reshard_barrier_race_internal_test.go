@@ -72,23 +72,32 @@ type putGate struct {
 	fired    atomic.Bool
 }
 
-func (g *gateFactory) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
-	be, err := g.inner.OpenUnit(gu, epoch)
+func (g *gateFactory) OpenUnit(m storageunit.MountRef, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	be, opened, err := g.inner.OpenUnit(m, epoch)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	wb := &gateBackend{Backend: be, gu: gu, fac: g}
-	g.backends[gu] = wb
-	return wb, nil
+	wb := &gateBackend{Backend: be, gu: m.Unit(), fac: g}
+	g.backends[m.Unit()] = wb
+	return wb, opened, nil
 }
 
-func (g *gateFactory) CloseUnit(gu storageunit.GenUnit) error { return g.inner.CloseUnit(gu) }
-func (g *gateFactory) CurrentEpoch(gu storageunit.GenUnit) (storageunit.Epoch, bool) {
-	return g.inner.CurrentEpoch(gu)
+func (g *gateFactory) CloseUnit(m storageunit.MountRef) error { return g.inner.CloseUnit(m) }
+func (g *gateFactory) CurrentEpoch(m storageunit.MountRef) (storageunit.Epoch, bool) {
+	return g.inner.CurrentEpoch(m)
 }
-func (g *gateFactory) OpenUnits() []storageunit.GenUnit { return g.inner.OpenUnits() }
+func (g *gateFactory) OpenUnits() []storageunit.MountRef { return g.inner.OpenUnits() }
+func (g *gateFactory) DurableEpoch(m storageunit.MountRef) (storageunit.Epoch, error) {
+	return g.inner.DurableEpoch(m)
+}
+func (g *gateFactory) WriteServingMarker(m storageunit.MountRef, e storageunit.Epoch) error {
+	return g.inner.WriteServingMarker(m, e)
+}
+func (g *gateFactory) ReadServingMarker(m storageunit.MountRef) (storageunit.Epoch, bool, error) {
+	return g.inner.ReadServingMarker(m)
+}
 
 // armPut installs a gate on the gen-0 unit gu so the NEXT Put of key on it
 // suspends inside b.Put. Returns the gate.

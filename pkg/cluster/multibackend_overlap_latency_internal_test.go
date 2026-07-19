@@ -88,7 +88,7 @@ func TestOverlap_DrainPoller_ReleasesOnMarker_WithoutReconcileTick(t *testing.T)
 	if err != nil {
 		t.Fatalf("successor open: %v", err)
 	}
-	if err := hSucc.WriteServingMarker(target, succEpoch); err != nil {
+	if err := hSucc.WriteServingMarker(storageunit.ReplicaMount(target), succEpoch); err != nil {
 		t.Fatalf("successor marker: %v", err)
 	}
 

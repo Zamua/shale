@@ -1848,7 +1848,125 @@ selected between the two engines based on which backend it was handed.
 Deleting the fallback un-leaks the abstraction; nothing else had to change for
 that statement to become true.
 
-### What was retired
+The same diagnosis applied to R=1 versus R>1. Requiring a SECOND interface
+(`ReplicaBackendFactory`) was a second place shale asked what an adapter could
+do: `validateBackendMode` type-asserted it at `Open` and refused R>1 for a
+factory that did not implement it, and the cluster carried a `replicaFactory`
+capability view alongside `factory`. Collapsing the two ports removes that
+question.
+
+### One storage port
+
+`storageunit.BackendFactory` is now the ONLY storage interface shale declares.
+`ReplicaBackendFactory` is gone, the capability assertion at `Open` is gone, and
+there is no type assertion anywhere in shale that asks an adapter which subset
+of the contract it supports. An adapter either satisfies the contract or it does
+not, and that is a property of the adapter rather than a branch in the
+coordination layer.
+
+Every method is keyed by `storageunit.MountRef`, and R=1 is replica 0.
+
+#### The mount identity carries THREE components, not two
+
+This is the load-bearing decision, because the literal reading of the collapse
+is DATA-LOSS-UNSAFE.
+
+An adapter that derives a storage location from the mount identity does not
+derive the same location for "unit U" and "unit U, replica 0": the replica
+position is a CHILD segment, so the two are different strings. The slate
+encodings are the worked example:
+
+    sole    -> "<keyPrefix>u/g<gen>/u<id>"
+    replica -> "<keyPrefix>u/g<gen>/u<id>/r<replica>"
+
+An existing R=1 multi-backend deployment's bytes live at the FORMER. Resolving
+an R=1 open through the replica-0 encoding would mount an EMPTY database and
+report the unit fresh: silent total data loss presented as a healthy cluster.
+
+Before the collapse the selector was carried IMPLICITLY, by WHICH METHOD the
+cluster called (`OpenUnit` versus `OpenReplicaUnit`), with the cluster-side twin
+being `replicaFactory != nil`. One port has one method, so that carrier is gone
+and the bit has to become explicit. `MountRef` therefore carries:
+
+  - the generation-qualified unit,
+  - the replica position,
+  - the LAYOUT SELECTOR (`Replicated()`).
+
+It is built only through `SoleMount(gu)` or `ReplicaMount(ru)`; the fields are
+unexported, so there is no way to construct a ref whose layout is unset or to
+flip it on an existing one. `SoleMount(gu)` and `ReplicaMount(NewReplicaUnit(gu,
+0))` are DISTINCT values and DISTINCT map keys, exactly as their two locations
+are distinct strings, which also lets an adapter track both families of mounts
+in one map without aliasing.
+
+The un-leaking still holds: the layout is a property of the thing being opened,
+not a question shale asks the adapter about itself.
+
+Rejected alternatives: configuring the adapter with R at construction (one
+slate `Backing`/`Handle` serves both surfaces, and this moves a routing decision
+into adapter config, the leak wearing a different hat); and migrating R=1 data
+onto the replica-0 prefix (a data-movement event, not a refactor).
+
+#### The change is INTERFACE-ONLY
+
+No location derivation changed for either layout. The slate adapter already
+funnelled both surfaces through one internal `unitRef` plus `dbNameForRef`, "the
+SINGLE place the on-disk encoding split is decided"; that shape was LIFTED into
+`pkg/storageunit` as the exported `MountRef` and `unitRef` became an alias for
+it. The tagless pins in `backends/slate/dbname_test.go` still compile and pass
+UNCHANGED, including `TestDbNameForRef_R1AndReplica0DoNotAlias` (the explicit
+data-loss guard) and `TestUnitRef_R1AndReplica0AreDistinctMapKeys`. Having to
+EDIT any of them would have been the signal that the change had moved bytes.
+
+The serving-marker key moved from being addressed by `ReplicaUnit` to being
+addressed by the mount, deriving as `dbNameForRef(kp, ref) + "/serving"`. For a
+replica ref that is byte-for-byte the previous `dbNameReplicaFor(kp, ru) +
+"/serving"`, which is pinned by a new tagless test; for a sole ref it is a
+different key, which is the point (deriving both through the replica encoding
+would alias a sole mount's marker onto replica 0's).
+
+#### The port
+
+    OpenUnit(m MountRef, epoch Epoch) (backend.Backend, Epoch, error)
+    CloseUnit(m MountRef) error
+    CurrentEpoch(m MountRef) (Epoch, bool)
+    OpenUnits() []MountRef
+    DurableEpoch(m MountRef) (Epoch, error)
+    WriteServingMarker(m MountRef, epoch Epoch) error
+    ReadServingMarker(m MountRef) (Epoch, bool, error)
+
+Two signature changes beyond the key type. `OpenUnit` now RETURNS the exact
+epoch it opened at, which was previously only on the R>1 method and is what a
+caller must use as its open epoch rather than re-reading the durable epoch (a
+shared counter any node's later open bumps). `OpenUnits` returns mount refs, so
+it can enumerate replica mounts; the previous `[]GenUnit` signature could not
+name them, so an R>1 handle reported an empty set.
+
+#### The cluster side
+
+`c.replicaFactory` is gone; there is one `c.factory`. The capability predicate
+`replicaFactory != nil` became `c.replicaLayout()`, defined as `c.multi &&
+c.replicationFactor() > 1` -- the same expression `initReplicatedFactory` used,
+so the layout is unchanged for every configuration.
+
+`replicaLayout()` is NOT `multiReplicated()` and the two must not be
+substituted. `multiReplicated()` additionally requires a populated ring, so on a
+SINGLE-NODE R>1 cluster they disagree: such a cluster mounts by replica position
+while serving through the single-owner path. That divergence is pre-existing and
+deliberate, but it now also decides ADDRESSING, so using `multiReplicated()` for
+it would make a single-node R>1 cluster resolve mounts its own earlier boots
+wrote elsewhere. `c.mountRefFor(ru)` is the one place a tracked `ReplicaUnit`
+becomes a `MountRef`.
+
+#### Consequence: no configuration is refused for lacking a capability
+
+`Open` no longer rejects R>1 for a factory that cannot address replicas,
+because there is no longer a way to ask. A factory that compiles against the
+port has stated it meets the contract. This is the intended trade: the
+alternative is shale branching on adapter capability, which is the thing being
+removed.
+
+### What was retired (the fallback engine)
 
 `Config.Backend` WITH a `BindAddr` (legacy multi-node) and everything reachable
 only from it:

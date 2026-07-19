@@ -170,7 +170,7 @@ func TestFactory_CopyFreeFenceHandoff(t *testing.T) {
 	unit := gu(0, 3)
 
 	// A acquires at epoch 1, writes a recorded dataset, acks each.
-	beA, err := nodeA.OpenUnit(unit, storageunit.Epoch(1))
+	beA, _, err := nodeA.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("A open: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestFactory_CopyFreeFenceHandoff(t *testing.T) {
 	}
 
 	// A releases (flush + shutdown; bytes stay in the bucket).
-	if err := nodeA.CloseUnit(unit); err != nil {
+	if err := nodeA.CloseUnit(storageunit.SoleMount(unit)); err != nil {
 		t.Fatalf("A close: %v", err)
 	}
 
@@ -214,7 +214,7 @@ func TestFactory_CopyFreeFenceHandoff(t *testing.T) {
 	// B acquires at a higher epoch off the SAME backing. The intended floor
 	// is 2; the factory fences authoritatively above the durable manifest
 	// epoch. Opening B FENCES the staleA writer that opened just above.
-	beB, err := nodeB.OpenUnit(unit, storageunit.Epoch(2))
+	beB, _, err := nodeB.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(2))
 	if err != nil {
 		t.Fatalf("B open: %v", err)
 	}
@@ -252,7 +252,7 @@ func TestFactory_CopyFreeFenceHandoff(t *testing.T) {
 	}
 	t.Logf("stale A fenced as expected: %v", lastErr)
 
-	if err := nodeB.CloseUnit(unit); err != nil {
+	if err := nodeB.CloseUnit(storageunit.SoleMount(unit)); err != nil {
 		t.Fatalf("B close: %v", err)
 	}
 }
@@ -268,11 +268,11 @@ func TestFactory_IndependentGenerations(t *testing.T) {
 	old := gu(0, 1) // gen-0 unit 1
 	nu := gu(1, 1)  // gen-1 unit 1 (same UnitID, next generation)
 
-	beOld, err := h.OpenUnit(old, storageunit.Epoch(1))
+	beOld, _, err := h.OpenUnit(storageunit.SoleMount(old), storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("open old: %v", err)
 	}
-	beNew, err := h.OpenUnit(nu, storageunit.Epoch(1))
+	beNew, _, err := h.OpenUnit(storageunit.SoleMount(nu), storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("open new: %v", err)
 	}
@@ -304,8 +304,8 @@ func TestFactory_IndependentGenerations(t *testing.T) {
 		t.Fatalf("old unit fenced by opening the new gen unit: %v", err)
 	}
 
-	_ = h.CloseUnit(old)
-	_ = h.CloseUnit(nu)
+	_ = h.CloseUnit(storageunit.SoleMount(old))
+	_ = h.CloseUnit(storageunit.SoleMount(nu))
 }
 
 // TestFactory_DurabilityAcrossReacquire asserts acked writes survive
@@ -317,18 +317,18 @@ func TestFactory_DurabilityAcrossReacquire(t *testing.T) {
 	h := b.Handle()
 	unit := gu(0, 7)
 
-	be, err := h.OpenUnit(unit, storageunit.Epoch(1))
+	be, _, err := h.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
 	if err := be.Put([]byte("durable"), []byte("yes")); err != nil {
 		t.Fatalf("put: %v", err)
 	}
-	if err := h.CloseUnit(unit); err != nil {
+	if err := h.CloseUnit(storageunit.SoleMount(unit)); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	be2, err := h.OpenUnit(unit, storageunit.Epoch(2))
+	be2, _, err := h.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(2))
 	if err != nil {
 		t.Fatalf("reopen: %v", err)
 	}
@@ -339,7 +339,7 @@ func TestFactory_DurabilityAcrossReacquire(t *testing.T) {
 	if !bytes.Equal(got, []byte("yes")) {
 		t.Fatalf("durability: got %q want yes", got)
 	}
-	_ = h.CloseUnit(unit)
+	_ = h.CloseUnit(storageunit.SoleMount(unit))
 }
 
 // TestFactory_CurrentEpochAndOpenUnits pins the local-view queries:
@@ -350,23 +350,27 @@ func TestFactory_CurrentEpochAndOpenUnits(t *testing.T) {
 	b := newBacking(t, fx)
 	h := b.Handle()
 
-	if _, ok := h.CurrentEpoch(gu(0, 0)); ok {
+	if _, ok := h.CurrentEpoch(storageunit.SoleMount(gu(0, 0))); ok {
 		t.Fatalf("CurrentEpoch ok=true for an unmounted unit")
 	}
 
 	units := []storageunit.GenUnit{gu(0, 2), gu(0, 0), gu(1, 0)}
 	for _, u := range units {
-		if _, err := h.OpenUnit(u, storageunit.Epoch(3)); err != nil {
+		if _, _, err := h.OpenUnit(storageunit.SoleMount(u), storageunit.Epoch(3)); err != nil {
 			t.Fatalf("open %s: %v", u, err)
 		}
 	}
 
-	if e, ok := h.CurrentEpoch(gu(0, 0)); !ok || e < storageunit.Epoch(3) {
+	if e, ok := h.CurrentEpoch(storageunit.SoleMount(gu(0, 0))); !ok || e < storageunit.Epoch(3) {
 		t.Fatalf("CurrentEpoch(g0/u0) = (%d,%v), want (>=3, true)", e, ok)
 	}
 
 	got := h.OpenUnits()
-	want := []storageunit.GenUnit{gu(0, 0), gu(0, 2), gu(1, 0)}
+	want := []storageunit.MountRef{
+		storageunit.SoleMount(gu(0, 0)),
+		storageunit.SoleMount(gu(0, 2)),
+		storageunit.SoleMount(gu(1, 0)),
+	}
 	if len(got) != len(want) {
 		t.Fatalf("OpenUnits len = %d want %d (%v)", len(got), len(want), got)
 	}
@@ -376,7 +380,7 @@ func TestFactory_CurrentEpochAndOpenUnits(t *testing.T) {
 		}
 	}
 	for _, u := range units {
-		_ = h.CloseUnit(u)
+		_ = h.CloseUnit(storageunit.SoleMount(u))
 	}
 }
 
@@ -393,17 +397,17 @@ func TestFactory_DoubleOpenRejected(t *testing.T) {
 	h := b.Handle()
 	unit := gu(0, 4)
 
-	if _, err := h.OpenUnit(unit, storageunit.Epoch(5)); err != nil {
+	if _, _, err := h.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(5)); err != nil {
 		t.Fatalf("first open: %v", err)
 	}
-	if _, err := h.OpenUnit(unit, storageunit.Epoch(5)); err == nil {
+	if _, _, err := h.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(5)); err == nil {
 		t.Fatalf("re-open at the same epoch should be rejected (double-open), got nil")
 	}
-	if _, err := h.OpenUnit(unit, storageunit.Epoch(4)); err == nil {
+	if _, _, err := h.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(4)); err == nil {
 		t.Fatalf("re-open at a lower epoch should be rejected, got nil")
 	}
 	// A strictly-higher re-open WITHOUT a prior close is ALSO rejected now.
-	if _, err := h.OpenUnit(unit, storageunit.Epoch(6)); err == nil {
+	if _, _, err := h.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(6)); err == nil {
 		t.Fatalf("re-open at a higher epoch (without CloseUnit) should be rejected, got nil")
 	}
 	// After CloseUnit the held-state is cleared, so the held-check no longer
@@ -413,10 +417,10 @@ func TestFactory_DoubleOpenRejected(t *testing.T) {
 	// process after it has been opened (process-local epoch state), so the
 	// re-open-after-close path is exercised cross-process by the chaosreal
 	// adapter, not here. Closing simply must succeed and clear the slot.
-	if err := h.CloseUnit(unit); err != nil {
+	if err := h.CloseUnit(storageunit.SoleMount(unit)); err != nil {
 		t.Fatalf("close: %v", err)
 	}
-	if _, ok := h.CurrentEpoch(unit); ok {
+	if _, ok := h.CurrentEpoch(storageunit.SoleMount(unit)); ok {
 		t.Fatalf("CurrentEpoch ok=true after CloseUnit; the slot was not cleared")
 	}
 }
@@ -441,14 +445,14 @@ func TestFactory_FenceEpochArithmetic(t *testing.T) {
 	// or two: open + write + close a couple of times on a first handle.
 	h1 := b.Handle()
 	for i := 0; i < 2; i++ {
-		be, err := h1.OpenUnit(unit, storageunit.Epoch(1))
+		be, _, err := h1.OpenUnit(storageunit.SoleMount(unit), storageunit.Epoch(1))
 		if err != nil {
 			t.Fatalf("seed open %d: %v", i, err)
 		}
 		if err := be.Put([]byte("seed"), []byte("x")); err != nil {
 			t.Fatalf("seed put %d: %v", i, err)
 		}
-		if err := h1.CloseUnit(unit); err != nil {
+		if err := h1.CloseUnit(storageunit.SoleMount(unit)); err != nil {
 			t.Fatalf("seed close %d: %v", i, err)
 		}
 	}
@@ -472,7 +476,7 @@ func TestFactory_FenceEpochArithmetic(t *testing.T) {
 		t.Fatalf("test bug: intended floor %d is not stale relative to durable %d", stale, durableBefore)
 	}
 	h2 := b.Handle()
-	be, err := h2.OpenUnit(unit, stale)
+	be, _, err := h2.OpenUnit(storageunit.SoleMount(unit), stale)
 	if err != nil {
 		t.Fatalf("cold acquire with stale floor: %v", err)
 	}
@@ -490,10 +494,10 @@ func TestFactory_FenceEpochArithmetic(t *testing.T) {
 		t.Fatalf("factory under-fenced: durable epoch %d did not advance above %d (intended floor was a stale %d). A neutered fenceEpoch would open at the stale floor instead of max(intended, durable+1).", durableAfter, durableBefore, stale)
 	}
 	// And the opened epoch the handle recorded is strictly above durableBefore.
-	if e, ok := h2.CurrentEpoch(unit); !ok || e <= durableBefore {
+	if e, ok := h2.CurrentEpoch(storageunit.SoleMount(unit)); !ok || e <= durableBefore {
 		t.Fatalf("CurrentEpoch = (%d, %v), want > durableBefore=%d", e, ok, durableBefore)
 	}
-	_ = h2.CloseUnit(unit)
+	_ = h2.CloseUnit(storageunit.SoleMount(unit))
 }
 
 // TestFactory_PresentUnits enumerates units present in the bucket after
@@ -505,7 +509,7 @@ func TestFactory_PresentUnits(t *testing.T) {
 
 	want := []storageunit.GenUnit{gu(0, 0), gu(0, 5), gu(1, 2)}
 	for _, u := range want {
-		be, err := h.OpenUnit(u, storageunit.Epoch(1))
+		be, _, err := h.OpenUnit(storageunit.SoleMount(u), storageunit.Epoch(1))
 		if err != nil {
 			t.Fatalf("open %s: %v", u, err)
 		}
@@ -513,7 +517,7 @@ func TestFactory_PresentUnits(t *testing.T) {
 		if err := be.Put([]byte("seed"), []byte("x")); err != nil {
 			t.Fatalf("seed put %s: %v", u, err)
 		}
-		if err := h.CloseUnit(u); err != nil {
+		if err := h.CloseUnit(storageunit.SoleMount(u)); err != nil {
 			t.Fatalf("close %s: %v", u, err)
 		}
 	}

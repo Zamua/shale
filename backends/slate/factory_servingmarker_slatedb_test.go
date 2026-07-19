@@ -106,10 +106,10 @@ func TestServingMarker_WriteBeforeFenceVisibleAfterHandoff(t *testing.T) {
 
 	// The poll-only release signal round-trips: NEW writes the serving marker at
 	// its open epoch (its mount flip), and an OLD-side read observes it.
-	if err := newOwner.WriteServingMarker(p, openEpoch); err != nil {
+	if err := newOwner.WriteServingMarker(storageunit.ReplicaMount(p), openEpoch); err != nil {
 		t.Fatalf("WriteServingMarker: %v", err)
 	}
-	gotEpoch, ok, err := oldOwner.ReadServingMarker(p)
+	gotEpoch, ok, err := oldOwner.ReadServingMarker(storageunit.ReplicaMount(p))
 	if err != nil {
 		t.Fatalf("ReadServingMarker: %v", err)
 	}
@@ -194,7 +194,7 @@ func TestServingMarker_ForwardConcurrentWithFlipVisibleAfterHandoff(t *testing.T
 
 	// The mount flip: NEW serves locally + writes the serving marker. Stop the
 	// forward writer (in a real handoff the new owner stops forwarding here).
-	if err := newOwner.WriteServingMarker(p, openEpoch); err != nil {
+	if err := newOwner.WriteServingMarker(storageunit.ReplicaMount(p), openEpoch); err != nil {
 		t.Fatalf("WriteServingMarker: %v", err)
 	}
 	close(stop)

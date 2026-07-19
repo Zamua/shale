@@ -146,7 +146,7 @@ func TestReshard_DoublesUnitsAndPreservesData(t *testing.T) {
 		// factory's open set anymore.
 		oldID := storageunit.UnitForHash(h, oldCount)
 		oldGU := storageunit.NewGenUnit(0, oldID)
-		if _, open := fac.CurrentEpoch(oldGU); open {
+		if _, open := fac.CurrentEpoch(storageunit.SoleMount(oldGU)); open {
 			t.Fatalf("retired old gen-0 unit %s still open after reshard", oldGU)
 		}
 	}
@@ -156,9 +156,9 @@ func TestReshard_DoublesUnitsAndPreservesData(t *testing.T) {
 	if len(open) != 2*n {
 		t.Fatalf("factory has %d units open after reshard, want %d", len(open), 2*n)
 	}
-	for _, gu := range open {
-		if gu.Gen != 1 {
-			t.Fatalf("unit %s still open at old generation after reshard", gu)
+	for _, m := range open {
+		if m.Unit().Gen != 1 {
+			t.Fatalf("unit %s still open at old generation after reshard", m)
 		}
 	}
 }

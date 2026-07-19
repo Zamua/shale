@@ -40,7 +40,7 @@ package sharedfactory
 
 import (
 	"fmt"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -399,10 +399,16 @@ func (b *Backing) ServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, 
 }
 
 // Handle is a per-node factory handle over a shared Backing. It implements
-// storageunit.BackendFactory and storageunit.ReplicaBackendFactory. Several
-// handles (one per node) share one Backing, which is what makes a handoff
-// copy-free + fence-correct, and (at R>1) what makes a unit's R independent
-// replicas reachable from the nodes that hold them.
+// storageunit.BackendFactory, the one storage port. Several handles (one per
+// node) share one Backing, which is what makes a handoff copy-free +
+// fence-correct, and (at R>1) what makes a unit's R independent replicas
+// reachable from the nodes that hold them.
+//
+// It keeps TWO internal namespaces, one per layout, and routes on
+// MountRef.Replicated. That mirrors what a real adapter does with its two
+// on-disk prefixes: a sole mount and a replica-0 mount of the same unit are
+// different stores holding different bytes, and collapsing them would make an
+// R=1 handoff resolve to an empty store.
 type Handle struct {
 	backing *Backing
 
@@ -579,6 +585,93 @@ func (b *Backing) SetStrictReadFencing(on bool) { b.strictReadFencing.Store(on) 
 // justify why inline. Test-only.
 func (b *Backing) SetEagerFence(on bool) { b.eagerFence.Store(on) }
 
+// OpenUnit is the storageunit.BackendFactory entry point: it routes to the
+// per-layout open behind the MountRef's selector. A replicated ref opens the
+// mount's own per-replica store; a sole ref opens the unit's single store.
+// The two are independent, exactly as their on-disk prefixes are.
+func (h *Handle) OpenUnit(m storageunit.MountRef, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	if m.Replicated() {
+		return h.OpenReplicaUnit(m.ReplicaUnit(), epoch)
+	}
+	return h.openSole(m.Unit(), epoch)
+}
+
+// CloseUnit is the storageunit.BackendFactory release, routed by layout.
+func (h *Handle) CloseUnit(m storageunit.MountRef) error {
+	if m.Replicated() {
+		return h.CloseReplicaUnit(m.ReplicaUnit())
+	}
+	return h.closeSole(m.Unit())
+}
+
+// CurrentEpoch reports the epoch THIS handle currently holds m open at, and
+// ok=false if this handle does not have m open. LOCAL in-process view only,
+// per the BackendFactory contract: the cross-node source of truth is the
+// Backing's durable epoch (DurableEpoch), which OpenUnit fences against.
+func (h *Handle) CurrentEpoch(m storageunit.MountRef) (storageunit.Epoch, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if m.Replicated() {
+		e, ok := h.openReplica[m.ReplicaUnit()]
+		return e, ok
+	}
+	e, ok := h.open[m.Unit()]
+	return e, ok
+}
+
+// OpenUnits returns every mount THIS handle currently has open, both layouts,
+// in storageunit.CompareMountRefs order. A fresh copy the caller may retain.
+func (h *Handle) OpenUnits() []storageunit.MountRef {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]storageunit.MountRef, 0, len(h.open)+len(h.openReplica))
+	for gu := range h.open {
+		out = append(out, storageunit.SoleMount(gu))
+	}
+	for ru := range h.openReplica {
+		out = append(out, storageunit.ReplicaMount(ru))
+	}
+	slices.SortFunc(out, storageunit.CompareMountRefs)
+	return out
+}
+
+// DurableEpoch reports m's DURABLE writer-epoch from the shared Backing WITHOUT
+// opening it (0 if never opened). It is the test analogue of reading a slatedb
+// manifest writer-epoch from object storage: the CROSS-NODE source of truth
+// every handle sees, regardless of which handle currently holds the mount open.
+// The overlap handoff's old owner reads it as a LIVENESS HINT (the durable
+// epoch advancing past its own open epoch means a new owner fenced); it never
+// releases on a bare advance. It cannot fail here (the in-memory backing always
+// answers), so err is always nil.
+func (h *Handle) DurableEpoch(m storageunit.MountRef) (storageunit.Epoch, error) {
+	if m.Replicated() {
+		return h.backing.replicaDurableEpoch(m.ReplicaUnit()), nil
+	}
+	return h.backing.durableEpoch(m.Unit()), nil
+}
+
+// WriteServingMarker writes m's durable serving marker at epoch to the shared
+// Backing. The new owner calls it EXACTLY ONCE at its Acquiring -> Ready mount
+// flip; because the marker lives in the shared Backing every per-node Handle
+// references, the old owner's Handle observes it via ReadServingMarker across
+// nodes. The write is monotonic (never lowers a recorded epoch) so a stale
+// write cannot roll the marker back. It cannot fail here, so err is always nil.
+func (h *Handle) WriteServingMarker(m storageunit.MountRef, epoch storageunit.Epoch) error {
+	h.backing.writeServingMarker(m.ReplicaUnit(), epoch)
+	return nil
+}
+
+// ReadServingMarker reads m's durable serving marker from the shared Backing
+// WITHOUT opening it. It is the point-in-time liveness observation the old
+// owner's drainCheck polls: it releases ONLY on ok == true AND epoch >= its own
+// open epoch. ok == false means no live owner has reached Ready yet, so the old
+// owner stays Draining + keeps serving. It cannot fail here, so err is always
+// nil.
+func (h *Handle) ReadServingMarker(m storageunit.MountRef) (storageunit.Epoch, bool, error) {
+	e, ok := h.backing.readServingMarker(m.ReplicaUnit())
+	return e, ok, nil
+}
+
 // OpenReplicaUnit opens replica position ru.Replica of unit ru.Unit against
 // the per-replica shared backing, fencing any prior writer of the SAME
 // replica position. It returns a fencedReplicaBackend over the SHARED
@@ -586,6 +679,12 @@ func (b *Backing) SetEagerFence(on bool) { b.eagerFence.Store(on) }
 // prior writes, and so its writes start failing the instant a higher-epoch
 // owner of the same position acquires it. Distinct replica positions are
 // independent stores: opening replica 1 never touches replica 0.
+//
+// It is a TEST-ONLY convenience spelling of OpenUnit(ReplicaMount(ru), epoch),
+// not a port method: shale declares exactly one storage interface and never
+// asks whether an adapter has this. It survives because the R>1 tests address a
+// replica position directly and reading ReplicaMount at every one of them would
+// obscure what they are testing.
 func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
 	// Timeline recording (test-only): every call's (start, end) span, so the
 	// handoff-cycle latency pins can assert queued opens chain event-driven.
@@ -656,43 +755,17 @@ func (h *Handle) OpenReplicaUnit(ru storageunit.ReplicaUnit, epoch storageunit.E
 	return &fencedReplicaBackend{newFencedCore(h.backing, ru, opened, store, (*Backing).replicaDurableEpoch)}, opened, nil
 }
 
-// DurableEpochReplica reports replica ru's DURABLE writer-epoch from the
-// shared Backing WITHOUT opening it (0 if never opened). It is the test analogue
-// of reading the per-replica slatedb manifest writer-epoch from object storage:
-// the CROSS-NODE source of truth every handle sees, regardless of which handle
-// currently holds the position open. The overlap handoff's old owner reads it
-// as a LIVENESS HINT (the durable epoch advancing past its own open epoch means
-// a new owner fenced); it never releases on a bare advance. It cannot fail here
-// (the in-memory backing always answers), so err is always nil.
+// DurableEpochReplica reports replica ru's DURABLE writer-epoch from the shared
+// Backing WITHOUT opening it (0 if never opened). TEST-ONLY convenience for
+// DurableEpoch(ReplicaMount(ru)); see OpenReplicaUnit on why the spellings
+// survive.
 func (h *Handle) DurableEpochReplica(ru storageunit.ReplicaUnit) (storageunit.Epoch, error) {
 	return h.backing.replicaDurableEpoch(ru), nil
 }
 
-// WriteServingMarker writes the durable serving marker for replica ru at epoch
-// to the shared Backing (v0.8 Phase 2e). The new owner calls it EXACTLY ONCE at
-// its Acquiring -> Ready mount flip; because the marker lives in the shared
-// Backing every per-node Handle references, the old owner's Handle observes it
-// via ReadServingMarker across nodes. The write is monotonic (never lowers a
-// recorded epoch) so a stale write cannot roll the marker back. It cannot fail
-// here (the in-memory backing always answers), so err is always nil.
-func (h *Handle) WriteServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch) error {
-	h.backing.writeServingMarker(ru, epoch)
-	return nil
-}
-
-// ReadServingMarker reads the durable serving marker for replica ru from the
-// shared Backing WITHOUT opening it (v0.8 Phase 2e). It is the point-in-time
-// liveness observation the old owner's drainCheck polls: it releases ONLY on
-// ok == true AND epoch >= its own open epoch. ok == false means no live owner
-// has reached Ready yet, so the old owner stays Draining + keeps serving. It
-// cannot fail here, so err is always nil.
-func (h *Handle) ReadServingMarker(ru storageunit.ReplicaUnit) (storageunit.Epoch, bool, error) {
-	e, ok := h.backing.readServingMarker(ru)
-	return e, ok, nil
-}
-
 // CloseReplicaUnit releases replica ru from THIS handle. Idempotent; the
-// shared per-replica bytes are retained in the Backing.
+// shared per-replica bytes are retained in the Backing. TEST-ONLY convenience
+// for CloseUnit(ReplicaMount(ru)).
 func (h *Handle) CloseReplicaUnit(ru storageunit.ReplicaUnit) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -700,30 +773,30 @@ func (h *Handle) CloseReplicaUnit(ru storageunit.ReplicaUnit) error {
 	return nil
 }
 
-// OpenUnit acquires unit u against the shared backing, fencing any prior
-// owner whose epoch is lower. It returns a fencedBackend over the SHARED
-// bytes so this handle sees every write any prior owner made (the copy-free
-// handoff) and so this handle's own writes start failing the instant a
-// still-higher-epoch owner acquires u later.
+// openSole acquires the SOLE mount of unit gu against the shared backing,
+// fencing any prior owner whose epoch is lower. It returns a fencedBackend over
+// the SHARED bytes so this handle sees every write any prior owner made (the
+// copy-free handoff) and so this handle's own writes start failing the instant
+// a still-higher-epoch owner acquires gu later.
 //
 // Two cases, mirroring the BackendFactory contract:
 //
-//   - This handle ALREADY holds u open: re-opening at an equal-or-lower
-//     epoch is a double-open programming error (a unit has one live writer
+//   - This handle ALREADY holds gu open: re-opening at an equal-or-lower
+//     epoch is a double-open programming error (a mount has one live writer
 //     per handle); reject. A strictly-higher re-open is allowed (the same
 //     node bumping its own epoch).
-//   - This handle does NOT hold u (the cold-acquire / handoff case): the
+//   - This handle does NOT hold gu (the cold-acquire / handoff case): the
 //     intended epoch is a best-effort floor; the backing fences
 //     authoritatively at max(intended, durableEpoch+1). This NEVER rejects -
 //     a new owner must always be able to take the lease - because the
 //     cluster cannot know another node's durable epoch from its in-process
-//     view (CurrentEpoch returns ok=false for a unit it never held), so it
+//     view (CurrentEpoch returns ok=false for a mount it never held), so it
 //     passes a low floor and the durable manifest governs.
-func (h *Handle) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
+func (h *Handle) openSole(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
 	h.mu.Lock()
 	if cur, held := h.open[gu]; held && epoch <= cur {
 		h.mu.Unlock()
-		return nil, fmt.Errorf("sharedfactory: unit %s already open on this handle at epoch %d, refusing open at %d", gu, cur, epoch)
+		return nil, 0, fmt.Errorf("sharedfactory: unit %s already open on this handle at epoch %d, refusing open at %d", gu, cur, epoch)
 	}
 	h.mu.Unlock()
 
@@ -731,50 +804,23 @@ func (h *Handle) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (back
 	h.mu.Lock()
 	h.open[gu] = opened
 	h.mu.Unlock()
-	return &fencedBackend{newFencedCore(h.backing, gu, opened, store, (*Backing).durableEpoch)}, nil
+	// opened is the EXACT fence epoch this open landed at (max(intended,
+	// durable+1)); the caller uses it as this node's open epoch.
+	return &fencedBackend{newFencedCore(h.backing, gu, opened, store, (*Backing).durableEpoch)}, opened, nil
 }
 
-// CloseUnit releases gu from THIS handle. It flushes nothing (memory is
-// always "durable" here) and does NOT lower the backing's durable epoch -
-// releasing a lease never un-fences a higher-epoch owner. Idempotent:
-// closing a unit this handle does not hold is a no-op returning nil. The
-// shared bytes are retained in the Backing so a later OpenUnit (here or on
-// another handle) at a higher epoch sees them - this is the durable-bytes-
-// survive-unmount property a real handoff relies on.
-func (h *Handle) CloseUnit(gu storageunit.GenUnit) error {
+// closeSole releases gu's sole mount from THIS handle. It flushes nothing
+// (memory is always "durable" here) and does NOT lower the backing's durable
+// epoch - releasing a lease never un-fences a higher-epoch owner. Idempotent:
+// closing a mount this handle does not hold is a no-op returning nil. The
+// shared bytes are retained in the Backing so a later open (here or on another
+// handle) at a higher epoch sees them - this is the durable-bytes-survive-
+// unmount property a real handoff relies on.
+func (h *Handle) closeSole(gu storageunit.GenUnit) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	delete(h.open, gu)
 	return nil
-}
-
-// CurrentEpoch reports the epoch THIS handle currently holds gu open at, and
-// ok=false if this handle does not have gu open. LOCAL in-process view only,
-// per the BackendFactory contract: the cross-node source of truth is the
-// Backing's durable epoch (DurableEpoch), which OpenUnit fences against.
-func (h *Handle) CurrentEpoch(gu storageunit.GenUnit) (storageunit.Epoch, bool) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	e, ok := h.open[gu]
-	return e, ok
-}
-
-// OpenUnits returns the units THIS handle currently has open, ascending by
-// (Generation, UnitID). A fresh copy the caller may retain.
-func (h *Handle) OpenUnits() []storageunit.GenUnit {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make([]storageunit.GenUnit, 0, len(h.open))
-	for gu := range h.open {
-		out = append(out, gu)
-	}
-	sort.Slice(out, func(i, j int) bool {
-		if out[i].Gen != out[j].Gen {
-			return out[i].Gen < out[j].Gen
-		}
-		return out[i].ID < out[j].ID
-	})
-	return out
 }
 
 // fencedCore is the WRITE-FENCING half both fenced backends share: the epoch
@@ -929,3 +975,7 @@ func (b *Backing) ReplicaFlushCount(ru storageunit.ReplicaUnit) int {
 	defer b.mu.Unlock()
 	return b.replicaFlushes[ru]
 }
+
+// compile-time assertion that Handle satisfies the one storage port. There is
+// no second interface to assert: shale declares exactly one.
+var _ storageunit.BackendFactory = (*Handle)(nil)

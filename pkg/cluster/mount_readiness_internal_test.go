@@ -216,7 +216,7 @@ func TestMountReadiness_BootDeferredCountsAndClearsAtMountSeam(t *testing.T) {
 	if err != nil {
 		t.Fatalf("peer open: %v", err)
 	}
-	if err := peer.WriteServingMarker(served, peerEpoch); err != nil {
+	if err := peer.WriteServingMarker(storageunit.ReplicaMount(served), peerEpoch); err != nil {
 		t.Fatalf("peer write serving marker: %v", err)
 	}
 
@@ -240,7 +240,7 @@ func TestMountReadiness_BootDeferredCountsAndClearsAtMountSeam(t *testing.T) {
 	// the reshard split mounts and any future mount site do - deliberately NOT
 	// via an acquire path with its own per-site Delete. The seam itself must
 	// clear the record.
-	b, _, err := c.replicaFactory.OpenReplicaUnit(served, acquireBaseEpoch)
+	b, _, err := c.factory.OpenUnit(storageunit.ReplicaMount(served), acquireBaseEpoch)
 	if err != nil {
 		t.Fatalf("open for mount: %v", err)
 	}
@@ -328,7 +328,7 @@ func TestMountReadiness_NotDesiredCountsNowhere(t *testing.T) {
 			t.Fatalf("fixture broke the one-position-per-unit assumption: %s is desired", foreign)
 		}
 	}
-	fb, _, err := c.replicaFactory.OpenReplicaUnit(foreign, storageunit.Epoch(1))
+	fb, _, err := c.factory.OpenUnit(storageunit.ReplicaMount(foreign), storageunit.Epoch(1))
 	if err != nil {
 		t.Fatalf("open foreign: %v", err)
 	}

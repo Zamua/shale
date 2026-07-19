@@ -39,7 +39,7 @@ import (
 // leaving a node that opted into the decentralized path without its agreement
 // object.
 func (c *Cluster) initReshardArbiter() error {
-	if c.cfg.ConditionalStore == nil || c.replicaFactory == nil {
+	if c.cfg.ConditionalStore == nil || !c.replicaLayout() {
 		return nil
 	}
 	a := reshard.NewArbiter(c.cfg.ConditionalStore)

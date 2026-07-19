@@ -127,7 +127,7 @@ func TestReconcileReleasesNoLongerOwned(t *testing.T) {
 		t.Fatalf("after release, A mounted %v, want [0]", got)
 	}
 	// The factory handle no longer holds unit 1 either.
-	if _, ok := c.factory.CurrentEpoch(gu0(1)); ok {
+	if _, ok := c.factory.CurrentEpoch(storageunit.SoleMount(gu0(1))); ok {
 		t.Fatal("factory still holds unit 1 after release")
 	}
 }
@@ -143,14 +143,14 @@ func TestReconcileIdempotent(t *testing.T) {
 	first := mountedUnits(c)
 	// Capture the epoch each owned unit was opened at; a second reconcile
 	// must NOT re-open (which would bump the epoch).
-	e0, _ := c.factory.CurrentEpoch(gu0(0))
+	e0, _ := c.factory.CurrentEpoch(storageunit.SoleMount(gu0(0)))
 	for range 5 {
 		c.reconcileUnits()
 	}
 	if got := mountedUnits(c); len(got) != len(first) || got[0] != first[0] || got[1] != first[1] {
 		t.Fatalf("idempotent reconcile changed mounted set: %v -> %v", first, got)
 	}
-	if e, _ := c.factory.CurrentEpoch(gu0(0)); e != e0 {
+	if e, _ := c.factory.CurrentEpoch(storageunit.SoleMount(gu0(0))); e != e0 {
 		t.Fatalf("idempotent reconcile re-opened unit 0: epoch %d -> %d", e0, e)
 	}
 }
@@ -173,7 +173,7 @@ func TestReconcileSelfHealsLostMount(t *testing.T) {
 	c.mountMu.Lock()
 	delete(c.mountMap, replica0(gu0(1)))
 	c.mountMu.Unlock()
-	_ = c.factory.CloseUnit(gu0(1))
+	_ = c.factory.CloseUnit(storageunit.SoleMount(gu0(1)))
 
 	// Reconcile re-acquires it (still owned, not mounted -> acquire).
 	c.reconcileUnits()

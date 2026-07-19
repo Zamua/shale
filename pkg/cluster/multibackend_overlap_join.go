@@ -65,7 +65,7 @@ func (c *Cluster) maintainJoiningState() {
 // is trivially warmed. Snapshots the mounted set under mountMu; the pending-set
 // derivation reads the ring/membership without the lock.
 func (c *Cluster) allPendingPositionsMounted() bool {
-	if c.replicaFactory == nil {
+	if !c.replicaLayout() {
 		return true
 	}
 	pending := c.desiredPendingReplicaUnits(c.drainingIDs())

@@ -142,20 +142,21 @@ func (s *scanPauser) claim(prefix []byte) *scanPause {
 }
 
 // pausingFactory wraps a node's BackendFactory so the unit backends it mounts
-// can pause a scan mid-flight. Base BackendFactory only: this fixture runs R=1,
-// which is the mode that uses the base interface (the cluster type-asserts
-// ReplicaBackendFactory only at R>1).
+// can pause a scan mid-flight. It wraps the ONE storage port, so it is
+// layout-agnostic: whichever MountRef the cluster opens is passed straight
+// through and the wrapper never has to know whether this fixture is R=1 or
+// R>1.
 type pausingFactory struct {
 	storageunit.BackendFactory
 	pauser *scanPauser
 }
 
-func (f *pausingFactory) OpenUnit(gu storageunit.GenUnit, epoch storageunit.Epoch) (backend.Backend, error) {
-	b, err := f.BackendFactory.OpenUnit(gu, epoch)
+func (f *pausingFactory) OpenUnit(m storageunit.MountRef, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	b, opened, err := f.BackendFactory.OpenUnit(m, epoch)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	return &pausingBackend{Backend: b, pauser: f.pauser}, nil
+	return &pausingBackend{Backend: b, pauser: f.pauser}, opened, nil
 }
 
 type pausingBackend struct {

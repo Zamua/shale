@@ -333,7 +333,7 @@ func (c *Cluster) reshardFlip(targetGen storageunit.Generation) error {
 		c.mountMu.Lock()
 		delete(c.mountMap, replica0(oldGU))
 		c.mountMu.Unlock()
-		_ = c.factory.CloseUnit(oldGU)
+		_ = c.factory.CloseUnit(storageunit.SoleMount(oldGU))
 	}
 	return nil
 }
@@ -560,7 +560,7 @@ func (c *Cluster) discardGenUnits(gen, keepGen storageunit.Generation) {
 	}
 	c.mountMu.Unlock()
 	for _, gu := range toDrop {
-		_ = c.factory.CloseUnit(gu)
+		_ = c.factory.CloseUnit(storageunit.SoleMount(gu))
 	}
 }
 
@@ -608,13 +608,13 @@ func (c *Cluster) bisectUnitStatic(gen storageunit.Generation, k storageunit.Uni
 	// generation. Creating in the shared backing is what makes the later
 	// redistribution copy-free: a child this node built is the SAME durable
 	// bytes the eventual ring owner will open.
-	lowBE, err := c.factory.OpenUnit(lowGU, epochAtOpen)
+	lowBE, _, err := c.factory.OpenUnit(storageunit.SoleMount(lowGU), epochAtOpen)
 	if err != nil {
 		return fmt.Errorf("open child %s: %w", lowGU, err)
 	}
-	highBE, err := c.factory.OpenUnit(highGU, epochAtOpen)
+	highBE, _, err := c.factory.OpenUnit(storageunit.SoleMount(highGU), epochAtOpen)
 	if err != nil {
-		_ = c.factory.CloseUnit(lowGU)
+		_ = c.factory.CloseUnit(storageunit.SoleMount(lowGU))
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
 	c.mountMu.Lock()

@@ -409,16 +409,13 @@ func validateBackendMode(cfg *Config) (multi bool, err error) {
 	case hasFactory != hasUnitCount:
 		return false, errors.New("cluster: multi-backend mode requires BOTH BackendFactory and UnitCount")
 	case hasFactory && hasUnitCount:
-		// Multi-backend mode. At R>1 (replicated multi-backend, v0.8 Phase 2b)
-		// the factory MUST be a ReplicaBackendFactory: a unit's R replicas are
-		// independent durable databases keyed by replica position, which the
-		// base BackendFactory cannot open. A single-replica factory at R>1 is a
-		// configuration error caught here, not a runtime nil-deref.
-		if cfg.ReplicationFactor > 1 {
-			if _, ok := cfg.BackendFactory.(storageunit.ReplicaBackendFactory); !ok {
-				return false, fmt.Errorf("cluster: multi-backend mode at ReplicationFactor %d requires a ReplicaBackendFactory (the per-replica independent durable databases R>1 needs)", cfg.ReplicationFactor)
-			}
-		}
+		// Multi-backend mode, at any ReplicationFactor. There is no capability
+		// check here and there must never be one again: shale declares ONE
+		// storage port, and an adapter that compiles against it has stated it
+		// meets the contract. Asking a factory at Open which subset of the
+		// contract it supports is the leak this collapse removed; R>1 is not a
+		// different port, only a different mount identity (a replica position
+		// instead of a sole unit).
 		return true, nil
 	case hasBackend:
 		return false, nil
@@ -607,15 +604,6 @@ type Cluster struct {
 	// clear-decision does not race a self-snapshot; the authoritative gossiped bit
 	// is driven through membership.SetJoining alongside this flag.
 	selfJoining atomic.Bool
-
-	// replicaFactory is the R>1 (replicated multi-backend, v0.8 Phase 2b)
-	// capability view of factory: non-nil iff the factory implements
-	// ReplicaBackendFactory AND R>1. The replicated paths open each owned unit
-	// at its replica POSITION (an independent durable database) through this.
-	// Nil at R=1 and in legacy mode. The per-unit replica POSITION is the
-	// mountMap key's Replica field (Phase 2e re-keying); there is no separate
-	// replicaPos map.
-	replicaFactory storageunit.ReplicaBackendFactory
 
 	// genState is the generation-aware routing state (v0.8 Phase 4): the
 	// CURRENT generation, the unit count at that generation, the doubled

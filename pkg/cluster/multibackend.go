@@ -322,16 +322,14 @@ func (c *Cluster) initMultiBackend() error {
 	if d := c.cfg.TestingMountDelay; d > 0 {
 		time.Sleep(d)
 	}
-	c.initReplicatedFactory()
 	// Decentralized reshard agreement (v0.9): construct + seed the Arbiter when
 	// opted in (ConditionalStore set) on an R>1 cluster. No-op otherwise. Done
-	// after initReplicatedFactory (replicaFactory gates it) and before the mount
-	// so the agreed epoch object exists from node start.
+	// before the mount so the agreed epoch object exists from node start.
 	if err := c.initReshardArbiter(); err != nil {
 		_ = c.closeMountedUnits()
 		return err
 	}
-	if c.replicaFactory != nil {
+	if c.replicaLayout() {
 		return c.mountReplicaUnits()
 	}
 
@@ -340,7 +338,11 @@ func (c *Cluster) initMultiBackend() error {
 		// the unit's durable manifest if one already exists. A later
 		// membership change drives the Phase 3 handoff (acquireUnit) which
 		// opens at a strictly higher epoch to fence a prior owner.
-		b, err := c.factory.OpenUnit(gu, epochAtOpen)
+		//
+		// SoleMount, not mountRefFor: this loop is the !replicaLayout() half of
+		// the branch above, so the ref is unconditionally the sole one, and
+		// saying so directly keeps the addressing readable at the call site.
+		b, _, err := c.factory.OpenUnit(storageunit.SoleMount(gu), epochAtOpen)
 		if err != nil {
 			// Rollback is best-effort: we are already failing Open, so a
 			// secondary close error does not change the outcome. The
@@ -392,14 +394,10 @@ func (c *Cluster) closeMountedUnits() error {
 	var firstErr error
 	for ru := range c.mountMap {
 		// At R>1 each unit is an independent durable database mounted at a
-		// replica POSITION, so release the right replica copy via the per-
-		// replica factory; at R=1 (and legacy) release the GenUnit-keyed unit
-		// (ru.Replica is 0 there).
-		if c.replicaFactory != nil {
-			if err := c.replicaFactory.CloseReplicaUnit(ru); err != nil && firstErr == nil {
-				firstErr = err
-			}
-		} else if err := c.factory.CloseUnit(ru.Unit); err != nil && firstErr == nil {
+		// replica POSITION, so release the right replica copy; at R=1 release
+		// the unit's sole mount (ru.Replica is 0 there). mountRefFor is what
+		// picks, from this cluster's fixed layout.
+		if err := c.factory.CloseUnit(c.mountRefFor(ru)); err != nil && firstErr == nil {
 			firstErr = err
 		}
 		delete(c.mountMap, ru)

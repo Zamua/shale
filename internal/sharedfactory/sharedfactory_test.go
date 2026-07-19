@@ -27,7 +27,7 @@ func TestCopyFreeHandoff(t *testing.T) {
 
 	// A acquires U at epoch 1 and writes some keys (these are "acked" - they
 	// returned success, so they are durable).
-	ba, err := a.OpenUnit(u, 1)
+	ba, _, err := a.OpenUnit(storageunit.SoleMount(u), 1)
 	if err != nil {
 		t.Fatalf("A.OpenUnit: %v", err)
 	}
@@ -39,10 +39,10 @@ func TestCopyFreeHandoff(t *testing.T) {
 	}
 
 	// Handoff: A releases (CloseUnit, flush), B acquires at a higher epoch.
-	if err := a.CloseUnit(u); err != nil {
+	if err := a.CloseUnit(storageunit.SoleMount(u)); err != nil {
 		t.Fatalf("A.CloseUnit: %v", err)
 	}
-	bb, err := b.OpenUnit(u, 2)
+	bb, _, err := b.OpenUnit(storageunit.SoleMount(u), 2)
 	if err != nil {
 		t.Fatalf("B.OpenUnit at higher epoch: %v", err)
 	}
@@ -70,7 +70,7 @@ func TestFenceLocksOutPriorOwner(t *testing.T) {
 	b := backing.Handle()
 	u := gu0(0)
 
-	ba, err := a.OpenUnit(u, 1)
+	ba, _, err := a.OpenUnit(storageunit.SoleMount(u), 1)
 	if err != nil {
 		t.Fatalf("A.OpenUnit: %v", err)
 	}
@@ -81,7 +81,7 @@ func TestFenceLocksOutPriorOwner(t *testing.T) {
 
 	// B acquires at a higher epoch (the fence point) - note A has NOT closed
 	// yet, modeling A not having observed the membership change.
-	if _, err := b.OpenUnit(u, 2); err != nil {
+	if _, _, err := b.OpenUnit(storageunit.SoleMount(u), 2); err != nil {
 		t.Fatalf("B.OpenUnit at higher epoch: %v", err)
 	}
 
@@ -121,7 +121,7 @@ func TestColdAcquireFencesAboveDurable(t *testing.T) {
 	b := backing.Handle()
 	u := gu0(7)
 
-	if _, err := a.OpenUnit(u, 5); err != nil {
+	if _, _, err := a.OpenUnit(storageunit.SoleMount(u), 5); err != nil {
 		t.Fatalf("A.OpenUnit at 5: %v", err)
 	}
 	if backing.DurableEpoch(u) != 5 {
@@ -131,7 +131,7 @@ func TestColdAcquireFencesAboveDurable(t *testing.T) {
 	// B acquires with a LOW intended epoch (1) - it never held u, so its
 	// local CurrentEpoch is ok=false and the cluster would pass the base
 	// floor. The backing must still fence ABOVE the durable 5, landing at 6.
-	if _, err := b.OpenUnit(u, 1); err != nil {
+	if _, _, err := b.OpenUnit(storageunit.SoleMount(u), 1); err != nil {
 		t.Fatalf("B.OpenUnit cold-acquire with low floor: %v (a new owner must always be able to take the lease)", err)
 	}
 	if backing.DurableEpoch(u) != 6 {
@@ -148,17 +148,17 @@ func TestDoubleOpenSameHandleRejected(t *testing.T) {
 	a := backing.Handle()
 	u := gu0(2)
 
-	if _, err := a.OpenUnit(u, 3); err != nil {
+	if _, _, err := a.OpenUnit(storageunit.SoleMount(u), 3); err != nil {
 		t.Fatalf("A.OpenUnit at 3: %v", err)
 	}
 	// Re-open at equal / lower on the SAME handle: rejected.
 	for _, e := range []storageunit.Epoch{3, 2} {
-		if _, err := a.OpenUnit(u, e); err == nil {
+		if _, _, err := a.OpenUnit(storageunit.SoleMount(u), e); err == nil {
 			t.Fatalf("A re-open at %d (already holds at 3): expected error, got nil", e)
 		}
 	}
 	// Strictly-higher re-open on the same handle is fine.
-	if _, err := a.OpenUnit(u, 4); err != nil {
+	if _, _, err := a.OpenUnit(storageunit.SoleMount(u), 4); err != nil {
 		t.Fatalf("A re-open at 4: %v", err)
 	}
 }
@@ -171,27 +171,27 @@ func TestHandlesIndependentOpenSets(t *testing.T) {
 	a := backing.Handle()
 	b := backing.Handle()
 
-	if _, err := a.OpenUnit(gu0(0), 1); err != nil {
+	if _, _, err := a.OpenUnit(storageunit.SoleMount(gu0(0)), 1); err != nil {
 		t.Fatalf("A.OpenUnit 0: %v", err)
 	}
-	if _, err := a.OpenUnit(gu0(1), 1); err != nil {
+	if _, _, err := a.OpenUnit(storageunit.SoleMount(gu0(1)), 1); err != nil {
 		t.Fatalf("A.OpenUnit 1: %v", err)
 	}
-	if _, err := b.OpenUnit(gu0(2), 1); err != nil {
+	if _, _, err := b.OpenUnit(storageunit.SoleMount(gu0(2)), 1); err != nil {
 		t.Fatalf("B.OpenUnit 2: %v", err)
 	}
 
-	if got := a.OpenUnits(); len(got) != 2 || got[0] != gu0(0) || got[1] != gu0(1) {
+	if got := a.OpenUnits(); len(got) != 2 || got[0] != storageunit.SoleMount(gu0(0)) || got[1] != storageunit.SoleMount(gu0(1)) {
 		t.Fatalf("A.OpenUnits = %v, want [g0/u0 g0/u1]", got)
 	}
-	if got := b.OpenUnits(); len(got) != 1 || got[0] != gu0(2) {
+	if got := b.OpenUnits(); len(got) != 1 || got[0] != storageunit.SoleMount(gu0(2)) {
 		t.Fatalf("B.OpenUnits = %v, want [g0/u2]", got)
 	}
 	// CurrentEpoch is local: A holds 0 at epoch 1, B does not hold 0.
-	if e, ok := a.CurrentEpoch(gu0(0)); !ok || e != 1 {
+	if e, ok := a.CurrentEpoch(storageunit.SoleMount(gu0(0))); !ok || e != 1 {
 		t.Fatalf("A.CurrentEpoch(0) = (%d,%v), want (1,true)", e, ok)
 	}
-	if _, ok := b.CurrentEpoch(gu0(0)); ok {
+	if _, ok := b.CurrentEpoch(storageunit.SoleMount(gu0(0))); ok {
 		t.Fatalf("B.CurrentEpoch(0) ok=true, want false (B never opened unit 0)")
 	}
 }
@@ -215,17 +215,17 @@ func TestServingMarkerCrossNodeReadWrite(t *testing.T) {
 
 	// No live owner has reached Ready yet: the old owner sees no marker and must
 	// keep serving (Draining).
-	if e, ok, err := oldOwner.ReadServingMarker(ru); err != nil || ok || e != 0 {
+	if e, ok, err := oldOwner.ReadServingMarker(storageunit.ReplicaMount(ru)); err != nil || ok || e != 0 {
 		t.Fatalf("ReadServingMarker before write = (%d,%v,%v), want (0,false,nil)", e, ok, err)
 	}
 
 	// New owner mounts, flips, and writes the marker at its open epoch (5).
-	if err := newOwner.WriteServingMarker(ru, 5); err != nil {
+	if err := newOwner.WriteServingMarker(storageunit.ReplicaMount(ru), 5); err != nil {
 		t.Fatalf("WriteServingMarker: %v", err)
 	}
 
 	// The OLD owner's handle now observes the marker at epoch 5 (cross-node).
-	if e, ok, err := oldOwner.ReadServingMarker(ru); err != nil || !ok || e != 5 {
+	if e, ok, err := oldOwner.ReadServingMarker(storageunit.ReplicaMount(ru)); err != nil || !ok || e != 5 {
 		t.Fatalf("ReadServingMarker after write = (%d,%v,%v), want (5,true,nil)", e, ok, err)
 	}
 }
@@ -238,21 +238,21 @@ func TestServingMarkerMonotonic(t *testing.T) {
 	h := backing.Handle()
 	ru := ru0(3, 0)
 
-	if err := h.WriteServingMarker(ru, 9); err != nil {
+	if err := h.WriteServingMarker(storageunit.ReplicaMount(ru), 9); err != nil {
 		t.Fatalf("WriteServingMarker 9: %v", err)
 	}
 	// A stale lower-epoch write must be ignored (no rollback).
-	if err := h.WriteServingMarker(ru, 4); err != nil {
+	if err := h.WriteServingMarker(storageunit.ReplicaMount(ru), 4); err != nil {
 		t.Fatalf("WriteServingMarker 4: %v", err)
 	}
-	if e, ok, err := h.ReadServingMarker(ru); err != nil || !ok || e != 9 {
+	if e, ok, err := h.ReadServingMarker(storageunit.ReplicaMount(ru)); err != nil || !ok || e != 9 {
 		t.Fatalf("after stale write = (%d,%v,%v), want (9,true,nil)", e, ok, err)
 	}
 	// A higher-epoch write advances it.
-	if err := h.WriteServingMarker(ru, 12); err != nil {
+	if err := h.WriteServingMarker(storageunit.ReplicaMount(ru), 12); err != nil {
 		t.Fatalf("WriteServingMarker 12: %v", err)
 	}
-	if e, _, _ := h.ReadServingMarker(ru); e != 12 {
+	if e, _, _ := h.ReadServingMarker(storageunit.ReplicaMount(ru)); e != 12 {
 		t.Fatalf("after higher write = %d, want 12", e)
 	}
 }
@@ -354,13 +354,13 @@ func TestServingMarkerIndependentPositions(t *testing.T) {
 	backing := NewBacking()
 	h := backing.Handle()
 
-	if err := h.WriteServingMarker(ru0(1, 0), 2); err != nil {
+	if err := h.WriteServingMarker(storageunit.ReplicaMount(ru0(1, 0)), 2); err != nil {
 		t.Fatalf("WriteServingMarker r0: %v", err)
 	}
-	if _, ok, _ := h.ReadServingMarker(ru0(1, 1)); ok {
+	if _, ok, _ := h.ReadServingMarker(storageunit.ReplicaMount(ru0(1, 1))); ok {
 		t.Fatalf("replica 1 marker ok=true, want false (only replica 0 written)")
 	}
-	if e, ok, _ := h.ReadServingMarker(ru0(1, 0)); !ok || e != 2 {
+	if e, ok, _ := h.ReadServingMarker(storageunit.ReplicaMount(ru0(1, 0))); !ok || e != 2 {
 		t.Fatalf("replica 0 marker = (%d,%v), want (2,true)", e, ok)
 	}
 }
