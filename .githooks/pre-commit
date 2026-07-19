@@ -3,8 +3,9 @@
 #
 # What it checks (Go-only; no-op when no .go files are staged):
 #   1. gofmt    every staged .go file is properly formatted
-#   2. go vet   the whole module passes vet
-#   3. golangci-lint (if installed) runs against the staged diff
+#   2. go vet   the whole module passes vet (workspace-resolved)
+#   3. build    each backend module builds with GOWORK=off, as CI does
+#   4. golangci-lint (if installed) runs against the staged diff
 #
 # Activate once per clone:
 #   git config core.hooksPath .githooks
@@ -17,15 +18,28 @@
 #   git commit --no-verify
 set -euo pipefail
 
-# Collect staged Go files (Added / Copied / Modified / Renamed).
-staged_go=$(git diff --cached --name-only --diff-filter=ACMR | grep -E '\.go$' || true)
-if [ -z "$staged_go" ]; then
+# Collect staged files (Added / Copied / Modified / Renamed).
+staged=$(git diff --cached --name-only --diff-filter=ACMR)
+staged_go=$(printf '%s\n' "$staged" | grep -E '\.go$' || true)
+# go.mod / go.sum are tracked separately: a pin bump touches no .go file at all,
+# yet it is the change most able to break module resolution. Gating everything
+# behind staged .go files would skip step 3 on exactly those commits.
+staged_mod=$(printf '%s\n' "$staged" | grep -E '(^|/)go\.(mod|sum)$' || true)
+if [ -z "$staged_go" ] && [ -z "$staged_mod" ]; then
   exit 0
 fi
 
 # 1. gofmt: list any staged file whose formatting is off.
-unformatted=$(printf '%s\n' "$staged_go" | xargs gofmt -l 2>/dev/null || true)
-if [ -n "$unformatted" ]; then
+#
+# Do NOT suppress gofmt's stderr or its exit status here. gofmt exits 2 and
+# prints the parse error when a file does not compile, while printing NOTHING
+# to stdout - so `2>/dev/null || true` would render a syntactically broken
+# file indistinguishable from a clean one, and this check would pass it.
+if [ -n "$staged_go" ] && ! unformatted=$(printf '%s\n' "$staged_go" | xargs gofmt -l); then
+  printf 'pre-commit: gofmt failed (see the parse error above)\n' >&2
+  exit 1
+fi
+if [ -n "${unformatted:-}" ]; then
   printf 'pre-commit: the following files are not gofmt-clean:\n%s\n' "$unformatted" >&2
   printf '\nRun:\n  gofmt -w %s\n' "$unformatted" >&2
   exit 1
@@ -37,8 +51,32 @@ if ! go vet ./...; then
   exit 1
 fi
 
-# 3. golangci-lint: only if installed. Skips with a warning otherwise so
+# 3. Per-module build with GOWORK=off, mirroring CI and the release build.
+#
+# Steps 1 and 2 run with the workspace active, so they resolve the core module
+# to the IN-TREE source. Consumers and CI resolve it to the version each
+# backend's go.mod actually requires. Those two views can disagree: a backend
+# using a core symbol that is not in its required core version compiles under
+# the workspace and fails everywhere else. Checking only the workspace form
+# means checking a configuration nobody ships.
+for m in backends/pebble backends/slate; do
+  # A missing module dir is not a build failure; reporting it as one would
+  # point the reader at the wrong problem.
+  [ -d "$m" ] || continue
+  if ! (cd "$m" && GOWORK=off go build ./...); then
+    printf 'pre-commit: GOWORK=off build failed in %s\n' "$m" >&2
+    printf '            The workspace hides this: %s builds against the core\n' "$m" >&2
+    printf '            version its go.mod REQUIRES, not the in-tree source.\n' >&2
+    printf '            Bump that pin, or land the core change first.\n' >&2
+    exit 1
+  fi
+done
+
+# 4. golangci-lint: only if installed. Skips with a warning otherwise so
 #    a contributor without the tool installed isn't blocked from committing.
+if [ -z "$staged_go" ]; then
+  exit 0
+fi
 if command -v golangci-lint >/dev/null 2>&1; then
   if ! golangci-lint run --new-from-rev HEAD --fix=false; then
     printf 'pre-commit: golangci-lint reported issues\n' >&2
