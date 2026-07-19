@@ -41,26 +41,79 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
+// readFailureKind separates the two fundamentally different things a probe can
+// observe. The distinction is load-bearing for any caller that classifies
+// failures: a REFUSAL is a liveness event (the read declined to answer, loudly),
+// whereas a VALUE fault is a correctness event (the read answered, wrongly or
+// not at all, for a key that was acked). No availability argument can ever
+// excuse a value fault, so the two must not be flattened into one string.
+type readFailureKind int
+
+const (
+	// failErr: the read returned an error. Err is non-nil.
+	failErr readFailureKind = iota
+	// failWrongValue: Get returned bytes that are not the seeded value.
+	failWrongValue
+	// failEmptyScan: ScanPrefix completed cleanly but yielded nothing for a
+	// key that was seeded and acked.
+	failEmptyScan
+)
+
+// readFailure is one client-visible probe failure, retaining the structure a
+// caller needs to classify it rather than only the rendered string.
+type readFailure struct {
+	Op   string // "get", "scan", "scan next"
+	Key  string
+	Unit storageunit.UnitID
+	Node string
+	Kind readFailureKind
+	Err  error  // non-nil iff Kind == failErr
+	Got  []byte // the returned bytes, for Kind == failWrongValue
+}
+
+func (f readFailure) String() string {
+	switch f.Kind {
+	case failWrongValue:
+		return fmt.Sprintf("get %s (unit %d) via %s: wrong value %q", f.Key, f.Unit, f.Node, f.Got)
+	case failEmptyScan:
+		return fmt.Sprintf("scan %s (unit %d) via %s: empty result for a seeded key", f.Key, f.Unit, f.Node)
+	default:
+		return fmt.Sprintf("%s %s (unit %d) via %s: %v", f.Op, f.Key, f.Unit, f.Node, f.Err)
+	}
+}
+
 // probeReadsOnce issues one Get and one full ScanPrefix for every seeded unit
 // key through every entry node, single-attempt, and returns the collected
-// failures (empty = fully transparent this round). The scan uses the seeded
-// key itself as the prefix, so a healthy scan yields exactly that key with its
-// seeded value; an iterator error at open OR at Next counts as a failure (the
-// remote scan stream surfaces server-side errors at Next).
+// failures rendered as strings (empty = fully transparent this round).
 func probeReadsOnce(entries []*sharedNode, uk map[storageunit.UnitID]string, want []byte) []string {
-	var fails []string
+	details := probeReadsOnceDetailed(entries, uk, want)
+	out := make([]string, 0, len(details))
+	for _, f := range details {
+		out = append(out, f.String())
+	}
+	return out
+}
+
+// probeReadsOnceDetailed is probeReadsOnce's structured form: same probes, same
+// failure conditions, but the failures keep their unit / node / op / error so a
+// caller can classify them. The scan uses the seeded key itself as the prefix,
+// so a healthy scan yields exactly that key with its seeded value; an iterator
+// error at open OR at Next counts as a failure (the remote scan stream surfaces
+// server-side errors at Next).
+func probeReadsOnceDetailed(entries []*sharedNode, uk map[storageunit.UnitID]string, want []byte) []readFailure {
+	var fails []readFailure
 	for _, n := range entries {
 		for u, k := range uk {
 			got, err := n.Cluster.Get([]byte(k))
 			if err != nil {
-				fails = append(fails, fmt.Sprintf("get %s (unit %d) via %s: %v", k, u, n.ID, err))
+				fails = append(fails, readFailure{Op: "get", Key: k, Unit: u, Node: n.ID, Kind: failErr, Err: err})
 			} else if !bytes.Equal(got, want) {
-				fails = append(fails, fmt.Sprintf("get %s (unit %d) via %s: wrong value %q", k, u, n.ID, got))
+				fails = append(fails, readFailure{Op: "get", Key: k, Unit: u, Node: n.ID, Kind: failWrongValue, Got: got})
 			}
 
 			it, err := n.Cluster.ScanPrefix([]byte(k))
 			if err != nil {
-				fails = append(fails, fmt.Sprintf("scan %s (unit %d) via %s: %v", k, u, n.ID, err))
+				fails = append(fails, readFailure{Op: "scan", Key: k, Unit: u, Node: n.ID, Kind: failErr, Err: err})
 				continue
 			}
 			// NB: at R>1 the stored bytes are LWW envelopes and ScanPrefix
@@ -71,12 +124,12 @@ func probeReadsOnce(entries []*sharedNode, uk map[storageunit.UnitID]string, wan
 			for {
 				kk, _, nerr := it.Next()
 				if nerr != nil {
-					fails = append(fails, fmt.Sprintf("scan next %s (unit %d) via %s: %v", k, u, n.ID, nerr))
+					fails = append(fails, readFailure{Op: "scan next", Key: k, Unit: u, Node: n.ID, Kind: failErr, Err: nerr})
 					break
 				}
 				if kk == nil {
 					if seen == 0 {
-						fails = append(fails, fmt.Sprintf("scan %s (unit %d) via %s: empty result for a seeded key", k, u, n.ID))
+						fails = append(fails, readFailure{Op: "scan", Key: k, Unit: u, Node: n.ID, Kind: failEmptyScan})
 					}
 					break
 				}
