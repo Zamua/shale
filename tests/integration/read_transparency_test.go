@@ -481,10 +481,21 @@ drainLoop:
 	// silent, which is worse than the loud kind. Its sibling pin
 	// TestLeaveEntryServesWhileDraining already requires its own window to have
 	// been observed; this one was missing the same guard.
-	if drainRounds < 3 {
+	//
+	// THE THRESHOLD IS DELIBERATELY LOW, and lower than that sibling's. Round
+	// COUNT is a function of probe THROUGHPUT (each round issues 16 units x 3
+	// survivors x 2 ops), and throughput is exactly what differs between a fast
+	// developer machine and a 2-vCPU CI runner, while the drain's duration is
+	// mostly wall-clock bound by the survivors' acquire latency. So a high
+	// threshold would encode a throughput assumption and fail on a slow runner:
+	// the same shape of defect this file is fixing. The guard exists to catch a
+	// window that closed BEFORE it was observed (the failure seen here was 0
+	// rounds), not to assert a sampling rate. One round is already 96 reads.
+	// Measured locally across 15 runs: 6 rounds minimum, 52 maximum.
+	if drainRounds < 2 {
 		t.Fatalf("the drain completed after only %d probe rounds, so the drain window was never "+
-			"meaningfully observed and a pass here would assert nothing. Widen the survivors' acquire "+
-			"delay (currently 2.5s) or the drain timeout for a provable window", drainRounds)
+			"observed and a pass here would assert nothing. Widen the survivors' acquire delay "+
+			"(currently 2.5s) or the drain timeout for a provable window", drainRounds)
 	}
 	// Log the window on PASSING runs too: the size of the window a gate observed
 	// is the evidence that its pass means something, and a gate that reports it
