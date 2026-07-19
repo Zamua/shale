@@ -6,7 +6,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Zamua/shale/internal/memfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rpc"
@@ -98,11 +97,11 @@ func TestThreeNode_AggregateWaitsForPeerGRPCColdStart(t *testing.T) {
 // nil stop).
 func startTestNodeGRPCDown(t *testing.T, id, seedAddr string) *testNode {
 	t.Helper()
-	fac := memfactory.New()
+	h := fixtureBacking(t).Handle()
 	grpcAddr := hostPort(freePort(t)) // reserve a port; do NOT listen yet
 	cfg := cluster.Config{
 		NodeID:               id,
-		BackendFactory:       fac,
+		BackendFactory:       h,
 		UnitCount:            storageunit.MustUnitCount(defaultTestUnitCount),
 		GRPCAddr:             grpcAddr,
 		LogOutput:            io.Discard,
@@ -116,7 +115,7 @@ func startTestNodeGRPCDown(t *testing.T, id, seedAddr string) *testNode {
 	n := &testNode{
 		ID:       id,
 		Cluster:  c,
-		Factory:  fac,
+		Handle:   h,
 		BindAddr: bindAddr,
 		GRPCAddr: grpcAddr,
 		// grpcServer + stop are nil until startNodeGRPC; testNode.Close handles nil.

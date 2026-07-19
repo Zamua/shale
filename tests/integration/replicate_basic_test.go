@@ -15,7 +15,6 @@ import (
 	"testing"
 
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/ring"
 )
 
 // TestReplicate_R2_KeyLandsOnBothReplicas pins the v0.4 fan-out
@@ -35,15 +34,7 @@ func TestReplicate_R2_KeyLandsOnBothReplicas(t *testing.T) {
 		}
 	}
 
-	// Build the expected primary + successor pair from the same Members
-	// snapshot every node sees. ring.LocateKeyN is deterministic so the
-	// test-side ring agrees with the cluster's internal ring.
-	r := ring.New()
-	for _, m := range nodes[0].Cluster.Members() {
-		r.Add(m)
-	}
-
-	// Map node ID -> testNode for direct backend peering.
+	// Map node ID -> testNode for direct mount peering.
 	byID := make(map[string]*testNode, len(nodes))
 	for _, nd := range nodes {
 		byID[nd.ID] = nd
@@ -52,34 +43,37 @@ func TestReplicate_R2_KeyLandsOnBothReplicas(t *testing.T) {
 	for i := range n {
 		key := fmt.Appendf(nil, "rep2-%04d", i)
 		want := fmt.Appendf(nil, "v-%04d", i)
-		replicas := r.LocateKeyN(key, 2)
+		// The replica set is derived from the key's UNIT, not the raw key:
+		// routing is key -> unit -> replica set, so hashing the key
+		// directly would name a different pair whenever the two disagree.
+		replicas := replicaSetOnRing(nodes[0].Cluster, string(key), defaultTestUnitCount, 2)
 		if len(replicas) != 2 {
-			t.Fatalf("LocateKeyN(%s, 2) returned %d members", key, len(replicas))
+			t.Fatalf("replica set for %s returned %d members", key, len(replicas))
 		}
-		// Every replica's backend must hold the envelope for this key.
+		// Every replica must hold the envelope for this key.
 		for _, rep := range replicas {
-			nd, ok := byID[rep.ID]
+			nd, ok := byID[rep]
 			if !ok {
-				t.Fatalf("unknown replica node %s", rep.ID)
+				t.Fatalf("unknown replica node %s", rep)
 			}
 			raw, err := nd.physicalGet(key)
 			if err != nil {
-				t.Fatalf("replica %s missing key %s: %v", rep.ID, key, err)
+				t.Fatalf("replica %s missing key %s: %v", rep, key, err)
 			}
 			env, err := cluster.Decode(raw)
 			if err != nil {
-				t.Fatalf("replica %s decode %s: %v", rep.ID, key, err)
+				t.Fatalf("replica %s decode %s: %v", rep, key, err)
 			}
 			if !bytes.Equal(env.Payload, want) {
-				t.Errorf("replica %s key %s: payload=%q want %q", rep.ID, key, env.Payload, want)
+				t.Errorf("replica %s key %s: payload=%q want %q", rep, key, env.Payload, want)
 			}
 			if env.Stamp.TimestampNanos == 0 {
-				t.Errorf("replica %s key %s: zero stamp", rep.ID, key)
+				t.Errorf("replica %s key %s: zero stamp", rep, key)
 			}
 		}
 		// The third (non-replica) node must NOT hold the key.
 		for _, nd := range nodes {
-			if nd.ID == replicas[0].ID || nd.ID == replicas[1].ID {
+			if nd.ID == replicas[0] || nd.ID == replicas[1] {
 				continue
 			}
 			if _, err := nd.physicalGet(key); err == nil {

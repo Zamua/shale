@@ -235,6 +235,13 @@ func TestThreeNode_LeaveSurvives(t *testing.T) {
 	if err := waitForMembersAll(survivors, 2, 10*time.Second); err != nil {
 		t.Fatalf("post-leave convergence: %v", err)
 	}
+	// Membership convergence is not enough: the departed node's units are
+	// re-assigned to the survivors, and a write that lands while one is
+	// still being acquired is refused with the retryable acquiring-window
+	// error. Wait for the debounced reconcile to run AND apply its mounts
+	// so the writes below exercise steady-state routing, which is what this
+	// test is about.
+	waitForClusterReady(t, survivors, 15*time.Second)
 
 	// Pick a key whose new owner is one of the survivors (which any
 	// key must be, post-leave). Write via N1, read via N2 - covers

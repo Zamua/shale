@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/blob"
 	"github.com/Zamua/shale/pkg/blob/blobmem"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/rpc"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 )
 
@@ -57,7 +57,8 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 
 	cfg := cluster.Config{
 		NodeID:               id,
-		Backend:              memory.New(),
+		BackendFactory:       fixtureBacking(t).Handle(),
+		UnitCount:            storageunit.MustUnitCount(defaultTestUnitCount),
 		BlobStore:            store,
 		GRPCAddr:             grpcAddr,
 		LogOutput:            io.Discard,

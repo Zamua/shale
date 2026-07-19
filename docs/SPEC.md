@@ -1886,6 +1886,29 @@ only from it:
 the retired Coordinator and were REMOVED from the public `Config`. shale is
 pre-v1; there is no migration path and no deprecation window.
 
+### Known gap: re-replicating an under-replicated unit
+
+A unit written while the cluster was too small to hold R replicas stays
+under-replicated after the cluster grows. Concretely: a solo founder at R=2
+writes into ONE replica position, because there is one node; when a second node
+joins it acquires the (empty) second-position databases and the ring is
+satisfied, but nothing copies position 0's bytes into position 1. The pair
+settles holding a PARTITION of the keys rather than each holding all of them.
+
+This is a consequence of the model, not a regression: the lease-handoff engine
+never copies bytes, which is exactly what makes it copy-free. The retired
+per-node engine papered over it by copying keys during its reconcile pass.
+Closing it properly needs an anti-entropy / re-replication pass that fills a
+newly-owned replica position from a peer that already holds one, which is a
+design question of its own.
+
+`tests/integration/rf2_membership_change_test.go` and
+`rf2_shrink_retention_test.go` carry skipped tests asserting the property, kept
+because it is one a replicated store should eventually hold. Note the SHRINK
+direction is fine and covered: a leave never drops a key below R
+(`TestRF2_NoKeyDropsBelowReplicationFactorOnLeave` passes), because the
+surviving replica databases already exist.
+
 ### The binaries
 
 `shaled` and `shaled-pebble` are single-node demonstration and test daemons.

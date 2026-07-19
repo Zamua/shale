@@ -13,20 +13,20 @@ package integration
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"io"
 	"net"
 	"strconv"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/internal/goleakignore"
-	"github.com/Zamua/shale/internal/memfactory"
+	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"go.uber.org/goleak"
@@ -81,7 +81,7 @@ const defaultTestUnitCount = 8
 type testNode struct {
 	ID       string
 	Cluster  *cluster.Cluster
-	Factory  *memfactory.Factory
+	Handle   *sharedfactory.Handle
 	BindAddr string
 	GRPCAddr string
 
@@ -89,65 +89,118 @@ type testNode struct {
 	grpcServer *grpc.Server
 }
 
-// physicalGet reads key from whichever of this node's OPEN units holds
-// it, bypassing all routing. It is the multi-backend spelling of "peek
-// under the cluster layer at this node's own bytes": a miss means no
-// unit this node has mounted holds the key.
+// physicalGet reads key from whichever unit this node has MOUNTED,
+// bypassing all routing. It is the multi-backend spelling of "peek under
+// the cluster layer at this node's own bytes": a miss means no unit this
+// node holds contains the key. Note this is a question about MOUNTS, not
+// about the shared store: every node's Handle is a view onto the same
+// backing, so a unit's bytes are only "this node's" while this node owns
+// the lease.
 func (n *testNode) physicalGet(key []byte) ([]byte, error) {
-	for _, gu := range n.Factory.OpenUnits() {
-		be, ok := n.Factory.UnitBackend(gu)
-		if !ok {
-			continue
-		}
-		v, err := be.Get(key)
-		if err == nil {
-			return v, nil
-		}
-		if !errors.Is(err, backend.ErrNotFound) {
-			return nil, err
+	if v, err := n.Cluster.LocalGet(key); err == nil {
+		return v, nil
+	}
+	// LocalGet resolves ONE position per unit; at R>1 this node may hold the
+	// key at a different position. Address each explicitly before concluding
+	// the node does not have it.
+	for u := range defaultTestUnitCount {
+		gu := storageunit.NewGenUnit(0, storageunit.UnitID(u))
+		for r := range maxTestReplicas {
+			ru := storageunit.NewReplicaUnit(gu, uint8(r))
+			v, err := n.Cluster.LocalReplicaGetAt(ru, key)
+			if err == nil {
+				return v, nil
+			}
 		}
 	}
 	return nil, backend.ErrNotFound
 }
 
-// physicalKeyCount totals the keys across every unit this node has open.
+// physicalKeyCount totals the keys across every unit this node has mounted.
 func (n *testNode) physicalKeyCount(t *testing.T) int {
 	t.Helper()
 	return n.physicalKeyCountPrefix(t, nil)
 }
 
 // physicalKeyCountPrefix totals the keys under prefix across every unit
-// this node has open. A nil prefix counts everything.
+// this node has mounted. A nil prefix counts everything.
 func (n *testNode) physicalKeyCountPrefix(t *testing.T, prefix []byte) int {
 	t.Helper()
-	total := 0
-	for _, gu := range n.Factory.OpenUnits() {
-		be, ok := n.Factory.UnitBackend(gu)
-		if !ok {
-			continue
+	// A local scan can land mid-handoff, while a unit is being acquired by
+	// this node. That is a TRANSIENT refusal with a defined retry, not a
+	// count of zero, and callers here are asking "what does this node hold
+	// once things settle" - so ride it out rather than reporting a number
+	// that was never true.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		count, err := n.tryPhysicalKeyCountPrefix(prefix)
+		if err == nil {
+			return count
 		}
-		it, err := be.ScanPrefix(prefix)
-		if err != nil {
-			t.Fatalf("scan unit %v on %s: %v", gu, n.ID, err)
+		if !clustertest.IsTransientWarmupErr(err) || !time.Now().Before(deadline) {
+			t.Fatalf("local scan on %s: %v", n.ID, err)
 		}
-		for {
-			k, _, err := it.Next()
-			if err != nil {
-				_ = it.Close()
-				t.Fatalf("scan next unit %v on %s: %v", gu, n.ID, err)
-			}
-			if k == nil {
-				break
-			}
-			total++
-		}
-		_ = it.Close()
+		time.Sleep(50 * time.Millisecond)
 	}
-	return total
 }
 
+func (n *testNode) tryPhysicalKeyCountPrefix(prefix []byte) (int, error) {
+	keys, err := n.tryPhysicalKeysPrefix(prefix)
+	if err != nil {
+		return 0, err
+	}
+	return len(keys), nil
+}
+
+// tryPhysicalKeysPrefix returns the DISTINCT keys under prefix that this node
+// physically holds, across every replica position it has mounted.
+//
+// LocalScanPrefix alone is not the right instrument at R>1: it resolves ONE
+// backend per unit (the position this node reads at), so a node that holds a
+// different position of some other unit reports those keys as absent. The
+// symptom is a physical count that looks like a PARTITION of the keyspace on a
+// cluster where every node should hold everything. Addressing each replica
+// position explicitly, and unioning, is what "what does this node physically
+// hold" actually means when a unit has R independent databases.
+//
+// Positions this node does not hold return the retryable acquiring error,
+// which is skipped rather than propagated: not holding a position is the
+// normal case, not a failure.
+func (n *testNode) tryPhysicalKeysPrefix(prefix []byte) (map[string]struct{}, error) {
+	keys := make(map[string]struct{})
+	for u := range defaultTestUnitCount {
+		gu := storageunit.NewGenUnit(0, storageunit.UnitID(u))
+		for r := range maxTestReplicas {
+			ru := storageunit.NewReplicaUnit(gu, uint8(r))
+			it, err := n.Cluster.LocalReplicaScanAt(ru, prefix)
+			if err != nil {
+				// Not mounted here (or mid-acquire): nothing to count.
+				continue
+			}
+			for {
+				k, _, nerr := it.Next()
+				if nerr != nil {
+					_ = it.Close()
+					return nil, nerr
+				}
+				if k == nil {
+					break
+				}
+				keys[string(k)] = struct{}{}
+			}
+			_ = it.Close()
+		}
+	}
+	return keys, nil
+}
+
+// maxTestReplicas bounds the replica-position sweep above. No fixture in this
+// tree runs above R=3, and probing a position no fixture uses costs one
+// cheap not-mounted answer.
+const maxTestReplicas = 3
+
 // Close tears the node down: shuts the gRPC server, closes the cluster
-// (which closes membership + backend). Safe to call once.
+// (which closes membership + releases its unit leases). Safe to call once.
 func (n *testNode) Close() {
 	if n.Cluster != nil {
 		_ = n.Cluster.Close()
@@ -174,6 +227,38 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 	return startTestNodeWithReplication(t, id, seedAddr, 1, 0, 0)
 }
 
+// fixtureBacking is the ONE shared durable store every node started by
+// startTestNode / startTestNodeWithReplication opens its units against.
+//
+// This is not a convenience: it is what makes the fixture a faithful
+// multi-backend cluster. A unit handoff moves the LEASE, not the bytes, so
+// the successor must open the SAME store the predecessor wrote to. Giving
+// each node its own factory would make every handoff silently lose the
+// unit's data, and the tests would pass or fail for reasons that have
+// nothing to do with what they assert.
+//
+// Keyed per test so parallel tests cannot see each other's units.
+var fixtureBackings sync.Map // *testing.T -> *sharedfactory.Backing
+
+func fixtureBacking(t *testing.T) *sharedfactory.Backing {
+	t.Helper()
+	// Fixtures build nodes from subtests as well as the top-level test, so
+	// key on the ROOT test the nodes belong to via t.Name's first segment.
+	root := t.Name()
+	if i := strings.IndexByte(root, '/'); i >= 0 {
+		root = root[:i]
+	}
+	if v, ok := fixtureBackings.Load(root); ok {
+		return v.(*sharedfactory.Backing)
+	}
+	b := sharedfactory.NewBacking()
+	actual, loaded := fixtureBackings.LoadOrStore(root, b)
+	if !loaded {
+		t.Cleanup(func() { fixtureBackings.Delete(root) })
+	}
+	return actual.(*sharedfactory.Backing)
+}
+
 // startTestNodeWithReplication is the replication-aware variant. R=1
 // + zero-valued consistency knobs reproduce startTestNode exactly (the
 // Cluster's normalizeConfig fills in WriteQuorum + ReadNearest at
@@ -182,7 +267,7 @@ func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replicationFactor int, wc cluster.WriteConsistency, rc cluster.ReadConsistency) *testNode {
 	t.Helper()
 
-	fac := memfactory.New()
+	h := fixtureBacking(t).Handle()
 
 	// The gRPC listener has to exist BEFORE cluster.Open so we know the
 	// address to advertise via memberlist Meta. Same two-phase pattern
@@ -197,7 +282,7 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 
 	cfg := cluster.Config{
 		NodeID:         id,
-		BackendFactory: fac,
+		BackendFactory: h,
 		UnitCount:      storageunit.MustUnitCount(defaultTestUnitCount),
 		GRPCAddr:       grpcAddr,
 		LogOutput:      io.Discard,
@@ -228,7 +313,7 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	n := &testNode{
 		ID:         id,
 		Cluster:    c,
-		Factory:    fac,
+		Handle:     h,
 		BindAddr:   bindAddr,
 		GRPCAddr:   grpcAddr,
 		grpcServer: grpcSrv,
@@ -251,12 +336,14 @@ func waitForMembersAll(cs []*cluster.Cluster, want int, timeout time.Duration) e
 // from the same Members() snapshot agree (consistent hashing is
 // deterministic + hashed on Member.ID), so this faithfully previews
 // which node a Put/Get would route to.
+// ownerOf names the node the ring places key's UNIT on. Routing is
+// key -> unit -> owner, so hashing the raw key against the ring (the
+// per-node model) would name a different node whenever the two disagree.
+// It mirrors the cluster's own lookup without reaching into unexported
+// internals; unitOwnerID is the same computation with an explicit unit
+// count.
 func ownerOf(c *cluster.Cluster, key string) string {
-	r := ring.New()
-	for _, m := range c.Members() {
-		r.Add(m)
-	}
-	return r.LocateKey([]byte(key)).ID
+	return unitOwnerID(c, key, defaultTestUnitCount)
 }
 
 // freePort, isBindConflict and openClusterRetryBind delegate to the

@@ -223,22 +223,28 @@ func TestCAS_ExpectAbsentConflict_Remote(t *testing.T) {
 // the atomic multi-write apply.
 func TestCAS_ConflictFreeCommit_Remote(t *testing.T) {
 	f := newTwoNodeFixture(t)
-	// Two distinct keys that both shard to N2 (co-shard, so no
-	// cross-shard guard fires).
-	var k1, k2 string
+	// Two distinct keys in the SAME UNIT on N2. A transaction is
+	// single-SHARD, and the shard is the unit: two keys can share an owner
+	// NODE while living in different units, which the cross-shard guard
+	// correctly refuses. So co-owner is not enough; co-UNIT is the
+	// requirement.
+	var k1, k2, unit string
 	for i := 0; i < 5000 && (k1 == "" || k2 == ""); i++ {
 		k := fmt.Sprintf("cas-cf-%d", i)
 		if ownerOf(f.N1.Cluster, k) != "n2" {
 			continue
 		}
+		u := f.N1.Cluster.RoutedUnitToken([]byte(k))
 		if k1 == "" {
-			k1 = k
-		} else if k != k1 {
+			k1, unit = k, u
+			continue
+		}
+		if k != k1 && u == unit {
 			k2 = k
 		}
 	}
 	if k1 == "" || k2 == "" {
-		t.Fatalf("could not find two distinct N2-owned keys")
+		t.Fatalf("could not find two distinct N2-owned keys in one unit")
 	}
 	if err := f.N1.Cluster.Put([]byte(k1), []byte("a0")); err != nil {
 		t.Fatalf("seed k1: %v", err)
