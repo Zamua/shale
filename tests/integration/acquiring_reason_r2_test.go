@@ -10,9 +10,10 @@ package integration
 // the one the R=1 tests cover, and a gate that works at R=1 can silently fail
 // there. These tests drive the PUBLIC API at R=2 so that gap cannot reopen.
 //
-// The window is held open deterministically: a background loop re-clears the
-// replica-0 mount faster than the reconcile can restore it, leaving that node
-// owner-but-unmounted (the real handoff state) for the whole call.
+// The window is HELD OPEN, not raced: the fixture arms an acquire delay far
+// beyond any bounded wait here, clears the replica-0 mount ONCE, and proves the
+// position is observably owner-but-unmounted (the real handoff state) before it
+// issues the op. Releasing the delay closes the window.
 //
 // Each entry point is driven from BOTH nodes. Whichever node holds replica-0,
 // one direction makes the mid-acquire leg IN-PROCESS and the other makes it a
@@ -22,6 +23,7 @@ package integration
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -53,6 +55,16 @@ func r2AcquiringPair(t *testing.T, unitCount int) (n1, n2 *sharedNode, key strin
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("ring convergence: %v", err)
 	}
+	// Registered AFTER each node's own t.Cleanup(Close), so it runs BEFORE them
+	// (cleanups are LIFO): no teardown ever waits out an armed acquire delay, on
+	// ANY exit path including a t.Fatalf from inside a held window. This is what
+	// makes arming a 5-minute delay affordable - the cost of a wide window must
+	// not be paid by a runner that never needed it.
+	t.Cleanup(func() {
+		n1.Handle.SetAcquireDelay(0)
+		n2.Handle.SetAcquireDelay(0)
+	})
+
 	// Any key works at R=2 on a 2-node ring (both nodes are replicas of every
 	// unit). A key that BOTH nodes can write is the settle condition worth
 	// waiting on: it proves the replica positions are mounted on both sides and
@@ -75,12 +87,112 @@ func r2AcquiringPair(t *testing.T, unitCount int) (n1, n2 *sharedNode, key strin
 	return nil, nil, "", 0
 }
 
-// holdAcquiringWindow keeps unit u's replica-0 mount cleared on both nodes
-// until the returned stop func is called. Only the node that actually holds
-// replica-0 has anything to clear; the other clear is a harmless no-op, so the
-// caller does not need to know which is which. The co-replica keeps acking
-// throughout, which is what makes the shortfall a PURE acquiring shortfall
-// (acks below W with zero hard failures) rather than an outage.
+// replicaLineState parses DebugState's per-position line for ru on one node and
+// reports that node's desired/mounted view of it. parsed is false when the node
+// has no line for ru at all (it does not hold the position), which is a
+// different thing from holding it and having it mounted - folding the two
+// together would let "the wrong node was inspected" read as "the window is
+// open".
+func replicaLineState(c *cluster.Cluster, ru storageunit.ReplicaUnit) (desired, mounted, parsed bool) {
+	prefix := ru.String() + " "
+	for _, line := range strings.Split(c.DebugState(), "\n") {
+		line = strings.TrimSpace(line)
+		if !strings.HasPrefix(line, prefix) {
+			continue
+		}
+		return strings.Contains(line, "desired=true"),
+			strings.Contains(line, "mounted=true"),
+			true
+	}
+	return false, false, false
+}
+
+// waitAcquiringWindowOpen blocks until some node reports ru as
+// DESIRED-BUT-UNMOUNTED: the MEASURED form of "a node owns this replica
+// position and cannot serve it", which is the state the op below has to be
+// issued in for its result to mean anything. It returns that node's ID.
+//
+// It exists because the previous fixture ASSUMED the window instead of
+// observing it. That version re-cleared the mount on a 1ms loop and raced the
+// periodic reconcile for it; when the reconcile won, both replicas really were
+// mounted, W=2 really was satisfiable, and the Put's ack was CORRECT - but the
+// test read that ack as a contract violation and failed. Locally the race was
+// invisible (400/400 refusals), while a loaded 2-vCPU CI runner lost it. The
+// window has to be a thing this test opens and closes, not one it out-runs.
+func waitAcquiringWindowOpen(t *testing.T, nodes []*sharedNode, ru storageunit.ReplicaUnit, timeout time.Duration) string {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		for _, n := range nodes {
+			desired, mounted, parsed := replicaLineState(n.Cluster, ru)
+			if parsed && desired && !mounted {
+				return n.ID
+			}
+		}
+		if !time.Now().Before(deadline) {
+			var dumps strings.Builder
+			for _, n := range nodes {
+				fmt.Fprintf(&dumps, "\n--- %s ---\n%s", n.ID, n.Cluster.DebugState())
+			}
+			t.Fatalf("no node reported %s as desired-but-unmounted within %s, so the acquiring window "+
+				"this gate probes in was never open and the op below would be issued against a fully "+
+				"mounted replica set. This is a fixture-window miss, not a contract result. State:%s",
+				ru, timeout, dumps.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// holdAcquiringWindowDelay is armed past any bounded wait in this file so the
+// window's width is never sampled from the runner's speed. It is NEVER slept:
+// every caller releases it, and r2AcquiringPair's cleanup releases it again on
+// any t.Fatalf path, so a runner only ever pays the time the probe itself takes.
+const holdAcquiringWindowDelay = 5 * time.Minute
+
+// holdProvenAcquiringWindow puts unit u's replica-0 holder into the
+// owner-but-unmounted state, PROVES it is in that state, and HOLDS IT THERE
+// until the returned stop func is called.
+//
+// The hold is the armed acquire delay, not a race: every path that re-mounts a
+// replica position goes through the factory's OpenReplicaUnit, so with the delay
+// armed BEFORE the mount is cleared, the periodic reconcile's restoring open
+// blocks in the delay and the mount cannot land. SetAcquireDelay re-reads as it
+// sleeps, so stop() releases the open already in flight rather than only later
+// ones. Only the node that actually holds replica-0 has anything to clear; the
+// other clear is a harmless no-op, so the caller does not need to know which is
+// which. The co-replica stays mounted and keeps acking throughout, which is what
+// makes the shortfall a PURE acquiring shortfall (acks below W with zero hard
+// failures) rather than an outage.
+//
+// It is separate from holdAcquiringWindow rather than replacing it because that
+// one is also called from an Aggregate fan-out goroutine, where t.Fatalf (which
+// the window proof needs, and which must run on the test goroutine) is not
+// legal. Callers that CAN prove their window should prefer this one.
+func holdProvenAcquiringWindow(t *testing.T, nodes []*sharedNode, u storageunit.UnitID) (stop func()) {
+	t.Helper()
+	for _, n := range nodes {
+		n.Handle.SetAcquireDelay(holdAcquiringWindowDelay)
+	}
+	for _, n := range nodes {
+		n.Cluster.TestingClearMount(u)
+	}
+	ru := storageunit.NewReplicaUnit(storageunit.NewGenUnit(0, u), 0)
+	holder := waitAcquiringWindowOpen(t, nodes, ru, 30*time.Second)
+	t.Logf("acquiring window held open on %s: %s desired-but-unmounted under a %s acquire delay",
+		holder, ru, holdAcquiringWindowDelay)
+	return func() {
+		for _, n := range nodes {
+			n.Handle.SetAcquireDelay(0)
+		}
+	}
+}
+
+// holdAcquiringWindow is the ORIGINAL racing hold: a background loop re-clears
+// unit u's replica-0 mount, betting it can out-run the periodic reconcile that
+// restores it. It cannot prove the window was open when the op ran, so a
+// reconcile that wins the race leaves the op looking at a fully mounted replica
+// set. Retained ONLY for the Aggregate callers, which invoke it from a fan-out
+// goroutine and so cannot use the proving variant above.
 func holdAcquiringWindow(nodes []*sharedNode, u storageunit.UnitID) (stop func()) {
 	done := make(chan struct{})
 	var wg sync.WaitGroup
@@ -142,7 +254,7 @@ func TestAcquiringReason_R2WriteMatchesErrAcquiring(t *testing.T) {
 		node *sharedNode
 	}{{"entry=arr1", n1}, {"entry=arr2", n2}} {
 		t.Run("Put/"+entry.name, func(t *testing.T) {
-			stop := holdAcquiringWindow(nodes, u)
+			stop := holdProvenAcquiringWindow(t, nodes, u)
 			defer stop()
 			err := entry.node.Cluster.Put([]byte(key), []byte("v"))
 			if err == nil {
@@ -152,7 +264,7 @@ func TestAcquiringReason_R2WriteMatchesErrAcquiring(t *testing.T) {
 		})
 
 		t.Run("Delete/"+entry.name, func(t *testing.T) {
-			stop := holdAcquiringWindow(nodes, u)
+			stop := holdProvenAcquiringWindow(t, nodes, u)
 			defer stop()
 			err := entry.node.Cluster.Delete([]byte(key))
 			if err == nil {
@@ -184,21 +296,21 @@ func TestAcquiringReason_R2AllEntryPointsMatchErrAcquiring(t *testing.T) {
 		node *sharedNode
 	}{{"entry=arr1", n1}, {"entry=arr2", n2}} {
 		t.Run("Get/"+entry.name, func(t *testing.T) {
-			stop := holdAcquiringWindow(nodes, u)
+			stop := holdProvenAcquiringWindow(t, nodes, u)
 			defer stop()
 			_, err := entry.node.Cluster.Get([]byte(key))
 			requireAcquiringOrServed(t, "Get/"+entry.name, err)
 		})
 
 		t.Run("ScanPrefix/"+entry.name, func(t *testing.T) {
-			stop := holdAcquiringWindow(nodes, u)
+			stop := holdProvenAcquiringWindow(t, nodes, u)
 			defer stop()
 			_, err := entry.node.Cluster.ScanPrefix([]byte(key))
 			requireAcquiringOrServed(t, "ScanPrefix/"+entry.name, err)
 		})
 
 		t.Run("Transact/"+entry.name, func(t *testing.T) {
-			stop := holdAcquiringWindow(nodes, u)
+			stop := holdProvenAcquiringWindow(t, nodes, u)
 			defer stop()
 			err := entry.node.Cluster.Transact([]byte(key), func(tx backend.Transaction) error {
 				return tx.Put([]byte(key), []byte("txv"))
