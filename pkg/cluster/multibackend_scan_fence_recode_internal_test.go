@@ -64,9 +64,7 @@ func TestScan_FencedMount_RecodedToTransient_AndEvicted(t *testing.T) {
 		if !isTransientReplicaErr(err) {
 			t.Fatalf("a recoded fenced scan must classify transient (so the inventory retry rides it out); got %v", err)
 		}
-		c.mountMu.RLock()
-		_, stillMounted := c.mountMap[target]
-		c.mountMu.RUnlock()
+		_, stillMounted := c.mounts.backendFor(target)
 		if stillMounted {
 			t.Fatalf("a fenced scan must EVICT the stale mount so the reconcile re-acquires it fresh; %v still mounted", target)
 		}
@@ -96,7 +94,7 @@ func TestScan_FencedMount_RecodedToTransient_AndEvicted(t *testing.T) {
 		if r := c.MountReadiness(); r.PendingUnits != 0 {
 			t.Fatalf("fixture must be fully mounted so the coverage guard does not pre-empt the fence path: %+v", r)
 		}
-		c.mountMap[target] = fenceScanBackend{Backend: memory.New()}
+		c.mounts.mountUndecorated(target, fenceScanBackend{Backend: memory.New()})
 		c.closed.Store(true)
 		return c
 	}

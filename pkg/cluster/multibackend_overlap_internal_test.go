@@ -133,8 +133,8 @@ func TestOverlap_MarkerHold_Conditions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open: %v", err)
 	}
-	c.mountMap[ru] = b
-	c.myOpenEpoch.Store(ru, opened)
+	c.mounts.mountUndecorated(ru, b)
+	c.mounts.recordOpenEpoch(ru, opened)
 
 	// MARKER ABSENT (a boot-mounted position): must NOT hold.
 	if c.heldForMissingSuccessorMarker(ru) {
@@ -247,7 +247,7 @@ func TestOverlap_Reconcile_DrainSplit_SetsDrainingKeepsMount(t *testing.T) {
 		if err != nil {
 			t.Fatalf("seed mount %v: %v", target, err)
 		}
-		c.mountMap[target] = b
+		c.mounts.mountUndecorated(target, b)
 	}
 
 	c.reconcileReplicaUnitsOverlap()
@@ -297,7 +297,7 @@ func TestOverlap_Reconcile_PlainDropOut_Releases(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed mount: %v", err)
 	}
-	c.mountMap[target] = b
+	c.mounts.mountUndecorated(target, b)
 
 	c.reconcileReplicaUnitsOverlap()
 
@@ -334,7 +334,7 @@ func TestOverlap_Reconcile_PositionMoveHold_HeldUntilSameUnitMounts(t *testing.T
 	if err != nil {
 		t.Fatalf("seed mount: %v", err)
 	}
-	c.mountMap[held] = b
+	c.mounts.mountUndecorated(held, b)
 
 	// PASS 1: the release half must HOLD the stale copy (same-unit desire not
 	// yet mounted when the release half runs), while the acquire half mounts
@@ -384,7 +384,7 @@ func TestOverlap_Reconcile_PendingOwner_AcquiresAndMarks(t *testing.T) {
 		if err != nil {
 			t.Fatalf("seed current mount %v: %v", target, err)
 		}
-		c.mountMap[target] = b
+		c.mounts.mountUndecorated(target, b)
 	}
 
 	pending := c.desiredPendingReplicaUnits(c.draining)
@@ -480,8 +480,8 @@ func TestOverlap_drainCheck_ReleasesOnServingMarker(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed mount: %v", err)
 	}
-	c.mountMap[target] = b
-	c.handoffPhase[target] = storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: 1}
+	c.mounts.mountUndecorated(target, b)
+	c.mounts.setPhase(target, storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: 1})
 
 	// No marker yet: drainCheck must NOT release (keeps serving).
 	c.drainCheck(target)
@@ -532,8 +532,8 @@ func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 	}
 
 	// 2) the ring now moves ru OFF self: beginDrain sets OpenEpoch = E.
-	c.mountMap[target] = b
-	c.handoffPhase[target] = storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: E}
+	c.mounts.mountUndecorated(target, b)
+	c.mounts.setPhase(target, storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: E})
 
 	if got, _ := h.DurableEpochReplica(target); got != E {
 		t.Fatalf("durable fence epoch should still be E=%d (no successor opened), got %d", E, got)
@@ -578,8 +578,8 @@ func TestOverlap_drainCheck_NeverReleasesOnBareFenceEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("seed mount: %v", err)
 	}
-	c.mountMap[target] = b
-	c.handoffPhase[target] = storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: 1}
+	c.mounts.mountUndecorated(target, b)
+	c.mounts.setPhase(target, storageunit.HandoffState{Phase: storageunit.PhaseDraining, OpenEpoch: 1})
 
 	// Simulate a new owner FENCING (advancing the durable epoch) WITHOUT ever
 	// writing the serving marker (it crashed mid-mount).

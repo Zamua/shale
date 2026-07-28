@@ -75,7 +75,7 @@ func TestOverlap_DrainPoller_ReleasesOnMarker_WithoutReconcileTick(t *testing.T)
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
 	target := ru(0, 0, 0)
 
-	// Mount through the real flip (records myOpenEpoch = 1, writes own marker).
+	// Mount through the real flip (records the open epoch = 1, writes own marker).
 	_ = c.acquireReplicaUnitOverlapBlocking(target)
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
 		t.Fatalf("precondition: target should be mounted")
@@ -187,11 +187,9 @@ func TestOverlapAcquire_SlowOpenReleasesPermit_QueueUnstarved(t *testing.T) {
 	if _, ok := c.localBackendForReplicaUnit(stuck); ok {
 		t.Fatalf("stuck position reported mounted while its open is hung")
 	}
-	c.mountMu.Lock()
-	_, inFlight := c.acquireInFlight[stuck]
-	c.mountMu.Unlock()
+	inFlight := c.mounts.acquireInFlight(stuck)
 	if !inFlight {
-		t.Fatalf("stuck position lost its acquireInFlight dedup entry while its open is still running")
+		t.Fatalf("stuck position lost its in-flight dedup entry while its open is still running")
 	}
 
 	// Release the hang: the stuck open completes and mounts through the

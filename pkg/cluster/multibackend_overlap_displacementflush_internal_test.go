@@ -57,7 +57,7 @@ func waitReplicaFlushCount(t *testing.T, b *sharedfactory.Backing, ru storageuni
 
 // TestOverlap_DisplacementFlush_FiresExactlyOncePerTransition pins the whole
 // lifecycle on the REAL mount path (acquireReplicaUnitOverlapBlocking ->
-// storeMount, so the mounted entry is the fencedSelfHealing decorator and the
+// the mount seam, so the mounted entry is the fencedSelfHealing decorator and the
 // flush must reach the inner backend through the unwrap):
 //
 //  1. mounting alone never flushes;
@@ -71,7 +71,7 @@ func TestOverlap_DisplacementFlush_FiresExactlyOncePerTransition(t *testing.T) {
 	shutdownReplicatedFixture(t, c)
 	target := ru(0, 0, 0)
 
-	// 1) Mount through the real flip: storeMount wraps the factory backend in
+	// 1) Mount through the real flip: the mount seam wraps the factory backend in
 	// the fencedSelfHealing decorator. No flush yet.
 	_ = c.acquireReplicaUnitOverlapBlocking(target)
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
@@ -123,11 +123,8 @@ func TestOverlap_DisplacementFlush_SkipsBackendWithoutCapability(t *testing.T) {
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
 	shutdownReplicatedFixture(t, c)
 	target := ru(0, 1, 0)
-
-	c.mountMu.Lock()
-	c.storeMount(target, memory.New()) // wrapped in the decorator, like production
-	c.mountMu.Unlock()
-	c.myOpenEpoch.Store(target, storageunit.Epoch(1))
+	c.mounts.mount(target, memory.New()) // wrapped in the decorator, like production
+	c.mounts.recordOpenEpoch(target, storageunit.Epoch(1))
 
 	c.beginDrain(target)
 	if st := c.handoffPhaseOf(target); st.Phase != storageunit.PhaseDraining {

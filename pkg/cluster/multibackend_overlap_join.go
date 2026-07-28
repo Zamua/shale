@@ -59,11 +59,11 @@ func (c *Cluster) maintainJoiningState() {
 
 // allPendingPositionsMounted reports whether every position this node owns under
 // the PENDING view (its real-ownership set, the ring excluding draining members)
-// is present in mountMap. It is the JOIN completion gate - the entry-side mirror
-// of allOwnedPositionsHandedOff. True once the node has finished warming, so the
+// is mounted. It is the JOIN completion gate - the entry-side mirror of
+// allOwnedPositionsHandedOff. True once the node has finished warming, so the
 // Joining bit can clear. A node with no pending positions (or no replica factory)
-// is trivially warmed. Snapshots the mounted set under mountMu; the pending-set
-// derivation reads the ring/membership without the lock.
+// is trivially warmed. The pending set is derived from the ring/membership
+// first, then tested against ONE coherent view of the mount table.
 func (c *Cluster) allPendingPositionsMounted() bool {
 	if !c.replicaLayout() {
 		return true
@@ -72,12 +72,5 @@ func (c *Cluster) allPendingPositionsMounted() bool {
 	if len(pending) == 0 {
 		return true
 	}
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	for _, ru := range pending {
-		if _, ok := c.mountMap[ru]; !ok {
-			return false
-		}
-	}
-	return true
+	return c.mounts.allMounted(pending)
 }

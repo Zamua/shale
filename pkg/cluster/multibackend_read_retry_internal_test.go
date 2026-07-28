@@ -93,9 +93,7 @@ func TestUnionReadRetry_ServesThroughFenceWindow(t *testing.T) {
 	c.acquireReplicaUnit(ru)
 	c.reconcileMu.Unlock()
 	env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "seed"}, Payload: []byte("v1")})
-	c.mountMu.RLock()
-	b := c.mountMap[ru]
-	c.mountMu.RUnlock()
+	b, _ := c.mounts.backendFor(ru)
 	if b == nil {
 		t.Fatalf("fixture: position %v not mounted", ru)
 	}
@@ -250,9 +248,7 @@ func TestUnionReadRetry_ClosedMountLegIsTransient(t *testing.T) {
 	if err := sb.Put(key, env); err != nil {
 		t.Fatalf("seed put: %v", err)
 	}
-	c.mountMu.Lock()
-	c.mountMap[ru] = closedStubBackend{}
-	c.mountMu.Unlock()
+	c.mounts.mountUndecorated(ru, closedStubBackend{})
 
 	const healAfter = 300 * time.Millisecond
 	heal := func() chan struct{} {
@@ -285,9 +281,7 @@ func TestUnionReadRetry_ClosedMountLegIsTransient(t *testing.T) {
 	<-healDone
 
 	// Same for a SCAN leg: re-plant the closed handle over the healed mount.
-	c.mountMu.Lock()
-	c.mountMap[ru] = closedStubBackend{}
-	c.mountMu.Unlock()
+	c.mounts.mountUndecorated(ru, closedStubBackend{})
 	armT = time.Now()
 	healDone = heal()
 	it, err := c.scanReplicatedUnit(key)

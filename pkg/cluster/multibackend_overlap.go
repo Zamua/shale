@@ -51,7 +51,7 @@ import (
 // reconcileReplicaUnits for the R>1 path. It makes this node's mounted +
 // in-flight set match the units it replicates under the LIVE ring, but unlike
 // the clean-cut reconcile it SEQUENCES the two halves of a position move via the
-// handoffPhase FSM so the position is never stranded:
+// handoff-phase FSM so the position is never stranded:
 //
 //   - DRAIN half: a mounted position this node holds in CURRENT but not in
 //     PENDING is set Draining (it keeps serving + receiving union dual-writes;
@@ -61,7 +61,7 @@ import (
 //     mount-complete it writes its serving marker. A pure new mount with no
 //     transition takes the clean-cut acquire.
 //
-// Caller MUST hold reconcileMu; mount + phase mutations take mountMu.
+// Caller MUST hold reconcileMu; mount + phase mutations go through the table.
 func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	joining, draining := c.transitionSets()
 
@@ -88,12 +88,7 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 		pendingSet[ru] = struct{}{}
 	}
 
-	c.mountMu.RLock()
-	mounted := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
-	for ru := range c.mountMap {
-		mounted = append(mounted, ru)
-	}
-	c.mountMu.RUnlock()
+	mounted := c.mounts.mountedList()
 
 	mountedSet := make(map[storageunit.ReplicaUnit]struct{}, len(mounted))
 	for _, ru := range mounted {
@@ -109,7 +104,7 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 	// drainCheck would never release it and the position would be stranded in
 	// Draining forever. Abort the drain: clear the in-flight phase so the position
 	// returns to Owned (it has been mounted + serving the whole time, so no
-	// availability gap). Reads under mountMu; the phase clear takes the lock.
+	// availability gap). Both the read and the phase clear go through the table.
 	//
 	// The PENDING gate is load-bearing: a position in CURRENT but NOT in PENDING is
 	// being HANDED OFF (this node is itself draining, or a draining successor split
@@ -369,29 +364,11 @@ func (c *Cluster) heldForMissingSuccessorMarker(ru storageunit.ReplicaUnit) bool
 // datum a wedged-open pipeline stall hides: a single line naming which
 // position has held the open permit for how long.
 func (c *Cluster) logAcquireQueueSummary() {
-	c.mountMu.RLock()
-	inFlight := len(c.acquireInFlight)
-	gainers := 0
-	for _, st := range c.handoffPhase {
-		if st.Phase.IsGainer() {
-			gainers++
-		}
-	}
-	mounted := len(c.mountMap)
-	c.mountMu.RUnlock()
+	mounted, gainers, inFlight := c.mounts.queueStats()
 	if gainers == 0 && inFlight == 0 {
 		return // steady state: no line.
 	}
-	holders := 0
-	var oldestRU storageunit.ReplicaUnit
-	var oldest time.Time
-	c.permitHolders.Range(func(k, v any) bool {
-		holders++
-		if ts := v.(time.Time); oldest.IsZero() || ts.Before(oldest) {
-			oldest, oldestRU = ts, k.(storageunit.ReplicaUnit)
-		}
-		return true
-	})
+	holders, oldestRU, oldest := c.mounts.permitSummary()
 	if holders > 0 {
 		c.logf("shale: acquire queue: %d mounted, %d acquiring, %d in flight, %d holding an open permit (oldest %s held %s)",
 			mounted, gainers, inFlight, holders, oldestRU, time.Since(oldest).Round(time.Second))
@@ -413,22 +390,11 @@ func (c *Cluster) logAcquireQueueSummary() {
 // the position's durable open epoch (strictly above the leaver's, which releases
 // its drain). Caller holds reconcileMu. A no-op unless genuinely stuck.
 func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
-	c.mountMu.Lock()
-	if _, inFlight := c.acquireInFlight[ru]; inFlight {
-		c.mountMu.Unlock()
-		return // a flip goroutine is running; let it complete.
+	if !c.mounts.finishStuckGainer(ru) {
+		// A flip goroutine is running, the position is not mounted, or it is
+		// already Owned / in a loser phase: nothing to finish.
+		return
 	}
-	st, ok := c.handoffPhase[ru]
-	if !ok || !st.Phase.IsGainer() {
-		c.mountMu.Unlock()
-		return // Owned (no phase) or a loser phase: nothing to finish.
-	}
-	if _, mounted := c.mountMap[ru]; !mounted {
-		c.mountMu.Unlock()
-		return // not mounted; the acquire half re-drives the mount.
-	}
-	delete(c.handoffPhase, ru) // mounted + no phase = Owned (serving locally).
-	c.mountMu.Unlock()
 
 	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at THIS
 	// node's EXACT open epoch (the recorded factory return) - exactly what the
@@ -443,8 +409,8 @@ func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
 // one). It must NOT be replaced by openEpochForReplica at the call sites: that
 // re-reads the shared, climbing durable, which is the bug this fix removes.
 func (c *Cluster) ownOpenEpoch(ru storageunit.ReplicaUnit) storageunit.Epoch {
-	if v, ok := c.myOpenEpoch.Load(ru); ok {
-		return v.(storageunit.Epoch)
+	if e, ok := c.mounts.openEpochOf(ru); ok {
+		return e
 	}
 	return c.openEpochForReplica(ru)
 }
@@ -503,7 +469,7 @@ func (c *Cluster) desiredCurrentReplicaUnits(joining map[string]struct{}) []stor
 // mounting) serves it; a routed op to the still-Acquiring new owner gets
 // errUnitAcquiring. Paired with TestingForceCleanCut also disabling the Option-A
 // retry, this is the regime the gate proves collapses. Caller holds reconcileMu;
-// mount mutations take mountMu.
+// mount mutations go through the mount table.
 func (c *Cluster) reconcileReplicaUnitsCleanCut() {
 	desired := c.desiredReplicaUnits()
 	desiredSet := make(map[storageunit.ReplicaUnit]struct{}, len(desired))
@@ -511,12 +477,7 @@ func (c *Cluster) reconcileReplicaUnitsCleanCut() {
 		desiredSet[ru] = struct{}{}
 	}
 
-	c.mountMu.RLock()
-	mounted := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
-	for ru := range c.mountMap {
-		mounted = append(mounted, ru)
-	}
-	c.mountMu.RUnlock()
+	mounted := c.mounts.mountedList()
 
 	mountedSet := make(map[storageunit.ReplicaUnit]struct{}, len(mounted))
 	for _, ru := range mounted {
@@ -540,11 +501,9 @@ func (c *Cluster) reconcileReplicaUnitsCleanCut() {
 }
 
 // handoffPhaseOf returns the in-flight HandoffState for ru (the zero value, with
-// Phase 0, when ru is not in flight). Reads under mountMu.
+// Phase 0, when ru is not in flight).
 func (c *Cluster) handoffPhaseOf(ru storageunit.ReplicaUnit) storageunit.HandoffState {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	return c.handoffPhase[ru]
+	return c.mounts.phaseOf(ru)
 }
 
 // beginDrain puts a position into PhaseDraining (the loser side): the node no
@@ -552,43 +511,31 @@ func (c *Cluster) handoffPhaseOf(ru storageunit.ReplicaUnit) storageunit.Handoff
 // over, so it KEEPS SERVING the still-mounted entry (dual-written via the union)
 // until the successor is Ready. It does NOT release the mount. The OpenEpoch
 // recorded is the epoch this node opened the position at - drainCheck compares
-// the serving marker against it. Caller holds reconcileMu; the phase write takes
-// mountMu.
+// the serving marker against it. Caller holds reconcileMu; the phase write goes
+// through the mount table.
 func (c *Cluster) beginDrain(ru storageunit.ReplicaUnit) {
 	// Gate the drain on THIS node's EXACT open epoch (recorded from the factory
 	// return), NOT the live durable: the live durable climbs as the SUCCESSOR
 	// opens, which would push the release threshold above the successor's serving
 	// marker and hang the drain to its timeout (the graceful-scale-down
 	// availability gap). The recorded value is stable across reclaim/re-drain.
-	// Read OUTSIDE mountMu (ownOpenEpoch's defensive fallback can do shared-storage
-	// I/O, which must never run under the lock routed ops need). The read races the
-	// mountMap check below only benignly: myOpenEpoch never holds a LOWER epoch for
-	// a live mount, so a stale read can only INFLATE the gate (hang direction, self-
-	// corrected next poll), never release early.
+	// Read OUTSIDE the table lock (ownOpenEpoch's defensive fallback can do
+	// shared-storage I/O, which must never run under the lock routed ops need).
+	// The read races armDrain's mount check only benignly: the recorded open
+	// epoch never holds a LOWER epoch for a live mount, so a stale read can only
+	// INFLATE the gate (hang direction, self-corrected next poll), never release
+	// early.
 	open := c.ownOpenEpoch(ru)
-	c.mountMu.Lock()
-	b, mounted := c.mountMap[ru]
-	if !mounted {
-		// Lost the mount under us (a concurrent evict); nothing to drain.
-		c.mountMu.Unlock()
+	b, armed := c.mounts.armDrain(ru, open)
+	if !armed {
+		// Not mounted (a concurrent evict), already mid-transition, or the FSM
+		// refused the edge: nothing to drain.
 		return
 	}
-	if c.handoffPhase[ru].Phase != 0 {
-		c.mountMu.Unlock()
-		return
-	}
-	next, err := storageunit.NextOnDrain(storageunit.HandoffState{})
-	if err != nil {
-		c.mountMu.Unlock()
-		return
-	}
-	next.OpenEpoch = open
-	c.handoffPhase[ru] = next
-	c.mountMu.Unlock()
 
 	// DISPLACEMENT FLUSH (docs/SPEC.md "Displacement flush"): this call is the
-	// Owned -> Draining edge - reached ONLY when the phase was just armed above
-	// (the phase!=0 return keeps re-entrant drain ticks out), so the flush fires
+	// Owned -> Draining edge - reached ONLY when armDrain just armed the phase
+	// (it refuses a re-entrant drain tick), so the flush fires
 	// EXACTLY ONCE per displacement transition. Flushing the displaced owner's
 	// memtable NOW means the successor's fencing open (already racing this)
 	// replays a minimal WAL tail instead of the whole unflushed tail. A reclaim
@@ -627,7 +574,7 @@ const drainPollerMaxLife = 30 * time.Second
 // loser-phase (Draining) position exists, for at most drainPollerMaxLife,
 // then exits. Armed from beginDrain (the Owned -> Draining edge). The
 // periodic reconcile keeps running the same checks as the backstop;
-// drainCheck's mountMap CAS-delete keeps the release exactly-once regardless
+// drainCheck's compare-and-delete keeps the release exactly-once regardless
 // of how many pollers observe the marker.
 func (c *Cluster) ensureDrainPoller() {
 	if !c.drainPollerActive.CompareAndSwap(false, true) {
@@ -676,16 +623,9 @@ func (c *Cluster) ensureDrainPoller() {
 }
 
 // hasLoserPhase reports whether any position is currently in a loser
-// (Draining) phase. Reads under mountMu.
+// (Draining) phase.
 func (c *Cluster) hasLoserPhase() bool {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	for _, st := range c.handoffPhase {
-		if st.Phase.IsLoser() {
-			return true
-		}
-	}
-	return false
+	return c.mounts.hasLoserPhase()
 }
 
 // flushDisplaced asks a displaced (newly-Draining) position's backend to make
@@ -709,8 +649,8 @@ func (c *Cluster) flushDisplaced(b backend.Backend) {
 	}()
 }
 
-// flushableBackend reports whether b (a mountMap entry) supports the OPTIONAL
-// Flusher capability, unwrapping the fencedSelfHealing decorator storeMount
+// flushableBackend reports whether b (a mount-table entry) supports the OPTIONAL
+// Flusher capability, unwrapping the fencedSelfHealing decorator the mount seam
 // wraps every mounted backend in. The unwrap keeps the capability honest: the
 // decorator itself must not advertise Flush for an inner backend that cannot.
 func flushableBackend(b backend.Backend) (backend.Flusher, bool) {
@@ -728,11 +668,9 @@ func flushableBackend(b backend.Backend) (backend.Flusher, bool) {
 // (the union covers the position via the current owner). The phase is set BEFORE
 // the mount starts so there is no instant where routing targets this node, the
 // mount is incomplete, AND no phase entry exists. Caller holds reconcileMu; the
-// phase write takes mountMu.
+// phase write goes through the mount table.
 func (c *Cluster) beginAcquire(ru storageunit.ReplicaUnit) {
-	c.mountMu.Lock()
-	c.handoffPhase[ru] = storageunit.HandoffState{Phase: storageunit.PhaseAcquiring}
-	c.mountMu.Unlock()
+	c.mounts.setPhase(ru, storageunit.HandoffState{Phase: storageunit.PhaseAcquiring})
 }
 
 // reclaimDrainingPosition aborts an in-flight drain for a position this node
@@ -741,16 +679,9 @@ func (c *Cluster) beginAcquire(ru storageunit.ReplicaUnit) {
 // mounted AND in a loser phase (a concurrent drainCheck may have already
 // released it, in which case the acquire half re-mounts it cleanly). The mount
 // is never touched here - the position has been served locally the entire time -
-// so the reclaim has no availability gap. Takes mountMu.
+// so the reclaim has no availability gap.
 func (c *Cluster) reclaimDrainingPosition(ru storageunit.ReplicaUnit) {
-	c.mountMu.Lock()
-	defer c.mountMu.Unlock()
-	if _, mounted := c.mountMap[ru]; !mounted {
-		return
-	}
-	if cur, ok := c.handoffPhase[ru]; ok && cur.Phase.IsLoser() {
-		delete(c.handoffPhase, ru)
-	}
+	c.mounts.reclaimDrain(ru)
 }
 
 // openEpochForReplica reports the epoch this node currently holds ru open at,
@@ -774,7 +705,7 @@ func (c *Cluster) openEpochForReplica(ru storageunit.ReplicaUnit) storageunit.Ep
 // acquireReplicaUnitOverlap is the GAINER's mount under the pending-ranges model:
 // it opens the position (the slow MinIO mount happens here, during which the
 // union covers the position via the still-mounted current owner), then performs
-// THE MOUNT FLIP - inserts mountMap[ru] under mountMu and advances Acquiring ->
+// THE MOUNT FLIP - inserts the mount entry in the table and advances Acquiring ->
 // Ready -> drops the phase entry (Owned) - and writes the durable SERVING MARKER
 // exactly once so the old owner's drainCheck poll releases. On open failure it
 // leaves the Acquiring phase in place (the union still covers the position via
@@ -787,32 +718,21 @@ func (c *Cluster) openEpochForReplica(ru storageunit.ReplicaUnit) storageunit.Ep
 // the reconcile (which holds reconcileMu). Serial opens would make a graceful
 // scale-down's drain exceed its budget - the leaving node would depart with
 // positions still un-handed-off. The position stays PhaseAcquiring (the union
-// covers it) until the goroutine completes the mount flip. The acquireInFlight
-// set (under mountMu) is the idempotency guard: a reconcile that re-drives an
+// covers it) until the goroutine completes the mount flip. The mount table's
+// in-flight set is the idempotency guard: a reconcile that re-drives an
 // already-in-flight acquire does not spawn a second open. The goroutine is
 // tracked by loopWG so Close awaits it.
 func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
-	c.mountMu.Lock()
-	if c.closed.Load() {
-		c.mountMu.Unlock()
+	if !c.mounts.startAcquire(ru) {
+		// Closing, or an open for this position is already running: do not
+		// spawn a second.
 		return
 	}
-	if _, inFlight := c.acquireInFlight[ru]; inFlight {
-		// An open for this position is already running; do not spawn a second.
-		c.mountMu.Unlock()
-		return
-	}
-	c.acquireInFlight[ru] = struct{}{}
-	c.mountMu.Unlock()
 
 	c.loopWG.Add(1)
 	go func() {
 		defer c.loopWG.Done()
-		defer func() {
-			c.mountMu.Lock()
-			delete(c.acquireInFlight, ru)
-			c.mountMu.Unlock()
-		}()
+		defer c.mounts.finishAcquire(ru)
 		// NODE-WIDE OPEN BOUND: take a permit around each open attempt, so a
 		// node gaining many positions at once runs at most
 		// Config.OpenConcurrency (default 1) real-data FFI opens concurrently -
@@ -824,7 +744,7 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 		// without any availability cost. Queued goroutines block on the permit
 		// channel, so when one open finishes the next queued open starts
 		// IMMEDIATELY (event-driven chaining, never a reconcile-tick wait). The
-		// acquireInFlight entry is held across the whole loop, so a reconcile
+		// in-flight entry is held across the whole loop, so a reconcile
 		// re-drive never spawns a duplicate waiter.
 		//
 		// FAILURE RE-DRIVE (handoff-cycle latency): a FAILED open used to
@@ -837,7 +757,7 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 		// reconcile remains the backstop (identical to the pre-fix behavior
 		// from that point on). Success/failure is the ERROR RETURNED by the
 		// blocking acquire - a signal private to this call, never a re-read of
-		// the shared lastAcquireErr diagnostic map (see that function's doc for
+		// the shared acquire-error diagnostic map (see that function's doc for
 		// why the shared map cannot carry this loop's control flow).
 		spawned := time.Now()
 		redrive := newCappedRetryWait(acquireRedriveBase, acquireRedriveCap)
@@ -852,11 +772,11 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 			var relOnce sync.Once
 			rel := func() {
 				relOnce.Do(func() {
-					c.permitHolders.Delete(ru)
+					c.mounts.dropPermit(ru)
 					permitRelease()
 				})
 			}
-			c.permitHolders.Store(ru, time.Now())
+			c.mounts.holdPermit(ru)
 			if c.closed.Load() {
 				rel()
 				return // Close ran while queued; nothing to open.
@@ -870,7 +790,7 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 			// watchdog): a slow/hung open must not starve the queue. After
 			// OpenPermitTimeout release the PERMIT ONLY - queued positions
 			// proceed; this position's open keeps running (un-cancellable FFI)
-			// and stays the only open for ru (acquireInFlight dedupes), so the
+			// and stays the only open for ru (the in-flight set dedupes), so the
 			// watchdog can never double-open a position. The overlap this
 			// creates with the next queued open is the accepted, detected-and-
 			// retried degraded mode argued in the spec.
@@ -916,17 +836,17 @@ const (
 // acquireReplicaUnitOverlapBlocking performs the GAINER's slow mount + flip
 // synchronously. It is run from acquireReplicaUnitOverlap's background goroutine
 // (so concurrent positions overlap) and directly by tests that want the
-// deterministic blocking behavior. It must NOT be called while holding mountMu
-// (it takes mountMu for the flip).
+// deterministic blocking behavior.
 //
 // It RETURNS the open error (nil once the position is mounted, or once a
 // concurrent reconcile/Close superseded this attempt - in both cases there is
 // nothing left to retry). The returned error is the ONLY success/failure signal
 // the caller's re-drive loop branches on. It deliberately does NOT read the
-// outcome back out of lastAcquireErr: that map is shared, per-ReplicaUnit, and
-// written AND cleared by every other mount site on the node (storeMount clears
-// it at every mount choke point, boot records a non-error "boot-deferred:"
-// string under the same key). Reading it back as a branch condition let another
+// outcome back out of the acquire-error record: that map is shared,
+// per-ReplicaUnit, and written AND cleared by every other mount site on the node
+// (the mount seam clears it at every mount, boot records a non-error
+// "boot-deferred:" string under the same key). Reading it back as a branch
+// condition let another
 // path's write decide this loop's control flow - a concurrent mount of ru could
 // clear the record and end the retry of a still-failing open, and a boot-defer
 // record could make a SUCCESSFUL open look failed and retry it. The error return
@@ -947,57 +867,32 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 			// old owner is still a routed current owner serving via the union.
 			// Mirror the failure into the diagnostic map (DebugState /
 			// MountReadiness read it) and return it as the control signal.
-			c.lastAcquireErr.Store(ru, err.Error())
+			c.mounts.recordAcquireErr(ru, err.Error())
 			return err
 		}
 	}
-	c.lastAcquireErr.Delete(ru)
+	c.mounts.clearAcquireErr(ru)
 
 	// openedEpoch is THIS node's EXACT open epoch (factory return), used as the
 	// serving-marker epoch + recorded as this node's drain gate. NOT a re-read of
 	// the climbing durable. Record it before the mount flip so a beginDrain that
-	// sees mountMap[ru] also sees the epoch.
-	c.myOpenEpoch.Store(ru, openedEpoch)
+	// sees the mount also sees the epoch.
+	c.mounts.recordOpenEpoch(ru, openedEpoch)
 
-	// THE MOUNT FLIP: insert the mount entry + advance the phase to Ready under
-	// ONE mountMu hold so a routed op never sees the mount present without the
+	// THE MOUNT FLIP: insert the mount entry + resolve the phase to Owned under
+	// ONE table hold so a routed op never sees the mount present without the
 	// phase resolved (and vice versa).
-	c.mountMu.Lock()
-	if c.closed.Load() {
-		c.mountMu.Unlock()
-		c.myOpenEpoch.Delete(ru) // no mount installed; don't leak the recorded epoch.
+	switch c.mounts.completeAcquireFlip(ru, b, openedEpoch) {
+	case flipSuperseded:
+		c.mounts.forgetOpenEpoch(ru) // no mount installed; don't leak the recorded epoch.
 		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 		return nil // Close superseded this attempt; nothing to retry.
-	}
-	cur := c.handoffPhase[ru]
-	if cur.Phase != storageunit.PhaseAcquiring {
-		// The phase entry is gone or not Acquiring (a concurrent reconcile already
-		// flipped or dropped it). Still install the mount (it is the authoritative
-		// durable owner) and drop any stale phase entry.
-		c.storeMount(ru, b)
-		delete(c.handoffPhase, ru)
-		c.mountMu.Unlock()
+	case flipMountedResolved:
+		// The phase entry was already resolved elsewhere (or the FSM edge was
+		// illegal). The mount is installed either way; still publish the marker.
 		_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), openedEpoch)
-		return nil // Mounted (the phase entry was already resolved elsewhere).
+		return nil
 	}
-	ready, err := storageunit.NextOnReady(cur, openedEpoch)
-	if err != nil {
-		// Illegal edge should not happen (cur is Acquiring); install the mount and
-		// drop the phase to converge to Owned regardless.
-		c.storeMount(ru, b)
-		delete(c.handoffPhase, ru)
-		c.mountMu.Unlock()
-		_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), openedEpoch)
-		return nil // Mounted (illegal FSM edge converged to Owned).
-	}
-	c.storeMount(ru, b)
-	// Ready is transient: once the mount entry is present the node serves locally,
-	// so the steady state is Owned (no phase entry). Drop the entry rather than
-	// parking in Ready - Owned = mounted + no phase, per the FSM's steady-state
-	// poles.
-	_ = ready
-	delete(c.handoffPhase, ru)
-	c.mountMu.Unlock()
 
 	// Write the serving marker EXACTLY ONCE, AFTER the mount flip (outside the
 	// lock: it is shared-storage I/O). This is the durable, poll-observable release
@@ -1020,14 +915,13 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 // marker proves serving).
 //
 // Lock discipline (review P1-3): the ReadServingMarker I/O runs OUTSIDE any
-// cluster lock (a slow MinIO read must not block routed ops' mountMap reads). The
-// phase compare-and-advance (Draining -> Releasing) and the mountMap
-// compare-and-delete are ONE critical section under mountMu, made exactly-once by
-// the CAS-on-mountMap-delete (delete only if it still points at the same
-// backend). CloseReplicaUnit runs AFTER the lock is dropped (the entry is already
-// removed), so a slow close does not hold mountMu. Caller holds reconcileMu (so
-// two passes do not both enter the edge); the exactly-once guard is the mountMap
-// CAS regardless.
+// cluster lock (a slow MinIO read must not block routed ops' mount lookups). The
+// phase compare-and-advance (Draining -> Releasing) and the mount-entry
+// compare-and-delete are ONE critical section inside the mount table
+// (releaseDrained), made exactly-once by that delete. CloseReplicaUnit runs after
+// it returns (the entry is already removed), so a slow close does not hold the
+// table lock. Caller holds reconcileMu (so two passes do not both enter the
+// edge); the exactly-once guard is the table's delete regardless.
 func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	state := c.handoffPhaseOf(ru)
 	if state.Phase != storageunit.PhaseDraining {
@@ -1040,15 +934,9 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 	// in the readiness poll below, and the acquire half's loser-phase skip would
 	// never let the position re-mount - permanently stranding a re-desired position
 	// as unowned/unserved. The mount being gone means there is nothing to drain.
-	c.mountMu.Lock()
-	if cur, ok := c.handoffPhase[ru]; ok && cur.Phase == storageunit.PhaseDraining {
-		if _, mounted := c.mountMap[ru]; !mounted {
-			delete(c.handoffPhase, ru)
-			c.mountMu.Unlock()
-			return
-		}
+	if c.mounts.clearOrphanedDrain(ru) {
+		return
 	}
-	c.mountMu.Unlock()
 
 	// I/O OUTSIDE the lock: poll the durable serving marker.
 	markerEpoch, ok, err := c.factory.ReadServingMarker(storageunit.ReplicaMount(ru))
@@ -1071,37 +959,13 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 		return
 	}
 
-	// ONE mountMu critical section: advance Draining -> Releasing and
-	// compare-and-delete the mount entry. The CAS-delete (delete only if the entry
-	// is still the backend we drained) is the real exactly-once guard.
-	c.mountMu.Lock()
-	cur, inFlight := c.handoffPhase[ru]
-	if !inFlight || cur.Phase != storageunit.PhaseDraining {
-		// Another tick already advanced it. Done.
-		c.mountMu.Unlock()
+	// ONE critical section inside the table: advance Draining -> Releasing and
+	// delete the mount entry. Only that hold removes THIS entry, which is the
+	// exactly-once guard however many pollers observed the marker.
+	b, released := c.mounts.releaseDrained(ru)
+	if !released {
 		return
 	}
-	b, mounted := c.mountMap[ru]
-	if !mounted || b == nil {
-		// Already evicted; just drop the phase entry to converge to Absent.
-		delete(c.handoffPhase, ru)
-		c.mountMu.Unlock()
-		return
-	}
-	next, err := storageunit.NextOnRelease(cur)
-	if err != nil {
-		c.mountMu.Unlock()
-		return
-	}
-	// Exactly-once CAS-delete: only this critical section removes THIS entry.
-	delete(c.mountMap, ru)
-	c.myOpenEpoch.Delete(ru) // released; a re-acquire records a fresh open epoch.
-	// Drop the phase entry: Releasing is transient, the steady state after the
-	// release is Absent (no mount, no phase). next validates the edge; we converge
-	// straight to Absent.
-	_ = next
-	delete(c.handoffPhase, ru)
-	c.mountMu.Unlock()
 
 	// Drop this backend's group-commit flush state (bounded-lifetime eviction):
 	// the unit is unmounting, a remount opens a fresh backend, so the old entry
@@ -1121,15 +985,7 @@ func (c *Cluster) drainCheck(ru storageunit.ReplicaUnit) {
 // diff so a position that just became Draining is re-checked on the next tick.
 // Caller holds reconcileMu.
 func (c *Cluster) runDrainChecks() {
-	c.mountMu.RLock()
-	draining := make([]storageunit.ReplicaUnit, 0)
-	for ru, st := range c.handoffPhase {
-		if st.Phase == storageunit.PhaseDraining {
-			draining = append(draining, ru)
-		}
-	}
-	c.mountMu.RUnlock()
-	for _, ru := range draining {
+	for _, ru := range c.mounts.drainingPositions() {
 		c.drainCheck(ru)
 	}
 }

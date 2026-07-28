@@ -32,7 +32,7 @@ func seedOwnedPositions(t *testing.T, c *Cluster, backing *sharedfactory.Backing
 		if err != nil {
 			t.Fatalf("seed mount %v: %v", target, err)
 		}
-		c.mountMap[target] = b
+		c.mounts.mountUndecorated(target, b)
 	}
 	return desired
 }
@@ -134,7 +134,7 @@ func TestLeave_DrainForLeave_NoOpOutsideMultiReplicated(t *testing.T) {
 	}
 }
 
-// TestLeave_ownedPositionCount tracks the mountMap size.
+// TestLeave_ownedPositionCount tracks the mount-table size.
 func TestLeave_ownedPositionCount(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
@@ -147,7 +147,7 @@ func TestLeave_ownedPositionCount(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
-	c.mountMap[target] = b
+	c.mounts.mountUndecorated(target, b)
 	if c.ownedPositionCount() != 1 {
 		t.Fatalf("after one mount ownedPositionCount = %d, want 1", c.ownedPositionCount())
 	}

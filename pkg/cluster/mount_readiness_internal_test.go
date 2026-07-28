@@ -89,7 +89,7 @@ func TestMountReadiness_NoneMounted(t *testing.T) {
 
 // TestMountReadiness_FailedOpenCounts: an open that ERRORS leaves the position
 // pending AND counted in FailedOpenUnits with its error surfaced; repairing +
-// re-acquiring clears both. Pins that the counts read the SAME lastAcquireErr
+// re-acquiring clears both. Pins that the counts read the SAME acquire records
 // record the degraded-boot path maintains.
 func TestMountReadiness_FailedOpenCounts(t *testing.T) {
 	backing := sharedfactory.NewBacking()
@@ -196,7 +196,7 @@ func TestMountReadinessPredicate_Thresholds(t *testing.T) {
 // boot mount DEFERS because a peer holds its serving marker (the real Phase 2f
 // deferral path) counts in FailedOpenUnits with the boot-deferred message, and
 // the record clears when the position mounts THROUGH THE MOUNT SEAM
-// (storeMount) alone - no acquire-path per-site Delete involved. The final
+// (the mount table's mount) alone - no acquire-path per-site clear involved. The final
 // release step is the regression pin: without the seam clear, the stale
 // boot-deferred record would resurface as a phantom failed acquire the moment
 // the position unmounts again.
@@ -236,24 +236,22 @@ func TestMountReadiness_BootDeferredCountsAndClearsAtMountSeam(t *testing.T) {
 		t.Fatalf("LastAcquireError = %q, want the boot-deferred message", r.LastAcquireError)
 	}
 
-	// The position later mounts THROUGH THE SEAM ONLY (storeMount), the way
-	// the reshard split mounts and any future mount site do - deliberately NOT
-	// via an acquire path with its own per-site Delete. The seam itself must
-	// clear the record.
+	// The position later mounts THROUGH THE SEAM ONLY (the mount table's mount),
+	// the way the reshard split mounts and any future mount site do -
+	// deliberately NOT via an acquire path with its own per-site clear. The seam
+	// itself must clear the record.
 	b, _, err := c.factory.OpenUnit(storageunit.ReplicaMount(served), acquireBaseEpoch)
 	if err != nil {
 		t.Fatalf("open for mount: %v", err)
 	}
-	c.mountMu.Lock()
-	c.storeMount(served, b)
-	c.mountMu.Unlock()
+	c.mounts.mount(served, b)
 
 	r = c.MountReadiness()
 	if r.MountedUnits != k || r.PendingUnits != 0 || r.FailedOpenUnits != 0 || r.LastAcquireError != "" {
 		t.Fatalf("after seam mount: %+v, want all %d mounted, no pending/failed", r, k)
 	}
 
-	// THE PIN: unmount again (a release never touches lastAcquireErr). A
+	// THE PIN: unmount again (a release never touches the acquire record). A
 	// stale record would resurface here; the seam clear means none exists.
 	c.reconcileMu.Lock()
 	c.releaseReplicaUnit(served)
@@ -303,7 +301,7 @@ func TestMountReadiness_LastAcquireErrorPicksMinPosition(t *testing.T) {
 	}
 }
 
-// TestMountReadiness_NotDesiredCountsNowhere: a position present in mountMap
+// TestMountReadiness_NotDesiredCountsNowhere: a position present in the mount table
 // (or carrying a stale acquire-error record) that this node does NOT desire -
 // the mid-drain loser shape - counts NOWHERE: not mounted, not pending, not
 // failed. Readiness is scoped to the desired set (what the node owes).
@@ -332,14 +330,12 @@ func TestMountReadiness_NotDesiredCountsNowhere(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open foreign: %v", err)
 	}
-	c.mountMu.Lock()
-	c.storeMount(foreign, fb)
-	c.mountMu.Unlock()
+	c.mounts.mount(foreign, fb)
 	// And a stale acquire-error record for ANOTHER non-desired position: the
 	// desired-set scoping must keep it out of the failed count too.
 	last := desired[len(desired)-1]
 	foreignPending := storageunit.NewReplicaUnit(last.Unit, 1-last.Replica)
-	c.lastAcquireErr.Store(foreignPending, "stale record for a position this node does not desire")
+	c.mounts.recordAcquireErr(foreignPending, "stale record for a position this node does not desire")
 
 	r := c.MountReadiness()
 	if r.DesiredUnits != k || r.MountedUnits != k || r.PendingUnits != 0 || r.FailedOpenUnits != 0 {

@@ -22,7 +22,7 @@ type MountReadiness struct {
 	// whether the acquire is quietly in flight, boot-deferred, or failing.
 	PendingUnits int
 	// FailedOpenUnits is the subset of pending positions whose most recent
-	// acquire attempt recorded an error in lastAcquireErr: an open that
+	// acquire attempt recorded an error in the mount table: an open that
 	// returned an error, or a boot-deferral that declined to open because a
 	// peer holds the serving marker. A successful mount deletes the record,
 	// so the count never carries a stale error for a mounted position.
@@ -35,8 +35,8 @@ type MountReadiness struct {
 }
 
 // MountReadiness returns this node's current mount-state counts. It reads the
-// SAME internal state DebugState reads (the desired set, mountMap under
-// mountMu, lastAcquireErr) but returns plain counts: O(desired positions),
+// SAME internal state DebugState reads (the desired set and the mount table's
+// mounts + acquire records) but returns plain counts: O(desired positions),
 // no formatting, cheap enough to sit behind a probe polled every few seconds.
 // In legacy single-backend mode (no per-unit mounts) every count is zero and
 // Ready is vacuously true: the one backend either opened at Open or Open
@@ -45,33 +45,18 @@ func (c *Cluster) MountReadiness() MountReadiness {
 	if !c.multi {
 		return MountReadiness{}
 	}
-	// The desired set is computed OUTSIDE mountMu (it takes the gen + ring
-	// locks internally), mirroring DebugState's lock ordering.
+	// The desired set is computed OUTSIDE the mount table's lock (it takes the
+	// gen + ring locks internally), mirroring DebugState's lock ordering; the
+	// tally then runs against ONE coherent view of the table.
 	desired := c.desiredReplicaUnits()
-
-	r := MountReadiness{DesiredUnits: len(desired)}
-	var firstFailed string // ru.String() of the failed position picked so far
-
-	c.mountMu.RLock()
-	for _, ru := range desired {
-		if _, ok := c.mountMap[ru]; ok {
-			r.MountedUnits++
-			continue
-		}
-		r.PendingUnits++
-		v, ok := c.lastAcquireErr.Load(ru)
-		if !ok {
-			continue
-		}
-		r.FailedOpenUnits++
-		msg, _ := v.(string)
-		if key := ru.String(); firstFailed == "" || key < firstFailed {
-			firstFailed = key
-			r.LastAcquireError = msg
-		}
+	counts := c.mounts.readiness(desired)
+	return MountReadiness{
+		DesiredUnits:     len(desired),
+		MountedUnits:     counts.Mounted,
+		PendingUnits:     counts.Pending,
+		FailedOpenUnits:  counts.Failed,
+		LastAcquireError: counts.FirstError,
 	}
-	c.mountMu.RUnlock()
-	return r
 }
 
 // Ready reports whether this node has mounted at least

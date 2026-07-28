@@ -78,9 +78,7 @@ func swapInFailingMount(t *testing.T, c *Cluster, key []byte) (storageunit.Repli
 		t.Fatalf("fixture: solo cluster should mount the unit for key %q", key)
 	}
 	failing := failWriteBackend{Backend: mounted}
-	c.mountMu.Lock()
-	c.mountMap[ru] = failing
-	c.mountMu.Unlock()
+	c.mounts.mountUndecorated(ru, failing)
 	return ru, failing
 }
 
@@ -143,9 +141,7 @@ func TestLocalWriteDiscipline_EveryEntryPointEvictsStaleMountAndRefuses(t *testi
 			// re-acquires it fresh. Asserted by pointer: a reconcile may have
 			// already swapped a healthy backend in, which is a pass; what must
 			// never remain is the failed handle itself.
-			c.mountMu.RLock()
-			cur, stillMounted := c.mountMap[ru]
-			c.mountMu.RUnlock()
+			cur, stillMounted := c.mounts.backendFor(ru)
 			if stillMounted && cur == failing {
 				t.Fatalf("%s left the failed mount for %v in the mount map; it must be evicted so the next reconcile re-acquires at the durable-max epoch", tc.name, ru)
 			}

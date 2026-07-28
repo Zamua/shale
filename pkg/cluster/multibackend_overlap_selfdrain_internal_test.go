@@ -34,7 +34,7 @@ func TestOverlap_Reconcile_SelfDraining_GateStable_NoReclaimEscalation(t *testin
 	if len(current) == 0 {
 		t.Fatal("self owns no positions; ring fixture broken")
 	}
-	// Mount via direct mountMap (no myOpenEpoch recorded) so ownOpenEpoch takes the
+	// Mount undecorated + directly (no open epoch recorded) so ownOpenEpoch takes the
 	// durable fallback - the same climbing source the staging escalation came
 	// through - making a reclaim re-capture observable as gate escalation.
 	h := backing.Handle()
@@ -43,7 +43,7 @@ func TestOverlap_Reconcile_SelfDraining_GateStable_NoReclaimEscalation(t *testin
 		if err != nil {
 			t.Fatalf("seed mount %v: %v", target, err)
 		}
-		c.mountMap[target] = b
+		c.mounts.mountUndecorated(target, b)
 	}
 
 	// Pass 1: positions enter Draining at the current durable epoch.
@@ -110,7 +110,7 @@ func TestOverlap_Reconcile_PendingMount_HeldAcrossReconciles(t *testing.T) {
 		if err != nil {
 			t.Fatalf("seed current mount %v: %v", target, err)
 		}
-		c.mountMap[target] = b
+		c.mounts.mountUndecorated(target, b)
 	}
 
 	pending := c.desiredPendingReplicaUnits(c.draining)
@@ -177,8 +177,8 @@ func TestOverlap_Reconcile_SelfDraining_ReleasedPositionNotReacquired(t *testing
 		if err != nil {
 			t.Fatalf("seed mount %v: %v", target, err)
 		}
-		c.mountMap[target] = b
-		c.myOpenEpoch.Store(target, ep)
+		c.mounts.mountUndecorated(target, b)
+		c.mounts.recordOpenEpoch(target, ep)
 	}
 
 	c.reconcileReplicaUnitsOverlap()
@@ -239,8 +239,8 @@ func TestOverlap_evictStaleMount_DoesNotEvictDrainingPosition(t *testing.T) {
 	if err != nil {
 		t.Fatalf("mount: %v", err)
 	}
-	c.mountMap[target] = b
-	c.myOpenEpoch.Store(target, ep)
+	c.mounts.mountUndecorated(target, b)
+	c.mounts.recordOpenEpoch(target, ep)
 
 	c.reconcileReplicaUnitsOverlap()
 	if c.handoffPhaseOf(target).Phase != storageunit.PhaseDraining {

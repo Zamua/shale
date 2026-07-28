@@ -141,13 +141,11 @@ func TestFanoutBinding_ReplicatedUnitWriteAcquiringShortfallStaysRetryable(t *te
 	// mount map. This is the real handoff state (owner, not yet mounted), not a
 	// synthetic error injected at the classifier.
 	gu := c.genUnitForKey(key)
-	c.mountMu.Lock()
-	for ru := range c.mountMap {
+	for _, ru := range c.mounts.mountedList() {
 		if ru.Unit == gu {
-			delete(c.mountMap, ru)
+			c.mounts.unmount(ru)
 		}
 	}
-	c.mountMu.Unlock()
 
 	assertAcquiringShortfall(t, "putReplicatedUnitAttempt", c.putReplicatedUnitAttempt(context.Background(), key, env))
 }
@@ -214,11 +212,9 @@ func TestFanoutBinding_ReshardDualWriteAcquiringShortfallStaysRetryable(t *testi
 	for _, l := range legs.auth {
 		authRUs[l.ru] = struct{}{}
 	}
-	c.mountMu.Lock()
 	for ru := range authRUs {
-		delete(c.mountMap, ru)
+		c.mounts.unmount(ru)
 	}
-	c.mountMu.Unlock()
 
 	if suppMounted := mountedCount(c, legs.supp); suppMounted != len(legs.supp) {
 		t.Fatalf("clearing the authoritative mounts also unmounted the supplementary generation "+
@@ -232,11 +228,9 @@ func TestFanoutBinding_ReshardDualWriteAcquiringShortfallStaysRetryable(t *testi
 // mountedCount reports how many of legs' positions currently resolve to a
 // mounted backend.
 func mountedCount(c *Cluster, legs []routedReplica) int {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
 	var n int
 	for _, l := range legs {
-		if _, ok := c.mountMap[l.ru]; ok {
+		if _, ok := c.mounts.backendFor(l.ru); ok {
 			n++
 		}
 	}

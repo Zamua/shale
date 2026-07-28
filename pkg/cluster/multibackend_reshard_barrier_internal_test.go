@@ -94,9 +94,7 @@ func barrierChildHas(t *testing.T, c *Cluster, gen storageunit.Generation, key s
 	h := storageunit.HashShardKey(c.shardKey([]byte(key)))
 	child := storageunit.UnitForHash(h, newCount)
 	gu := storageunit.NewGenUnit(gen+1, child)
-	c.mountMu.RLock()
-	be, ok := c.mountMap[replica0(gu)]
-	c.mountMu.RUnlock()
+	be, ok := c.mounts.backendFor(replica0(gu))
 	if !ok {
 		t.Fatalf("child store %s not mounted", gu)
 	}

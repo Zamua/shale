@@ -9,12 +9,12 @@ import (
 )
 
 // These tests pin the ACQUIRE RESULT CHANNEL: acquireReplicaUnitOverlapBlocking
-// reports success/failure through its ERROR RETURN, and lastAcquireErr is only a
+// reports success/failure through its ERROR RETURN, and the acquire record is only a
 // diagnostic mirror of that outcome.
 //
 // The structure they guard: the re-drive loop in acquireReplicaUnitOverlap used
-// to decide whether to retry by re-reading c.lastAcquireErr.Load(ru) after the
-// call. That map is shared by every mount site on the node - storeMount clears
+// to decide whether to retry by re-reading the acquire record for ru after the
+// call. That map is shared by every mount site on the node - the mount seam clears
 // the entry at the mount choke point, and the boot path writes a NON-error
 // "boot-deferred:" string under the same key - so an unrelated path's write
 // could decide this loop's branch: a concurrent mount of ru clearing the record
@@ -27,7 +27,7 @@ import (
 
 // TestAcquireOverlapBlocking_ReturnsOpenError pins the FAILURE direction: an
 // un-openable position surfaces the open error as the RETURN VALUE (the retry
-// loop's branch condition), and mirrors the same text into lastAcquireErr for
+// loop's branch condition), and mirrors the same text into the acquire record for
 // /debug/shale/state + MountReadiness.
 func TestAcquireOverlapBlocking_ReturnsOpenError(t *testing.T) {
 	backing := sharedfactory.NewBacking()
@@ -57,12 +57,12 @@ func TestAcquireOverlapBlocking_ReturnsOpenError(t *testing.T) {
 
 	// The diagnostic mirror is still populated: MountReadiness counts
 	// FailedOpenUnits off it and DebugState prints it.
-	v, ok := c.lastAcquireErr.Load(target)
+	s, ok := c.mounts.acquireErrOf(target)
 	if !ok {
-		t.Fatalf("lastAcquireErr must still be populated for %s (MountReadiness reads it)", target)
+		t.Fatalf("the acquire record must still be populated for %s (MountReadiness reads it)", target)
 	}
-	if s, _ := v.(string); !strings.Contains(s, "empty SSTable") {
-		t.Fatalf("lastAcquireErr for %s = %q, want the open error", target, s)
+	if !strings.Contains(s, "empty SSTable") {
+		t.Fatalf("the acquire record for %s = %q, want the open error", target, s)
 	}
 	if r := c.MountReadiness(); r.FailedOpenUnits == 0 || !strings.Contains(r.LastAcquireError, "empty SSTable") {
 		t.Fatalf("MountReadiness must surface the failed open: %+v", r)
@@ -81,7 +81,7 @@ func TestAcquireOverlapBlocking_ReturnsNilOnMount(t *testing.T) {
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
 
 	target := ru(0, 0, 0)
-	c.lastAcquireErr.Store(target, "boot-deferred: a peer is serving this position (serving marker epoch 3)")
+	c.mounts.recordAcquireErr(target, "boot-deferred: a peer is serving this position (serving marker epoch 3)")
 
 	if err := c.acquireReplicaUnitOverlapBlocking(target); err != nil {
 		t.Fatalf("a successful mount must return nil, got %v", err)
@@ -89,7 +89,7 @@ func TestAcquireOverlapBlocking_ReturnsNilOnMount(t *testing.T) {
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
 		t.Fatalf("%s should be mounted after a successful acquire", target)
 	}
-	if v, ok := c.lastAcquireErr.Load(target); ok {
+	if v, ok := c.mounts.acquireErrOf(target); ok {
 		t.Fatalf("a successful mount must clear the diagnostic record, still holds %q", v)
 	}
 }

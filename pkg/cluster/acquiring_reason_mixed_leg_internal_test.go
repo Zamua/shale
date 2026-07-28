@@ -136,7 +136,7 @@ func TestAcquiringReason_MixedAcquiringAndUnreachableLegPrefersAcquiring(t *test
 		if rr.member.ID != c.cfg.NodeID {
 			continue
 		}
-		if b, ok := c.mountMap[rr.ru]; ok {
+		if b, ok := c.mounts.backendFor(rr.ru); ok {
 			if err := b.Put([]byte(key), Encode(Envelope{Payload: []byte("v")})); err != nil {
 				t.Fatalf("seed the local replica position: %v", err)
 			}
@@ -157,13 +157,11 @@ func TestAcquiringReason_MixedAcquiringAndUnreachableLegPrefersAcquiring(t *test
 
 	// Now open the acquiring window: drop EVERY position of the key's unit from
 	// the mount map, leaving this node owner-but-unmounted.
-	c.mountMu.Lock()
-	for ru := range c.mountMap {
+	for _, ru := range c.mounts.mountedList() {
 		if ru.Unit == gu {
-			delete(c.mountMap, ru)
+			c.mounts.unmount(ru)
 		}
 	}
-	c.mountMu.Unlock()
 
 	_, err := c.getReplicatedUnitOnce(time.Now().Add(3*time.Second), []byte(key))
 	if err == nil {

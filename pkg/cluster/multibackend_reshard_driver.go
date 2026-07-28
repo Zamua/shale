@@ -78,17 +78,9 @@ func (c *Cluster) observeReshard() {
 }
 
 // ownedParentSlots returns the gen-g parent ReplicaUnits this node currently has
-// mounted (the slots it copies into children). Read under mountMu.
+// mounted (the slots it copies into children).
 func (c *Cluster) ownedParentSlots(gs genState) []storageunit.ReplicaUnit {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	var out []storageunit.ReplicaUnit
-	for ru := range c.mountMap {
-		if ru.Unit.Gen == gs.gen {
-			out = append(out, ru)
-		}
-	}
-	return out
+	return c.mounts.mountedAtGen(gs.gen)
 }
 
 // driveSplitCopies copies each owned, not-yet-cut-over parent slot into its
