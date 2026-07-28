@@ -21,6 +21,7 @@ jobs:
           - .
           - backends/pebble
           - backends/slate
+          - cmd
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -25,7 +25,7 @@ jobs:
       - name: go vet + build (workspace, all modules)
         run: |
           set -euo pipefail
-          MODULES=(. backends/pebble backends/slate)
+          MODULES=(. backends/pebble backends/slate cmd)
           for m in "${MODULES[@]}"; do
             echo "::group::go vet $m"; (cd "$m" && go vet ./...); echo "::endgroup::"
             echo "::group::go build $m"; (cd "$m" && go build ./...); echo "::endgroup::"
@@ -33,7 +33,7 @@ jobs:
       - name: per-module build (GOWORK=off)
         run: |
           set -euo pipefail
-          for m in backends/pebble backends/slate; do
+          for m in backends/pebble backends/slate cmd; do
             echo "::group::GOWORK=off go build $m"; (cd "$m" && GOWORK=off go build ./...); echo "::endgroup::"
           done
 
