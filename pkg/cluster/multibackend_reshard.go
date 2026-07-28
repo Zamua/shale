@@ -521,8 +521,7 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 		_ = c.factory.CloseUnit(storageunit.SoleMount(lowGU))
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
-	c.mounts.mount(replica0(lowGU), lowBE)
-	c.mounts.mount(replica0(highGU), highBE)
+	c.mounts.mountPair(replica0(lowGU), lowBE, replica0(highGU), highBE)
 
 	// The source backend (old gen-g unit K), which keeps serving throughout.
 	src, ok := c.mounts.backendFor(replica0(oldGU))

@@ -511,6 +511,24 @@ func (t *mountTable) mount(ru storageunit.ReplicaUnit, b backend.Backend) {
 	t.mountLocked(ru, b)
 }
 
+// mountPair installs BOTH positions in ONE hold, so no reader can observe one
+// without the other. The bisect needs this: its two gen-(g+1) children are the
+// halves of one parent's key-space, and a torn view is a view of a key-space
+// that is only half-covered. Two successive mount calls would publish that
+// intermediate state.
+//
+// No CURRENT reader is harmed by the torn view (the blob sweep re-checks its
+// unit-token set and fails closed, and the R=1 reconcile is excluded by
+// reshardMu), so this is not a bug fix. It is here so the all-or-nothing
+// property is a property of the type rather than a standing bet that no future
+// reader will care - which is the same reason the mutex is private.
+func (t *mountTable) mountPair(ruA storageunit.ReplicaUnit, bA backend.Backend, ruB storageunit.ReplicaUnit, bB backend.Backend) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.mountLocked(ruA, bA)
+	t.mountLocked(ruB, bB)
+}
+
 // mountUnlessClosed installs ru -> b unless the cluster is shutting down,
 // reporting whether it mounted. The closed check pairs atomically with the
 // insert: Close sets the flag BEFORE draining the table, so observing false
@@ -572,17 +590,29 @@ func (t *mountTable) evictIfSame(ru storageunit.ReplicaUnit, failed backend.Back
 // it dropped, so the caller closes them OUTSIDE the lock. Collect-and-delete is
 // one critical section so a concurrent mount cannot slip a position past the
 // sweep between the two halves.
+//
+// It deletes the POSITIONS it collected rather than re-deriving replica 0 from
+// each unit. The inline predecessor derived replica0(gu), which is the same key
+// on the only path that reaches this (the R=1 reshard barrier, where every
+// mount is at replica 0) but silently wrong above R=1: a position at replica 1
+// would be REPORTED dropped - so the caller closes its backend - while its table
+// entry survived, leaving a mount pointing at a closed database. Extracting this
+// into a named, reusable method is what makes that worth correcting now: the
+// quirk was invisible while it was four lines inside one caller, and is a trap
+// once it has a name and a doc comment inviting a second one.
 func (t *mountTable) dropGeneration(gen storageunit.Generation) []storageunit.GenUnit {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	dropped := make([]storageunit.GenUnit, 0)
+	positions := make([]storageunit.ReplicaUnit, 0)
 	for ru := range t.mounts {
 		if ru.Unit.Gen == gen {
 			dropped = append(dropped, ru.Unit)
+			positions = append(positions, ru)
 		}
 	}
-	for _, gu := range dropped {
-		delete(t.mounts, replica0(gu))
+	for _, ru := range positions {
+		delete(t.mounts, ru)
 	}
 	return dropped
 }
