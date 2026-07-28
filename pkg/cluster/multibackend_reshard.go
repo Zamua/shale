@@ -250,9 +250,7 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, ru st
 	pos, ok := c.localReplicaPos(gu)
 	if ok {
 		ru = storageunit.NewReplicaUnit(gu, pos)
-		c.mountMu.RLock()
-		be, ok = c.mountMap[ru]
-		c.mountMu.RUnlock()
+		be, ok = c.mounts.backendFor(ru)
 		if ok {
 			return be, ru, pause.RUnlock, true
 		}
@@ -269,17 +267,7 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, ru st
 	// mount recodes to the transient) and applied apply-if-newer, so a fallback
 	// can degrade to a retry but never to a wrong ack. Lowest-position pick keeps
 	// the resolve deterministic for a dual-position holder.
-	c.mountMu.RLock()
-	found := false
-	for cand, b := range c.mountMap {
-		if cand.Unit != gu {
-			continue
-		}
-		if !found || cand.Replica < ru.Replica {
-			ru, be, found = cand, b, true
-		}
-	}
-	c.mountMu.RUnlock()
+	be, ru, found := c.mounts.lowestForUnit(gu)
 	if !found {
 		return nil, storageunit.ReplicaUnit{}, pause.RUnlock, false
 	}
@@ -301,29 +289,18 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, ru st
 // This is the Phase 3 self-heal philosophy applied to a fenced mount; it keeps
 // the NO-ACKED-WRITE-LOST invariant by never acking a write that did not land.
 func (c *Cluster) evictStaleMount(ru storageunit.ReplicaUnit, failed backend.Backend) {
-	c.mountMu.Lock()
-	// Do NOT evict a position mid-DRAIN: a fenced/failed write on a Draining
-	// position is the EXPECTED successor-fence signal (the successor opened the
-	// shared db at a higher epoch, fencing the leaver's handle), NOT the stale-
-	// handle factory desync this eviction+re-acquire path exists for (#408).
-	// Evicting here would drop the leaver's mount before the successor's serving
-	// marker proves it is serving, and the cleared mount would then be re-grabbed
-	// by the reconcile - the mutual-fencing ping-pong that hangs the graceful
-	// drain to its timeout (the write-path half of #410). The fenced write simply
-	// fails on the leaver's leg and retries onto the union (the successor's leg
-	// acked it); drainCheck completes the drain on the successor's marker.
-	if st, ok := c.handoffPhase[ru]; ok && st.Phase.IsLoser() {
-		c.mountMu.Unlock()
-		return
-	}
-	evicted := false
-	if cur, ok := c.mountMap[ru]; ok && cur == failed {
-		delete(c.mountMap, ru)
-		c.myOpenEpoch.Delete(ru) // re-acquire records a fresh open epoch.
-		evicted = true
-	}
-	c.mountMu.Unlock()
-	if evicted && c.ring != nil {
+	// evictIfSame does NOT evict a position mid-DRAIN: a fenced/failed write on a
+	// Draining position is the EXPECTED successor-fence signal (the successor
+	// opened the shared db at a higher epoch, fencing the leaver's handle), NOT
+	// the stale-handle factory desync this eviction+re-acquire path exists for
+	// (#408). Evicting there would drop the leaver's mount before the successor's
+	// serving marker proves it is serving, and the cleared mount would then be
+	// re-grabbed by the reconcile - the mutual-fencing ping-pong that hangs the
+	// graceful drain to its timeout (the write-path half of #410). The fenced
+	// write simply fails on the leaver's leg and retries onto the union (the
+	// successor's leg acked it); drainCheck completes the drain on the
+	// successor's marker.
+	if c.mounts.evictIfSame(ru, failed) && c.ring != nil {
 		// Schedule a (debounced) reconcile so the unit is RE-ACQUIRED fresh at
 		// the durable-max epoch promptly, rather than waiting for the slow
 		// self-heal loop tick. Safe to call from the KV path: scheduleReconcile
@@ -505,13 +482,10 @@ func (c *Cluster) Reshard() error {
 // bisects the units it locally owns; the new children land on their ring
 // owners via reconcile afterward).
 func (c *Cluster) mountedOldUnits(gen storageunit.Generation) []storageunit.UnitID {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	out := make([]storageunit.UnitID, 0, len(c.mountMap))
-	for ru := range c.mountMap {
-		if ru.Unit.Gen == gen {
-			out = append(out, ru.Unit.ID)
-		}
+	atGen := c.mounts.mountedAtGen(gen)
+	out := make([]storageunit.UnitID, 0, len(atGen))
+	for _, ru := range atGen {
+		out = append(out, ru.Unit.ID)
 	}
 	// ascending for a deterministic march
 	for i := 1; i < len(out); i++ {
@@ -537,7 +511,7 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 	// 1. CREATE the two fresh gen-(g+1) children (open at the base epoch; they
 	// are brand-new databases with no prior writer to fence). Mount them so
 	// the copy can write into them AND so the local routing fast-path resolves
-	// them once the cut-over flag flips (resolveGenUnit -> mountMap lookup).
+	// them once the cut-over flag flips (resolveGenUnit -> mount lookup).
 	lowBE, _, err := c.factory.OpenUnit(storageunit.SoleMount(lowGU), epochAtOpen)
 	if err != nil {
 		return fmt.Errorf("open child %s: %w", lowGU, err)
@@ -547,15 +521,10 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 		_ = c.factory.CloseUnit(storageunit.SoleMount(lowGU))
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
-	c.mountMu.Lock()
-	c.storeMount(replica0(lowGU), lowBE)
-	c.storeMount(replica0(highGU), highBE)
-	c.mountMu.Unlock()
+	c.mounts.mountPair(replica0(lowGU), lowBE, replica0(highGU), highBE)
 
 	// The source backend (old gen-g unit K), which keeps serving throughout.
-	c.mountMu.RLock()
-	src, ok := c.mountMap[replica0(oldGU)]
-	c.mountMu.RUnlock()
+	src, ok := c.mounts.backendFor(replica0(oldGU))
 	if !ok {
 		return fmt.Errorf("old unit %s not mounted", oldGU)
 	}
@@ -606,9 +575,7 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 	// Retire old-K: its key-space has cut over, so release the lease + free
 	// the gen-g database. CloseUnit at the OLD generation does not touch the
 	// gen-(g+1) children (distinct identities).
-	c.mountMu.Lock()
-	delete(c.mountMap, replica0(oldGU))
-	c.mountMu.Unlock()
+	c.mounts.unmount(replica0(oldGU))
 	_ = c.factory.CloseUnit(storageunit.SoleMount(oldGU))
 	return nil
 }

@@ -317,7 +317,7 @@ func TestFinalizeSplit_AdvancesMarkerWithRealParents(t *testing.T) {
 	enterSplit(t, c)
 
 	parentRU := mountParentAndChildren(t, c, 0, storageunit.MustUnitCount(4))
-	pb := c.mountMap[parentRU]
+	pb, _ := c.mounts.backendFor(parentRU)
 	for _, k := range keysInUnit(t, c, 0, storageunit.MustUnitCount(4), 4) {
 		env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "n1"}, Payload: []byte("x")})
 		if err := pb.Put(k, env); err != nil {
@@ -335,9 +335,7 @@ func TestFinalizeSplit_AdvancesMarkerWithRealParents(t *testing.T) {
 	if rec := readMarker(t, c.cfg.ConditionalStore); rec.Gen != 1 || rec.Count != 8 {
 		t.Fatalf("marker not advanced through a real split: want {gen:1,count:8}, got {gen:%d,count:%d}", rec.Gen, rec.Count)
 	}
-	c.mountMu.RLock()
-	_, stillMounted := c.mountMap[parentRU]
-	c.mountMu.RUnlock()
+	_, stillMounted := c.mounts.backendFor(parentRU)
 	if stillMounted {
 		t.Fatalf("parent %v should be retired after finalize", parentRU)
 	}

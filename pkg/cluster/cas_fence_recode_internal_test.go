@@ -71,7 +71,7 @@ func TestCommitCASApply_FencedAtAnyOp_RecodedToTransient(t *testing.T) {
 				t.Fatalf("self desires no positions; ring fixture broken")
 			}
 			for _, target := range desired {
-				c.mountMap[target] = fenceAtBackend{Backend: memory.New(), at: at}
+				c.mounts.mountUndecorated(target, fenceAtBackend{Backend: memory.New(), at: at})
 			}
 
 			pinKey := keyResolvingToOwnedMount(t, c)

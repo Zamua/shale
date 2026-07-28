@@ -139,8 +139,8 @@ func TestPutReshardDualWrite_LandsInBothGenerations(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open child: %v", err)
 	}
-	c.mountMap[parentRU] = pb
-	c.mountMap[childRU] = cb
+	c.mounts.mountUndecorated(parentRU, pb)
+	c.mounts.mountUndecorated(childRU, cb)
 
 	// All legs local to self, so each dispatch applies to its mounted backend.
 	legs := reshardLegs{

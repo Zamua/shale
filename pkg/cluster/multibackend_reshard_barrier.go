@@ -318,7 +318,7 @@ func (c *Cluster) reshardFlip(targetGen storageunit.Generation) error {
 	// ATOMIC FLIP: publish the gen-(g+1) routing state in one store. From this
 	// instant resolveGenUnit returns GenUnit{gen+1, UnitForHash(h, 2N)} for
 	// every key (cutOver empty: the whole space is now at the new generation),
-	// and the mount-map lookup finds the gen-(g+1) child the bisect created.
+	// and the mount lookup finds the gen-(g+1) child the bisect created.
 	c.commitGenState(genState{
 		gen:     targetGen,
 		count:   nextCount,
@@ -330,9 +330,7 @@ func (c *Cluster) reshardFlip(targetGen storageunit.Generation) error {
 	// generation does not touch the distinct gen-(g+1) children.
 	for _, k := range oldUnits {
 		oldGU := storageunit.NewGenUnit(start.gen, k)
-		c.mountMu.Lock()
-		delete(c.mountMap, replica0(oldGU))
-		c.mountMu.Unlock()
+		c.mounts.unmount(replica0(oldGU))
 		_ = c.factory.CloseUnit(storageunit.SoleMount(oldGU))
 	}
 	return nil
@@ -548,17 +546,7 @@ func (c *Cluster) discardGenUnits(gen, keepGen storageunit.Generation) {
 		// Defensive: never discard the generation the node is staying at.
 		return
 	}
-	c.mountMu.Lock()
-	toDrop := make([]storageunit.GenUnit, 0)
-	for ru := range c.mountMap {
-		if ru.Unit.Gen == gen {
-			toDrop = append(toDrop, ru.Unit)
-		}
-	}
-	for _, gu := range toDrop {
-		delete(c.mountMap, replica0(gu))
-	}
-	c.mountMu.Unlock()
+	toDrop := c.mounts.dropGeneration(gen)
 	for _, gu := range toDrop {
 		_ = c.factory.CloseUnit(storageunit.SoleMount(gu))
 	}
@@ -617,15 +605,10 @@ func (c *Cluster) bisectUnitStatic(gen storageunit.Generation, k storageunit.Uni
 		_ = c.factory.CloseUnit(storageunit.SoleMount(lowGU))
 		return fmt.Errorf("open child %s: %w", highGU, err)
 	}
-	c.mountMu.Lock()
-	c.storeMount(replica0(lowGU), lowBE)
-	c.storeMount(replica0(highGU), highBE)
-	c.mountMu.Unlock()
+	c.mounts.mountPair(replica0(lowGU), lowBE, replica0(highGU), highBE)
 
 	// The source backend (old gen-g unit K), which keeps serving reads.
-	c.mountMu.RLock()
-	src, ok := c.mountMap[replica0(oldGU)]
-	c.mountMu.RUnlock()
+	src, ok := c.mounts.backendFor(replica0(oldGU))
 	if !ok {
 		return fmt.Errorf("old unit %s not mounted", oldGU)
 	}

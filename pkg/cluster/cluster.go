@@ -221,7 +221,7 @@ type Config struct {
 	// hold the node-wide open permit before the permit watchdog releases
 	// the PERMIT ONLY, so queued positions proceed while the slow/hung open
 	// keeps running to completion (the FFI open is not cancellable; the
-	// position stays deduped by acquireInFlight, so no double-open). This
+	// position stays deduped by the in-flight set, so no double-open). This
 	// converts a wedged open from a total acquire-pipeline stall into one
 	// stuck position. See docs/SPEC.md "v0.8 Phase 2e" (the permit
 	// watchdog) for the overlap-risk reasoning. Zero (or negative) is
@@ -459,117 +459,37 @@ type Cluster struct {
 
 	// multi-backend mode (v0.8). multi is true when the cluster runs in
 	// multi-backend mode (BackendFactory + UnitCount set); in that mode
-	// c.backend is nil and every op resolves a per-unit backend from
-	// mountMap instead. In legacy mode multi is false, mountMap is nil, and
-	// none of this is touched. factory opens / closes per-unit backends;
-	// unitCount is the fixed N AT THE STARTING GENERATION (the live count +
-	// generation that routing uses are in genState, which a doubling reshard
-	// advances). genOwner answers "which node owns this generation-qualified
-	// unit" off the ring (default c.genUnitOwner; tests override it). mountMap
-	// holds the units this node has mounted, KEYED BY GenUnit so a gen-g unit
-	// K and a gen-(g+1) unit K (the doubling's old + new) coexist without
-	// colliding. The map is initialized at Open, then mutated by the Phase 3
-	// lease-handoff reconcile on every membership change (acquire newly-owned
-	// / release no-longer-owned) and by the Phase 4 resharder (bisect creates
-	// the gen-(g+1) children, cut-over retires the gen-g unit). mountMu guards
-	// mountMap. See multibackend.go and multibackend_rebalance.go.
-	//
-	// v0.8 Phase 2e: mountMap is keyed by ReplicaUnit = (GenUnit, replica
-	// position), NOT bare GenUnit, so a node can hold the OLD position
-	// (draining) AND the NEW position (acquiring) of the SAME unit at once
-	// during an overlap handoff. At R=1 (and in the legacy / reshard paths) a
-	// node holds at most one position per unit and uses position 0, so a
-	// ReplicaUnit-keyed map is equivalent to the old per-GenUnit map: the
-	// non-replicated paths key via replica0(gu). The separate replicaPos map is
-	// folded into the key (the position is ru.Replica).
+	// c.backend is nil and every op resolves a per-unit backend from the mount
+	// table instead. In legacy mode multi is false and none of this is touched.
+	// factory opens / closes per-unit backends; unitCount is the fixed N AT THE
+	// STARTING GENERATION (the live count + generation that routing uses are in
+	// genState, which a doubling reshard advances). genOwner answers "which node
+	// owns this generation-qualified unit" off the ring (default c.genUnitOwner;
+	// tests override it).
 	multi     bool
 	factory   storageunit.BackendFactory
 	unitCount storageunit.UnitCount
 	genOwner  func(storageunit.GenUnit) (storageunit.NodeID, bool)
-	mountMu   sync.RWMutex
-	mountMap  map[storageunit.ReplicaUnit]backend.Backend
 
-	// lastAcquireErr records, per ReplicaUnit, why a DESIRED position is not
-	// mounted: the most recent OpenReplicaUnit failure during an acquire
-	// (clean-cut, overlap, rebalance or degraded boot), or the non-error
-	// "boot-deferred:" note when boot declined to open a position a live peer
-	// is serving. The acquire paths otherwise swallow the error and retry next
-	// tick, so a position that fails to mount forever would be invisible.
-	//
-	// WRITE-ONLY OBSERVABILITY. The mount paths WRITE it; only the reporting
-	// surfaces READ it (DebugState's /debug/shale/state dump and MountReadiness,
-	// which counts FailedOpenUnits and picks LastAcquireError from it). No
-	// control flow may branch on it. It is a single map shared by every mount
-	// site on the node: storeMount clears the entry at the mount choke point and
-	// boot writes a NON-error string under the same key, so a retry loop reading
-	// it back would let an unrelated path's write decide its branch (the overlap
-	// re-drive loop did exactly that until acquireReplicaUnitOverlapBlocking was
-	// given an error return). Records for positions that are no longer desired
-	// are ignored by the readers rather than swept.
-	//
-	// sync.Map so it needs no Open-time init and no extra lock ordering.
-	lastAcquireErr sync.Map // storageunit.ReplicaUnit -> string
-
-	// myOpenEpoch records the EXACT epoch THIS node opened each mounted
-	// ReplicaUnit at, captured from OpenReplicaUnit's RETURN VALUE (not a re-read
-	// of the shared, climbing DurableEpochReplica). It is the STABLE drain-release
-	// gate (beginDrain) AND the epoch the serving marker carries: both must be
-	// THIS node's exact open epoch, captured once, immutable for the mount's life,
-	// so a successor's marker (at the successor's open epoch == leaver's + 1) is
-	// permanently strictly above the leaver's gate. Recorded just before
-	// mountMap[ru] at every open site (so a beginDrain that sees the mount also
-	// sees the epoch); cleared on release. See docs/SPEC.md v0.8 Phase 2e. sync.Map
-	// (no Open-time init).
-	myOpenEpoch sync.Map // storageunit.ReplicaUnit -> storageunit.Epoch
-
-	// handoffPhase holds, per IN-FLIGHT ReplicaUnit, the pure
-	// ownership-transition state of an overlap handoff (v0.8 Phase 2e,
-	// Option B). Absence means steady state: Owned if mountMap[ru] is present,
-	// Absent otherwise. Only positions mid-transition carry a HandoffState:
-	//
-	//   - on the GAINER (taking over a position): PhaseAcquiring -> PhaseReady.
-	//     While Acquiring the new owner is still mounting and FORWARDS routed
-	//     ops to the recorded Predecessor (the position-addressed forward); at
-	//     Ready its mountMap[ru] entry is inserted (the mount flip) and it
-	//     serves locally.
-	//   - on the LOSER (giving up a position): PhaseDraining -> PhaseReleasing.
-	//     While Draining the old owner KEEPS SERVING (directly and for the new
-	//     owner's forwards); at Releasing it tears down its mount exactly once
-	//     after the new owner is proven Ready via the durable serving marker.
-	//
-	// Guarded by mountMu (the same lock as mountMap), so the phase value + the
-	// mount entry move together: the complete state of an in-flight position is
-	// the phase value + the mount entry + (Acquiring) the recorded predecessor,
-	// all keyed by ReplicaUnit. NO scattered isDraining/hasFlipped booleans.
-	// Nil outside the R>1 (multiReplicated) paths.
-	handoffPhase map[storageunit.ReplicaUnit]storageunit.HandoffState
-
-	// acquireInFlight tracks ReplicaUnits whose overlap mount (the slow
-	// OpenReplicaUnit) is currently running in a background goroutine. The
-	// overlap acquire opens asynchronously so a node gaining MANY positions at
-	// once (a graceful scale-down hands a survivor all the leaving node's
-	// positions) mounts them CONCURRENTLY instead of serializing one slow open
-	// after another inside the reconcile - which would make the drain exceed its
-	// budget and the leaving node depart before the hand-off completes. The set
-	// is the idempotency guard: a reconcile that re-drives an already-in-flight
-	// acquire must NOT spawn a second open for the same position. Guarded by
-	// mountMu.
-	acquireInFlight map[storageunit.ReplicaUnit]struct{}
-
-	// openSem is the node-wide permit gate bounding how many replica-unit
-	// opens run CONCURRENTLY on this node's factory, sized by
-	// Config.OpenConcurrency (normalized via openConcurrency; default 1).
-	// The background overlap acquires (acquireReplicaUnitOverlap goroutines)
-	// take a permit around each OpenReplicaUnit, so a node gaining many
-	// positions at once queues the opens at the SAME bound the boot mount
-	// pool (mountReplicaUnits) enforces - one knob governs every real-data
-	// open on the node. The queued positions stay PhaseAcquiring (the union
-	// covers them) so bounding costs availability nothing; it only sequences
-	// the FFI opens, which is required while concurrent real-data opens are
-	// unsafe in the shipped binding (see defaultOpenConcurrency). Created
-	// LAZILY under mountMu on first use so its size reflects the config at
-	// first acquire (mirrors mountReplicaUnits sizing its pool at call time).
-	openSem chan struct{}
+	// mounts is the MOUNT TABLE: the single owner of "which storage-unit
+	// positions does this node currently have open, at what epoch, in what
+	// handoff phase". It holds the mount map (keyed by ReplicaUnit = (GenUnit,
+	// replica position), so a gen-g unit K and a gen-(g+1) unit K coexist, and so
+	// a node can hold the OLD (draining) and NEW (acquiring) position of the SAME
+	// unit at once during an overlap handoff), the per-position open epoch, the
+	// in-flight handoff phase, the in-flight acquire set, the per-position
+	// acquire diagnostic, and the node-wide open-permit gate - all behind ONE
+	// PRIVATE mutex it takes itself. Nothing outside mounttable.go can hold that
+	// lock, so every multi-step transition is a table method rather than a
+	// hand-taken lock plus a convention. The map is populated at Open, then
+	// mutated by the Phase 3 lease-handoff reconcile on every membership change
+	// (acquire newly-owned / release no-longer-owned) and by the Phase 4
+	// resharder (bisect creates the gen-(g+1) children, cut-over retires the
+	// gen-g unit). Initialized by Open in every mode; empty in legacy mode, and
+	// its zero value reads as "nothing mounted" so a Cluster built without Open
+	// (a white-box test fixture) behaves as the nil maps this replaced did. See
+	// mounttable.go, multibackend.go and multibackend_rebalance.go.
+	mounts mountTable
 
 	// drainPollerActive guards the at-most-one background fast drain poller
 	// (ensureDrainPoller): while any position is Draining the poller re-runs
@@ -577,12 +497,6 @@ type Cluster struct {
 	// owner releases within ~half a second of its successor's serving marker
 	// instead of waiting for the periodic reconcile tick.
 	drainPollerActive atomic.Bool
-
-	// permitHolders tracks which positions currently hold a node-wide open
-	// permit and since when (ru -> time.Time). Observability only: the
-	// per-tick acquire-queue summary line names the oldest holder, which is
-	// exactly the datum a wedged-open pipeline stall hides without it.
-	permitHolders sync.Map
 
 	// draining is a TEST-ONLY override for the gossiped Draining set: when
 	// non-nil, drainingIDs returns it directly instead of reading the membership
@@ -667,10 +581,11 @@ type Cluster struct {
 	// map at a time, so two membership changes whose settle timers fire
 	// close together cannot interleave mounts. It is the multi-backend
 	// analogue of the legacy single-flight settle-timer Evaluate. Nil work
-	// in legacy mode (the reconcile never runs there). It is DISTINCT from
-	// mountMu: mountMu guards individual mount-map reads/writes (taken by
-	// every KV op); reconcileMu serializes whole reconcile PASSES so the
-	// acquire/release diff sees a coherent before-state.
+	// in legacy mode (the reconcile never runs there). It is DISTINCT from the
+	// mount table's own lock: that one guards individual mount-map
+	// reads/writes (taken by every KV op); reconcileMu serializes whole
+	// reconcile PASSES so the acquire/release diff sees a coherent
+	// before-state.
 	reconcileMu sync.Mutex
 
 	// Populated in multi-node mode; nil in single-node mode.
@@ -824,6 +739,10 @@ func Open(cfg Config) (*Cluster, error) {
 		closeCh:            make(chan struct{}),
 		peerClientsBlocked: cfg.TestingBlockPeerDials,
 	}
+	// The mount table is initialized unconditionally (it is cheap and empty in
+	// legacy mode) so no path has to check for it, and HERE - after c exists -
+	// because it closes over c's mount decorator and closed flag.
+	c.mounts.init(c)
 	c.repairCtx, c.repairCancel = context.WithCancel(context.Background())
 
 	if cfg.BindAddr == "" {
@@ -1166,12 +1085,12 @@ func (c *Cluster) LocalGet(key []byte) ([]byte, error) {
 		// the ring moved it off us (the v0.3 receive-window forwarder AND a v0.8
 		// DRAINING node, which is excluded from the ownership ring but still holds
 		// the unit mounted while it hands off). localBackendForKey would disclaim
-		// it via the ring index; scan the mountMap by unit instead.
+		// it via the ring index; scan the mount table by unit instead.
 		b, ok := c.localMountedBackendForKey(key)
 		if !ok {
 			return nil, backend.ErrNotFound
 		}
-		// b is the fence-self-healing mount (storeMount): a fenced forwarded read
+		// b is the fence-self-healing mount (the mount seam): a fenced forwarded read
 		// recodes to transient + evicts the stale mount on the node that physically
 		// holds it, so it self-heals instead of returning the raw fence forever.
 		return b.Get(key)
@@ -1644,7 +1563,7 @@ func (c *Cluster) Get(key []byte) ([]byte, error) {
 				// acquiring-window error (never serve a stale result).
 				return nil, errUnitAcquiring("Get")
 			}
-			// b is the fence-self-healing mount (storeMount): a fenced read
+			// b is the fence-self-healing mount (the mount seam): a fenced read
 			// self-heals here, so the simple Get is safe.
 			return b.Get(key)
 		}

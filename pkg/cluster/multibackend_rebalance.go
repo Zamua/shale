@@ -158,7 +158,7 @@ func (c *Cluster) runReconcile() {
 // re-acquires it), so it is safe to run on every membership event.
 //
 // RESHARD INTERACTION (Phase 4): a unit being actively bisected by a local
-// Reshard is a mountMap entry the reshard owns for the duration of the
+// Reshard is a mount-table entry the reshard owns for the duration of the
 // bisect. To avoid the reconcile fighting the resharder (releasing a
 // mid-bisect old unit, or releasing a freshly-created child before the
 // generation advances), the reconcile takes reshardMu for the snapshot +
@@ -184,8 +184,8 @@ func (c *Cluster) runReconcile() {
 // post-bisect call) or because runReconcile took reshardMu before reconcileMu.
 // This mutual exclusion matters because a bisect transiently mounts the
 // gen-(g+1) children and holds the gen-g old unit until cut-over; a reconcile
-// running concurrently could release those mid-bisect. mountMap mutations
-// inside acquireUnit / releaseUnit take mountMu.
+// running concurrently could release those mid-bisect. The mount mutations
+// inside acquireUnit / releaseUnit go through the mount table.
 func (c *Cluster) reconcileUnits() {
 	if c.replicaLayout() {
 		// v0.9 decentralized online reshard: when an Arbiter is wired (opt-in via
@@ -243,18 +243,16 @@ func (c *Cluster) reconcileUnits() {
 		desiredSet[gu] = struct{}{}
 	}
 
-	// Snapshot the currently-mounted set under the read lock so we diff
-	// against a coherent view. acquireUnit / releaseUnit re-take mountMu
-	// (write) to mutate, so a concurrent reader of the mount map never sees
-	// a half-applied reconcile.
-	c.mountMu.RLock()
-	mounted := make(map[storageunit.GenUnit]struct{}, len(c.mountMap))
-	for ru := range c.mountMap {
+	// Snapshot the currently-mounted set so we diff against a coherent view.
+	// acquireUnit / releaseUnit re-enter the table to mutate, so a concurrent
+	// reader of the mount map never sees a half-applied reconcile.
+	snapshot := c.mounts.mountedList()
+	mounted := make(map[storageunit.GenUnit]struct{}, len(snapshot))
+	for _, ru := range snapshot {
 		// R=1 lease-handoff path: a node holds each unit at position 0, so the
 		// GenUnit view is ru.Unit.
 		mounted[ru.Unit] = struct{}{}
 	}
-	c.mountMu.RUnlock()
 
 	// RELEASE first: units this node no longer owns. The old owner of a
 	// handed-off unit runs this half. CloseUnit flushes (durable) then
@@ -296,7 +294,7 @@ func (c *Cluster) reconcileUnits() {
 // acquire. We never serve gu from a wrong engine and never lose a write by
 // failing to mount.
 //
-// Caller MUST hold reconcileMu. mountMap mutation takes mountMu.
+// Caller MUST hold reconcileMu. The mount mutation goes through the mount table.
 func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 	epoch := c.nextEpochFor(gu)
 	b, _, err := c.factory.OpenUnit(storageunit.SoleMount(gu), epoch)
@@ -306,22 +304,18 @@ func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 		// mount a half-open unit. Record the failure so the readiness
 		// counts (FailedOpenUnits/LastAcquireError) see it, keyed by the
 		// R=1 mount position exactly as acquireReplicaUnit records at R>1.
-		c.lastAcquireErr.Store(replica0(gu), err.Error())
+		c.mounts.recordAcquireErr(replica0(gu), err.Error())
 		return
 	}
-	c.lastAcquireErr.Delete(replica0(gu))
-	c.mountMu.Lock()
-	if c.closed.Load() {
-		// Close raced us between OpenUnit and the mount. Close already ran
-		// closeMountedUnits over the mountMap, so inserting now would leak
-		// this freshly-opened backend past shutdown (and risk a write after
-		// Close). Release it instead of mounting.
-		c.mountMu.Unlock()
+	c.mounts.clearAcquireErr(replica0(gu))
+	if !c.mounts.mountUnlessClosed(replica0(gu), b) {
+		// Close raced us between OpenUnit and the mount. Close already drained
+		// the mount table, so inserting now would leak this freshly-opened
+		// backend past shutdown (and risk a write after Close). Release it
+		// instead of mounting.
 		_ = c.factory.CloseUnit(storageunit.SoleMount(gu))
 		return
 	}
-	c.storeMount(replica0(gu), b)
-	c.mountMu.Unlock()
 }
 
 // releaseUnit unmounts the generation-qualified unit gu via CloseUnit, which
@@ -337,11 +331,9 @@ func (c *Cluster) acquireUnit(gu storageunit.GenUnit) {
 // after the close would leave a brief window where the local map still
 // points at a backend whose lease is being torn down.
 //
-// Caller MUST hold reconcileMu. mountMap mutation takes mountMu.
+// Caller MUST hold reconcileMu. The mount mutation goes through the mount table.
 func (c *Cluster) releaseUnit(gu storageunit.GenUnit) {
-	c.mountMu.Lock()
-	delete(c.mountMap, replica0(gu))
-	c.mountMu.Unlock()
+	c.mounts.unmount(replica0(gu))
 	// CloseUnit is idempotent + best-effort: a close error does not change
 	// ownership (the ring already moved gu off this node), and the new
 	// owner's higher-epoch open fences any writer this close failed to stop.
@@ -382,10 +374,7 @@ func (c *Cluster) TestingClearMount(u storageunit.UnitID) {
 	if !c.multi {
 		return
 	}
-	gu := storageunit.NewGenUnit(c.genSnapshot().gen, u)
-	c.mountMu.Lock()
-	delete(c.mountMap, replica0(gu))
-	c.mountMu.Unlock()
+	c.mounts.unmount(replica0(storageunit.NewGenUnit(c.genSnapshot().gen, u)))
 }
 
 // errAcquiringSentinel is the package-private sentinel that tags every

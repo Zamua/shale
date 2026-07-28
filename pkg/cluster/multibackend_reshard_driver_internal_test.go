@@ -76,7 +76,7 @@ func TestFinalizeSplit_AdvancesAndRetiresParents(t *testing.T) {
 	enterSplit(t, c)
 
 	parentRU := mountParentAndChildren(t, c, 0, storageunit.MustUnitCount(4))
-	pb := c.mountMap[parentRU]
+	pb, _ := c.mounts.backendFor(parentRU)
 	for _, k := range keysInUnit(t, c, 0, storageunit.MustUnitCount(4), 4) {
 		env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "n1"}, Payload: []byte("x")})
 		if err := pb.Put(k, env); err != nil {
@@ -97,9 +97,7 @@ func TestFinalizeSplit_AdvancesAndRetiresParents(t *testing.T) {
 	if after.gen != 1 || after.count.N() != 8 || !after.nextCount.IsZero() || len(after.cutOver) != 0 {
 		t.Fatalf("after finalize genState = %+v, want gen1 count8 nextCount0 cutOver{}", after)
 	}
-	c.mountMu.RLock()
-	_, stillMounted := c.mountMap[parentRU]
-	c.mountMu.RUnlock()
+	_, stillMounted := c.mounts.backendFor(parentRU)
 	if stillMounted {
 		t.Fatalf("parent %v should be retired after finalize", parentRU)
 	}
@@ -120,7 +118,7 @@ func TestFinalizeSplit_QuiescesParentWrites(t *testing.T) {
 	enterSplit(t, c)
 	gs := c.genSnapshot()
 	parentRU := mountParentAndChildren(t, c, 0, storageunit.MustUnitCount(4))
-	parentB := c.mountMap[parentRU]
+	parentB, _ := c.mounts.backendFor(parentRU)
 
 	for _, k := range keysInUnit(t, c, 0, storageunit.MustUnitCount(4), 4) {
 		env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "n1"}, Payload: []byte("base")})
@@ -136,7 +134,7 @@ func TestFinalizeSplit_QuiescesParentWrites(t *testing.T) {
 	xKey := keysInUnit(t, c, 0, storageunit.MustUnitCount(4), 1)[0]
 	h := storageunit.HashShardKey(c.shardKey(xKey))
 	childRU := storageunit.NewReplicaUnit(storageunit.NewGenUnit(1, storageunit.UnitForHash(h, storageunit.MustUnitCount(8))), 0)
-	childB := c.mountMap[childRU]
+	childB, _ := c.mounts.backendFor(childRU)
 
 	next := gs.clone()
 	for _, u := range next.count.IDs() {

@@ -107,20 +107,13 @@ func (c *Cluster) openPermitTimeout() time.Duration {
 }
 
 // acquireOpenPermit blocks until a node-wide open permit is available and
-// returns the release func. The permit gate (openSem) is created lazily
-// under mountMu on first use, sized by openConcurrency() at that moment.
+// returns the release func. The permit gate lives in the mount table and is
+// created lazily on first use, sized by openConcurrency() at that moment.
 // Used by the background overlap acquires; the boot mount pool carries the
 // same bound via its own errgroup limit (boot and reconcile do not overlap:
 // mountReplicaUnits completes before Open returns and starts the loops).
 func (c *Cluster) acquireOpenPermit() (release func()) {
-	c.mountMu.Lock()
-	if c.openSem == nil {
-		c.openSem = make(chan struct{}, c.openConcurrency())
-	}
-	sem := c.openSem
-	c.mountMu.Unlock()
-	sem <- struct{}{}
-	return func() { <-sem }
+	return c.mounts.openPermit(c.openConcurrency())
 }
 
 // genUnitBytes encodes a GenUnit (the generation-qualified storage identity)
@@ -299,15 +292,6 @@ func (c *Cluster) initMultiBackend() error {
 		}
 	}
 
-	c.mountMap = make(map[storageunit.ReplicaUnit]backend.Backend)
-	// handoffPhase (v0.8 Phase 2e, pending ranges) tracks in-flight handoff
-	// transitions per ReplicaUnit, guarded by mountMu alongside mountMap. Empty at
-	// Open (no transition in flight); populated by reconcileReplicaUnitsOverlap
-	// when a draining-excluded split moves a position (Acquiring on the pending
-	// owner, Draining on the leaver).
-	c.handoffPhase = make(map[storageunit.ReplicaUnit]storageunit.HandoffState)
-	c.acquireInFlight = make(map[storageunit.ReplicaUnit]struct{})
-
 	// R>1 (replicated multi-backend, v0.8 Phase 2b): mount each owned unit at
 	// its replica POSITION (an independent durable database) via the per-replica
 	// factory, then return. The R=1 single-mount loop below is bypassed; the
@@ -350,14 +334,14 @@ func (c *Cluster) initMultiBackend() error {
 			_ = c.closeMountedUnits()
 			return fmt.Errorf("cluster: open unit %s: %w", gu, err)
 		}
-		c.storeMount(replica0(gu), b)
+		c.mounts.mount(replica0(gu), b)
 	}
 	return nil
 }
 
 // replica0 is the ReplicaUnit at position 0 for a GenUnit. The R=1 single-mount
 // paths (legacy multi-backend Phase 2/3, reshard Phase 4) hold each unit at one
-// position (0), so they key the ReplicaUnit-keyed mountMap via replica0(gu). The
+// position (0), so they key the ReplicaUnit-keyed mount table via replica0(gu). The
 // R>1 replicated paths key by the unit's ACTUAL replica position instead. Phase
 // 2e re-keying helper.
 func replica0(gu storageunit.GenUnit) storageunit.ReplicaUnit {
@@ -365,7 +349,7 @@ func replica0(gu storageunit.GenUnit) storageunit.ReplicaUnit {
 }
 
 // localReplicaPos returns the replica POSITION this node holds key's unit gu at,
-// for resolving the ReplicaUnit-keyed mountMap on a normal ring-routed local op.
+// for resolving the ReplicaUnit-keyed mount table on a normal ring-routed local op.
 // At R>1 it is this node's index in the unit's live replica set (unitReplicas);
 // the node appears at most once, so the position is unique. At R=1 (and in the
 // legacy / reshard paths) there is one position (0). ok is false at R>1 when this
@@ -386,13 +370,12 @@ func (c *Cluster) localReplicaPos(gu storageunit.GenUnit) (pos uint8, ok bool) {
 // closeMountedUnits releases every unit this node has mounted, via the
 // factory's CloseUnit. Called from Close (and from initMultiBackend's
 // rollback path). Best-effort: it attempts every unit and returns the first
-// error so a single stubborn unit does not strand the rest. After this the
-// mount map is cleared.
+// error so a single stubborn unit does not strand the rest. The table is
+// emptied in one step first, then each unit is closed OUTSIDE the table lock -
+// the close is backing-store I/O and must not run under a lock routed ops take.
 func (c *Cluster) closeMountedUnits() error {
-	c.mountMu.Lock()
-	defer c.mountMu.Unlock()
 	var firstErr error
-	for ru := range c.mountMap {
+	for _, ru := range c.mounts.takeAll() {
 		// At R>1 each unit is an independent durable database mounted at a
 		// replica POSITION, so release the right replica copy; at R=1 release
 		// the unit's sole mount (ru.Replica is 0 there). mountRefFor is what
@@ -400,7 +383,6 @@ func (c *Cluster) closeMountedUnits() error {
 		if err := c.factory.CloseUnit(c.mountRefFor(ru)); err != nil && firstErr == nil {
 			firstErr = err
 		}
-		delete(c.mountMap, ru)
 	}
 	return firstErr
 }
@@ -433,10 +415,7 @@ func (c *Cluster) localBackendForKey(key []byte) (backend.Backend, bool) {
 	if !ok {
 		return nil, false
 	}
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	b, ok := c.mountMap[storageunit.NewReplicaUnit(gu, pos)]
-	return b, ok
+	return c.mounts.backendFor(storageunit.NewReplicaUnit(gu, pos))
 }
 
 // localBackendForReplicaUnit resolves the mounted backend for an EXPLICIT
@@ -444,19 +423,16 @@ func (c *Cluster) localBackendForKey(key []byte) (backend.Backend, bool) {
 // the POSITION-ADDRESSED path the overlap-handoff predecessor's forwarded-op
 // handler uses (v0.8 Phase 2e): the moving position is no longer this node's
 // own ring index (the ring rotated it away), so localBackendForKey would not
-// find it - but the position is still mounted in a Draining handoffPhase entry,
+// find it - but the position is still mounted in a Draining handoff-phase entry,
 // reachable only by its explicit ru. ok=false means this node does not have ru
 // mounted (it already released, or never held it), in which case the caller
 // refuses with the loop-guard rather than re-forwarding. Multi-backend mode only.
 func (c *Cluster) localBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backend.Backend, bool) {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	b, ok := c.mountMap[ru]
-	return b, ok
+	return c.mounts.backendFor(ru)
 }
 
 // localReadBackendForReplicaUnit resolves the mounted backend a READ leg
-// addressed at ru serves from: mountMap[ru] when the exact position is
+// addressed at ru serves from: the table entry for ru when the exact position is
 // mounted, FALLING BACK to the LOWEST mounted position of the SAME unit when
 // it is not (returning the ru actually resolved, so a fence recode evicts the
 // right mount). This is the READ sibling of localWriteBackendForKey's
@@ -473,47 +449,21 @@ func (c *Cluster) localBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backen
 // NO position of ru's unit mounted (a mid-acquire pending owner): the caller
 // returns the transient acquiring error and the union covers the read.
 func (c *Cluster) localReadBackendForReplicaUnit(ru storageunit.ReplicaUnit) (backend.Backend, storageunit.ReplicaUnit, bool) {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	if b, ok := c.mountMap[ru]; ok {
-		return b, ru, true
-	}
-	var (
-		be    backend.Backend
-		got   storageunit.ReplicaUnit
-		found bool
-	)
-	for cand, b := range c.mountMap {
-		if cand.Unit != ru.Unit {
-			continue
-		}
-		if !found || cand.Replica < got.Replica {
-			got, be, found = cand, b, true
-		}
-	}
-	return be, got, found
+	return c.mounts.backendForOrLowest(ru)
 }
 
 // localMountedBackendForKey resolves the key's unit against this node's PHYSICAL
-// mountMap (ANY replica index), NOT the live-ring index. It backs LocalGet (the
+// mount table (ANY replica index), NOT the live-ring index. It backs LocalGet (the
 // "we physically hold this key even though the ring moved it off us" read
 // forwarder). The ring-index resolver (localBackendForKey) disclaims a position
 // this node is no longer the ring owner of - which is exactly a DRAINING node:
 // it is excluded from the ownership ring (graceful scale-down) yet still holds
-// the unit MOUNTED while it hands off. Scanning the mountMap by GenUnit lets the
+// the unit MOUNTED while it hands off. Scanning the mount table by GenUnit lets the
 // draining node keep serving routed reads of the data it physically holds during
 // the drain window, instead of refusing them via the loop-guard. Returns the
 // first mounted backend whose ReplicaUnit is for the key's GenUnit.
 func (c *Cluster) localMountedBackendForKey(key []byte) (backend.Backend, bool) {
-	gu := c.genUnitForKey(key)
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	for ru, b := range c.mountMap {
-		if ru.Unit == gu {
-			return b, true
-		}
-	}
-	return nil, false
+	return c.mounts.anyForUnit(c.genUnitForKey(key))
 }
 
 // mountedBackends returns a snapshot of every backend this node currently
@@ -534,18 +484,7 @@ type mountedUnit struct {
 }
 
 func (c *Cluster) mountedUnits() []mountedUnit {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	ids := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
-	for ru := range c.mountMap {
-		ids = append(ids, ru)
-	}
-	sortReplicaUnits(ids)
-	out := make([]mountedUnit, 0, len(ids))
-	for _, ru := range ids {
-		out = append(out, mountedUnit{ru: ru, b: c.mountMap[ru]})
-	}
-	return out
+	return c.mounts.mountedPairs()
 }
 
 // scanCoverageErr reports the acquiring refusal when this node's mount map does

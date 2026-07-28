@@ -16,7 +16,6 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
-	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -35,17 +34,15 @@ func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfa
 		// LogOutput io.Discard: the acquire/mount transition logging added for
 		// the handoff observability would otherwise write to os.Stderr (logf's
 		// deliberate fallback) in every white-box test.
-		cfg:             Config{NodeID: self, ReplicationFactor: r, LogOutput: io.Discard},
-		multi:           true,
-		factory:         h,
-		unitCount:       storageunit.MustUnitCount(n),
-		mountMap:        make(map[storageunit.ReplicaUnit]backend.Backend),
-		handoffPhase:    make(map[storageunit.ReplicaUnit]storageunit.HandoffState),
-		acquireInFlight: make(map[storageunit.ReplicaUnit]struct{}),
-		pauseUnits:      make(map[storageunit.UnitID]*sync.RWMutex),
-		ring:            rg,
-		closeCh:         make(chan struct{}),
+		cfg:        Config{NodeID: self, ReplicationFactor: r, LogOutput: io.Discard},
+		multi:      true,
+		factory:    h,
+		unitCount:  storageunit.MustUnitCount(n),
+		pauseUnits: make(map[storageunit.UnitID]*sync.RWMutex),
+		ring:       rg,
+		closeCh:    make(chan struct{}),
 	}
+	c.mounts.init(c)
 	c.genOwner = c.genUnitOwner
 	c.initGenState()
 	// Terminate the fixture's background goroutines at test end exactly as a
@@ -265,20 +262,20 @@ func TestMountReplicaUnits_DegradedBoot(t *testing.T) {
 	}
 
 	// The poisoned position is SKIPPED: unmounted, but recorded for /debug/shale/state.
-	if _, ok := c.mountMap[bad]; ok {
+	if _, ok := c.mounts.backendFor(bad); ok {
 		t.Fatalf("poisoned replica %s must NOT be mounted", bad)
 	}
-	v, ok := c.lastAcquireErr.Load(bad)
+	s, ok := c.mounts.acquireErrOf(bad)
 	if !ok {
-		t.Fatalf("poisoned replica %s must be recorded in lastAcquireErr", bad)
+		t.Fatalf("poisoned replica %s must be recorded as a failed acquire", bad)
 	}
-	if s, _ := v.(string); !strings.Contains(s, "empty SSTable") {
-		t.Fatalf("lastAcquireErr for %s = %q, want it to carry the open error", bad, s)
+	if !strings.Contains(s, "empty SSTable") {
+		t.Fatalf("the acquire record for %s = %q, want it to carry the open error", bad, s)
 	}
 
 	// Every OTHER desired position IS mounted: the healthy units keep full service.
 	for _, ru := range desired[1:] {
-		if _, ok := c.mountMap[ru]; !ok {
+		if _, ok := c.mounts.backendFor(ru); !ok {
 			t.Fatalf("healthy replica %s must be mounted on a degraded boot", ru)
 		}
 	}
@@ -290,11 +287,11 @@ func TestMountReplicaUnits_DegradedBoot(t *testing.T) {
 	c.reconcileMu.Lock()
 	c.acquireReplicaUnit(bad)
 	c.reconcileMu.Unlock()
-	if _, ok := c.mountMap[bad]; !ok {
+	if _, ok := c.mounts.backendFor(bad); !ok {
 		t.Fatalf("repaired replica %s must mount on re-acquire", bad)
 	}
-	if _, ok := c.lastAcquireErr.Load(bad); ok {
-		t.Fatalf("lastAcquireErr for %s must be cleared after a successful re-acquire", bad)
+	if _, ok := c.mounts.acquireErrOf(bad); ok {
+		t.Fatalf("the acquire record for %s must be cleared after a successful re-acquire", bad)
 	}
 }
 
@@ -330,7 +327,7 @@ func TestMountReplicaUnits_BoundedConcurrency(t *testing.T) {
 		if err := c.mountReplicaUnits(); err != nil {
 			t.Fatalf("mountReplicaUnits (limit %d): %v", limit, err)
 		}
-		if got := len(c.mountMap); got != owned {
+		if got := c.mounts.mountedCount(); got != owned {
 			t.Fatalf("limit %d: mounted %d of %d owned positions", limit, got, owned)
 		}
 		if peak := h.MaxConcurrentOpens(); peak != wantMax {
@@ -383,10 +380,10 @@ func TestMountReplicaUnits_DoesNotFenceServingPeer(t *testing.T) {
 	}
 
 	// `served` is DEFERRED: not mounted, recorded, and - crucially - NOT fenced.
-	if _, ok := c.mountMap[served]; ok {
+	if _, ok := c.mounts.backendFor(served); ok {
 		t.Fatalf("position %s a peer is serving must NOT be mounted at boot", served)
 	}
-	if v, ok := c.lastAcquireErr.Load(served); !ok || !strings.Contains(v.(string), "serving") {
+	if v, ok := c.mounts.acquireErrOf(served); !ok || !strings.Contains(v, "serving") {
 		t.Fatalf("served position should be recorded boot-deferred; ok=%v v=%v", ok, v)
 	}
 	// THE FIX: the peer was NOT fenced - its writes still succeed.
@@ -396,7 +393,7 @@ func TestMountReplicaUnits_DoesNotFenceServingPeer(t *testing.T) {
 
 	// Cold-mount still works: the other desired positions (no marker) ARE mounted.
 	for _, ru := range desired[1:] {
-		if _, ok := c.mountMap[ru]; !ok {
+		if _, ok := c.mounts.backendFor(ru); !ok {
 			t.Fatalf("un-marked position %s should mount normally at boot", ru)
 		}
 	}

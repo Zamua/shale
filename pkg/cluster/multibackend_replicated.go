@@ -101,7 +101,7 @@ func (c *Cluster) replicaLayout() bool {
 
 // mountRefFor is the ONE place a ReplicaUnit the cluster tracks becomes the
 // MountRef the storage port is keyed by. Every mount this cluster holds is
-// tracked as a ReplicaUnit (mountMap is ReplicaUnit-keyed, with the R=1 paths
+// tracked as a ReplicaUnit (the mount table is ReplicaUnit-keyed, with the R=1 paths
 // using position 0), but the PORT needs the layout selector too, so the
 // conversion has to go through the cluster's own layout.
 //
@@ -235,7 +235,7 @@ func (c *Cluster) mountReplicaUnits() error {
 			// everything, and a true sole-survivor re-acquires a stale-marked position
 			// once the ring converges.
 			if epoch, ok, merr := c.factory.ReadServingMarker(storageunit.ReplicaMount(ru)); merr == nil && ok && epoch > 0 {
-				c.lastAcquireErr.Store(ru, fmt.Sprintf("boot-deferred: a peer is serving this position (serving marker epoch %d); not fenced - reconcile hands off after convergence", epoch))
+				c.mounts.recordAcquireErr(ru, fmt.Sprintf("boot-deferred: a peer is serving this position (serving marker epoch %d); not fenced - reconcile hands off after convergence", epoch))
 				c.logf("shale: boot defer - NOT opening replica %s: a peer is serving it (marker epoch %d); "+
 					"avoiding a fence; reconcile will acquire it after ring convergence", ru, epoch)
 				deferred.Add(1)
@@ -257,17 +257,15 @@ func (c *Cluster) mountReplicaUnits() error {
 				// the open, so a transient failure self-heals and a permanent one stays
 				// observable until repaired. Reads to the unit are served by the peer;
 				// writes to it block under W (bounded, never lost) until it is restored.
-				c.lastAcquireErr.Store(ru, err.Error())
+				c.mounts.recordAcquireErr(ru, err.Error())
 				c.logf("shale: DEGRADED BOOT - skipping replica %s: open failed: %v "+
 					"(unit served by peer; desired-but-unmounted, reconcile will retry)", ru, err)
 				skipped.Add(1)
 				return nil
 			}
-			c.lastAcquireErr.Delete(ru)
-			c.myOpenEpoch.Store(ru, openedEpoch) // this node's exact open epoch (drain gate)
-			c.mountMu.Lock()
-			c.storeMount(ru, b)
-			c.mountMu.Unlock()
+			c.mounts.clearAcquireErr(ru)
+			c.mounts.recordOpenEpoch(ru, openedEpoch) // this node's exact open epoch (drain gate)
+			c.mounts.mount(ru, b)
 			mounted.Add(1)
 			return nil
 		})
@@ -408,31 +406,29 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 		// #408): this path only runs for a DESIRED-but-UNMOUNTED position, so the
 		// cluster has no live mount for ru. If the factory nonetheless refuses the
 		// open because it still holds ru open on this handle ("already open on this
-		// handle"), its openReplica state is STALE relative to mountMap and every
-		// retry fails identically forever. Close the stale handle to re-sync, then
-		// reopen ONCE. The close is safe: there is no mountMap entry pointing at it,
+		// handle"), its openReplica state is STALE relative to the mount table and
+		// every retry fails identically forever. Close the stale handle to re-sync,
+		// then reopen ONCE. The close is safe: no mount entry points at it,
 		// so no routed op can be reading it. If the reopen still fails (a genuine
 		// open failure, e.g. a peer holds the durable db), record it + retry next tick.
 		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 		b, openedEpoch, err = c.factory.OpenUnit(storageunit.ReplicaMount(ru), epoch)
 		if err != nil {
-			c.lastAcquireErr.Store(ru, err.Error())
+			c.mounts.recordAcquireErr(ru, err.Error())
 			return
 		}
 	}
-	c.lastAcquireErr.Delete(ru)
+	c.mounts.clearAcquireErr(ru)
 	// Record THIS node's exact open epoch (from the factory return) BEFORE the
-	// mount, so a beginDrain that sees mountMap[ru] also sees the epoch.
-	c.myOpenEpoch.Store(ru, openedEpoch)
-	c.mountMu.Lock()
-	if c.closed.Load() {
-		c.mountMu.Unlock()
-		c.myOpenEpoch.Delete(ru)
+	// mount, so a beginDrain that sees the mount also sees the epoch.
+	c.mounts.recordOpenEpoch(ru, openedEpoch)
+	if !c.mounts.mountUnlessClosed(ru, b) {
+		// Close raced us between the open and the mount; release rather than
+		// leaking the freshly-opened backend past shutdown.
+		c.mounts.forgetOpenEpoch(ru)
 		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 		return
 	}
-	c.storeMount(ru, b)
-	c.mountMu.Unlock()
 
 	// Write the durable serving marker AFTER the mount (outside the lock: shared
 	// storage I/O), at THIS node's EXACT open epoch (the factory return value, NOT
@@ -443,13 +439,11 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 }
 
 // releaseReplicaUnit unmounts the ReplicaUnit ru via the per-replica factory.
-// The mount-map entry is removed BEFORE the close so a routed op stops resolving
+// The mount entry is removed BEFORE the close so a routed op stops resolving
 // the local backend immediately. Caller MUST hold reconcileMu.
 func (c *Cluster) releaseReplicaUnit(ru storageunit.ReplicaUnit) {
-	c.mountMu.Lock()
-	delete(c.mountMap, ru)
-	c.mountMu.Unlock()
-	c.myOpenEpoch.Delete(ru) // a re-acquire records a fresh open epoch.
+	c.mounts.unmount(ru)
+	c.mounts.forgetOpenEpoch(ru) // a re-acquire records a fresh open epoch.
 	_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 }
 
@@ -596,7 +590,7 @@ func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Membe
 		// position ru this member holds. For a current owner ru is its current
 		// index; for a pending owner ru is the slot it acquired (which its own
 		// current-set ring index would NOT resolve, since a pending owner is absent
-		// from the current set). applyEnvelopeIfNewerToBackend resolves mountMap[ru]
+		// from the current set). applyEnvelopeIfNewerToBackend resolves the mount
 		// directly. A pending owner still mid-mount has no mounted entry for ru and
 		// returns errUnitAcquiring; the union covers the key via the still-mounted
 		// current owner and the fan-out tolerates the transient. There is NO
@@ -618,7 +612,7 @@ func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Membe
 		return err
 	}
 	// Position-addressed forward: carry the explicit ru so the remote replica
-	// resolves mountMap[ru] directly (a pending owner is not at this position in
+	// resolves the mount for ru directly (a pending owner is not at this position in
 	// its own current-set ring index).
 	return cli.PutAtReplica(ctx, ru, key, envBytes)
 }
@@ -643,7 +637,7 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 	// guard-gated on the receiver's ring view, which REFUSES a displaced current
 	// owner during a join for a key it does not physically hold (the fresh-key
 	// If-None-Match read) - the position-addressed wire (GetAtReplica ->
-	// LocalReplicaGetAt) resolves mountMap[ru] directly with no guard, so every
+	// LocalReplicaGetAt) resolves the mount for ru directly with no guard, so every
 	// union leg answers value / not-found / acquiring on its own mount state. In
 	// steady state routed == the stable set at its ring indices, so the resolved
 	// backends are identical to the old member-keyed path.
@@ -784,7 +778,7 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 
 // dispatchReplicaGetUnitAt is the POSITION-ADDRESSED read leg of the routed
 // union fan-out (the read mirror of dispatchReplicaPutUnit): the local-self
-// branch resolves mountMap[ru] directly (a mid-mount position returns the
+// branch resolves the mount for ru directly (a mid-mount position returns the
 // transient errUnitAcquiring the fan-out skips); the remote branch carries the
 // explicit ru on the wire (GetAtReplica -> LocalReplicaGetAt) so the receiver
 // resolves the exact mounted copy it holds, with no ring-view ownership guard -
@@ -802,7 +796,7 @@ func (c *Cluster) dispatchReplicaGetUnitAt(ctx context.Context, replica ring.Mem
 		if !ok {
 			return nil, errUnitAcquiring("Get")
 		}
-		// b is the fence-self-healing mount (storeMount): a fenced read recodes to
+		// b is the fence-self-healing mount (the mount seam): a fenced read recodes to
 		// the transient acquiring-window error + evicts the stale mount here, so a
 		// fenced GET self-heals instead of returning the raw fence forever (#433).
 		return b.Get(key)

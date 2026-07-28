@@ -14,7 +14,6 @@ import (
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
-	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -41,16 +40,15 @@ func newReconcileCluster(t *testing.T, self string, n int, backing *sharedfactor
 	t.Helper()
 	h := backing.Handle()
 	c := &Cluster{
-		cfg:             Config{NodeID: self},
-		multi:           true,
-		factory:         h,
-		unitCount:       storageunit.MustUnitCount(n),
-		genOwner:        owners.OwnerOfGen,
-		mountMap:        make(map[storageunit.ReplicaUnit]backend.Backend),
-		acquireInFlight: make(map[storageunit.ReplicaUnit]struct{}),
-		pauseUnits:      make(map[storageunit.UnitID]*sync.RWMutex),
-		closeCh:         make(chan struct{}),
+		cfg:        Config{NodeID: self},
+		multi:      true,
+		factory:    h,
+		unitCount:  storageunit.MustUnitCount(n),
+		genOwner:   owners.OwnerOfGen,
+		pauseUnits: make(map[storageunit.UnitID]*sync.RWMutex),
+		closeCh:    make(chan struct{}),
 	}
+	c.mounts.init(c)
 	c.initGenState()
 	return c
 }
@@ -63,10 +61,9 @@ func gu0(id storageunit.UnitID) storageunit.GenUnit {
 // mountedUnits returns this node's mounted unit ids (gen-0, ascending). The
 // reconcile tests do not reshard, so every mounted GenUnit is at generation 0.
 func mountedUnits(c *Cluster) []storageunit.UnitID {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	out := make([]storageunit.UnitID, 0, len(c.mountMap))
-	for ru := range c.mountMap {
+	mounted := c.mounts.mountedList()
+	out := make([]storageunit.UnitID, 0, len(mounted))
+	for _, ru := range mounted {
 		out = append(out, ru.Unit.ID)
 	}
 	// insertion-sort for determinism
@@ -79,9 +76,7 @@ func mountedUnits(c *Cluster) []storageunit.UnitID {
 }
 
 func hasUnit(c *Cluster, u storageunit.UnitID) bool {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	_, ok := c.mountMap[replica0(gu0(u))]
+	_, ok := c.mounts.backendFor(replica0(gu0(u)))
 	return ok
 }
 
@@ -170,9 +165,7 @@ func TestReconcileSelfHealsLostMount(t *testing.T) {
 
 	// Simulate a lost mount: drop unit 1 from the map (and from the handle)
 	// without changing ownership.
-	c.mountMu.Lock()
-	delete(c.mountMap, replica0(gu0(1)))
-	c.mountMu.Unlock()
+	c.mounts.unmount(replica0(gu0(1)))
 	_ = c.factory.CloseUnit(storageunit.SoleMount(gu0(1)))
 
 	// Reconcile re-acquires it (still owned, not mounted -> acquire).
@@ -196,7 +189,7 @@ func TestAcquireFencesPriorOwner(t *testing.T) {
 
 	// A mounts its units and writes an ACKED key directly to U's backend.
 	a.reconcileUnits()
-	abk := a.mountMap[replica0(gu0(u))]
+	abk, _ := a.mounts.backendFor(replica0(gu0(u)))
 	if abk == nil {
 		t.Fatal("A did not mount unit 1")
 	}
@@ -207,7 +200,7 @@ func TestAcquireFencesPriorOwner(t *testing.T) {
 	// Ring hands U to B. B reconciles -> acquires U at a higher epoch.
 	ownersB[1] = "B"
 	b.reconcileUnits()
-	bbk := b.mountMap[replica0(gu0(u))]
+	bbk, _ := b.mounts.backendFor(replica0(gu0(u)))
 	if bbk == nil {
 		t.Fatal("B did not acquire unit 1 on reconcile")
 	}
@@ -219,7 +212,7 @@ func TestAcquireFencesPriorOwner(t *testing.T) {
 	}
 
 	// A is fenced: B acquired U at a higher epoch, so A's stale mount cannot
-	// write U anymore. Via the fence-self-healing decorator (storeMount) the
+	// write U anymore. Via the fence-self-healing decorator (the mount seam) the
 	// fenced write does NOT surface the raw fence - it recodes to the TRANSIENT
 	// acquiring-window error AND evicts A's stale mount, so a retry re-routes to
 	// the new owner instead of wedging on the dead handle (#433).

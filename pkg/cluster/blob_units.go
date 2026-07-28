@@ -84,7 +84,7 @@ func (c *Cluster) RoutedUnitToken(routeKey []byte) string {
 // In legacy mode this node owns the whole keyspace, so the single sentinel
 // ["legacy"] (the one prefix blob/legacy/).
 //
-// In multi-backend mode it is the set of GenUnits currently in the mount map
+// In multi-backend mode it is the set of GenUnits currently in the mount table
 // (each ReplicaUnit's Unit field is the GenUnit), rendered as tokens and
 // deduplicated across replica positions. The reshard-era reclamation of objects
 // under an OLD-generation parent token prefix (after a doubling re-keys a unit)
@@ -93,11 +93,10 @@ func (c *Cluster) MountedUnits() []string {
 	if !c.multi {
 		return []string{legacyUnitToken}
 	}
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	seen := make(map[string]struct{}, len(c.mountMap))
-	out := make([]string, 0, len(c.mountMap))
-	for ru := range c.mountMap {
+	mounted := c.mounts.mountedList()
+	seen := make(map[string]struct{}, len(mounted))
+	out := make([]string, 0, len(mounted))
+	for _, ru := range mounted {
 		tok := unitToken(ru.Unit)
 		if _, ok := seen[tok]; ok {
 			continue

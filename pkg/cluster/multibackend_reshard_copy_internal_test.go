@@ -87,7 +87,7 @@ func mountParentAndChildren(t *testing.T, c *Cluster, k storageunit.UnitID, oldC
 		if err != nil {
 			t.Fatalf("open %v: %v", ru, err)
 		}
-		c.mountMap[ru] = b
+		c.mounts.mountUndecorated(ru, b)
 	}
 	return parentRU
 }
@@ -100,7 +100,7 @@ func TestCopyParentIntoChildren_RoutesAndLWW(t *testing.T) {
 	parentRU := mountParentAndChildren(t, c, 0, storageunit.MustUnitCount(4))
 
 	keys := keysInUnit(t, c, 0, storageunit.MustUnitCount(4), 8)
-	pb := c.mountMap[parentRU]
+	pb, _ := c.mounts.backendFor(parentRU)
 	for _, k := range keys {
 		env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 10, NodeID: "n1"}, Payload: append([]byte("v-"), k...)})
 		if err := pb.Put(k, env); err != nil {
@@ -121,7 +121,8 @@ func TestCopyParentIntoChildren_RoutesAndLWW(t *testing.T) {
 		h := storageunit.HashShardKey(c.shardKey(k))
 		childID := storageunit.UnitForHash(h, storageunit.MustUnitCount(8))
 		childRU := storageunit.NewReplicaUnit(storageunit.NewGenUnit(1, childID), 0)
-		got, err := c.mountMap[childRU].Get(k)
+		childB, _ := c.mounts.backendFor(childRU)
+		got, err := childB.Get(k)
 		if err != nil {
 			t.Fatalf("child %v missing key %q: %v", childRU, k, err)
 		}
@@ -141,13 +142,14 @@ func TestCopyParentIntoChildren_RoutesAndLWW(t *testing.T) {
 	h := storageunit.HashShardKey(c.shardKey(k0))
 	childRU := storageunit.NewReplicaUnit(storageunit.NewGenUnit(1, storageunit.UnitForHash(h, storageunit.MustUnitCount(8))), 0)
 	newer := Encode(Envelope{Stamp: Stamp{TimestampNanos: 99, NodeID: "n1"}, Payload: []byte("newer")})
-	if _, err := c.applyEnvelopeIfNewerToBackendReport(c.mountMap[childRU], childRU, k0, newer); err != nil {
+	childB, _ := c.mounts.backendFor(childRU)
+	if _, err := c.applyEnvelopeIfNewerToBackendReport(childB, childRU, k0, newer); err != nil {
 		t.Fatal(err)
 	}
 	if applied3, _ := c.copyParentIntoChildren(parentRU, gs); applied3 != 0 {
 		t.Fatalf("stale copy applied %d, want 0 (LWW must protect the newer child value)", applied3)
 	}
-	got, _ := c.mountMap[childRU].Get(k0)
+	got, _ := childB.Get(k0)
 	dec, _ := Decode(got)
 	if !bytes.Equal(dec.Payload, []byte("newer")) {
 		t.Fatalf("LWW violated: child payload = %q, want newer", dec.Payload)
@@ -198,11 +200,11 @@ func TestCopyParentIntoSurvivor_ForwardsToLocalSurvivor(t *testing.T) {
 		if err != nil {
 			t.Fatalf("open %v: %v", ru, err)
 		}
-		c.mountMap[ru] = b
+		c.mounts.mountUndecorated(ru, b)
 	}
 
 	keys := keysInUnit(t, c, parentRU.Unit.ID, storageunit.MustUnitCount(8), 5)
-	pb := c.mountMap[parentRU]
+	pb, _ := c.mounts.backendFor(parentRU)
 	for _, k := range keys {
 		env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 7, NodeID: "n1"}, Payload: append([]byte("m-"), k...)})
 		if err := pb.Put(k, env); err != nil {
@@ -214,7 +216,7 @@ func TestCopyParentIntoSurvivor_ForwardsToLocalSurvivor(t *testing.T) {
 		t.Fatalf("copyParentIntoSurvivor: %v", err)
 	}
 
-	sb := c.mountMap[survivorRU]
+	sb, _ := c.mounts.backendFor(survivorRU)
 	for _, k := range keys {
 		got, err := sb.Get(k)
 		if err != nil {
@@ -234,7 +236,7 @@ func TestCopyParentUntilCaughtUp_Clean(t *testing.T) {
 	gs := c.genSnapshot()
 	parentRU := mountParentAndChildren(t, c, 0, storageunit.MustUnitCount(4))
 
-	pb := c.mountMap[parentRU]
+	pb, _ := c.mounts.backendFor(parentRU)
 	for _, k := range keysInUnit(t, c, 0, storageunit.MustUnitCount(4), 6) {
 		env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 5, NodeID: "n1"}, Payload: []byte("x")})
 		if err := pb.Put(k, env); err != nil {

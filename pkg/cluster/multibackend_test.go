@@ -2,7 +2,7 @@ package cluster
 
 // White-box tests for multi-backend mode (v0.8 Phase 2). These live in
 // package cluster (not cluster_test) so they can reach the unexported
-// mode wiring: validateBackendMode, genUnitBytes, the mountMap, and the
+// mode wiring: validateBackendMode, genUnitBytes, the mount table, and the
 // per-unit routing. The cross-node forwarding path is covered separately
 // by the in-process integration tests in tests/integration.
 
@@ -167,8 +167,8 @@ func TestMultiBackendMountsAllUnitsSingleNode(t *testing.T) {
 	if len(open) != n {
 		t.Fatalf("factory has %d units open, want %d (single node owns all): %v", len(open), n, open)
 	}
-	if len(c.mountMap) != n {
-		t.Fatalf("mountMap has %d units, want %d", len(c.mountMap), n)
+	if got := c.mounts.mountedCount(); got != n {
+		t.Fatalf("the mount table has %d units, want %d", got, n)
 	}
 }
 
@@ -201,7 +201,7 @@ func TestMultiBackendRoundTripAndPlacement(t *testing.T) {
 		// And confirm physical placement: the value lives in the backend
 		// for THIS key's generation-qualified unit, and nowhere else.
 		gu := c.genUnitForKey(k)
-		b := c.mountMap[replica0(gu)]
+		b, _ := c.mounts.backendFor(replica0(gu))
 		if v, err := b.Get(k); err != nil || !bytes.Equal(v, []byte("v-"+string(k))) {
 			t.Fatalf("key %s not in unit %s's backend: v=%q err=%v", k, gu, v, err)
 		}

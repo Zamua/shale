@@ -46,7 +46,7 @@ const drainPollInterval = 50 * time.Millisecond
 //
 // THE COMPLETION GATE (allOwnedPositionsHandedOff): this node stays a CURRENT
 // OWNER in the ring throughout the drain, so it KEEPS its positions mounted and
-// keeps serving them - the old mountMap-empties completion is therefore NOT the
+// keeps serving them - the old mount-table-empties completion is therefore NOT the
 // signal (a current owner's mount does not vanish on its own). Instead the drain
 // is done when EVERY position this node still has mounted as a Draining position
 // has a serving marker strictly above its open epoch. drainCheck runs on the
@@ -123,9 +123,9 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 // for that ReplicaUnit. A position with no such marker is still being handed off
 // (its successor has not mounted) and blocks completion.
 //
-// It snapshots the mounted set under mountMu, then reads the durable serving
-// marker for each position OUTSIDE the lock (a slow shared-storage read must not
-// block routed ops' mountMap reads). The strict (>) gate matches drainCheck's
+// It snapshots the mounted set from the table, then reads the durable serving
+// marker for each position OUTSIDE any lock (a slow shared-storage read must not
+// block routed ops' mount lookups). The strict (>) gate matches drainCheck's
 // release rule: a marker strictly above the leaver's open epoch is positive proof
 // a live SUCCESSOR is serving (the leaver's own stale gain-marker at exactly its
 // open epoch does not count). A position that drainCheck has already RELEASED is
@@ -136,14 +136,7 @@ func (c *Cluster) allOwnedPositionsHandedOff() bool {
 	if !c.replicaLayout() {
 		return true
 	}
-	c.mountMu.RLock()
-	mounted := make([]storageunit.ReplicaUnit, 0, len(c.mountMap))
-	for ru := range c.mountMap {
-		mounted = append(mounted, ru)
-	}
-	c.mountMu.RUnlock()
-
-	for _, ru := range mounted {
+	for _, ru := range c.mounts.mountedList() {
 		// Gate on THIS node's OWN open epoch (the recorded factory return), NOT the
 		// live durable: the durable climbs as the successor opens, which would push
 		// `open` up to the successor's serving-marker epoch and make this gate (a
@@ -161,11 +154,9 @@ func (c *Cluster) allOwnedPositionsHandedOff() bool {
 }
 
 // ownedPositionCount returns how many ReplicaUnit positions this node still has
-// mounted. Reads under mountMu. Kept as an introspection helper for tests; the
-// DrainForLeave completion gate is allOwnedPositionsHandedOff (which the leaver
-// can satisfy while still serving its mounts), not mountMap emptying.
+// mounted. Kept as an introspection helper for tests; the DrainForLeave
+// completion gate is allOwnedPositionsHandedOff (which the leaver can satisfy
+// while still serving its mounts), not the mount table emptying.
 func (c *Cluster) ownedPositionCount() int {
-	c.mountMu.RLock()
-	defer c.mountMu.RUnlock()
-	return len(c.mountMap)
+	return c.mounts.mountedCount()
 }

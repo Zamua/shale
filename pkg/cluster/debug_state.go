@@ -46,20 +46,12 @@ func (c *Cluster) DebugState() string {
 	desired := ruBoolSet(c.desiredReplicaUnits())
 	pending := ruBoolSet(c.desiredPendingReplicaUnits(draining))
 
-	c.mountMu.RLock()
-	mounted := make(map[storageunit.ReplicaUnit]bool, len(c.mountMap))
-	for ru := range c.mountMap {
-		mounted[ru] = true
-	}
-	phases := make(map[storageunit.ReplicaUnit]storageunit.HandoffState, len(c.handoffPhase))
-	for ru, st := range c.handoffPhase {
-		phases[ru] = st
-	}
-	acquiring := make([]string, 0)
-	for ru := range c.acquireInFlight {
+	snap := c.mounts.snapshot()
+	mounted, phases := snap.mounted, snap.phases
+	acquiring := make([]string, 0, len(snap.inFlight))
+	for _, ru := range snap.inFlight {
 		acquiring = append(acquiring, ru.String())
 	}
-	c.mountMu.RUnlock()
 	sort.Strings(acquiring)
 	fmt.Fprintf(&b, "acquire-in-flight=%v\n", acquiring)
 
@@ -94,7 +86,7 @@ func (c *Cluster) DebugState() string {
 			wedged++
 		}
 		acqErr := ""
-		if v, ok := c.lastAcquireErr.Load(ru); ok {
+		if v, ok := c.mounts.acquireErrOf(ru); ok {
 			acqErr = fmt.Sprintf(" lastAcquireErr=%q", v)
 		}
 		fmt.Fprintf(&b, "  %s desired=%v pending=%v mounted=%v phase=%s%s%s\n",

@@ -181,7 +181,7 @@ func (c *peerClient) ScanPrefixForwarded(ctx context.Context, prefix []byte) (gr
 // The *AtReplica variants are the POSITION-ADDRESSED overlap forward (v0.8
 // Phase 2e): they carry the EXPLICIT ReplicaUnit on the wire so the predecessor
 // (which no longer holds the moving position at its own ring index) resolves
-// mountMap[ru] DIRECTLY and serves the Draining entry, rather than re-resolving
+// the mount for ru DIRECTLY and serves the Draining entry, rather than re-resolving
 // the position from the key against its live ring. The new (Acquiring) owner
 // forwards routed ops here while it mounts. Forwarded stays true so the
 // receiving server treats it as a peer-to-peer op (no re-routing); ru carries

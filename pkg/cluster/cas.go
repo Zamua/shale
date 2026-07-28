@@ -408,7 +408,7 @@ func (c *Cluster) CommitCASApply(ctx context.Context, level backend.IsolationLev
 // already synchronously durable (memory/pebble, or slate at AwaitDurable=true)
 // does not implement backend.Flusher, so there is no RAM-loss window and the
 // flush is skipped (returns nil). flushableBackend unwraps the fencedSelfHealing
-// decorator storeMount wraps a mounted backend in, so a real slate mount at
+// decorator the mount seam wraps a mounted backend in, so a real slate mount at
 // AwaitDurable=false is found and Flush() forces its memtable durable to the
 // object store. A non-nil return is a genuine durability failure the under-W
 // branch surfaces terminally (see the call site); a nil return means the lone

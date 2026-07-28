@@ -34,7 +34,7 @@ import (
 // (1), the successor marker (2) is strictly above it and the leaver releases.
 //
 // Pre-fix (gate on the live durable = 2) the marker 2 is NOT > 2 and the drain
-// hangs. The myOpenEpoch record here is exactly what the real mount path
+// hangs. The open-epoch record here is exactly what the real mount path
 // (acquireReplicaUnitOverlapBlocking) records from the factory return.
 func TestOverlap_beginDrain_GatesOnOwnOpenEpoch_ReleasesAfterSuccessorMarker(t *testing.T) {
 	backing := sharedfactory.NewBacking()
@@ -53,8 +53,8 @@ func TestOverlap_beginDrain_GatesOnOwnOpenEpoch_ReleasesAfterSuccessorMarker(t *
 	if leaverEpoch != 1 {
 		t.Fatalf("precondition: leaver open epoch should be 1, got %d", leaverEpoch)
 	}
-	c.mountMap[target] = bLeaver
-	c.myOpenEpoch.Store(target, leaverEpoch)
+	c.mounts.mountUndecorated(target, bLeaver)
+	c.mounts.recordOpenEpoch(target, leaverEpoch)
 
 	// 2) A SUCCESSOR opens the position (bumping the live durable to 2) and writes
 	//    its serving marker at its open epoch (2) -- BEFORE the leaver drains.
@@ -71,7 +71,7 @@ func TestOverlap_beginDrain_GatesOnOwnOpenEpoch_ReleasesAfterSuccessorMarker(t *
 	}
 
 	// 3) NOW the leaver drains. The fixed gate captures the leaver's OWN open epoch
-	//    (1) from myOpenEpoch, NOT the live durable (2, the successor's bump).
+	//    (1) from the recorded open epoch, NOT the live durable (2, the successor's bump).
 	c.beginDrain(target)
 	st := c.handoffPhaseOf(target)
 	if st.Phase != storageunit.PhaseDraining {
@@ -94,7 +94,7 @@ func TestOverlap_beginDrain_GatesOnOwnOpenEpoch_ReleasesAfterSuccessorMarker(t *
 // TestOverlap_beginDrain_RealMountPath_CapturesOwnOpenEpoch drives the REAL mount
 // flip (acquireReplicaUnitOverlapBlocking) rather than installing the mount by
 // hand, so it exercises the actual capture mechanism end-to-end: the flip records
-// myOpenEpoch from the factory return, and beginDrain later reads it. A successor
+// the open epoch from the factory return, and beginDrain later reads it. A successor
 // then opens + marks above the leaver's epoch and the leaver releases.
 func TestOverlap_beginDrain_RealMountPath_CapturesOwnOpenEpoch(t *testing.T) {
 	backing := sharedfactory.NewBacking()
@@ -104,15 +104,15 @@ func TestOverlap_beginDrain_RealMountPath_CapturesOwnOpenEpoch(t *testing.T) {
 
 	// The leaver mounts through the real overlap-blocking flip. With no Acquiring
 	// phase set up the flip installs the mount, drops to Owned, records
-	// myOpenEpoch from the factory return, and writes its own serving marker - all
+	// the open epoch from the factory return, and writes its own serving marker - all
 	// at its EXACT open epoch (1).
 	_ = c.acquireReplicaUnitOverlapBlocking(target)
 	if _, mounted := c.localBackendForReplicaUnit(target); !mounted {
 		t.Fatalf("leaver should have mounted via the real flip")
 	}
-	gotEpoch, ok := c.myOpenEpoch.Load(target)
-	if !ok || gotEpoch.(storageunit.Epoch) != 1 {
-		t.Fatalf("real mount flip should have recorded myOpenEpoch=1, got %v ok=%v", gotEpoch, ok)
+	gotEpoch, ok := c.mounts.openEpochOf(target)
+	if !ok || gotEpoch != 1 {
+		t.Fatalf("real mount flip should have recorded an open epoch of 1, got %v ok=%v", gotEpoch, ok)
 	}
 
 	// A successor opens (durable -> 2) + marks at 2.
@@ -152,8 +152,8 @@ func TestOverlap_beginDrain_EscalationImmunity_MultiOpenCascade(t *testing.T) {
 	if err != nil {
 		t.Fatalf("leaver open: %v", err)
 	}
-	c.mountMap[target] = bLeaver
-	c.myOpenEpoch.Store(target, leaverEpoch)
+	c.mounts.mountUndecorated(target, bLeaver)
+	c.mounts.recordOpenEpoch(target, leaverEpoch)
 
 	// TWO successors open in cascade (a slow handoff that re-acquires), each on its
 	// own handle, bumping the live durable 1 -> 2 -> 3. The latest serving owner
@@ -209,8 +209,8 @@ func TestOverlap_allOwnedPositionsHandedOff_GatesOnOwnOpenEpoch(t *testing.T) {
 	if err != nil {
 		t.Fatalf("leaver open: %v", err)
 	}
-	c.mountMap[target] = bLeaver
-	c.myOpenEpoch.Store(target, leaverEpoch)
+	c.mounts.mountUndecorated(target, bLeaver)
+	c.mounts.recordOpenEpoch(target, leaverEpoch)
 
 	// Before any successor marker the position is NOT handed off (the leaver keeps
 	// serving).

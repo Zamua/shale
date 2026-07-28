@@ -1,7 +1,7 @@
 // Position-addressed replica apply (v0.8 Phase 2e, pending ranges). This is the
 // WIRE side of the union DUAL-WRITE: a routed write to a union member carries the
 // EXPLICIT ReplicaUnit on the wire (the *AtReplica peer client + the Ru field) so
-// the receiving replica resolves mountMap[ru] DIRECTLY, rather than re-deriving
+// the receiving replica resolves the mount for ru DIRECTLY, rather than re-deriving
 // the position from the key against its own current-set ring index. This is
 // required because a PENDING owner (a node added to the routed union by the
 // draining-excluded split) does NOT appear at the position in its current-set
@@ -102,7 +102,7 @@ func (c *Cluster) LocalReplicaGetAt(ru storageunit.ReplicaUnit, key []byte) ([]b
 	if !ok {
 		return nil, recodeForwardedReplicaErr(errUnitAcquiring("Get"))
 	}
-	// b is the fence-self-healing mount (storeMount): a fenced read recodes to
+	// b is the fence-self-healing mount (the mount seam): a fenced read recodes to
 	// the transient acquiring-window error + evicts the stale mount; recode
 	// that transient for the wire too.
 	v, err := b.Get(key)
