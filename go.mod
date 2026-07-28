@@ -6,7 +6,7 @@ toolchain go1.26.4
 
 require (
 	github.com/Zamua/shale/backends/pebble v0.0.0
-	github.com/Zamua/shale/backends/slate v0.0.0
+	github.com/Zamua/shale/backends/slate v0.11.1
 	github.com/buraksezer/consistent v0.10.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/hashicorp/memberlist v0.5.4
@@ -17,15 +17,6 @@ require (
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
 	slatedb.io/slatedb-go v0.13.1
-)
-
-// Pre-tag development: the backend submodules aren't yet published, so
-// cross-module imports (cmd/shaled, cmd/shale-bench) resolve through
-// the in-repo paths. The matching replace lines in backends/*/go.mod
-// point the other direction. Removed once the backends are tagged.
-replace (
-	github.com/Zamua/shale/backends/pebble => ./backends/pebble
-	github.com/Zamua/shale/backends/slate => ./backends/slate
 )
 
 require (
@@ -82,3 +73,18 @@ require (
 	golang.org/x/tools v0.44.0 // indirect
 	gopkg.in/ini.v1 v1.67.2 // indirect
 )
+
+// THE LAST FAKE VERSION. backends/pebble has never been tagged, so the require
+// above names v0.0.0 - a version that exists nowhere - and only this replace
+// makes it resolve. A replace is NOT honored downstream, so the PUBLISHED core
+// module currently declares a dependency no consumer can satisfy. Module-graph
+// pruning hides that from anyone who only imports pkg/cluster (the requirement
+// is never loaded), which is why it went unnoticed; a WORKSPACE consumer loads
+// every module fully and hits it immediately.
+//
+// backends/slate above is the fixed shape: a real tagged version, no replace.
+// Removing this line is blocked on tagging backends/pebble, which is blocked on
+// this commit landing (pebble now requires core v0.13.0 with no replace of its
+// own, so it is tag-ready). Sequence: land this -> tag backends/pebble ->
+// require that version here -> delete this replace.
+replace github.com/Zamua/shale/backends/pebble => ./backends/pebble

@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
-	github.com/Zamua/shale v0.0.0
+	github.com/Zamua/shale v0.13.0
 	github.com/cockroachdb/pebble v1.1.5
 )
 
@@ -55,15 +55,6 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa // indirect
 	google.golang.org/grpc v1.81.1 // indirect
 	google.golang.org/protobuf v1.36.11 // indirect
-)
-
-// Pre-tag development: the core module isn't yet published at a version
-// that hosts the backends/* split, so per-module builds resolve the
-// core (and the sibling backend module the core's cmd/* transitively
-// references) through the in-repo paths. Removed once both are tagged.
-replace (
-	github.com/Zamua/shale => ../..
-	github.com/Zamua/shale/backends/slate => ../slate
 )
 
 // cockroachdb/errors (transitive via pebble) requires the OLD
