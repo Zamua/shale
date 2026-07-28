@@ -26,3 +26,6 @@ shaled-pebble
 !backends/slate/cmd/shaled-slate/
 !backends/pebble/cmd/shaled-pebble/
 Dockerfile.*.local
+
+# Nested throwaway worktree; never part of the module.
+/cas-check/
