@@ -40,7 +40,20 @@
 // unit's backing store before its ack, so after the reshard every acked write
 // is visible. The phase is built to this invariant.
 //
-// Scope: multi-backend mode ONLY (legacy per-node path untouched). R=1 only.
+// Scope: multi-backend mode ONLY. THIS FILE is the R=1 / single-node inline
+// bisect; it is not the only resharder. Agreement on advancing the generation
+// has three implementations today, selected by what the cluster was given:
+//
+//   - single-node:              this file's inline bisect (nobody to agree with)
+//   - R=1 multi-node:           the coordinated freeze barrier
+//                               (multibackend_reshard_barrier.go)
+//   - R>1 with a ConditionalStore: the decentralized CAS arbiter
+//                               (multibackend_reshard_arbiter.go + pkg/reshard)
+//
+// So resharding at R>1 DOES exist - via the arbiter, not via this file. An
+// earlier version of this comment said "R=1 only" without that qualifier,
+// which read as "shale cannot reshard at R>1" and is false.
+//
 // Assumes STABLE membership for the duration of a reshard (concurrent
 // membership-change + reshard is out of scope - a later concern).
 
