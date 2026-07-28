@@ -6,6 +6,7 @@ use (
 	.
 	./backends/pebble
 	./backends/slate
+	./cmd
 )
 
 // Workspace-level replace: cockroachdb/errors v1.11.3 (transitive

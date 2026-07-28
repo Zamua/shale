@@ -64,11 +64,15 @@ backends/              each backend is its own Go module (own go.mod, own deps)
   pebble/              Pebble local-disk LSM impl
                        module: github.com/Zamua/shale/backends/pebble
     cmd/shaled-pebble/ per-backend shaled binary (pebble-only)
-cmd/
+cmd/                   the command-line tools; its OWN Go module
+                       (module: github.com/Zamua/shale/cmd). These are
+                       CONSUMERS of shale, not shale - they are out of the
+                       library module so it does not carry their deps,
+                       notably the backend adapters the bench harness needs.
   shaled/              the reference shaled binary; memory backend only
-                       (no heavy storage deps in the core module)
   shale/               CLI; put/get/delete/scan/topology/stats/ping over gRPC
                        against a running node (defaults to 127.0.0.1:7947)
+  shale-bench/         comparative benchmark harness (memory / pebble / slate)
 internal/              private helpers + test fixtures
 tests/
   unit/                per-package tests
