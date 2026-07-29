@@ -91,6 +91,14 @@ func (r gracefulLeaveResult) duringAckRate() float64 {
 // generous value enables the drain (the gate), 0 disables it (the break-demo,
 // today's tear-down-immediately behavior).
 func runGracefulLeave(t *testing.T, drainTimeout, mountDelay time.Duration) gracefulLeaveResult {
+	return runGracefulLeaveConc(t, drainTimeout, mountDelay, 8)
+}
+
+// runGracefulLeaveConc is runGracefulLeave with the open-concurrency bound
+// explicit. The gates run at 8 (see the mutate comment below); the no-drain
+// break-demo runs at the PRODUCTION default of 1, where the drain's absence
+// is still visible - see the demo for why that divergence is deliberate.
+func runGracefulLeaveConc(t *testing.T, drainTimeout, mountDelay time.Duration, openConcurrency int) gracefulLeaveResult {
 	t.Helper()
 	const unitCount = 32
 	backing := sharedfactory.NewBacking()
@@ -113,7 +121,7 @@ func runGracefulLeave(t *testing.T, drainTimeout, mountDelay time.Duration) grac
 		// open bound (1) would serialize them past the drain budget. No FFI
 		// hazard in the mock double; the bound is pinned separately in
 		// pkg/cluster (TestOverlapAcquire_BoundedByOpenConcurrency).
-		cfg.OpenConcurrency = 8
+		cfg.OpenConcurrency = openConcurrency
 	}
 
 	// Start a 4-node R=2 cluster (default 5s WriteTimeout) and let it fully
@@ -442,7 +450,21 @@ func TestGracefulLeave_HoldsAvailabilityThroughLeave(t *testing.T) {
 // proving the drain wait is what holds availability, not luck. Durability (the
 // oracle) must STILL hold: no-drain is lossless-but-unavailable.
 func TestGracefulLeave_BreakDemo_NoDrainShowsGap(t *testing.T) {
-	r := runGracefulLeave(t, 0, glMountDelay)
+	// PRODUCTION open bound (1), not the gates' lifted 8 - and that divergence
+	// is the honest part, so it gets spelled out. Since v0.14.2 routed the
+	// reconcile's acquires through the background BOUNDED path, a no-drain
+	// leave at concurrency 8 mounts every orphaned position in ~one mount
+	// latency and the write retry rides most of the window: this demo's
+	// during-leave ack rate rose to ~98%, above its own ceiling, and the demo
+	// stopped demonstrating anything. That was a REAL availability improvement
+	// making the sabotage too weak, not the gate going vacuous - but the
+	// improvement is bounded by OpenConcurrency, and production runs the
+	// default of 1 (the FFI-safety bound), where orphaned positions still
+	// mount strictly serially and the gap the drain exists to prevent is very
+	// much alive. So the demo pins the drain's necessity at the bound
+	// production actually runs, while the gates keep 8 (their assertions are
+	// about drain transparency, which must hold regardless of the bound).
+	r := runGracefulLeaveConc(t, 0, glMountDelay, 1)
 	if r.duringAttempted == 0 {
 		t.Fatalf("continuous writer attempted zero writes during the leave window")
 	}
