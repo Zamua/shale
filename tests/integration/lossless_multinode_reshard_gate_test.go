@@ -278,6 +278,20 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	freezeProbeVal := want[freezeProbeKey]
 	var sawFrozen atomic.Bool // observed at least one node frozen during the run
 	var readOKWhileFrozen atomic.Bool
+	// The gate OWNS its observation window: the coordinator's post-FREEZE hook
+	// holds the barrier open (bounded) until the reader has provably run one
+	// probe inside it. Without this the assertion races the freeze duration -
+	// a fast freeze under a loaded machine slips between two 2ms polls and the
+	// vacuity guard below fails a run whose reshard was perfectly healthy
+	// (observed: green scoped 8/8, flaky only under full-suite load).
+	freezeObserved := make(chan struct{})
+	var freezeObservedOnce sync.Once
+	n1.Cluster.TestingSetAfterFreezeHook(func() {
+		select {
+		case <-freezeObserved:
+		case <-time.After(5 * time.Second):
+		}
+	})
 	var readWg sync.WaitGroup
 	readWg.Go(func() {
 		for !stop.Load() {
@@ -291,6 +305,8 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 				if err == nil && bytes.Equal(got, freezeProbeVal) {
 					readOKWhileFrozen.Store(true)
 				}
+				// One full probe ran inside the window: release the barrier.
+				freezeObservedOnce.Do(func() { close(freezeObserved) })
 			}
 			time.Sleep(2 * time.Millisecond)
 		}
