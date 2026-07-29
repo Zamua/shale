@@ -368,7 +368,7 @@ func TestDesiredPendingReplicaUnits_SplitChildren(t *testing.T) {
 	enterSplit(t, c)
 
 	// A draining member exercises the pending (draining-excluded) resolver.
-	pending := c.desiredPendingReplicaUnits(map[string]struct{}{"n3": {}})
+	pending := c.desiredPendingReplicaUnits(map[storageunit.NodeID]struct{}{"n3": {}})
 	assertSplitChildrenColocated(t, pending, 8)
 }
 

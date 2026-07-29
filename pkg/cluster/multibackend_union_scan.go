@@ -29,6 +29,7 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -57,7 +58,7 @@ func (c *Cluster) scanReplicatedUnitOnce(deadline time.Time, prefix []byte) (bac
 	var firstHardErr error
 	var firstUnreachable error
 	sawHandoffTransient := false
-	seen := make(map[string]struct{}, len(routed))
+	seen := make(map[storageunit.NodeID]struct{}, len(routed))
 	for _, rr := range routed {
 		// One leg per MEMBER: a dual-position holder (an index-shuffling
 		// survivor routed at both its old and new slots) is tried once - the
@@ -68,7 +69,7 @@ func (c *Cluster) scanReplicatedUnitOnce(deadline time.Time, prefix []byte) (bac
 		}
 		seen[rr.member.ID] = struct{}{}
 
-		if rr.member.ID == c.cfg.NodeID {
+		if string(rr.member.ID) == c.cfg.NodeID {
 			b, got, ok := c.localReadBackendForReplicaUnit(rr.ru)
 			if !ok {
 				sawHandoffTransient = true

@@ -17,8 +17,8 @@ package cluster
 import (
 	"fmt"
 
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/reshard"
-	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -126,7 +126,7 @@ func reshardGenStep(local genState, S reshard.State) (next genState, changed boo
 // §3.5. The whole key-space doubles, so EVERY child of EVERY parent this node
 // holds is desired up-front (not just cut-over ones); the cutOver set governs
 // ROUTING (which generation serves a key), not which children are mounted.
-func (c *Cluster) splitChildrenVia(gs genState, self storageunit.NodeID, replicaAt func(gu storageunit.GenUnit) []ring.Member) []storageunit.ReplicaUnit {
+func (c *Cluster) splitChildrenVia(gs genState, self storageunit.NodeID, replicaAt func(gu storageunit.GenUnit) []coord.Node) []storageunit.ReplicaUnit {
 	out := make([]storageunit.ReplicaUnit, 0, gs.nextCount.N())
 	for _, child := range gs.nextCount.IDs() {
 		parent, err := storageunit.ParentUnit(child, gs.nextCount)
@@ -134,7 +134,7 @@ func (c *Cluster) splitChildrenVia(gs genState, self storageunit.NodeID, replica
 			continue
 		}
 		for slot, m := range replicaAt(storageunit.NewGenUnit(gs.gen, parent)) {
-			if storageunit.NodeID(m.ID) == self {
+			if m.ID == self {
 				out = append(out, storageunit.NewReplicaUnit(storageunit.NewGenUnit(gs.gen+1, child), uint8(slot)))
 				break
 			}

@@ -27,6 +27,7 @@ import (
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"go.uber.org/goleak"
@@ -295,14 +296,16 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 		WriteConsistency:     wc,
 		ReadConsistency:      rc,
 	}
+	gcfg := gossip.Config{LogOutput: io.Discard}
 	if seedAddr != "" {
-		cfg.Seeds = []string{seedAddr}
+		gcfg.Seeds = []string{seedAddr}
 	}
 
-	// openClusterRetryBind sets cfg.BindAddr (re-rolling a fresh port and
-	// retrying if memberlist hits the release-rebind port race) and returns
-	// the address actually bound, which the node advertises as its seed.
-	c, bindAddr := openClusterRetryBind(t, cfg)
+	// openClusterRetryBind fills in the coordinator's bind address (re-rolling
+	// a fresh port and retrying if memberlist hits the release-rebind port
+	// race) and returns the address actually bound, which the node advertises
+	// as its seed.
+	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
@@ -359,9 +362,9 @@ func isBindConflict(err error) bool {
 	return clustertest.IsBindConflict(err)
 }
 
-func openClusterRetryBind(t *testing.T, cfg cluster.Config, forbiddenPorts ...int) (*cluster.Cluster, string) {
+func openClusterRetryBind(t *testing.T, cfg cluster.Config, gcfg gossip.Config, forbiddenPorts ...int) (*cluster.Cluster, string) {
 	t.Helper()
-	return clustertest.OpenClusterRetryBind(t, cfg, forbiddenPorts...)
+	return clustertest.OpenClusterRetryBind(t, cfg, gcfg, forbiddenPorts...)
 }
 
 // bindPortOf extracts the port from a "host:port" bind address. Used to

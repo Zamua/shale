@@ -25,7 +25,7 @@ import (
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -359,7 +359,7 @@ func TestUnionReadRetry_OutageSurfacesDialErrorFast(t *testing.T) {
 			_ = cli.Close()
 		}
 	})
-	rg := ring.New()
+	dead := make([]coord.Node, 0, 2)
 	for _, id := range []string{"g1", "g2"} {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -367,9 +367,9 @@ func TestUnionReadRetry_OutageSurfacesDialErrorFast(t *testing.T) {
 		}
 		addr := l.Addr().String()
 		_ = l.Close()
-		rg.Add(ring.Member{ID: id, Addr: addr})
+		dead = append(dead, coord.Node{ID: storageunit.NodeID(id), Addr: addr})
 	}
-	c.ring = rg
+	setCoordMembers(c, dead...)
 
 	key := []byte("rr-outage-key")
 	t0 := time.Now()
@@ -447,9 +447,7 @@ func TestUnionScan_WedgedLegBoundedByBudget(t *testing.T) {
 			}()
 		}
 	}()
-	rg := ring.New()
-	rg.Add(ring.Member{ID: "wedge", Addr: l.Addr().String()})
-	c.ring = rg
+	setCoordMembers(c, coord.Node{ID: "wedge", Addr: l.Addr().String()})
 
 	key := []byte("rr-wedged-key")
 	t0 := time.Now()
@@ -490,10 +488,10 @@ func TestUnionReadRetry_DeadMemberLegIsTransient(t *testing.T) {
 	}
 	deadAddr := l.Addr().String()
 	_ = l.Close()
-	rg := ring.New()
-	rg.Add(ring.Member{ID: "self", Addr: "self:0"})
-	rg.Add(ring.Member{ID: "ghost", Addr: deadAddr})
-	c.ring = rg
+	setCoordMembers(c,
+		coord.Node{ID: "self", Addr: "self:0"},
+		coord.Node{ID: "ghost", Addr: deadAddr},
+	)
 
 	key := []byte("rr-dead-member-key")
 	gu := c.genUnitForKey(key)
@@ -615,7 +613,7 @@ func TestUnionReadRetry_LingeringDeadMemberAbsorbed(t *testing.T) {
 
 	// Phase 1 ring: both routed members dead (the reader's STALE view right
 	// after the members departed - the lag window).
-	staleRing := ring.New()
+	stale := make([]coord.Node, 0, 2)
 	for _, id := range []string{"g1", "g2"} {
 		l, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
@@ -623,9 +621,9 @@ func TestUnionReadRetry_LingeringDeadMemberAbsorbed(t *testing.T) {
 		}
 		addr := l.Addr().String()
 		_ = l.Close()
-		staleRing.Add(ring.Member{ID: id, Addr: addr})
+		stale = append(stale, coord.Node{ID: storageunit.NodeID(id), Addr: addr})
 	}
-	c.ring = staleRing
+	setCoordMembers(c, stale...)
 
 	key := []byte("rr-lag-key")
 	gu := c.genUnitForKey(key)
@@ -650,12 +648,10 @@ func TestUnionReadRetry_LingeringDeadMemberAbsorbed(t *testing.T) {
 	go func() {
 		defer close(updated)
 		time.Sleep(ringUpdateAt)
-		// Mutate the ring IN PLACE (Remove/Add under the ring's own lock),
-		// exactly as reconcileRingFromMembership does - the cluster never
-		// swaps the ring pointer while routing reads it.
-		c.ring.Remove("g1")
-		c.ring.Remove("g2")
-		c.ring.Add(ring.Member{ID: "self", Addr: "self:0"})
+		// Move the coordination view under the reader, exactly as a real
+		// membership change does while routing is mid-flight.
+		removeCoordMembers(c, "g1", "g2")
+		addCoordMember(c, coord.Node{ID: "self", Addr: "self:0"})
 		c.reconcileMu.Lock()
 		c.acquireReplicaUnit(ru)
 		c.reconcileMu.Unlock()

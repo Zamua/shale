@@ -44,7 +44,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc/codes"
@@ -52,28 +52,29 @@ import (
 )
 
 // multiReplicated reports whether this cluster runs the R>1 (replicated)
-// multi-backend paths: multi-backend mode, R>1, and a populated ring. It is
+// multi-backend paths: multi-backend mode, R>1, and a populated view. It is
 // the multi analogue of casReplicated(): when true, Put / Get / Delete /
 // CommitCASApply route to the per-unit replicated paths below; when false
-// (multi + R=1) the Phase 2/3/4 single-mount paths run unchanged. A nil /
-// empty ring (single-node) collapses to the single-mount R=1 path, which is
+// (multi + R=1) the Phase 2/3/4 single-mount paths run unchanged. An absent /
+// empty view (single-node) collapses to the single-mount R=1 path, which is
 // correct: with one node there is one replica.
 func (c *Cluster) multiReplicated() bool {
-	return c.multi && c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty()
+	return c.multi && c.replicationFactor() > 1 && c.coord != nil && !c.coord.View().Empty()
 }
 
-// unitReplicas returns the ordered replica set (primary + R-1 ring
-// successors) for the generation-qualified unit gu: ring.LocateKeyN over
-// genUnitBytes(gu), the SAME successor-chain machinery the legacy per-node
-// R>1 path uses, but hashing the unit id instead of the raw key's shard key.
-// Co-location holds by construction: every key in a {tag} set hashes to one
-// unit, so the set's whole replica placement is identical. With a nil / empty
-// ring it returns the local node (single-node: this node is the one replica).
-func (c *Cluster) unitReplicas(gu storageunit.GenUnit) []ring.Member {
-	if c.ring == nil || c.ring.Empty() {
-		return []ring.Member{{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}}
+// unitReplicas returns the ordered replica set for the generation-qualified
+// unit gu - the primary plus R-1 successors, primary first - straight from the
+// coordinator. Co-location holds by construction: every key in a {tag} set
+// resolves to one unit, so the set's whole replica placement is identical.
+// With no coordination view it returns the local node (single-node: this node
+// is the one replica).
+func (c *Cluster) unitReplicas(gu storageunit.GenUnit) []coord.Node {
+	ns := c.locate(gu, c.replicationFactor(), coord.Placement{})
+	if len(ns) == 0 {
+		// No coordination view: this node is the one replica.
+		return []coord.Node{c.selfNode()}
 	}
-	return c.ring.LocateKeyN(genUnitBytes(gu), c.replicationFactor())
+	return ns
 }
 
 // replicaLayout reports whether this cluster addresses storage BY REPLICA
@@ -142,7 +143,7 @@ func (c *Cluster) desiredReplicaUnits() []storageunit.ReplicaUnit {
 // MERGE's survivors at their own gen-(g+1) ring home (ownedReplicaUnitsAt at
 // gen+1). Both augmentations are no-ops in steady state, so the common path is
 // unchanged.
-func (c *Cluster) desiredReplicaUnitsVia(replicaAt func(gu storageunit.GenUnit) []ring.Member) []storageunit.ReplicaUnit {
+func (c *Cluster) desiredReplicaUnitsVia(replicaAt func(gu storageunit.GenUnit) []coord.Node) []storageunit.ReplicaUnit {
 	gs := c.genSnapshot()
 	self := storageunit.NodeID(c.cfg.NodeID)
 
@@ -162,7 +163,7 @@ func (c *Cluster) desiredReplicaUnitsVia(replicaAt func(gu storageunit.GenUnit) 
 // replicaAt (the live ring, or the draining-excluded ring for the pending set).
 // It is the shared core for both the gen-g pass and a merge's gen-(g+1) survivor
 // pass.
-func (c *Cluster) ownedReplicaUnitsAt(gen storageunit.Generation, count storageunit.UnitCount, self storageunit.NodeID, replicaAt func(gu storageunit.GenUnit) []ring.Member) []storageunit.ReplicaUnit {
+func (c *Cluster) ownedReplicaUnitsAt(gen storageunit.Generation, count storageunit.UnitCount, self storageunit.NodeID, replicaAt func(gu storageunit.GenUnit) []coord.Node) []storageunit.ReplicaUnit {
 	// Adapt the ring-backed replica lookup to the pure ReplicaLookup contract:
 	// map a UnitID to its replica nodes at `gen`, projecting each ring member id
 	// into a storageunit.NodeID.
@@ -177,12 +178,12 @@ func (c *Cluster) ownedReplicaUnitsAt(gen storageunit.Generation, count storageu
 	return out
 }
 
-// memberNodeIDs projects a ring member set into the pure-domain NodeID slice the
-// ReplicaLookup contract speaks.
-func memberNodeIDs(set []ring.Member) []storageunit.NodeID {
+// memberNodeIDs projects a located node set into the pure-domain NodeID slice
+// the ReplicaLookup contract speaks.
+func memberNodeIDs(set []coord.Node) []storageunit.NodeID {
 	nodes := make([]storageunit.NodeID, len(set))
 	for i, m := range set {
-		nodes[i] = storageunit.NodeID(m.ID)
+		nodes[i] = m.ID
 	}
 	return nodes
 }
@@ -440,7 +441,7 @@ func (c *Cluster) promptAcquireFreshPositions() {
 	}()
 }
 
-// peerJoiningCounts reports how many OTHER nodes the membership snapshot
+// peerJoiningCounts reports how many OTHER nodes the coordination view
 // contains and how many of those advertise Joining. peers > joining means at
 // least one established peer exists - the safety condition for acting on this
 // node's boot state immediately: an established peer proves there is a
@@ -450,15 +451,16 @@ func (c *Cluster) promptAcquireFreshPositions() {
 // is that a guard which cannot report its own reasoning costs a night of
 // diagnosis when it fires unexpectedly.
 func (c *Cluster) peerJoiningCounts() (peers, joining int) {
-	if c.membership == nil {
+	if c.coord == nil {
 		return 0, 0
 	}
-	for _, m := range c.membership.Snapshot() {
-		if m.ID == c.cfg.NodeID {
+	self := storageunit.NodeID(c.cfg.NodeID)
+	for _, m := range c.coord.View().Members {
+		if m.ID == self {
 			continue
 		}
 		peers++
-		if m.Joining {
+		if m.Joining() {
 			joining++
 		}
 	}
@@ -758,7 +760,7 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 	if len(routed) == 0 {
 		return writeAttempt{err: status.Error(codes.Unavailable, "shale: no replicas available for key")}
 	}
-	replicas := make([]ring.Member, len(routed))
+	replicas := make([]coord.Node, len(routed))
 	for i, rr := range routed {
 		replicas[i] = rr.member
 	}
@@ -772,7 +774,7 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 	// write-availability gap. idx maps each fan-out goroutine to its exact
 	// routedReplica.
 	acks, errs, transient, resultsCh := fanout(ctx, replicas, w,
-		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
+		func(opCtx context.Context, idx int, replica coord.Node) ([]byte, error) {
 			return nil, c.dispatchReplicaPutUnit(opCtx, replica, routed[idx].ru, key, envBytes)
 		})
 
@@ -791,8 +793,8 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 // the remote branch dispatches PutForwarded to the replica node, whose RPC
 // handler lands in LocalReplicaPut (multi R>1 branch). A frozen / acquiring
 // replica returns the transient code the fan-out tolerates.
-func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica ring.Member, ru storageunit.ReplicaUnit, key, envBytes []byte) error {
-	if replica.ID == c.cfg.NodeID {
+func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica coord.Node, ru storageunit.ReplicaUnit, key, envBytes []byte) error {
+	if string(replica.ID) == c.cfg.NodeID {
 		// v0.8 Phase 2e (pending ranges): apply the union dual-write to the EXPLICIT
 		// position ru this member holds. For a current owner ru is its current
 		// index; for a pending owner ru is the slot it acquired (which its own
@@ -874,7 +876,7 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 	// N is the stable read quorum, NOT widened by a transient union member; clamp
 	// to the routed size so a single-replica routed set is still answerable.
 	n := min(requiredReadReplicas(rc, stableR), len(routed))
-	queried := make([]ring.Member, len(routed))
+	queried := make([]coord.Node, len(routed))
 	for i, rr := range routed {
 		queried[i] = rr.member
 	}
@@ -883,7 +885,7 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 	// attempts never stack budgets past ReadTimeout.
 	fanoutCtx, cancelFanout := context.WithDeadline(context.Background(), deadline)
 	_, _, _, resultsCh := fanout(fanoutCtx, queried, n,
-		func(ctx context.Context, idx int, replica ring.Member) ([]byte, error) {
+		func(ctx context.Context, idx int, replica coord.Node) ([]byte, error) {
 			return c.dispatchReplicaGetUnitAt(ctx, replica, routed[idx].ru, key)
 		})
 
@@ -992,8 +994,8 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 // a displaced current owner during a join answers from its still-mounted
 // position, and a fresh key it holds no value for flows back as a plain
 // not-found (usable by the read quorum) instead of a loop-guard refusal.
-func (c *Cluster) dispatchReplicaGetUnitAt(ctx context.Context, replica ring.Member, ru storageunit.ReplicaUnit, key []byte) ([]byte, error) {
-	if replica.ID == c.cfg.NodeID {
+func (c *Cluster) dispatchReplicaGetUnitAt(ctx context.Context, replica coord.Node, ru storageunit.ReplicaUnit, key []byte) ([]byte, error) {
+	if string(replica.ID) == c.cfg.NodeID {
 		// Read-side mounted-position fallback (docs/SPEC.md "Union reads",
 		// guard 1): a ring change can shuffle this member's index within the
 		// unit's replica set, leaving the bytes mounted at the OLD position
@@ -1034,11 +1036,11 @@ func (c *Cluster) scheduleReadRepairUnit(key []byte, winnerEnv Envelope, gathere
 	// Map each routed union member to the ReplicaUnit it holds so a repair to a
 	// pending owner is position-addressed (same as the primary write path).
 	routed, _ := c.routedReplicasWithUnit(key)
-	ruByMember := make(map[string]storageunit.ReplicaUnit, len(routed))
+	ruByMember := make(map[storageunit.NodeID]storageunit.ReplicaUnit, len(routed))
 	for _, rr := range routed {
 		ruByMember[rr.member.ID] = rr.ru
 	}
-	laggers := make([]ring.Member, 0, len(gathered))
+	laggers := make([]coord.Node, 0, len(gathered))
 	for _, g := range gathered {
 		if !g.hadValue || winnerEnv.Stamp.Greater(g.env.Stamp) {
 			laggers = append(laggers, g.member)

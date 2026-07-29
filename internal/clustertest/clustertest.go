@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -83,10 +84,13 @@ func IsBindConflict(err error) bool {
 }
 
 // OpenClusterRetryBind opens a Cluster, retrying on a memberlist bind
-// conflict with a FRESH port each time. cfg.BindAddr is replaced with a
-// new FreePort allocation on every attempt (including the first, so the
-// caller does not have to seed it), and the BindAddr actually bound is
-// returned so the node fixture advertises the right seed address. This
+// conflict with a FRESH port each time. A gossip coordinator is built per
+// attempt with gcfg plus a new FreePort allocation (including on the first, so
+// the caller does not have to seed a bind address), and the BindAddr actually
+// bound is returned so the node fixture advertises the right seed address.
+//
+// The bind now happens inside cluster.Open, when it starts the coordinator, so
+// the retry still wraps exactly one call. This
 // waits on a REAL condition (a successful bind), not a sleep: it loops
 // only while memberlist reports the port is taken, and fails loudly if
 // every attempt in the bounded budget conflicts (which would indicate a
@@ -108,7 +112,7 @@ func IsBindConflict(err error) bool {
 // ephemeral-port allocator not to reuse it (darwin's is sequential and
 // effectively never does, which is why this hides on a Mac and bites on a
 // Linux CI runner, whose allocator is randomized).
-func OpenClusterRetryBind(t *testing.T, cfg cluster.Config, forbiddenPorts ...int) (*cluster.Cluster, string) {
+func OpenClusterRetryBind(t *testing.T, cfg cluster.Config, gcfg gossip.Config, forbiddenPorts ...int) (*cluster.Cluster, string) {
 	t.Helper()
 	const maxAttempts = 8
 	var lastErr error
@@ -120,7 +124,8 @@ func OpenClusterRetryBind(t *testing.T, cfg cluster.Config, forbiddenPorts ...in
 			continue
 		}
 		bindAddr := HostPort(port)
-		cfg.BindAddr = bindAddr
+		gcfg.BindAddr = bindAddr
+		cfg.Coordinator = gossip.New(gcfg)
 		c, err := cluster.Open(cfg)
 		if err == nil {
 			return c, bindAddr

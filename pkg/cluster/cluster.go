@@ -11,7 +11,7 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/blob"
-	"github.com/Zamua/shale/pkg/membership"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/reshard"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -70,8 +70,8 @@ const (
 )
 
 // Config configures a Cluster. NodeID + Backend are always required.
-// The peer-discovery fields (BindAddr, Seeds, GRPCAddr) are required
-// only for multi-node mode; in single-node mode they may be empty.
+// The peer fields (Coordinator, GRPCAddr) are required only for
+// multi-node mode; in single-node mode they may be left zero.
 type Config struct {
 	// NodeID is this node's stable identity. Used in membership +
 	// ring placement. MUST be unique within the cluster.
@@ -154,10 +154,22 @@ type Config struct {
 	// compile error. See kv.go.
 	BlobStore blob.Store
 
-	// BindAddr is the host:port memberlist listens on (UDP + TCP).
-	// Non-empty enables multi-node mode. Format: "host:port" (host
-	// may be empty for "all interfaces").
-	BindAddr string
+	// Coordinator is the COORDINATION PORT (pkg/coord): the thing that
+	// answers "which nodes should hold this storage unit". Non-nil enables
+	// multi-node mode.
+	//
+	// nil means SINGLE-NODE - this node owns the whole unit space and no op
+	// ever leaves the process - exactly as an empty BindAddr meant before the
+	// port existed. The caller constructs the coordinator (choosing the
+	// mechanism: pkg/coord/gossip today, a lease/CAS adapter later, a fake in
+	// a test) and this Cluster owns its lifecycle from there: Open starts it,
+	// Close closes it.
+	//
+	// The knobs the MECHANISM needs (a memberlist bind address, seed peers, a
+	// gossip log sink) live on the adapter's own config, not here. What the
+	// cluster knows about ITSELF - NodeID, GRPCAddr, its declared unit count,
+	// whether it starts warming - is handed over at Open as coord.Params.
+	Coordinator coord.Coordinator
 
 	// GRPCAddr is this node's gRPC service address, broadcast to
 	// peers as their forwarding target. Required in multi-node mode.
@@ -166,19 +178,17 @@ type Config struct {
 	// other machines).
 	GRPCAddr string
 
-	// Seeds are addresses of already-running cluster nodes (their
-	// BindAddr). Bootstrap gossip contacts these to discover the
-	// rest of the membership. Empty means this node is the seed.
-	Seeds []string
+	// LogOutput is where the cluster writes its own operational warnings
+	// (an under-replicated CAS commit, a failed unit acquire). nil is a
+	// silent sink for the gated warnings and stderr for the ones that must
+	// never be lost; tests pass io.Discard. It is NOT the coordinator's log
+	// sink - a gossip transport's chatter is the adapter's own config.
+	LogOutput io.Writer
 
 	// ShardKeyFn lets the app extract a shard key from a full key.
 	// Default = hashTagged identity (full key, honoring `{tag}`
 	// hash tags). Override for custom shard key shapes.
 	ShardKeyFn func(key []byte) []byte
-
-	// LogOutput is where membership's internal logger writes. nil
-	// means memberlist's default (stderr). Tests pass io.Discard.
-	LogOutput io.Writer
 
 	// RebalanceSettleDelay is how long the cluster waits after a
 	// membership event before running the unit reconcile. Each
@@ -387,7 +397,7 @@ type Config struct {
 // half-configures multi-backend mode must hear about it, not silently get
 // a degenerate one).
 //
-// Backend WITH a BindAddr is rejected. It used to select a second
+// Backend WITH a Coordinator is rejected. It used to select a second
 // coordination engine (plan key ranges, stream them between peers, verify,
 // sweep) which no longer exists: shale has ONE distributed model, the
 // unit lease handoff, and that needs a BackendFactory. Accepting the
@@ -404,8 +414,8 @@ func validateBackendMode(cfg *Config) (multi bool, err error) {
 	switch {
 	case hasBackend && (hasFactory || hasUnitCount):
 		return false, errors.New("cluster: set EITHER Backend (single-node) OR BackendFactory+UnitCount (multi-backend), not both")
-	case hasBackend && cfg.BindAddr != "":
-		return false, errors.New("cluster: Config.Backend is single-node only; multi-node (BindAddr set) requires BackendFactory + UnitCount")
+	case hasBackend && cfg.Coordinator != nil:
+		return false, errors.New("cluster: Config.Backend is single-node only; multi-node (Coordinator set) requires BackendFactory + UnitCount")
 	case hasFactory != hasUnitCount:
 		return false, errors.New("cluster: multi-backend mode requires BOTH BackendFactory and UnitCount")
 	case hasFactory && hasUnitCount:
@@ -502,21 +512,21 @@ type Cluster struct {
 	// non-nil, drainingIDs returns it directly instead of reading the membership
 	// snapshot. It lets the white-box pending-ranges tests inject a transition
 	// without a memberlist. Nil in production (the snapshot is authoritative).
-	draining map[string]struct{}
+	draining map[storageunit.NodeID]struct{}
 
 	// joining is a TEST-ONLY override for the gossiped Joining set: when non-nil,
 	// joiningIDs returns it directly instead of reading the membership snapshot.
 	// It lets the white-box pending-ranges tests inject a JOIN transition (and
 	// exercise the quorum floor) without a memberlist. Nil in production (the
 	// snapshot is authoritative). The entry-side mirror of draining above.
-	joining map[string]struct{}
+	joining map[storageunit.NodeID]struct{}
 
 	// selfJoining tracks whether THIS node currently advertises the Joining bit.
 	// Set true at boot when mountReplicaUnits boot-defers one or more owned
 	// positions (a peer is serving them); cleared by the reconcile once every
 	// owned position is mounted. Kept as a local atomic so the reconcile's
 	// clear-decision does not race a self-snapshot; the authoritative gossiped bit
-	// is driven through membership.SetJoining alongside this flag.
+	// is published through the coordination port alongside this flag.
 	selfJoining atomic.Bool
 
 	// genState is the generation-aware routing state (v0.8 Phase 4): the
@@ -588,9 +598,23 @@ type Cluster struct {
 	// before-state.
 	reconcileMu sync.Mutex
 
-	// Populated in multi-node mode; nil in single-node mode.
-	ring       *ring.Ring
-	membership *membership.Membership
+	// coord is the COORDINATION PORT this node asks "who should hold this
+	// unit". Non-nil in multi-node mode, nil in single-node mode (where the
+	// answer is always "me"). Supplied by the caller through Config; this
+	// Cluster starts it in Open and closes it in Close. Assigned once in Open
+	// before any goroutine spawns, then read-only.
+	coord coord.Coordinator
+
+	// bootstrap records how this node entered the cluster, as the coordinator
+	// determined at Start. A JOINED node must learn the cluster generation from
+	// an incumbent before it serves; a FOUNDED one defines it. Written once in
+	// Open, then read-only.
+	bootstrap coord.Bootstrap
+
+	// selfDraining mirrors selfJoining for the exit side. The port publishes a
+	// COMPLETE role set, so the two bits have to be tracked together here to
+	// be republished together; a coordinator never merges a partial update.
+	selfDraining atomic.Bool
 
 	clientsMu sync.RWMutex
 	clients   map[string]*peerClient // peer gRPC addr -> client
@@ -671,14 +695,12 @@ type Cluster struct {
 	// loser falls through to the closed CAS and waits on loopWG.
 	drainOnce sync.Once
 
-	// Rebalance state (multi-node only; unused in single-node mode,
-	// which builds no ring and so never sees one change). ringGen is
-	// the monotonic generation counter bumped on every
-	// membership-driven ring change (events loop + reconcile loop both
-	// call bumpRingGen). settleMu + settleTimer drive the debounce:
-	// every ring change (re)arms the timer; when it fires,
-	// runScheduledReconcile acquires newly-owned units and releases
-	// no-longer-owned ones.
+	// Rebalance state (multi-node only; unused in single-node mode, which has
+	// no coordinator and so never sees a topology change). ringGen is the
+	// monotonic generation counter bumped on every coordination change hint
+	// the coord loop folds in. settleMu + settleTimer drive the debounce:
+	// every change (re)arms the timer; when it fires, runScheduledReconcile
+	// acquires newly-owned units and releases no-longer-owned ones.
 	ringGen     atomic.Uint64
 	settleMu    sync.Mutex
 	settleTimer *time.Timer
@@ -711,10 +733,10 @@ type Cluster struct {
 
 // Open initializes a Cluster from cfg. In single-node mode it just
 // records the cfg + returns the wrapper. In multi-node mode (when
-// cfg.BindAddr is non-empty) it additionally brings up memberlist,
-// joins seeds, seeds the ring with the local node + any peers already
-// seen, and starts a goroutine that mirrors membership events into the
-// ring.
+// cfg.Coordinator is non-nil) it additionally STARTS the coordinator -
+// handing it this node's identity, declared unit count and initial role set -
+// derives the units this node owns from the resulting view, mounts them, and
+// starts the loops that react to later view changes.
 func Open(cfg Config) (*Cluster, error) {
 	if cfg.NodeID == "" {
 		return nil, errors.New("cluster: NodeID is required")
@@ -745,10 +767,10 @@ func Open(cfg Config) (*Cluster, error) {
 	c.mounts.init(c)
 	c.repairCtx, c.repairCancel = context.WithCancel(context.Background())
 
-	if cfg.BindAddr == "" {
-		// Single-node mode: no membership, no ring, every op is local.
-		// In multi-backend mode this node still owns the whole unit
-		// space (genUnitOwner reports the local owner on an empty ring),
+	if cfg.Coordinator == nil {
+		// Single-node mode: no coordinator, every op is local. In
+		// multi-backend mode this node still owns the whole unit space
+		// (genUnitOwner reports the local owner with no coordination view),
 		// so mount it now.
 		if multi {
 			if err := c.initMultiBackend(); err != nil {
@@ -763,157 +785,174 @@ func Open(cfg Config) (*Cluster, error) {
 	}
 
 	// JOIN write-transparency (v0.8 Phase 2e, entry side): a node JOINING an
-	// existing REPLICATED cluster (it has seeds, and R>1) advertises the Joining
-	// bit in its VERY FIRST gossip Meta - atomically with its ring presence - so a
-	// peer never learns the newcomer is a member (and clean-cut releases a position
-	// it displaces) BEFORE it learns the newcomer is Joining (which tells it to HOLD
-	// + drain instead). A founder (no seeds) or an R=1 node leaves it false, so cold
-	// first-cluster formation and the single-replica path are unchanged. The
-	// reconcile clears the bit once this node has mounted every position it owns.
-	startJoining := multi && cfg.ReplicationFactor > 1 && len(cfg.Seeds) > 0
-	c.selfJoining.Store(startJoining)
+	// existing REPLICATED cluster advertises the Joining role in its VERY FIRST
+	// announcement - atomically with its own presence - so a peer never learns
+	// the newcomer is a member (and clean-cut releases a position it displaces)
+	// BEFORE it learns the newcomer is warming (which tells it to HOLD + drain
+	// instead). "Am I joining an existing cluster or founding one" is the
+	// COORDINATOR's knowledge, not the cluster's, so this asks for the role and
+	// lets the coordinator drop it when it is founding; an R=1 node never asks
+	// for it, so the single-replica path is unchanged. The reconcile clears the
+	// role once this node has mounted every position it owns.
+	wantJoining := multi && cfg.ReplicationFactor > 1
+	var initialRoles coord.Role
+	if wantJoining {
+		initialRoles = coord.RoleJoining
+	}
 
-	mem, err := membership.Open(membership.Config{
-		NodeID:    cfg.NodeID,
-		BindAddr:  cfg.BindAddr,
-		GRPCAddr:  cfg.GRPCAddr,
-		Seeds:     cfg.Seeds,
-		Joining:   startJoining,
-		LogOutput: cfg.LogOutput,
-		// Gossip this node's standing declared shard count (SHALE_UNIT_COUNT)
-		// so the cluster can detect cluster-wide AGREEMENT on a desired count
-		// and drive a declarative reshard toward it (observeDeclaredReshardTarget).
-		// A zero UnitCount (legacy / non-multi-backend mode) yields 0 = "do not
-		// advertise", so peers treat this node as UNKNOWN and never auto-reshard
-		// on its account.
+	bootstrap, err := cfg.Coordinator.Start(coord.Params{
+		Self: coord.Node{ID: storageunit.NodeID(cfg.NodeID), Addr: cfg.GRPCAddr},
+		// Advertise this node's standing declared shard count
+		// (SHALE_UNIT_COUNT) so the cluster can detect cluster-wide AGREEMENT
+		// on a desired count and drive a declarative reshard toward it (see
+		// observeDeclaredReshardTarget). A zero UnitCount (legacy /
+		// non-multi-backend mode) yields 0 = "do not advertise", so peers treat
+		// this node as UNKNOWN and never auto-reshard on its account.
 		DeclaredUnitCount: cfg.UnitCount.N(),
-		// Periodic seed re-Join heals a post-startup gossip split (e.g. a
-		// mass rolling restart fragmenting the ring). Wired with the
-		// production default; only active when Seeds is non-empty, so a
-		// founder (no seeds) and in-process tests that pass no seeds run no
-		// loop. See membership.Config.RejoinInterval.
-		RejoinInterval: membership.DefaultRejoinInterval,
-		// Periodic local-Meta re-broadcast heals a STALE-Meta peer view after
-		// a STAGGERED rolling restart (a restarted pod resets its memberlist
-		// incarnation, so peers reject its fresh declared count as stale until
-		// the bumped-incarnation re-broadcast overtakes the remembered value).
-		// Wired with the production default; the gossiped declared count is
-		// what the declarative-reshard unanimity gate reads, so it must
-		// converge deterministically rather than race. See
-		// membership.Config.MetaRefreshInterval.
-		MetaRefreshInterval: membership.DefaultMetaRefreshInterval,
+		InitialRoles:      initialRoles,
 		// Homogeneous bootstrap: when a shared ConditionalStore is wired, every
-		// node carries the SAME seed list (a headless Service) and the first one
-		// up reaches no peer. AllowSoloStart lets it come up solo and contend to
-		// form via the __cluster/init marker, instead of failing Open. Without a
+		// node carries the SAME peer list (a headless Service) and the first one
+		// up reaches nobody. SoloStart lets it come up alone and contend to form
+		// via the __cluster/init marker, instead of failing Open. Without a
 		// ConditionalStore (no durable form-lock) keep the strict behavior: a
-		// joiner with unreachable seeds fails rather than silently fork.
-		AllowSoloStart: cfg.ConditionalStore != nil,
+		// node that cannot reach its peers fails rather than silently fork.
+		SoloStart: cfg.ConditionalStore != nil,
 	})
 	if err != nil {
-		return nil, fmt.Errorf("cluster: membership: %w", err)
+		return nil, fmt.Errorf("cluster: coordinator: %w", err)
 	}
+	c.coord = cfg.Coordinator
+	c.bootstrap = bootstrap
+	// The coordinator may have declined the Joining role (it is founding, not
+	// joining); track what it actually advertises, not what we asked for.
+	c.selfJoining.Store(c.selfHasRole(coord.RoleJoining))
 
-	c.membership = mem
-	c.ring = ring.New()
-
-	// Seed the ring with whatever membership knows about right now
-	// (always at least the local node; possibly peers if Join already
-	// returned a populated snapshot).
-	for _, m := range mem.Members() {
-		c.ring.Add(ring.Member{ID: m.ID, Addr: m.Addr})
-	}
-
-	// Derive the owned units from the now-seeded ring + mount them at
-	// Open. On every later membership change the events / reconcile loops
-	// below call bumpRingGen, which arms the COPY-FREE lease-handoff
-	// reconcile (multibackend_rebalance.go): a unit whose owner moved is
-	// released by the old owner (CloseUnit, flush) and acquired by the new
-	// owner (OpenUnit at a higher epoch, fencing the old). The bytes stay
-	// put in the shared durable store; only the lease moves.
+	// Derive the owned units from the coordinator's opening view + mount them
+	// at Open. On every later view change the loops below call bumpRingGen,
+	// which arms the COPY-FREE lease-handoff reconcile
+	// (multibackend_rebalance.go): a unit whose owner moved is released by the
+	// old owner (CloseUnit, flush) and acquired by the new owner (OpenUnit at a
+	// higher epoch, fencing the old). The bytes stay put in the shared durable
+	// store; only the lease moves.
 	if err := c.initMultiBackend(); err != nil {
-		_ = mem.Close()
+		_ = c.coord.Close()
 		return nil, err
 	}
 
-	// Run the events loop so future joins / leaves keep the ring in
-	// sync with membership. Also run a slower reconciliation loop
-	// that re-syncs the ring against the authoritative membership
-	// snapshot on a fixed cadence - belt + suspenders against the
-	// rare event-channel drop (membership uses a non-blocking send
-	// to preserve no-deadlock guarantees; if a consumer ever falls
-	// behind a join/leave could be lost, leaving the ring stale
-	// forever without this loop).
+	// React to coordination changes, and re-run the unit reconcile on a fixed
+	// cadence. The change hint is LOSSY BY CONTRACT (a coordinator may coalesce
+	// or drop hints), which is exactly why the periodic loop is not optional:
+	// it is what turns a missed hint into seconds of staleness instead of
+	// permanent divergence.
 	c.loopWG.Add(2)
-	go c.runEventsLoop()
+	go c.runCoordLoop()
 	go c.runReconcileLoop()
 
 	return c, nil
 }
 
-// runEventsLoop mirrors membership join/leave events into the ring.
-// It exits when the membership events channel is closed (Close drives
-// that) or closeCh is signalled. The two-channel select keeps Close
-// from blocking on a slow producer.
-func (c *Cluster) runEventsLoop() {
+// runCoordLoop reacts to coordination change hints. Its whole job is the two
+// things a view change means to the storage layer: a peer's dial address may
+// be stale (evict its cached client) and unit ownership may have moved (arm the
+// debounced lease-handoff reconcile).
+//
+// It deliberately does NOT trust the hint to describe what changed - the port
+// says the hint is lossy and coalescing - so it re-reads the whole view and
+// acts on that. It exits when closeCh is signalled.
+func (c *Cluster) runCoordLoop() {
 	defer c.loopWG.Done()
-	events := c.membership.Events()
+	changed := c.coord.Changed()
 	for {
 		select {
-		case ev, ok := <-events:
-			if !ok {
-				return
-			}
-			switch ev.Type {
-			case membership.EventJoin:
-				// v0.8 Phase 2e (pending ranges): a DRAINING member STAYS a
-				// current owner in the consistent-hash ring - it is NOT excluded.
-				// The current/pending split (current = ring INCLUDING draining;
-				// pending = ring EXCLUDING draining) is computed PER-OP inside
-				// routedReplicasForKey, not baked into the ring. So the event loop Adds a
-				// draining member normally (it keeps its positions + keeps serving
-				// the union); the drain ends only when its successors are provably
-				// serving (the serving-marker gate), and the real memberlist.Leave()
-				// then fires an EventLeave that removes it. (This REVERSES the
-				// superseded draining-exclusion stopgap.)
-				//
-				// If the addr changed (NotifyUpdate path - same ID,
-				// different Meta payload), evict the cached client
-				// for the OLD addr so the next dial picks up the
-				// new endpoint. Look up the prior addr via the ring
-				// snapshot before Add overwrites it.
-				oldAddr := c.priorAddrForID(ev.Member.ID)
-				c.ring.Add(ring.Member{ID: ev.Member.ID, Addr: ev.Member.Addr})
-				if oldAddr != "" && oldAddr != ev.Member.Addr {
-					c.evictClient(oldAddr)
-				}
-				c.bumpRingGen()
-				// A join can CREATE positions that have never existed - on a
-				// growing cluster the ring hands this node replica positions
-				// nobody has ever mounted or marked. Those are acquired
-				// promptly rather than a settle-debounce later; see the
-				// method for the two independent safety gates.
-				c.promptAcquireFreshPositions()
-			case membership.EventLeave:
-				c.ring.Remove(ev.Member.ID)
-				// Drop any cached client for this departed peer so
-				// the next dial picks up a fresh connection if the
-				// same node ever returns on a different address.
-				c.evictClient(ev.Member.Addr)
-				c.bumpRingGen()
-			}
+		case <-changed:
+			c.onViewChanged()
 		case <-c.closeCh:
 			return
 		}
 	}
 }
 
-// runReconcileLoop re-syncs the ring against membership.Members() on
-// a fixed cadence. The event-channel layer in membership drops events
-// on backpressure (intentional - keeps memberlist's callback goroutine
-// unblocked); without this loop, a single dropped join would leave the
-// ring permanently missing that node. With it, ring divergence
-// auto-heals within one tick.
+// onViewChanged folds one coordination view into this node's local state:
+// drop peer clients the view invalidated, then arm the settle timer so the
+// unit reconcile picks up any ownership move.
+//
+// bumpRingGen fires on EVERY hint, including one where nothing moved. That is
+// deliberate and matches the pre-port behavior: the reconcile it arms is
+// idempotent and cheap when the mounted set already matches desired, and a
+// "nothing moved" hint is precisely the signal that some member's ROLE flipped
+// without its address changing - which DOES change routing.
+func (c *Cluster) onViewChanged() {
+	c.evictStaleClients()
+	c.bumpRingGen()
+	// A view change can CREATE positions that have never existed - on a
+	// growing cluster the placement hands this node replica positions nobody
+	// has ever mounted or marked. Those are acquired promptly rather than a
+	// settle-debounce later. Pre-port this fired only on the JOIN event; the
+	// port's hint is lossy and coalescing, so no arrival can be assumed
+	// join-free - and the method's own gates (markerless + desired + unmounted
+	// targets only, startAcquire dedup, Joining/closed checks) make it a no-op
+	// on every hint that did not mint fresh positions.
+	c.promptAcquireFreshPositions()
+}
+
+// evictStaleClients drops every cached peer client whose endpoint is no longer
+// a member address in the current view. That covers both ways an endpoint goes
+// stale - a member restarted on a new port (its old address is gone from the
+// view) and a member departed entirely - with ONE stateless rule.
+//
+// It is deliberately a SWEEP over the cache rather than a diff against the
+// previously-seen view. The change hint coalesces by contract, so two changes
+// can arrive as one wakeup and a diff would never see the intermediate address
+// it was supposed to evict. Sweeping asks the only question that matters -
+// "does anyone still answer at this address" - and cannot miss.
+//
+// Every cached client was dialed at an address the cluster read out of a view
+// (routed replicas, peer scans, seed generation queries), so an address absent
+// from the current view is unreachable by construction, never a live peer the
+// sweep might cut off. Dropping it is what lets the next dial reach the live
+// endpoint: a cached client pointed at a dead endpoint does not fail once, it
+// enters gRPC's TRANSIENT_FAILURE backoff and fails EVERY forward for the whole
+// backoff window.
+func (c *Cluster) evictStaleClients() {
+	if c.coord == nil {
+		return
+	}
+	live := make(map[string]struct{})
+	for _, m := range c.coord.View().Members {
+		if m.Addr != "" {
+			live[m.Addr] = struct{}{}
+		}
+	}
+	// An empty view carries no information about who is reachable (the
+	// coordinator has not seen a member yet); dropping every client on it would
+	// tear down healthy connections for no reason.
+	if len(live) == 0 {
+		return
+	}
+
+	c.clientsMu.RLock()
+	stale := make([]string, 0, len(c.clients))
+	for addr := range c.clients {
+		if _, ok := live[addr]; !ok {
+			stale = append(stale, addr)
+		}
+	}
+	c.clientsMu.RUnlock()
+
+	for _, addr := range stale {
+		c.evictClient(addr)
+	}
+}
+
+// runReconcileLoop re-runs the unit reconcile on a fixed cadence.
+//
+// Self-heal (v0.8 Phase 3): a transient OpenUnit/CloseUnit failure during an
+// earlier reconcile would otherwise strand a unit (owned but not mounted, or
+// mounted but not owned) until the next view change, since view-driven
+// reconciles only fire on a change hint. The reconcile is idempotent and cheap
+// when the mounted set already matches desired, so run it every tick to
+// re-acquire / release any drifted unit. It runs inside the loopWG-tracked
+// loop, so Close awaits it.
 func (c *Cluster) runReconcileLoop() {
 	defer c.loopWG.Done()
 	t := time.NewTicker(reconcileInterval)
@@ -923,126 +962,105 @@ func (c *Cluster) runReconcileLoop() {
 		case <-c.closeCh:
 			return
 		case <-t.C:
-			c.reconcileRingFromMembership()
 			if c.multi {
-				// Self-heal (v0.8 Phase 3): a transient OpenUnit/CloseUnit
-				// failure during an earlier reconcile would otherwise strand
-				// a unit (owned but not mounted, or mounted but not owned)
-				// until the next membership change, since membership-driven
-				// reconciles only fire on a ring change. The unit reconcile
-				// is idempotent and cheap when the mounted set already matches
-				// desired, so run it every tick to re-acquire/release any
-				// drifted unit. This runs inside the loopWG-tracked loop, so
-				// Close awaits it.
 				c.runReconcile()
 			}
 		}
 	}
 }
 
-// reconcileRingFromMembership reads the authoritative membership snapshot
-// and applies any missed adds/removes to the ring. Idempotent: an
-// already-present member's Add is a no-op (ring.Add overwrites the
-// same Member with itself) and a non-member's absence is the desired
-// state.
-func (c *Cluster) reconcileRingFromMembership() {
-	if c.membership == nil || c.ring == nil {
-		return
+// selfHasRole reports whether the coordinator currently advertises role for
+// THIS node.
+func (c *Cluster) selfHasRole(role coord.Role) bool {
+	if c.coord == nil {
+		return false
 	}
-	snap := c.membership.Snapshot()
-	want := make(map[string]ring.Member, len(snap))
-	for _, m := range snap {
-		// v0.8 Phase 2e (pending ranges): a DRAINING member STAYS a CURRENT
-		// OWNER in the ring - do NOT exclude it. The current/pending split is
-		// computed per-op inside routedReplicasForKey (current = ring INCLUDING
-		// draining members; pending = a ring genuinely REBUILT without the
-		// draining members), so the ring carries every alive member and the
-		// leaver keeps its positions + keeps serving the routed union until
-		// its successors are provably serving. (This REVERSES the
-		// superseded draining-exclusion: dropping a draining member here is what
-		// collapsed its snapshot and stranded the hand-off.)
-		want[m.ID] = ring.Member{ID: m.ID, Addr: m.Addr}
-	}
-	changed := false
-	// Add anyone missing from the ring (or with a stale Addr).
-	for id, m := range want {
-		oldAddr := c.priorAddrForID(id)
-		if oldAddr != m.Addr {
-			c.ring.Add(m)
-			if oldAddr != "" {
-				c.evictClient(oldAddr)
-			}
-			changed = true
-		}
-	}
-	// Remove anyone the ring still has but membership has dropped.
-	for _, m := range c.ring.Members() {
-		if _, ok := want[m.ID]; !ok {
-			c.ring.Remove(m.ID)
-			c.evictClient(m.Addr)
-			changed = true
-		}
-	}
-	if changed {
-		// A reconcile-driven ring change is no different from an
-		// event-driven one as far as the rebalance protocol cares;
-		// arm the settle timer so the missed delta gets folded into
-		// the next Evaluate.
-		c.bumpRingGen()
-	}
+	v := c.coord.View()
+	m, ok := v.Member(v.Self.ID)
+	return ok && m.Roles.Has(role)
 }
 
-// priorAddrForID returns the Addr currently recorded in the ring for
-// the given ID, or "" if absent. Used by the reconciliation path to
-// evict a now-stale cached client when a peer's Addr changes.
-func (c *Cluster) priorAddrForID(id string) string {
-	if c.ring == nil {
-		return ""
+// publishRoles republishes this node's COMPLETE role set from the two local
+// flags. The port is declarative - a coordinator replaces the whole set, it
+// never merges a partial update - so joining and draining must always be
+// published together.
+func (c *Cluster) publishRoles() {
+	if c.coord == nil {
+		return
 	}
-	for _, m := range c.ring.Members() {
-		if m.ID == id {
-			return m.Addr
-		}
+	var r coord.Role
+	if c.selfJoining.Load() {
+		r |= coord.RoleJoining
 	}
-	return ""
+	if c.selfDraining.Load() {
+		r |= coord.RoleDraining
+	}
+	_ = c.coord.SetRole(r)
 }
 
 // NodeID returns this node's stable identity, as supplied in Config.
 func (c *Cluster) NodeID() string { return c.cfg.NodeID }
 
-// Members returns a snapshot of the cluster's current ring membership.
-// In single-node mode this is a single-element slice containing the
+// Members returns a snapshot of the cluster's current membership, sorted by
+// node id. In single-node mode this is a single-element slice containing the
 // local node with Addr=cfg.GRPCAddr (which can be empty if the caller
 // didn't set GRPCAddr; no gRPC peer routing is set up in single-node
 // mode regardless).
+//
+// It keeps returning ring.Member - an (id, dial address) pair - so the
+// app-facing surface is UNCHANGED by the coordination port. The value is
+// projected from the coordinator's view; nothing about the shape implies the
+// coordinator places units on a ring.
 func (c *Cluster) Members() []ring.Member {
-	if c.ring == nil {
+	if c.coord == nil {
 		return []ring.Member{{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}}
 	}
-	return c.ring.Members()
+	ms := c.coord.View().Members
+	out := make([]ring.Member, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, ring.Member{ID: string(m.ID), Addr: m.Addr})
+	}
+	return out
 }
 
-// OwnsKey reports whether the local node is the RING owner of key.
+// selfNode is this node as the routing layer addresses it.
+func (c *Cluster) selfNode() coord.Node {
+	return coord.Node{ID: storageunit.NodeID(c.cfg.NodeID), Addr: c.cfg.GRPCAddr}
+}
+
+// isSelf reports whether n is the local node.
+func (c *Cluster) isSelf(n coord.Node) bool { return string(n.ID) == c.cfg.NodeID }
+
+// locate asks the coordinator for up to n nodes for gu, primary first, under
+// the given placement. Returns nil in single-node mode (no coordinator).
+func (c *Cluster) locate(gu storageunit.GenUnit, n int, p coord.Placement) []coord.Node {
+	if c.coord == nil {
+		return nil
+	}
+	return c.coord.Locate(gu, n, p)
+}
+
+// OwnsKey reports whether the local node is the PLACED owner of key.
 // Used by the gRPC server's forwarding-loop guard: a request that
 // arrives with forwarded=true but does NOT belong here is refused
 // rather than re-forwarded (which would loop A->B->A on diverged
-// rings).
+// views).
 //
-// In multi-backend mode (v0.8 Phase 3) the guard is UNIT-RING-OWNERSHIP
-// based: a key belongs to this node iff the ring places the key's storage
-// UNIT on this node, WHETHER OR NOT it is mounted yet. This is the Phase 3
+// In multi-backend mode (v0.8 Phase 3) the guard is UNIT-OWNERSHIP based: a
+// key belongs to this node iff the coordinator places the key's storage UNIT
+// on this node, WHETHER OR NOT it is mounted yet. This is the Phase 3
 // correction of the Phase 2 mount-based guard: during a lease handoff the
-// new owner is the ring owner BEFORE it has mounted the unit (the acquire
+// new owner is the placed owner BEFORE it has mounted the unit (the acquire
 // is in flight). A mount-based guard would refuse a forwarded op there with
-// FailedPrecondition ("refresh your ring"), but the originator's ring is
+// FailedPrecondition ("refresh your view"), but the originator's view is
 // already correct - refreshing changes nothing and it would re-forward to
-// the same node in a tight loop. Checking RING ownership instead lets the
+// the same node in a tight loop. Checking PLACEMENT instead lets the
 // forwarded op fall through to the local apply path, which returns the
 // retryable acquiring-window error (errUnitAcquiring, codes.Unavailable) so
 // the originator backs off and succeeds once the reconcile mounts the unit.
-// A node that is NOT the ring owner still returns false here, so the
+// A node that is NOT the placed owner still returns false here, so the
 // classic loop-guard (FailedPrecondition, refresh + re-route) is preserved
-// for a genuinely diverged ring.
+// for a genuinely diverged view.
 func (c *Cluster) OwnsKey(key []byte) bool {
 	if c.multi {
 		_, isLocal := c.unitOwnerOf(key)
@@ -1292,15 +1310,15 @@ func (c *Cluster) Close() error {
 	case <-time.After(5 * time.Second):
 	}
 
-	// Signal the events + reconcile loops to exit + wait for them
-	// before tearing down membership so we don't race with a late
-	// ring.Add on closed ring. The sweep goroutine also drains via
-	// loopWG (initRebalance adds 1 to the wait group for it).
+	// Signal the coordination + reconcile loops to exit + wait for them
+	// before closing the coordinator, so no loop is mid-View when the
+	// coordinator tears its transport down. The sweep goroutine also drains
+	// via loopWG (initRebalance adds 1 to the wait group for it).
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	c.loopWG.Wait()
 
-	if c.membership != nil {
-		if err := c.membership.Close(); err != nil {
+	if c.coord != nil {
+		if err := c.coord.Close(); err != nil {
 			firstErr = err
 		}
 	}
@@ -1348,26 +1366,21 @@ func (c *Cluster) shardKey(key []byte) []byte {
 	return ring.ShardKey(key)
 }
 
-// ownerOf returns the ring member that owns key + a bool indicating
-// whether the local node is that owner. In single-node mode (no ring)
-// it reports local-ownership unconditionally.
+// ownerOf returns the node that owns key + a bool indicating whether the local
+// node is that owner. In single-node mode (no coordinator) it reports
+// local-ownership unconditionally.
 //
-// In multi-backend mode (v0.8 Phase 2) ownership goes through the key's
-// storage UNIT, not the raw key: the unit id is placed on the ring, so
-// the owner of a key is the owner of its unit. This is the SAME ring used
-// for legacy routing, re-keyed onto unit ids (no second ring).
-func (c *Cluster) ownerOf(key []byte) (owner ring.Member, isLocal bool) {
+// Ownership goes through the key's storage UNIT, not the raw key: the
+// coordinator places units, so the owner of a key is the owner of its unit.
+func (c *Cluster) ownerOf(key []byte) (owner coord.Node, isLocal bool) {
+	// Every multi-node cluster is multi-backend (a Backend + a Coordinator is
+	// refused at Open), so ownership always resolves through the key's storage
+	// unit. The legacy per-node mode has no coordinator, hence no placement
+	// question to ask: this node owns everything.
 	if c.multi {
 		return c.unitOwnerOf(key)
 	}
-	if c.ring == nil || c.ring.Empty() {
-		return ring.Member{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}, true
-	}
-	// LocateKey applies ShardKey internally; passing the raw key here
-	// would double-extract for ShardKeyFn callers. Use the resolved
-	// shard key as the hashing input.
-	owner = c.ring.LocateKey(c.shardKey(key))
-	return owner, owner.ID == c.cfg.NodeID
+	return c.selfNode(), true
 }
 
 // clientFor returns a cached peerClient for addr, dialing on miss.
@@ -1802,7 +1815,7 @@ func (c *Cluster) Aggregate(fn func(b backend.Backend) any) []AggregateResult {
 	var wg sync.WaitGroup
 	for i, m := range members {
 		wg.Go(func() {
-			if m.ID == c.cfg.NodeID {
+			if string(m.ID) == c.cfg.NodeID {
 				if c.multi {
 					// Multi-backend: no single c.backend. Give fn a
 					// read-only view spanning this node's mounted units

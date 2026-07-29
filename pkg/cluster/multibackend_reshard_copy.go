@@ -17,7 +17,7 @@ import (
 	"context"
 	"time"
 
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -155,7 +155,7 @@ func (c *Cluster) copyParentIntoSurvivor(ru storageunit.ReplicaUnit, gs genState
 func (c *Cluster) forwardKeyQuorum(ctx context.Context, legs []routedReplica, key, envBytes []byte) error {
 	w := c.writeAckBar(len(legs))
 	acks, errs, transient, ch := fanout(ctx, membersOf(legs), w,
-		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
+		func(opCtx context.Context, idx int, replica coord.Node) ([]byte, error) {
 			return nil, c.dispatchReplicaPutUnit(opCtx, replica, legs[idx].ru, key, envBytes)
 		})
 	go drainResults(ch)

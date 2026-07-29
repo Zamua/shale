@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -83,7 +83,7 @@ func TestLearnGenerationFromSeed_PatientRidesOutColdStartingSeed(t *testing.T) {
 
 		stub := &stubGenServer{failFirst: 3, gen: 7, count: 4}
 		addr := serveStubGen(t, stub)
-		c.ring.Add(ring.Member{ID: "seed-1", Addr: addr})
+		addCoordMember(c, coord.Node{ID: "seed-1", Addr: addr})
 
 		if err := c.learnGenerationFromSeed(); err != nil {
 			t.Fatalf("patient learnGenerationFromSeed should ride out a cold-starting seed, got: %v", err)
@@ -110,7 +110,7 @@ func TestLearnGenerationFromSeed_PatientRidesOutColdStartingSeed(t *testing.T) {
 
 		stub := &stubGenServer{failFirst: 1000, gen: 7, count: 4} // never ready in-test
 		addr := serveStubGen(t, stub)
-		c.ring.Add(ring.Member{ID: "seed-1", Addr: addr})
+		addCoordMember(c, coord.Node{ID: "seed-1", Addr: addr})
 
 		err := c.learnGenerationFromSeed()
 		if err == nil {

@@ -16,6 +16,7 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -417,17 +418,18 @@ func openMultiBackendNodeAt(t *testing.T, id, bindAddr, seedBindAddr string) (*c
 func openMultiBackendNodeAtWithHarness(t *testing.T, id, bindAddr, seedBindAddr string) (*cluster.Cluster, func(), *grpcHarness) {
 	t.Helper()
 	grpcHarness, stop := startGRPC(t)
+	gcfg := gossip.Config{BindAddr: bindAddr, LogOutput: io.Discard}
+	if seedBindAddr != "" {
+		gcfg.Seeds = []string{seedBindAddr}
+	}
 	cfg := cluster.Config{
 		NodeID:               id,
 		BackendFactory:       memfactory.New(),
 		UnitCount:            storageunit.MustUnitCount(8),
-		BindAddr:             bindAddr,
 		GRPCAddr:             grpcHarness.addr,
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 100 * time.Millisecond,
-	}
-	if seedBindAddr != "" {
-		cfg.Seeds = []string{seedBindAddr}
+		Coordinator:          gossip.New(gcfg),
 	}
 	c, err := cluster.Open(cfg)
 	if err != nil {

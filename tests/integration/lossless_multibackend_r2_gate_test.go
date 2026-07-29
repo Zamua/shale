@@ -41,6 +41,7 @@ import (
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -79,11 +80,12 @@ func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicati
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 300 * time.Millisecond,
 	}
+	gcfg := gossip.Config{LogOutput: io.Discard}
 	if seedAddr != "" {
-		cfg.Seeds = []string{seedAddr}
+		gcfg.Seeds = []string{seedAddr}
 	}
 
-	c, bindAddr := openClusterRetryBind(t, cfg, forbiddenBindPorts...)
+	c, bindAddr := openClusterRetryBind(t, cfg, gcfg, forbiddenBindPorts...)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {

@@ -37,6 +37,7 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -278,7 +279,7 @@ func TestMBPhase2_ConfigValidationAtOpen(t *testing.T) {
 			// serve traffic while silently never moving data on a topology
 			// change, so Open refuses it outright.
 			name:    "backend + bind addr (legacy multi-node): error",
-			cfg:     cluster.Config{NodeID: "x", Backend: memory.New(), BindAddr: "127.0.0.1:0", GRPCAddr: "127.0.0.1:1", LogOutput: io.Discard},
+			cfg:     cluster.Config{NodeID: "x", Backend: memory.New(), Coordinator: gossip.New(gossip.Config{BindAddr: "127.0.0.1:0"}), GRPCAddr: "127.0.0.1:1", LogOutput: io.Discard},
 			wantErr: true,
 		},
 		{

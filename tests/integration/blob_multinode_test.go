@@ -12,6 +12,7 @@ import (
 	"github.com/Zamua/shale/pkg/blob"
 	"github.com/Zamua/shale/pkg/blob/blobmem"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -65,8 +66,9 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 		RebalanceSettleDelay: 500 * time.Millisecond,
 		ReplicationFactor:    1,
 	}
+	gcfg := gossip.Config{LogOutput: io.Discard}
 	if seedAddr != "" {
-		cfg.Seeds = []string{seedAddr}
+		gcfg.Seeds = []string{seedAddr}
 	}
 
 	// NewBlobKV opens the cluster internally; retry the bind on the
@@ -76,7 +78,8 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 	const maxAttempts = 8
 	for range maxAttempts {
 		bindAddr = hostPort(freePort(t))
-		cfg.BindAddr = bindAddr
+		gcfg.BindAddr = bindAddr
+		cfg.Coordinator = gossip.New(gcfg)
 		b, oerr := cluster.NewBlobKV(cfg)
 		if oerr == nil {
 			bkv = b

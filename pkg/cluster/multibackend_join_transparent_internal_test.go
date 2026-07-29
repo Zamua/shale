@@ -45,7 +45,7 @@ func TestJoin_currentUnitReplicas_ExcludesSingleJoiner(t *testing.T) {
 			t.Fatalf("R=2 full set must have 2 members, got %d", len(full))
 		}
 		joiner := full[1].ID // pretend the 2nd replica just joined
-		cur := c.currentUnitReplicas(g, map[string]struct{}{joiner: {}})
+		cur := c.currentUnitReplicas(g, map[storageunit.NodeID]struct{}{joiner: {}})
 
 		// The quorum floor must NOT engage for a single joiner in a 4-member ring:
 		// CURRENT always has R members.
@@ -63,8 +63,8 @@ func TestJoin_currentUnitReplicas_ExcludesSingleJoiner(t *testing.T) {
 			continue
 		}
 		// Marking a NON-replica as joining leaves CURRENT == full ring.
-		nonReplica := "n-absent"
-		curUnchanged := c.currentUnitReplicas(g, map[string]struct{}{nonReplica: {}})
+		nonReplica := storageunit.NodeID("n-absent")
+		curUnchanged := c.currentUnitReplicas(g, map[storageunit.NodeID]struct{}{nonReplica: {}})
 		if !sameMemberSet(curUnchanged, full) {
 			t.Fatalf("unit %d: excluding a non-replica joiner must leave CURRENT == full ring", u)
 		}
@@ -84,7 +84,7 @@ func TestJoin_currentUnitReplicas_ExcludesSingleJoiner(t *testing.T) {
 func TestJoin_QuorumFloor_NeverShrinksCurrentBelowR(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 16, 2, backing, "n1", "n2")
-	bothJoining := map[string]struct{}{"n1": {}, "n2": {}}
+	bothJoining := map[storageunit.NodeID]struct{}{"n1": {}, "n2": {}}
 
 	for _, u := range c.unitCount.IDs() {
 		g := gu(0, uint32(u))
@@ -111,7 +111,7 @@ func TestJoin_routedWithUnit_FloorHoldsAckBar(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 16, 2, backing, "n1", "n2")
 	c.cfg.WriteConsistency = WriteAll
-	c.joining = map[string]struct{}{"n1": {}, "n2": {}}
+	c.joining = map[storageunit.NodeID]struct{}{"n1": {}, "n2": {}}
 
 	for _, u := range c.unitCount.IDs() {
 		key := firstKeyForUnit(t, c, u)
@@ -141,7 +141,7 @@ func TestJoin_routedWithUnit_SingleJoinerFormsUnion(t *testing.T) {
 		if !containsMember(c.unitReplicas(g), "n4") {
 			continue
 		}
-		c.joining = map[string]struct{}{"n4": {}}
+		c.joining = map[storageunit.NodeID]struct{}{"n4": {}}
 		key := firstKeyForUnit(t, c, u)
 		routed, stableR := c.routedReplicasWithUnit(key)
 		if stableR != 2 {
@@ -163,7 +163,7 @@ func TestJoin_routedWithUnit_SingleJoinerFormsUnion(t *testing.T) {
 	}
 }
 
-func routedContainsMember(rs []routedReplica, id string) bool {
+func routedContainsMember(rs []routedReplica, id storageunit.NodeID) bool {
 	for _, r := range rs {
 		if r.member.ID == id {
 			return true

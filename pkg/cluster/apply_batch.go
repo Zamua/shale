@@ -5,7 +5,7 @@ import (
 	"errors"
 
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -163,7 +163,7 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, c
 	// Re-key the replica set per UNIT in multi-backend mode (v0.8 Phase 2b):
 	// the batch fans out to the pin key's UNIT's replica nodes (every key in
 	// a CAS commit co-shards with the pin key, so one unit covers the batch),
-	// not the per-node LocateKeyN over the raw shard key the legacy path uses.
+	// not a per-node lookup over the raw shard key.
 	//
 	// Workstream B (join/leave transparency): the replica set is the ROUTED
 	// UNION (current + pending members, exactly what a plain put fans out to)
@@ -176,14 +176,14 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, c
 	// its own mounted position), so a member routed at two positions (the
 	// index-shuffling survivor) gets ONE batch. In steady state the union is the
 	// stable set and stableR its size - byte-identical to the old behavior.
-	var allReplicas []ring.Member
+	var allReplicas []coord.Node
 	var w int
 	localAcks := 1 // the owner-local commit is always the first ack
 	if c.multiReplicated() {
 		routed, stableR := c.routedReplicasWithUnit(pinKey)
-		seen := make(map[string]struct{}, len(routed))
+		seen := make(map[storageunit.NodeID]struct{}, len(routed))
 		for _, rr := range routed {
-			if rr.member.ID == c.cfg.NodeID && rr.ru != committedRU {
+			if string(rr.member.ID) == c.cfg.NodeID && rr.ru != committedRU {
 				// OWNER EXTRA POSITION (the index-shuffling survivor mid-transition):
 				// the designated owner is routed at a SECOND position of the pin unit
 				// (its draining old slot alongside the acquired slot the commit
@@ -203,21 +203,23 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, c
 			allReplicas = append(allReplicas, rr.member)
 		}
 		w = c.writeAckBar(stableR)
-	} else {
-		allReplicas = c.ring.LocateKeyN(c.shardKey(pinKey), c.replicationFactor())
-		// W over the full replica set (the owner is one of them and its local
-		// commit is already one ack) - the legacy per-node path, unchanged.
-		w = requiredWriteAcks(c.cfg.WriteConsistency, len(allReplicas))
 	}
+	// There is no other arm. The pre-port LEGACY per-node R>1 CAS fan-out
+	// (locate over the raw shard key) is gone with legacy multi-node: a Config
+	// carrying both a Backend and a Coordinator is refused at Open, so any
+	// cluster with a coordination view is multi-backend and casReplicated()
+	// cannot outrun multiReplicated(). If a caller ever gets here without one,
+	// the empty replica set below refuses the write rather than inventing a
+	// placement.
 	if len(allReplicas) == 0 {
 		return writeAttempt{err: status.Error(codes.Unavailable, "shale: no replicas available for CAS write-set")}
 	}
 
 	// The replicas the fan-out actually dispatches to: everyone except
 	// the owner (this node), which already holds the write.
-	others := make([]ring.Member, 0, len(allReplicas))
+	others := make([]coord.Node, 0, len(allReplicas))
 	for _, r := range allReplicas {
-		if r.ID == c.cfg.NodeID {
+		if string(r.ID) == c.cfg.NodeID {
 			continue
 		}
 		others = append(others, r)
@@ -243,7 +245,7 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, c
 	remoteNeeded := w - localAcks
 
 	acks, errs, transient, resultsCh := fanout(ctx, others, remoteNeeded,
-		func(opCtx context.Context, _ int, replica ring.Member) ([]byte, error) {
+		func(opCtx context.Context, _ int, replica coord.Node) ([]byte, error) {
 			return nil, c.dispatchApplyBatch(opCtx, replica, writes)
 		})
 
@@ -272,8 +274,8 @@ func (c *Cluster) replicateCASBatchAttempt(ctx context.Context, pinKey []byte, c
 // guard ResourceExhausted is surfaced verbatim so fanout's
 // isTransientReplicaErr can classify it transient. Mirrors
 // dispatchReplicaPut's local-or-remote shape.
-func (c *Cluster) dispatchApplyBatch(ctx context.Context, replica ring.Member, writes []EnvelopeWrite) error {
-	if replica.ID == c.cfg.NodeID {
+func (c *Cluster) dispatchApplyBatch(ctx context.Context, replica coord.Node, writes []EnvelopeWrite) error {
+	if string(replica.ID) == c.cfg.NodeID {
 		// The owner already wrote via the CAS local commit; this branch
 		// only fires for a NON-owner local replica that happens to be the
 		// dispatch target. In practice the owner is excluded from `others`

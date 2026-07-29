@@ -42,8 +42,13 @@ func TestClusterConfig_SingleBackendMapping(t *testing.T) {
 	if !cc.UnitCount.IsZero() {
 		t.Fatalf("single-backend mapping: UnitCount must be zero in legacy mode, got N=%d", cc.UnitCount.N())
 	}
-	if cc.NodeID != "n1" || cc.BindAddr != ":7946" || cc.GRPCAddr != "1.2.3.4:9999" {
+	if cc.NodeID != "n1" || cc.GRPCAddr != "1.2.3.4:9999" {
 		t.Fatalf("single-backend mapping: common fields not threaded: %+v", cc)
+	}
+	// A bind address means multi-node, which is now expressed as a coordinator
+	// rather than a cluster-level BindAddr + Seeds pair.
+	if cc.Coordinator == nil {
+		t.Fatal("single-backend mapping: a non-empty BindAddr must produce a Coordinator")
 	}
 }
 

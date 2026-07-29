@@ -248,7 +248,7 @@ func (t *clusterTx) pinLocked(key []byte) {
 	owner, _ := t.c.ownerOf(key)
 	t.pinned = true
 	t.pinKey = append([]byte(nil), key...)
-	t.ownerID = owner.ID
+	t.ownerID = string(owner.ID)
 	if t.c.multi {
 		t.pinUnit = t.c.genUnitForKey(key)
 	}
@@ -287,7 +287,7 @@ func (t *clusterTx) guardShard(key []byte) error {
 		return nil
 	}
 	owner, _ := t.c.ownerOf(key)
-	if owner.ID != t.ownerID {
+	if string(owner.ID) != t.ownerID {
 		return backend.ErrCrossShard
 	}
 	return nil

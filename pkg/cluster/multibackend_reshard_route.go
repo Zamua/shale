@@ -28,7 +28,7 @@ package cluster
 import (
 	"context"
 
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -87,7 +87,7 @@ func (c *Cluster) routedReplicasForReshard(key []byte) (reshardLegs, bool) {
 // For a split's child legs the members are the PARENT's replica set (the child
 // is co-located at the parent's slots), so the child slot index matches the
 // parent slot index it was copied from.
-func legsAt(gu storageunit.GenUnit, members []ring.Member) []routedReplica {
+func legsAt(gu storageunit.GenUnit, members []coord.Node) []routedReplica {
 	out := make([]routedReplica, len(members))
 	for i, m := range members {
 		out[i] = routedReplica{member: m, ru: storageunit.NewReplicaUnit(gu, uint8(i))}
@@ -109,7 +109,7 @@ func (c *Cluster) putReshardDualWrite(ctx context.Context, legs reshardLegs, key
 	}
 	w := c.writeAckBar(legs.stableR)
 	acks, errs, transient, ch := fanout(ctx, authMembers, w,
-		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
+		func(opCtx context.Context, idx int, replica coord.Node) ([]byte, error) {
 			return nil, c.dispatchReplicaPutUnit(opCtx, replica, legs.auth[idx].ru, key, envBytes)
 		})
 	go drainResults(ch)
@@ -129,7 +129,7 @@ func (c *Cluster) fireSupplementary(ctx context.Context, legs []routedReplica, k
 		return
 	}
 	_, _, _, ch := fanout(ctx, members, 1, // requiredAcks clamped to 1 by fanout; ignored
-		func(opCtx context.Context, idx int, replica ring.Member) ([]byte, error) {
+		func(opCtx context.Context, idx int, replica coord.Node) ([]byte, error) {
 			return nil, c.dispatchReplicaPutUnit(opCtx, replica, legs[idx].ru, key, envBytes)
 		})
 	go drainResults(ch)
@@ -165,8 +165,8 @@ func (c *Cluster) resolveAndApplyReplicaPut(ru storageunit.ReplicaUnit, key, env
 }
 
 // membersOf projects the routed legs onto their member slice for fanout.
-func membersOf(legs []routedReplica) []ring.Member {
-	out := make([]ring.Member, len(legs))
+func membersOf(legs []routedReplica) []coord.Node {
+	out := make([]coord.Node, len(legs))
 	for i, l := range legs {
 		out[i] = l.member
 	}

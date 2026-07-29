@@ -44,10 +44,10 @@ func (c *Cluster) settleDelay() time.Duration {
 	return defaultSettleDelay
 }
 
-// bumpRingGen records that the ring shape has changed + schedules the
+// bumpRingGen records that the coordination view has changed + schedules the
 // debounced response at settleDelay from now. Subsequent calls within the
-// window reset the timer rather than fire multiple passes. Called from the
-// membership events loop AND from the reconcile loop.
+// window reset the timer rather than fire multiple passes, so a burst of
+// changes (or a coalesced hint that stood for several) still costs one pass.
 //
 // The debounced response is the COPY-FREE unit reconcile: acquire
 // newly-owned units, release no-longer-owned ones (see

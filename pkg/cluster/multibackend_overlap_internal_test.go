@@ -19,7 +19,7 @@ import (
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -50,7 +50,7 @@ func TestOverlap_pendingUnitReplicas_DropsDrainingMember(t *testing.T) {
 		t.Fatalf("with no draining members pending must equal current")
 	}
 	// Drain the primary (index 0): pending must drop it and pull in a survivor.
-	draining := map[string]struct{}{current[0].ID: {}}
+	draining := map[storageunit.NodeID]struct{}{current[0].ID: {}}
 	pending := c.pendingUnitReplicas(target, draining)
 	if len(pending) != 2 {
 		t.Fatalf("pending must still have R=2 survivors, got %d", len(pending))
@@ -77,19 +77,20 @@ func TestOverlap_pendingUnitReplicas_ExactPostLeavePlacement(t *testing.T) {
 	members := []string{"sg-a", "sg-b", "sg-c", "sg-d", "sg-e"}
 	c := newReplicatedCluster(t, "sg-b", 16, 2, backing, members...)
 
-	survivors := ring.New()
+	survivorIDs := make([]string, 0, len(members))
 	for _, id := range members {
 		if id == "sg-a" {
 			continue
 		}
-		survivors.Add(ring.Member{ID: id, Addr: id + ":0"})
+		survivorIDs = append(survivorIDs, id)
 	}
-	draining := map[string]struct{}{"sg-a": {}}
+	survivors := staticCoord("sg-b", nodesFor(survivorIDs...))
+	draining := map[storageunit.NodeID]struct{}{"sg-a": {}}
 	mismatches := 0
 	for _, u := range storageunit.MustUnitCount(16).IDs() {
 		gu := storageunit.NewGenUnit(0, u)
 		got := c.pendingUnitReplicas(gu, draining)
-		want := survivors.LocateKeyN(genUnitBytes(gu), 2)
+		want := survivors.Locate(gu, 2, coord.Placement{})
 		if len(got) != len(want) {
 			t.Errorf("unit %d: pending size %d, want %d", u, len(got), len(want))
 			mismatches++
@@ -211,7 +212,7 @@ func TestOverlap_desiredPendingReplicaUnits_GainsLeaversPositions(t *testing.T) 
 	}
 
 	// Drain n2: self should pick up some of n2's positions in the pending view.
-	pending := c.desiredPendingReplicaUnits(map[string]struct{}{"n2": {}})
+	pending := c.desiredPendingReplicaUnits(map[storageunit.NodeID]struct{}{"n2": {}})
 	extra := 0
 	for _, ru := range pending {
 		if _, ok := curSet[ru]; !ok {
@@ -234,7 +235,7 @@ func TestOverlap_Reconcile_DrainSplit_SetsDrainingKeepsMount(t *testing.T) {
 	// self is in the ring (a current owner) AND draining, so its positions are
 	// current-but-not-pending.
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
-	c.draining = map[string]struct{}{"self": {}}
+	c.draining = map[storageunit.NodeID]struct{}{"self": {}}
 
 	// Mount every position self currently owns, as if it had been serving them.
 	current := c.desiredReplicaUnits()
@@ -372,7 +373,7 @@ func TestOverlap_Reconcile_PendingOwner_AcquiresAndMarks(t *testing.T) {
 	c := newReplicatedCluster(t, "self", 16, 2, backing, "self", "n2", "n3")
 
 	// Drain n2: self gains some of n2's positions as pending-only.
-	c.draining = map[string]struct{}{"n2": {}}
+	c.draining = map[storageunit.NodeID]struct{}{"n2": {}}
 
 	current := c.desiredReplicaUnits()
 	curSet := make(map[storageunit.ReplicaUnit]struct{}, len(current))

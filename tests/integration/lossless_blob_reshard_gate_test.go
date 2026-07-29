@@ -54,6 +54,7 @@ import (
 	"github.com/Zamua/shale/pkg/blob"
 	"github.com/Zamua/shale/pkg/blob/blobmem"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/reshard"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
@@ -122,8 +123,9 @@ func startBlobShardNode(
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 300 * time.Millisecond,
 	}
+	gcfg := gossip.Config{LogOutput: io.Discard}
 	if seedAddr != "" {
-		cfg.Seeds = []string{seedAddr}
+		gcfg.Seeds = []string{seedAddr}
 	}
 
 	// NewBlobKV opens the cluster internally; retry the bind on the
@@ -133,7 +135,8 @@ func startBlobShardNode(
 	const maxAttempts = 8
 	for range maxAttempts {
 		bindAddr = hostPort(freePort(t))
-		cfg.BindAddr = bindAddr
+		gcfg.BindAddr = bindAddr
+		cfg.Coordinator = gossip.New(gcfg)
 		b, oerr := cluster.NewBlobKV(cfg)
 		if oerr == nil {
 			bkv = b

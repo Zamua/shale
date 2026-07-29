@@ -40,10 +40,10 @@ func seedOwnedPositions(t *testing.T, c *Cluster, backing *sharedfactory.Backing
 // markDraining models the leave under the pending-ranges model: self STAYS in
 // the ring (it is not removed) but advertises the Draining bit. Every node's
 // routedReplicasForKey then computes self's positions as current-but-not-pending, so
-// the reconcile sets them Draining. With no membership layer in this white-box
-// test, the draining set is injected directly via the test hook.
+// the reconcile sets them Draining. With no coordination transport in this
+// white-box test, the draining set is injected directly via the test hook.
 func markDraining(c *Cluster) {
-	c.draining = map[string]struct{}{c.cfg.NodeID: {}}
+	c.draining = map[storageunit.NodeID]struct{}{storageunit.NodeID(c.cfg.NodeID): {}}
 }
 
 // TestLeave_DrainForLeave_ReleasesAllWhenSuccessorsReady: the happy path. Self

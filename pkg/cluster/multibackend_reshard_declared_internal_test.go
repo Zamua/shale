@@ -8,27 +8,28 @@ package cluster
 // that a non-steady arbiter or a disagreeing/unknown member does NOT.
 
 import (
-	"io"
-	"net"
 	"strconv"
 	"testing"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
-	"github.com/Zamua/shale/pkg/membership"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 func TestUnanimousDeclaredCount(t *testing.T) {
-	mk := func(counts ...uint32) []membership.Member {
-		ms := make([]membership.Member, len(counts))
+	mk := func(counts ...uint32) []coord.Member {
+		ms := make([]coord.Member, len(counts))
 		for i, c := range counts {
-			ms[i] = membership.Member{ID: "n" + strconv.Itoa(i), DeclaredUnitCount: c}
+			ms[i] = coord.Member{
+				Node:              coord.Node{ID: storageunit.NodeID("n" + strconv.Itoa(i))},
+				DeclaredUnitCount: c,
+			}
 		}
 		return ms
 	}
 	cases := []struct {
 		name    string
-		members []membership.Member
+		members []coord.Member
 		wantD   uint32
 		wantOK  bool
 	}{
@@ -49,33 +50,9 @@ func TestUnanimousDeclaredCount(t *testing.T) {
 	}
 }
 
-// openDeclaringMembership opens a single-node Membership advertising the given
-// declared unit count, registering a Cleanup to close it.
-func openDeclaringMembership(t *testing.T, nodeID string, declared uint32) *membership.Membership {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("listen: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	mem, err := membership.Open(membership.Config{
-		NodeID:            nodeID,
-		BindAddr:          "127.0.0.1:" + strconv.Itoa(port),
-		GRPCAddr:          "127.0.0.1:1",
-		DeclaredUnitCount: declared,
-		LogOutput:         io.Discard,
-	})
-	if err != nil {
-		t.Fatalf("membership.Open: %v", err)
-	}
-	t.Cleanup(func() { _ = mem.Close() })
-	return mem
-}
-
 // newDeclaredReshardCluster builds an R=2 multi-backend cluster founded at
 // `founded` units with a wired arbiter (seeded count==target==founded) and a
-// real single-node membership advertising `declared` units.
+// transport-free coordinator whose single member advertises `declared` units.
 func newDeclaredReshardCluster(t *testing.T, founded int, declared uint32) *Cluster {
 	t.Helper()
 	backing := sharedfactory.NewBacking()
@@ -85,7 +62,13 @@ func newDeclaredReshardCluster(t *testing.T, founded int, declared uint32) *Clus
 	if err := c.initReshardArbiter(); err != nil {
 		t.Fatal(err)
 	}
-	c.membership = openDeclaringMembership(t, "n1", declared)
+	// One member, advertising the declared count: the unanimity gate reads the
+	// coordination view, so a lone declaring member IS unanimity.
+	setCoordMembers(c, coord.Node{ID: "n1", Addr: "n1:0"})
+	gossipCoord(c).TestingSetFacts(coord.Member{
+		Node:              coord.Node{ID: "n1", Addr: "n1:0"},
+		DeclaredUnitCount: declared,
+	})
 	return c
 }
 
@@ -150,7 +133,10 @@ func TestObserveDeclaredReshardTarget_DefersWhileConverging(t *testing.T) {
 func TestObserveDeclaredReshardTarget_NoArbiterIsNoop(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2", "n3")
-	c.membership = openDeclaringMembership(t, "n1", 8)
+	gossipCoord(c).TestingSetFacts(coord.Member{
+		Node:              coord.Node{ID: "n1", Addr: "n1:0"},
+		DeclaredUnitCount: 8,
+	})
 	// c.arbiter is nil (initReshardArbiter never called).
 	c.observeDeclaredReshardTarget() // must not panic
 }

@@ -28,7 +28,7 @@ import (
 func TestOverlap_Reconcile_SelfDraining_GateStable_NoReclaimEscalation(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
-	c.draining = map[string]struct{}{"self": {}}
+	c.draining = map[storageunit.NodeID]struct{}{"self": {}}
 
 	current := c.desiredReplicaUnits()
 	if len(current) == 0 {
@@ -97,7 +97,7 @@ func TestOverlap_Reconcile_SelfDraining_GateStable_NoReclaimEscalation(t *testin
 func TestOverlap_Reconcile_PendingMount_HeldAcrossReconciles(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 16, 2, backing, "self", "n2", "n3")
-	c.draining = map[string]struct{}{"n2": {}} // n2 leaving; self gains pending positions
+	c.draining = map[storageunit.NodeID]struct{}{"n2": {}} // n2 leaving; self gains pending positions
 
 	current := c.desiredReplicaUnits()
 	curSet := make(map[storageunit.ReplicaUnit]struct{}, len(current))
@@ -165,7 +165,7 @@ func TestOverlap_Reconcile_PendingMount_HeldAcrossReconciles(t *testing.T) {
 func TestOverlap_Reconcile_SelfDraining_ReleasedPositionNotReacquired(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
-	c.draining = map[string]struct{}{"self": {}}
+	c.draining = map[storageunit.NodeID]struct{}{"self": {}}
 
 	current := c.desiredReplicaUnits()
 	if len(current) == 0 {
@@ -227,7 +227,7 @@ func TestOverlap_Reconcile_SelfDraining_ReleasedPositionNotReacquired(t *testing
 func TestOverlap_evictStaleMount_DoesNotEvictDrainingPosition(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
-	c.draining = map[string]struct{}{"self": {}}
+	c.draining = map[storageunit.NodeID]struct{}{"self": {}}
 
 	current := c.desiredReplicaUnits()
 	if len(current) == 0 {

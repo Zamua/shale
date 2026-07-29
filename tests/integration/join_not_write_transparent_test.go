@@ -41,6 +41,7 @@ import (
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -93,13 +94,14 @@ func startReplicatedNodeSlowAcquireCfg(t *testing.T, id, seedAddr string, unitCo
 		// TestOverlapAcquire_BoundedByOpenConcurrency in pkg/cluster.
 		OpenConcurrency: 8,
 	}
+	gcfg := gossip.Config{}
 	if seedAddr != "" {
-		cfg.Seeds = []string{seedAddr}
+		gcfg.Seeds = []string{seedAddr}
 	}
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	c, bindAddr := openClusterRetryBind(t, cfg)
+	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() { defer close(serveDone); _ = grpcSrv.Serve(lis) }()
 	n := &sharedNode{

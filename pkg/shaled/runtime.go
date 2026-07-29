@@ -61,6 +61,8 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -442,8 +444,8 @@ func Run(cfg RunConfig) error {
 	// (it serves W=quorum for its moving units alongside the stable replica, so
 	// the writes ride through instead of waiting on the successor mount). ONLY
 	// AFTER the drain + cluster teardown do we GracefulStop the gRPC server.
-	// DrainForLeave's own contract pins this: "the REAL membership.Leave() +
-	// transport Shutdown ... run AFTER this drain returns." The previous order
+	// DrainForLeave's own contract pins this: "the REAL departure (the
+	// coordinator's Close ...) ... run AFTER this drain returns." The previous order
 	// (GracefulStop first) tore the transport down BEFORE the drain, so every
 	// union write a peer dual-wrote to this draining node got connection-refused
 	// for the entire drain window (W=quorum unmet on its moving units = the
@@ -524,7 +526,8 @@ func resolveSingleBackendBindAddr(std *StdConfig) (string, error) {
 // "Run threads ReplicationFactor + UnitCount + the right backend mode into the
 // cluster.Config it builds":
 //
-//   - common (both modes): NodeID, BindAddr, the resolved GRPCAddr, Seeds, and
+//   - common (both modes): NodeID, the resolved GRPCAddr, the Coordinator (a
+//     gossip adapter carrying BindAddr + Seeds, or nil for single-node), and
 //     ReplicationFactor (the fix: single-backend Run previously omitted R,
 //     pinning the legacy path to the cluster default).
 //   - single-backend (Backend set): Backend only; UnitCount stays zero
@@ -538,9 +541,8 @@ func resolveSingleBackendBindAddr(std *StdConfig) (string, error) {
 func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 	clusterCfg := cluster.Config{
 		NodeID:                    cfg.Std.NodeID,
-		BindAddr:                  cfg.Std.BindAddr,
 		GRPCAddr:                  grpcAddr,
-		Seeds:                     cfg.Std.Seeds,
+		Coordinator:               coordinatorFor(cfg.Std),
 		ReplicationFactor:         cfg.Std.ReplicationFactor,
 		GracefulLeaveDrainTimeout: cfg.Std.GracefulLeaveDrainTimeout,
 		WriteTimeout:              cfg.Std.WriteTimeout, // 0 -> cluster default (5s)
@@ -573,6 +575,24 @@ func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 	// mode it is inert.
 	clusterCfg.DeclarativeReshard = cfg.ConditionalStore != nil && cfg.BackendFactory != nil
 	return clusterCfg
+}
+
+// coordinatorFor builds this node's coordination adapter from the operator
+// flags, or returns nil for single-node (no bind address = nobody to
+// coordinate with, which is exactly what a nil Coordinator means to
+// cluster.Open).
+//
+// The gossip knobs stop here: BindAddr, Seeds and the memberlist log sink are
+// the ADAPTER's config, not the cluster's. Swapping in a lease/CAS coordinator
+// later is a change to this one function.
+func coordinatorFor(std StdConfig) coord.Coordinator {
+	if std.BindAddr == "" {
+		return nil
+	}
+	return gossip.New(gossip.Config{
+		BindAddr: std.BindAddr,
+		Seeds:    std.Seeds,
+	})
 }
 
 // buildCluster validates the Backend-vs-BackendFactory XOR and opens a Cluster
