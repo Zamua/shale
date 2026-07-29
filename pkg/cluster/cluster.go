@@ -1029,6 +1029,23 @@ func (c *Cluster) Members() []ring.Member {
 	return out
 }
 
+// PlacementMembers returns the member set placement is currently computed
+// over (the coordinator's placement basis). It equals Members() whenever the
+// coordinator holds one basis; under gossip it can briefly trail Members()
+// after a dropped event. Guards protecting placement-derived decisions read
+// THIS; everything stance-related reads Members().
+func (c *Cluster) PlacementMembers() []ring.Member {
+	if c.coord == nil {
+		return []ring.Member{{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}}
+	}
+	ms := c.coord.PlacementMembers()
+	out := make([]ring.Member, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, ring.Member{ID: string(m.ID), Addr: m.Addr})
+	}
+	return out
+}
+
 // selfNode is this node as the routing layer addresses it.
 func (c *Cluster) selfNode() coord.Node {
 	return coord.Node{ID: storageunit.NodeID(c.cfg.NodeID), Addr: c.cfg.GRPCAddr}
