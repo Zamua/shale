@@ -704,6 +704,12 @@ type Cluster struct {
 	ringGen     atomic.Uint64
 	settleMu    sync.Mutex
 	settleTimer *time.Timer
+	// settleImmediate marks the pending settleTimer as an IMMEDIATE (zero
+	// delay) arm - the boot-defer prompt and the stale-mount evict path use
+	// these to close a consumer-visible unavailability window NOW. A later
+	// debounced re-arm must never postpone one (see scheduleReconcileIn).
+	// Guarded by settleMu; cleared with settleTimer.
+	settleImmediate bool
 	// settlePending counts debounce-scheduled evaluations that have
 	// been armed but not yet completed (the timer is live, or its
 	// AfterFunc callback is running but has not yet returned). It makes

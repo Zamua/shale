@@ -338,3 +338,72 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 		t.Fatalf("expected settlePending==0 after the evaluation drained, got %d", got)
 	}
 }
+
+// TestScheduleReconcileIn_DebouncedRearmMustNotPostponeImmediate pins the
+// settle-timer arming state machine in the direction the doc comment always
+// promised but the code did not enforce: once an IMMEDIATE (zero-delay) pass
+// is pending - the boot-defer prompt, the stale-mount evict - a later
+// DEBOUNCED re-arm must not replace it. Last-writer-wins here silently pushed
+// the boot-defer prompt out a full production settle delay whenever a
+// coalesced view hint landed just after boot (the coordination port delivers
+// boot-time hints after Open returns), which turned "arming the reconcile
+// immediately" into a multi-second write-refusal window that outlived the
+// consumer's documented retry budget. Caught by
+// TestFreshBoot_StaggeredJoin_NoWriteGap failing ~1-in-2 under the port.
+//
+// The test drives the state machine directly (no timers race the assertions):
+// timer PONTER identity across the second arm is the proof of no replacement.
+func TestScheduleReconcileIn_DebouncedRearmMustNotPostponeImmediate(t *testing.T) {
+	c := &Cluster{}
+	c.cfg.RebalanceSettleDelay = time.Hour
+
+	// A pending IMMEDIATE arm (as the prompt leaves it; the hour delay stands
+	// in for "armed but not yet fired" so nothing races the assertions).
+	c.settleMu.Lock()
+	c.settlePending.Add(1)
+	c.settleImmediate = true
+	c.settleTimer = time.AfterFunc(time.Hour, func() {})
+	armed := c.settleTimer
+	c.settleMu.Unlock()
+
+	// The coalesced view hint lands: bumpRingGen -> scheduleReconcile.
+	c.scheduleReconcile()
+
+	c.settleMu.Lock()
+	sameTimer := c.settleTimer == armed
+	stillImmediate := c.settleImmediate
+	c.settleMu.Unlock()
+	if !sameTimer {
+		t.Fatal("a debounced re-arm REPLACED a pending immediate arm; the immediate pass was postponed by the settle delay")
+	}
+	if !stillImmediate {
+		t.Fatal("a debounced re-arm cleared the immediate flag while the immediate arm was still pending")
+	}
+	if got := c.settlePending.Load(); got != 1 {
+		t.Fatalf("pending obligation count changed on a refused re-arm: %d", got)
+	}
+
+	// The other direction is unchanged: an IMMEDIATE arm still wins over a
+	// pending debounced one (replaces its timer, sooner deadline).
+	c.settleMu.Lock()
+	c.settleImmediate = false // pending arm is now "debounced"
+	debounced := c.settleTimer
+	c.settleMu.Unlock()
+	c.scheduleReconcileIn(0)
+	c.settleMu.Lock()
+	replaced := c.settleTimer != debounced
+	nowImmediate := c.settleImmediate
+	if c.settleTimer != nil {
+		c.settleTimer.Stop()
+		c.settleTimer = nil
+	}
+	c.settleImmediate = false
+	c.settleMu.Unlock()
+	c.settlePending.Store(0)
+	if !replaced {
+		t.Fatal("an immediate arm failed to replace a pending debounced timer; zero-delay must win")
+	}
+	if !nowImmediate {
+		t.Fatal("an immediate arm did not mark the pending pass immediate")
+	}
+}
