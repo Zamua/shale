@@ -312,29 +312,70 @@ func (c *Cluster) mountReplicaUnits() error {
 	// never set and first-cluster convergence is unchanged.
 	if deferred.Load() > 0 {
 		c.setSelfJoining(true)
-		// ACQUIRE THE DEFERRED POSITIONS NOW, not a settle-debounce later. The
-		// debounce exists to absorb membership CHURN - several joins collapsing
-		// into one reconcile pass - but a boot-defer is not churn: this node
-		// already knows, at this instant, exactly which owned positions it is
-		// missing, and until they are warmed the cluster may not be able to
-		// assemble a write quorum for their units (the displaced peer holds ONE
-		// copy; this node's copy does not exist yet). Every debounce tick
-		// therefore extends a KNOWN quorum gap on the write path for no
-		// batching benefit. Observed downstream before this line existed: a
-		// 2-node bootstrap deferred 3 of 4 positions, the acquire arrived a
-		// full production settle delay later, and a write issued in the gap
-		// exhausted its entire retry budget. The write retry is sized to ride
-		// an OPEN (seconds); it is not sized to ride an open PLUS an idle
-		// debounce in front of it.
+		// ACQUIRE THE DEFERRED POSITIONS NOW - but ONLY when there is an
+		// ESTABLISHED cluster to warm into. Both halves of that sentence are
+		// load-bearing and each is backed by a failure:
 		//
-		// Routed through the normal settle machinery with a zero delay rather
-		// than calling the reconcile inline: Open must not block on acquires
-		// (the whole point of the defer is that warming is background work),
-		// and the settlePending accounting keeps WaitForRebalanceIdle honest
-		// about the pass this schedules.
-		c.scheduleReconcileIn(0)
+		// WHY NOW (the staggered join): a node joining an established cluster
+		// knows, at this instant, exactly which owned positions it is missing,
+		// and until they are warmed the cluster may not be able to assemble a
+		// write quorum for their units (the displaced peer holds ONE copy; this
+		// node's copy does not exist yet). The settle debounce exists to absorb
+		// membership churn, and a lone join into a converged ring is not churn -
+		// every debounce tick extends a KNOWN quorum gap for no batching
+		// benefit. Observed downstream: a 2-node bootstrap deferred 3 of 4
+		// positions, the acquire arrived a full production settle delay later,
+		// and a write in the gap exhausted its entire retry budget. The write
+		// retry is sized to ride an OPEN; not an open plus an idle debounce.
+		//
+		// WHY ONLY THEN (the mass boot): when EVERY node is booting at once,
+		// this node's ring is a partial view and its deferred set was computed
+		// against that partial view. Reconciling immediately means acting on
+		// the wrong topology - acquiring positions this node will not own once
+		// the ring converges, at epochs that fence sibling booting nodes' live
+		// mounts mid-boot. The debounce IS load-bearing there: it is what gives
+		// gossip time to converge before anyone acts. Skipping it in the mass
+		// case deterministically LOST ACKED WRITES in the mass-boot safety
+		// gate (8 of 8 runs) before this guard existed.
+		//
+		// The discriminator is the gossiped Joining bit, and its timing makes
+		// it exact rather than heuristic: every multi-node R>1 node advertises
+		// Joining from the moment its MEMBERSHIP opens (startJoining, before
+		// it mounts anything), and clears it only once fully warmed. So in a
+		// mass boot every visible peer says Joining and the gate falls back to
+		// the debounce; in a staggered join the established peers long ago
+		// cleared it and the gate fires. A peer that has not yet gossiped at
+		// all is simply not visible, which also (correctly) reads as
+		// not-established.
+		//
+		// Routed through the settle machinery with a zero delay rather than
+		// called inline: Open must not block on acquires, and the
+		// settlePending accounting keeps WaitForRebalanceIdle honest.
+		if c.hasEstablishedPeer() {
+			c.scheduleReconcileIn(0)
+		}
 	}
 	return nil
+}
+
+// hasEstablishedPeer reports whether the membership snapshot contains at least
+// one OTHER node that is fully warmed into the ring (not Joining). That is the
+// safety condition for acting on this node's boot state immediately: an
+// established peer proves there is a converged topology to warm into, rather
+// than a fleet-wide boot still negotiating one.
+func (c *Cluster) hasEstablishedPeer() bool {
+	if c.membership == nil {
+		return false
+	}
+	for _, m := range c.membership.Snapshot() {
+		if m.ID == c.cfg.NodeID {
+			continue
+		}
+		if !m.Joining {
+			return true
+		}
+	}
+	return false
 }
 
 // logf writes a one-line cluster-level event to cfg.LogOutput, FALLING BACK to
