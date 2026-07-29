@@ -152,3 +152,33 @@ func assertSameSet(t *testing.T, name string, got, want map[storageunit.NodeID]s
 		}
 	}
 }
+
+// TestPlacementMembers_ExposesTheBasisSplit pins the method's reason to exist:
+// it equals View's member set when the bases agree, and DIVERGES from View when
+// the placement ring has lost a member gossip still knows (the dropped-event
+// shape) - the deviation a placement-derived guard must be able to observe.
+func TestPlacementMembers_ExposesTheBasisSplit(t *testing.T) {
+	static := staticN(3)
+	pm := static.PlacementMembers()
+	vm := static.View().Members
+	if len(pm) != len(vm) {
+		t.Fatalf("static: placement %d members, view %d - a single-basis mode must agree", len(pm), len(vm))
+	}
+	for i := range pm {
+		if pm[i].ID != vm[i].ID {
+			t.Fatalf("static: placement[%d]=%s view[%d]=%s", i, pm[i].ID, i, vm[i].ID)
+		}
+	}
+
+	co := openSolo(t, "pm-solo", time.Hour)
+	if !waitForMember(co, "pm-solo", 2*time.Second) {
+		t.Fatal("local member never landed in the view")
+	}
+	co.TestingRemoveFromRing("pm-solo")
+	if got := co.PlacementMembers(); len(got) != 0 {
+		t.Fatalf("placement basis should be empty after the ring drop, got %v", got)
+	}
+	if _, ok := co.View().Member("pm-solo"); !ok {
+		t.Fatal("view lost the member on a ring-only drop; it must keep answering from the snapshot")
+	}
+}

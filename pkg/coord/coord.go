@@ -220,6 +220,18 @@ type Coordinator interface {
 	// and MUST NOT do I/O. Equivalent to !View().Empty() at all times.
 	Populated() bool
 
+	// PlacementMembers returns the member set Locate currently computes
+	// placement over, sorted by ID. For a single-basis coordinator (an
+	// assignment table; the static test coordinator) this IS View's member
+	// set. The gossip adapter is dual-basis: its placement ring trails the
+	// membership view by an event-loop hop and heals a dropped event only on
+	// the reconcile cadence, so this can briefly differ from View - which is
+	// precisely why it exists: a guard protecting a decision COMPUTED ON
+	// PLACEMENT (the reshard barrier's abort-on-membership-change) must be
+	// able to see the placement basis deviate, not only the view. MUST NOT
+	// block and MUST NOT do I/O.
+	PlacementMembers() []Node
+
 	// TransitionSets returns the IDs of members currently advertising
 	// RoleJoining and RoleDraining, as two independent sets. Either or both
 	// are nil when no member advertises that role - the common steady state -

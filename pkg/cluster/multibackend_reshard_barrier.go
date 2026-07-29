@@ -932,13 +932,25 @@ func (c *Cluster) reshardMembers() []memberRPC {
 // the cluster straddling. It returns a descriptive error alongside the bool for
 // the abort message.
 func (c *Cluster) membershipChanged(want map[string]struct{}) (bool, error) {
-	now := c.Members()
-	if len(now) != len(want) {
-		return true, fmt.Errorf("member count changed %d -> %d", len(want), len(now))
-	}
-	for _, m := range now {
-		if _, ok := want[m.ID]; !ok {
-			return true, fmt.Errorf("member set changed: %s joined (or replaced a departed member) mid-reshard", m.ID)
+	// BOTH bases are checked, and either deviating aborts. The membership
+	// VIEW is where a real swap lands first (gossip truth). The PLACEMENT
+	// basis is what the reshard's plan was actually computed over, and under
+	// gossip it can diverge from the view (a dropped event, healing only on
+	// the reconcile cadence) - a coordinator driving a plan from a diverged
+	// placement is exactly as wrong as one whose membership moved. The two
+	// agree everywhere but that window, and this guard exists to be
+	// conservative: a false abort costs one retry.
+	for basis, now := range map[string][]ring.Member{
+		"membership": c.Members(),
+		"placement":  c.PlacementMembers(),
+	} {
+		if len(now) != len(want) {
+			return true, fmt.Errorf("%s member count changed %d -> %d", basis, len(want), len(now))
+		}
+		for _, m := range now {
+			if _, ok := want[m.ID]; !ok {
+				return true, fmt.Errorf("%s member set changed: %s joined (or replaced a departed member) mid-reshard", basis, m.ID)
+			}
 		}
 	}
 	return false, nil

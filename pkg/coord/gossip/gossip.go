@@ -463,6 +463,23 @@ func (c *Coordinator) Populated() bool {
 	return c.r != nil && !c.r.Empty()
 }
 
+// PlacementMembers returns the ring's member set - the placement basis in
+// both modes. See coord.Coordinator: under gossip this can briefly trail the
+// (snapshot-based) View when an event was dropped, healing on the reconcile
+// cadence; exposing that gap is the method's purpose.
+func (c *Coordinator) PlacementMembers() []coord.Node {
+	if c.r == nil {
+		return nil
+	}
+	ms := c.r.Members()
+	out := make([]coord.Node, 0, len(ms))
+	for _, m := range ms {
+		out = append(out, coord.Node{ID: storageunit.NodeID(m.ID), Addr: m.Addr})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out
+}
+
 // TransitionSets returns the joining / draining member-ID sets. See
 // coord.Coordinator: per-operation, so it does ONE membership scan and builds
 // only the (steady-state nil) result maps - none of View's snapshot

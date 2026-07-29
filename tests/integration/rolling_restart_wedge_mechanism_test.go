@@ -322,12 +322,19 @@ func isMidAcquire(err error) bool {
 	return strings.Contains(st.Message(), "replicas mid-acquire")
 }
 
-// clustersAgreeOnMembers reports whether every node's ring reports the SAME set
-// of member ids. False is the membership-race fingerprint.
+// clustersAgreeOnMembers reports whether every node's PLACEMENT basis reports
+// the SAME set of member ids. False is the membership-race fingerprint.
+//
+// It deliberately reads PlacementMembers, not Members: the divergence this
+// mechanism test engineers is a ring-only one (TestingSetRingMembers mutates
+// the placement basis; gossip still agrees), which is exactly the production
+// shape of a dropped membership event. The membership VIEW is snapshot-based
+// and agrees across nodes throughout - by design - so reading it here would
+// make the vacuity guard unsatisfiable rather than protective.
 func clustersAgreeOnMembers(nodes []*sharedNode) bool {
 	var ref string
 	for _, n := range nodes {
-		ids := sortedMemberIDs(n.Cluster)
+		ids := sortedPlacementMemberIDs(n.Cluster)
 		key := strings.Join(ids, ",")
 		if ref == "" {
 			ref = key
@@ -340,8 +347,8 @@ func clustersAgreeOnMembers(nodes []*sharedNode) bool {
 	return true
 }
 
-func sortedMemberIDs(c *cluster.Cluster) []string {
-	ms := c.Members()
+func sortedPlacementMemberIDs(c *cluster.Cluster) []string {
+	ms := c.PlacementMembers()
 	ids := make([]string, 0, len(ms))
 	for _, m := range ms {
 		ids = append(ids, m.ID)
@@ -378,7 +385,7 @@ func waitMembersAgree(nodes []*sharedNode, timeout time.Duration) bool {
 func captureNodesState(nodes []*sharedNode) string {
 	var b strings.Builder
 	for _, n := range nodes {
-		fmt.Fprintf(&b, "\n===== node %s ring-members=%v =====\n", n.ID, sortedMemberIDs(n.Cluster))
+		fmt.Fprintf(&b, "\n===== node %s ring-members=%v =====\n", n.ID, sortedPlacementMemberIDs(n.Cluster))
 		b.WriteString(n.Cluster.DebugState())
 	}
 	return b.String()
