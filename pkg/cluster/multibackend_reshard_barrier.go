@@ -82,6 +82,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/ring"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -351,11 +352,11 @@ func (c *Cluster) reshardResume() error {
 		return fmt.Errorf("cluster: ReshardResume is only valid in multi-backend mode")
 	}
 	c.unfreeze()
-	// Re-key the ring onto the 2N gen-(g+1) ids: the Phase 3 reconcile
+	// Re-key placement onto the 2N gen-(g+1) ids: the Phase 3 reconcile
 	// acquires/releases so the new units redistribute by lease handoff. In
 	// single-node mode this is a no-op (self owns everything), but a multi-node
 	// resume schedules a debounced reconcile on every node. Cheap + idempotent.
-	if c.ring != nil {
+	if c.coord != nil {
 		c.bumpRingGen()
 	}
 	return nil
@@ -449,41 +450,26 @@ func (c *Cluster) TestingSetAfterFreezeHook(fn func()) {
 	c.testingAfterFreezeHook = fn
 }
 
-// TestingSetRingMembers replaces the local node's ring membership with the given
-// members (used to model a count-preserving membership swap mid-reshard: the
-// coordinator's Members() reads the ring, so swapping a member here makes the
-// barrier's membershipChanged re-check observe an identity change). Test-only
-// white-box hook; multi-node mode only (no-op if the ring is nil). Follows the
-// Testing* convention.
+// TestingSetRingMembers replaces the local node's placement basis with the
+// given members, modelling a node whose topology view has DIVERGED from its
+// peers' (a count-preserving membership swap mid-reshard: the barrier's
+// membershipChanged re-check reads Members(), so swapping a member here makes
+// it observe an identity change). Test-only white-box hook; multi-node mode
+// only, and only for a coordinator that offers the seam - a no-op otherwise.
+// Follows the Testing* convention.
 //
-// It MUTATES the existing *ring.Ring in place (Remove every current member, Add
-// the desired set) rather than swapping the c.ring POINTER. The c.ring field is
-// assigned once in Open before any goroutine spawns; thereafter only the
-// *Ring's own internally-locked Add/Remove mutate the membership, and the events
-// loop reads c.ring concurrently to call those. Reassigning the pointer here
-// would race that unguarded field read in the events loop (the *Ring is
-// internally locked, but the c.ring field is not). Going through Add/Remove on
-// the SAME pointer keeps every membership mutation under the ring's own RWMutex,
-// so there is no unsynchronized field access.
+// It keeps taking ring.Member so the existing white-box call sites are
+// unchanged; the value is just an (id, addr) pair.
 func (c *Cluster) TestingSetRingMembers(members []ring.Member) {
-	if c.ring == nil {
+	setter, ok := c.coord.(coord.MemberSetter)
+	if !ok {
 		return
 	}
-	want := make(map[string]struct{}, len(members))
+	nodes := make([]coord.Node, 0, len(members))
 	for _, m := range members {
-		want[m.ID] = struct{}{}
+		nodes = append(nodes, coord.Node{ID: storageunit.NodeID(m.ID), Addr: m.Addr})
 	}
-	// Remove any current member not in the desired set, then Add/refresh the
-	// desired set. Both go through the ring's internal lock; the c.ring pointer
-	// never changes, so the concurrent events-loop read is race-free.
-	for _, cur := range c.ring.Members() {
-		if _, keep := want[cur.ID]; !keep {
-			c.ring.Remove(cur.ID)
-		}
-	}
-	for _, m := range members {
-		c.ring.Add(m)
-	}
+	setter.TestingSetMembers(nodes)
 }
 
 // frozenFor reports whether this node is frozen AND its freeze target is exactly

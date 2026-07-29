@@ -22,18 +22,19 @@
 
 package cluster
 
-// setSelfJoining flips this node's local Joining flag AND gossips it via
-// membership.SetJoining, but only on a real change (the atomic Swap dedups, so a
-// repeated set/clear is a no-op with no gossip churn). The local atomic is the
+// setSelfJoining flips this node's local Joining flag AND republishes the role
+// set through the coordinator, but only on a real change (the atomic Swap
+// dedups, so a repeated set/clear costs nothing). The local atomic is the
 // source of truth the reconcile's clear-decision reads (avoids racing a
-// self-snapshot); membership carries the authoritative gossiped bit peers observe.
+// self-view read); the coordinator carries the authoritative role peers
+// observe. Publishing goes through publishRoles because the port is
+// declarative - it replaces the whole role set, so joining and draining must
+// travel together.
 func (c *Cluster) setSelfJoining(v bool) {
 	if c.selfJoining.Swap(v) == v {
 		return // unchanged
 	}
-	if c.membership != nil {
-		_ = c.membership.SetJoining(v)
-	}
+	c.publishRoles()
 }
 
 // maintainJoiningState clears this node's Joining bit once it has fully warmed:

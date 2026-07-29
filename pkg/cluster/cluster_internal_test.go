@@ -1,7 +1,7 @@
 package cluster
 
-// White-box tests that need access to unexported names
-// (reconcileRingFromMembership, clients map, ring) to pin regression
+// White-box tests that need access to unexported names (the coordination
+// field, the clients map, the settle-timer accounting) to pin regression
 // behavior the public-API tests cannot reach.
 
 import (
@@ -13,8 +13,8 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/memfactory"
-	"github.com/Zamua/shale/pkg/membership"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -38,14 +38,14 @@ func hp(port int) string {
 	return "127.0.0.1:" + strconv.Itoa(port)
 }
 
-// waitForLocalInRing polls the ring until it contains the local member
-// or the deadline expires. The events loop populates the ring from
-// the NotifyJoin memberlist fires on Open, so this should be near-
-// immediate but is racy enough to need a poll.
-func waitForLocalInRing(c *Cluster, timeout time.Duration) bool {
+// waitForLocalInView polls the coordination view until it contains the local
+// member or the deadline expires. The coordinator seeds itself from its own
+// join notification at Start, so this should be near-immediate but is racy
+// enough to need a poll.
+func waitForLocalInView(c *Cluster, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		for _, m := range c.ring.Members() {
+		for _, m := range c.Members() {
 			if m.ID == c.cfg.NodeID {
 				return true
 			}
@@ -54,6 +54,39 @@ func waitForLocalInRing(c *Cluster, timeout time.Duration) bool {
 	}
 	return false
 }
+
+// openGossipNode opens a real multi-node Cluster on a loopback gossip
+// coordinator whose ring reconcile is parked far in the future, so a
+// background heal cannot steamroll a divergence a test induces on purpose.
+func openGossipNode(t *testing.T, nodeID string, mutate func(*Config)) *Cluster {
+	t.Helper()
+	port := freeTCPPort(t)
+	cfg := Config{
+		NodeID:         nodeID,
+		BackendFactory: memfactory.New(),
+		UnitCount:      storageunit.MustUnitCount(2),
+		GRPCAddr:       "127.0.0.1:1",
+		LogOutput:      io.Discard,
+		Coordinator: gossip.New(gossip.Config{
+			BindAddr:          hp(port),
+			LogOutput:         io.Discard,
+			ReconcileInterval: time.Hour,
+		}),
+	}
+	if mutate != nil {
+		mutate(&cfg)
+	}
+	c, err := Open(cfg)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	t.Cleanup(func() { _ = c.Close() })
+	return c
+}
+
+// gossipCoord exposes c's coordinator as the concrete gossip adapter, for the
+// tests that drive its test seams.
+func gossipCoord(c *Cluster) *gossip.Coordinator { return c.coord.(*gossip.Coordinator) }
 
 // forceReconcileNow bypasses the settle-timer debounce and runs the
 // pending reconcile immediately, adopting whatever pending obligation is
@@ -80,24 +113,22 @@ func forceReconcileNow(c *Cluster) {
 // self-join schedules, so a test can establish a deterministic at-rest
 // baseline.
 //
-// memberlist.Create fires NotifyJoin for the local node, which queues an
-// EventJoin on membership's buffered events channel. runEventsLoop drains
-// it asynchronously and calls bumpRingGen -> scheduleEvaluate, which does
-// settlePending.Add(1) and re-Adds the local member to the ring. That
-// drain is NOT ordered against the test body: waitForLocalInRing returns
-// as soon as the ring is SEEDED (synchronously, in Open), which can happen
-// before the self-join event is processed. Under -race the events loop is
+// The gossip transport fires a join notification for the local node, which the
+// coordinator turns into a change hint. runCoordLoop drains it asynchronously
+// and calls bumpRingGen -> scheduleEvaluate, which does settlePending.Add(1).
+// That drain is NOT ordered against the test body: waitForLocalInView returns
+// as soon as the view is SEEDED (synchronously, in Open), which can happen
+// before the self-join hint is processed. Under -race the events loop is
 // scheduled late enough that the re-Add / settlePending bump lands AFTER a
 // test's at-rest assertion, which is the sole cause of both
-// TestReconcileRingFromMembership_RestoresMissingLocal and
 // TestWaitForRebalanceIdle_BlocksWhileDebouncePending flaking under -race.
 //
 // This helper waits for that scheduled evaluation to appear
 // (settlePending == 1), then runs it to completion via runEvaluateNow so
-// settlePending returns to 0 and no background goroutine has an unrun
-// re-Add / re-arm left in flight. After it returns, the only writers that
-// can still touch the ring or settlePending are the reconcile loop (which
-// callers park far in the future) and the test's own explicit drives.
+// settlePending returns to 0 and no background goroutine has an unrun re-arm
+// left in flight. After it returns, the only writers that can still touch
+// settlePending are the reconcile loop (which callers park far in the future)
+// and the test's own explicit drives.
 func quiesceInitialSelfJoin(t *testing.T, c *Cluster) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -110,75 +141,6 @@ func quiesceInitialSelfJoin(t *testing.T, c *Cluster) {
 	forceReconcileNow(c)
 	if got := c.settlePending.Load(); got != 0 {
 		t.Fatalf("self-join evaluation did not drain; settlePending=%d", got)
-	}
-}
-
-// TestReconcileRingFromMembership_RestoresMissingLocal pins issue 3b:
-// the reconcileRingFromMembership method must re-add a member that
-// membership knows about but the ring has lost (the failure mode where
-// an event-channel drop leaves the ring permanently stale).
-//
-// Approach: open a single-node multi-node-mode Cluster (no seeds, but
-// BindAddr set so the membership + reconcile machinery is active),
-// wait for the local node to land in the ring via the events loop,
-// then manually evict it from the ring to simulate divergence + call
-// reconcileRingFromMembership directly. The local member must reappear.
-//
-// Why this test would have caught a regression: any change that turned
-// reconcileRingFromMembership into a no-op (e.g. someone "simplifying"
-// by removing the Snapshot() call or guarding it with a wrong nil
-// check) leaves the ring missing the local ID forever after this test
-// induces the divergence. The assertion fires before the test cleans up.
-func TestReconcileRingFromMembership_RestoresMissingLocal(t *testing.T) {
-	// Park the reconcile loop far in the future so a background reconcile
-	// tick cannot re-Add "solo" between the manual Remove + the assertion
-	// (the test drives reconcileRingFromMembership explicitly).
-	saved := reconcileInterval
-	reconcileInterval = time.Hour
-	t.Cleanup(func() { reconcileInterval = saved })
-
-	port := freeTCPPort(t)
-	c, err := Open(Config{
-		NodeID:         "solo",
-		BackendFactory: memfactory.New(),
-		UnitCount:      storageunit.MustUnitCount(2),
-		BindAddr:       hp(port),
-		GRPCAddr:       "127.0.0.1:1",
-		LogOutput:      io.Discard,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
-
-	if !waitForLocalInRing(c, 2*time.Second) {
-		t.Fatalf("local member never landed in ring; ring=%v", c.ring.Members())
-	}
-
-	// Drain the local node's own self-join event before inducing the
-	// divergence. The self-join EventJoin queued by memberlist.Create is
-	// processed asynchronously by runEventsLoop, which re-Adds "solo". If
-	// that drain lands AFTER the Remove below (as it can under -race's late
-	// scheduling), the events loop re-inserts "solo" and the
-	// post-Remove-empty assertion fails. Quiescing it here guarantees the
-	// only writer left that could re-Add "solo" is the explicit
-	// reconcileRingFromMembership call we make below (the reconcile loop is
-	// parked an hour out).
-	quiesceInitialSelfJoin(t, c)
-
-	// Simulate the divergence: events-channel drop lost a join, ring
-	// no longer contains the local member. Membership.Snapshot() still
-	// returns it as authoritative.
-	c.ring.Remove("solo")
-	if len(c.ring.Members()) != 0 {
-		t.Fatalf("post-Remove ring should be empty, got %v", c.ring.Members())
-	}
-
-	c.reconcileRingFromMembership()
-
-	members := c.ring.Members()
-	if len(members) != 1 || members[0].ID != "solo" {
-		t.Fatalf("reconcile did not restore local member; ring=%v", members)
 	}
 }
 
@@ -199,29 +161,17 @@ func TestReconcileRingFromMembership_RestoresMissingLocal(t *testing.T) {
 // stays cached + a future forward dial returns the dead conn. The
 // assertion on clients[oldAddr] absence fires.
 func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
-	// Park the reconciler far in the future so the manual ring +
-	// clients state we set up below cannot be steamrolled by a
-	// reconcile tick between the inject + the assertion.
+	// Park BOTH reconcilers far in the future (the cluster's unit reconcile and
+	// the coordinator's own ring heal) so the manual view + clients state we set
+	// up below cannot be steamrolled by a tick between the inject + assertion.
 	saved := reconcileInterval
 	reconcileInterval = time.Hour
 	t.Cleanup(func() { reconcileInterval = saved })
 
-	port := freeTCPPort(t)
-	c, err := Open(Config{
-		NodeID:         "solo",
-		BackendFactory: memfactory.New(),
-		UnitCount:      storageunit.MustUnitCount(2),
-		BindAddr:       hp(port),
-		GRPCAddr:       "127.0.0.1:1",
-		LogOutput:      io.Discard,
-	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
+	c := openGossipNode(t, "solo", nil)
 
-	if !waitForLocalInRing(c, 2*time.Second) {
-		t.Fatalf("local member never landed in ring")
+	if !waitForLocalInView(c, 2*time.Second) {
+		t.Fatalf("local member never landed in the coordination view")
 	}
 
 	// Stand up two throwaway gRPC listeners so dialing oldAddr +
@@ -252,7 +202,7 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 	// at oldAddr previously. Inject a NotifyUpdate that flips the
 	// same ID to newAddr; the events loop should rewrite the ring +
 	// evict the oldAddr client.
-	c.ring.Add(ring.Member{ID: "peer-1", Addr: oldAddr})
+	addCoordMember(c, coord.Node{ID: "peer-1", Addr: oldAddr})
 
 	conn, err := grpc.NewClient(oldAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
@@ -262,7 +212,7 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 	c.clients[oldAddr] = &peerClient{conn: conn}
 	c.clientsMu.Unlock()
 
-	membership.TestingInjectUpdate(c.membership, "peer-1", newAddr)
+	gossipCoord(c).TestingInjectUpdate("peer-1", newAddr)
 
 	// Let the events loop drain + react. Poll for both conditions
 	// (ring updated + client evicted) up to 2s; the actual reaction
@@ -273,7 +223,7 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 		_, stillCached := c.clients[oldAddr]
 		c.clientsMu.RUnlock()
 		gotAddr := ""
-		for _, m := range c.ring.Members() {
+		for _, m := range c.Members() {
 			if m.ID == "peer-1" {
 				gotAddr = m.Addr
 				break
@@ -290,12 +240,12 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 	_, stillCached := c.clients[oldAddr]
 	c.clientsMu.RUnlock()
 	var gotAddr string
-	for _, m := range c.ring.Members() {
+	for _, m := range c.Members() {
 		if m.ID == "peer-1" {
 			gotAddr = m.Addr
 		}
 	}
-	t.Fatalf("addr-change eviction did not happen: ring peer-1 addr=%q (want %q), oldAddr still cached=%v",
+	t.Fatalf("addr-change eviction did not happen: view peer-1 addr=%q (want %q), oldAddr still cached=%v",
 		gotAddr, newAddr, stillCached)
 }
 
@@ -316,25 +266,14 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 	reconcileInterval = time.Hour
 	t.Cleanup(func() { reconcileInterval = saved })
 
-	port := freeTCPPort(t)
-	c, err := Open(Config{
-		NodeID:         "rb-pending",
-		BackendFactory: memfactory.New(),
-		UnitCount:      storageunit.MustUnitCount(2),
-		BindAddr:       hp(port),
-		GRPCAddr:       "127.0.0.1:1",
-		LogOutput:      io.Discard,
-		// Long delay: the armed timer must NOT fire on its own during
-		// the test. We drive the firing explicitly below.
-		RebalanceSettleDelay: time.Hour,
+	// Long delay: the armed timer must NOT fire on its own during the test. We
+	// drive the firing explicitly below.
+	c := openGossipNode(t, "rb-pending", func(cfg *Config) {
+		cfg.RebalanceSettleDelay = time.Hour
 	})
-	if err != nil {
-		t.Fatalf("Open: %v", err)
-	}
-	t.Cleanup(func() { _ = c.Close() })
 
-	if !waitForLocalInRing(c, 2*time.Second) {
-		t.Fatalf("local member never landed in ring")
+	if !waitForLocalInView(c, 2*time.Second) {
+		t.Fatalf("local member never landed in the coordination view")
 	}
 
 	// Drain the evaluation the local node's own self-join schedules so we

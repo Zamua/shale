@@ -138,13 +138,13 @@ func (c *Cluster) runReconcile() {
 	// RESUME RPC) would otherwise reject every write forever. clearStaleFreeze
 	// only clears a freeze the node has already flipped past AND that has aged
 	// beyond the coordinator's RESUME retry budget, so it never races a normal
-	// in-flight reshard. When it clears one, do the ring re-key the missed RESUME
+	// in-flight reshard. When it clears one, do the re-key the missed RESUME
 	// would have done (bumpRingGen) and fall through to the post-flip reconcile.
 	if c.isFrozen() {
 		if !c.clearStaleFreeze() {
 			return
 		}
-		if c.ring != nil {
+		if c.coord != nil {
 			c.bumpRingGen()
 		}
 	}

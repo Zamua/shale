@@ -14,8 +14,8 @@
 // old pods declare the OLD count and new pods declare the NEW count for ~a
 // roll's duration - would have nodes fighting the target back and forth (split,
 // then merge, then split). The fix is to gate the retarget on AGREEMENT: each
-// node gossips its standing declared count in membership metadata
-// (membership.Member.DeclaredUnitCount), and a node retargets the arbiter ONLY
+// node advertises its standing declared count through the coordination port
+// (coord.Member.DeclaredUnitCount), and a node retargets the arbiter ONLY
 // when the cluster is steady AND every live member advertises the SAME known
 // declared count (UNANIMITY). During a roll the live set is a mix, so no node
 // retargets until the roll completes; the moment the last node rolls, the set
@@ -27,7 +27,7 @@
 package cluster
 
 import (
-	"github.com/Zamua/shale/pkg/membership"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -44,8 +44,8 @@ func (c *Cluster) observeDeclaredReshardTarget() {
 		// gossiped declared count; everything else (tests driving the arbiter
 		// imperatively, legacy) leaves the target externally set.
 	}
-	if c.arbiter == nil || c.membership == nil {
-		return // declarative reshard requires a wired arbiter + membership
+	if c.arbiter == nil || c.coord == nil {
+		return // declarative reshard requires a wired arbiter + coordinator
 	}
 	// Only act when STEADY: no split/merge in flight on this node...
 	if !c.genSnapshot().nextCount.IsZero() {
@@ -64,7 +64,7 @@ func (c *Cluster) observeDeclaredReshardTarget() {
 	// advertise the SAME known declared count. A member with an unknown (0)
 	// count - an older image, or a node still mid-roll - breaks unanimity and
 	// DEFERS the retarget. This is the flap guard.
-	d, ok := unanimousDeclaredCount(c.membership.Snapshot())
+	d, ok := unanimousDeclaredCount(c.coord.View().Members)
 	if !ok {
 		return
 	}
@@ -88,7 +88,7 @@ func (c *Cluster) observeDeclaredReshardTarget() {
 // (_, false) - the fail-safe that DEFERS a declarative retarget until the whole
 // live cluster agrees. Pure (no I/O, no locks) so the unanimity logic is
 // testable in isolation.
-func unanimousDeclaredCount(members []membership.Member) (uint32, bool) {
+func unanimousDeclaredCount(members []coord.Member) (uint32, bool) {
 	var d uint32
 	for _, m := range members {
 		if m.DeclaredUnitCount == 0 {

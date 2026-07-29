@@ -29,7 +29,7 @@ import (
 	"sync"
 
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -39,7 +39,7 @@ import (
 // (envelope bytes) can be pulled out alongside the ack accounting
 // fanout does.
 type replicaResult struct {
-	Member ring.Member
+	Member coord.Node
 	Err    error
 	// Value carries the per-replica returned bytes for Get; nil for
 	// Put / Delete callbacks that have nothing to return. NotFound is
@@ -79,9 +79,9 @@ type replicaResult struct {
 // is what made the R>1 acquiring shortfall unattributable to its own callers.
 func fanout(
 	ctx context.Context,
-	replicas []ring.Member,
+	replicas []coord.Node,
 	requiredAcks int,
-	op func(ctx context.Context, idx int, replica ring.Member) ([]byte, error),
+	op func(ctx context.Context, idx int, replica coord.Node) ([]byte, error),
 ) (int, []error, []error, <-chan replicaResult) {
 	n := len(replicas)
 	if n == 0 {
@@ -327,7 +327,7 @@ func (c *Cluster) replicationFactor() int {
 // when the replica explicitly returned NotFound (which itself can win
 // LWW if no replica had a stamped value).
 type collected struct {
-	member   ring.Member
+	member   coord.Node
 	env      Envelope
 	hadValue bool
 }
@@ -456,7 +456,7 @@ func (c *Cluster) OwnsReplica(key []byte) bool {
 		// is unchanged.
 		routed, _ := c.routedReplicasForKey(key)
 		for _, m := range routed {
-			if m.ID == c.cfg.NodeID {
+			if string(m.ID) == c.cfg.NodeID {
 				return true
 			}
 		}

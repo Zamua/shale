@@ -300,7 +300,7 @@ func (c *Cluster) evictStaleMount(ru storageunit.ReplicaUnit, failed backend.Bac
 	// write simply fails on the leaver's leg and retries onto the union (the
 	// successor's leg acked it); drainCheck completes the drain on the
 	// successor's marker.
-	if c.mounts.evictIfSame(ru, failed) && c.ring != nil {
+	if c.mounts.evictIfSame(ru, failed) && c.coord != nil {
 		// Schedule a (debounced) reconcile so the unit is RE-ACQUIRED fresh at
 		// the durable-max epoch promptly, rather than waiting for the slow
 		// self-heal loop tick. Safe to call from the KV path: scheduleReconcile
@@ -415,7 +415,7 @@ func (c *Cluster) Reshard() error {
 	// flow lives in multibackend_reshard_barrier.go and is built to the same
 	// NO-ACKED-WRITE-LOST invariant (writes during the freeze are refused with a
 	// retryable error, never acked). The SINGLE-NODE path below stays unchanged.
-	if c.ring != nil && len(c.ring.Members()) > 1 {
+	if len(c.Members()) > 1 {
 		return c.reshardCoordinated()
 	}
 
@@ -455,12 +455,12 @@ func (c *Cluster) Reshard() error {
 	}
 	c.commitGenState(final)
 
-	// Re-key the ring onto the 2N generation-qualified unit ids: the Phase 3
+	// Re-key placement onto the 2N generation-qualified unit ids: the Phase 3
 	// reconcile acquires/releases so the new units redistribute across nodes
 	// by lease handoff. In single-node mode this is a cheap no-op (self owns
 	// everything regardless of generation). bumpRingGen schedules the
 	// debounced reconcile; in multi mode (c.multi) that is scheduleReconcile.
-	if c.ring != nil {
+	if c.coord != nil {
 		c.bumpRingGen()
 	}
 	// Run the reconcile directly (we already hold reshardMu, so we must NOT

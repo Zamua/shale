@@ -26,6 +26,7 @@ import (
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -163,13 +164,14 @@ func (c *inProcCluster) startNode(seedAddr string) (*node, error) {
 			BackendFactory:       h,
 			UnitCount:            storageunit.MustUnitCount(c.unitCount),
 			GRPCAddr:             grpcAddr,
-			BindAddr:             bindAddr,
 			LogOutput:            io.Discard,
 			RebalanceSettleDelay: c.settleDelay,
 		}
+		gcfg := gossip.Config{BindAddr: bindAddr, LogOutput: io.Discard}
 		if seedAddr != "" {
-			cfg.Seeds = []string{seedAddr}
+			gcfg.Seeds = []string{seedAddr}
 		}
+		cfg.Coordinator = gossip.New(gcfg)
 		var oerr error
 		cl, oerr = cluster.Open(cfg)
 		if oerr == nil {

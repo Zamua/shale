@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -311,12 +310,9 @@ func TestBroadcastFlip_ReportsAckedCountForStraddleDetection(t *testing.T) {
 // the cluster's ring membership between snapshots.
 func TestMembershipChanged_IdentityNotJustCount(t *testing.T) {
 	c, _ := openReshardCluster(t, 4)
-	// Populate a 3-member ring directly (the barrier's membershipChanged reads
-	// c.Members(), which reads c.ring).
-	c.ring = ring.New()
-	for _, id := range []string{"a", "b", "c"} {
-		c.ring.Add(ring.Member{ID: id, Addr: id + ":1"})
-	}
+	// Populate a 3-member view directly (the barrier's membershipChanged reads
+	// c.Members(), which projects the coordination view).
+	setCoordMembers(c, nodesFor("a", "b", "c")...)
 	want := map[string]struct{}{"a": {}, "b": {}, "c": {}}
 
 	// Unchanged set: no change.
@@ -325,19 +321,13 @@ func TestMembershipChanged_IdentityNotJustCount(t *testing.T) {
 	}
 
 	// Count-preserving swap: c leaves, d joins. Count stays 3 but identity moved.
-	c.ring = ring.New()
-	for _, id := range []string{"a", "b", "d"} {
-		c.ring.Add(ring.Member{ID: id, Addr: id + ":1"})
-	}
+	setCoordMembers(c, nodesFor("a", "b", "d")...)
 	if changed, _ := c.membershipChanged(want); !changed {
 		t.Fatal("P2-C VIOLATED: a count-preserving leave+join swap was NOT detected (count-only check would miss it)")
 	}
 
 	// A plain leave (count drops) is also a change.
-	c.ring = ring.New()
-	for _, id := range []string{"a", "b"} {
-		c.ring.Add(ring.Member{ID: id, Addr: id + ":1"})
-	}
+	setCoordMembers(c, nodesFor("a", "b")...)
 	if changed, _ := c.membershipChanged(want); !changed {
 		t.Fatal("a member leave was not detected")
 	}

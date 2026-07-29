@@ -9,10 +9,13 @@
 // Do not confuse them; almost every predicate in the package tests one or the
 // other, and a few (noted below) test both.
 //
-//   - NODE COUNT is set by Config.BindAddr. Empty means single-node: no
-//     membership, and c.ring stays NIL. Non-empty means multi-node: Open brings
-//     up a membership.Membership on BindAddr (joining via Config.Seeds) and a
-//     ring.Ring fed from membership events.
+//   - NODE COUNT is set by Config.Coordinator (the coordination port,
+//     pkg/coord). Nil means single-node: no coordination, and c.coord stays
+//     NIL, so every placement question answers "me". Non-nil means multi-node:
+//     Open STARTS the coordinator (handing it this node's identity, declared
+//     unit count and initial role set) and asks it who should hold each unit.
+//     HOW it answers - SWIM gossip plus a consistent hash ring today
+//     (pkg/coord/gossip), a lease/CAS table later - is invisible here.
 //   - BACKEND MODE is set by Config.Backend vs Config.BackendFactory +
 //     Config.UnitCount, plus Config.ReplicationFactor. That is the three-mode
 //     matrix below.
@@ -53,13 +56,13 @@
 //	PREDICATE                 DEFINED IN                    TRUE WHEN
 //	------------------------- ----------------------------- -----------------------------------------
 //	c.replicaLayout()         multibackend_replicated.go    multi && ReplicationFactor > 1
-//	                                                        (says nothing about the ring)
+//	                                                        (says nothing about coordination)
 //	c.multiReplicated()       multibackend_replicated.go    multi && ReplicationFactor > 1
-//	                                                        && ring != nil && !ring.Empty()
+//	                                                        && coord != nil && view not empty
 //
-// c.ring is constructed ONLY on the multi-node branch of Open (Config.BindAddr
-// set, cluster.go), so on a SINGLE-NODE cluster at R>1 the ring is nil and the
-// two predicates diverge:
+// c.coord is set ONLY on the multi-node branch of Open (Config.Coordinator
+// non-nil, cluster.go), so on a SINGLE-NODE cluster at R>1 there is no
+// coordination view and the two predicates diverge:
 //
 //   - the MOUNT + RECONCILE side keys off replicaLayout(), so it takes the R>1
 //     replica-position path (mountReplicaUnits, reconcileReplicaUnitsOverlap);
@@ -78,7 +81,8 @@
 //
 // A THIRD spelling of the same idea exists for the LEGACY path: "R>1 on the
 // legacy per-node backend" is casReplicated() (cas.go), whose body is
-// replicationFactor() > 1 && ring != nil && !ring.Empty() - and that expression
+// replicationFactor() > 1 && coord != nil && the view is non-empty - and that
+// expression
 // is ALSO written out inline in Put, Get and Delete (cluster.go). It is
 // multiReplicated() minus the c.multi conjunct. When adding a call site, reach
 // for the named predicate rather than re-spelling the expression.
@@ -117,11 +121,9 @@
 //
 //	MECHANISM                  ENTRY                       PREDICATE                        FILE
 //	-------------------------- --------------------------- -------------------------------- -----------------------------
-//	single-node online bisect  Cluster.Reshard()           multi && (ring == nil ||         multibackend_reshard.go
-//	                                                       len(ring.Members()) <= 1)
-//	coordinated freeze barrier Cluster.Reshard()           multi && ring != nil &&          multibackend_reshard_barrier.go
-//	                           -> reshardCoordinated()     len(ring.Members()) > 1
-//	                                                       (NO R check, NO arbiter check)
+//	single-node online bisect  Cluster.Reshard()           multi && len(Members()) <= 1     multibackend_reshard.go
+//	coordinated freeze barrier Cluster.Reshard()           multi && len(Members()) > 1      multibackend_reshard_barrier.go
+//	                           -> reshardCoordinated()     (NO R check, NO arbiter check)
 //	decentralized arbiter      reconcileUnits() tick       replicaLayout() (R>1) &&         multibackend_reshard_driver.go
 //	                           -> observeReshard()         c.arbiter != nil, which needs    (+ _arbiter, _declared,
 //	                                                       Config.ConditionalStore != nil   _copy, _marker, _route)
@@ -138,12 +140,12 @@
 //	external           Config.DeclarativeReshard == false    reshard.Arbiter.Retarget, called by a
 //	                   (the default)                         test or an external driver
 //	declared config    Config.DeclarativeReshard == true     observeDeclaredReshardTarget
-//	                   && arbiter != nil && membership != nil multibackend_reshard_declared.go
+//	                   && arbiter != nil && coord != nil      multibackend_reshard_declared.go
 //
 // The declared path additionally requires the cluster to be STEADY (no split in
 // flight), the arbiter to have converged (State.Count == State.Target), and
 // UNANIMITY: every live member must advertise the same non-zero declared unit
-// count in its membership metadata. A single member advertising 0 (an older
+// count through the coordination view. A single member advertising 0 (an older
 // image, or a pod mid-roll) is a VETO, which is what keeps a rolling deploy from
 // flapping the target back and forth.
 //
@@ -151,7 +153,7 @@
 //
 //  1. Is it legacy mode? Reshard() errors; there is no reshard.
 //  2. Did something call Reshard() (or the operator-facing Reshard RPC)? Then
-//     ring member count alone decides: 1 member -> inline bisect, >1 -> freeze
+//     member count alone decides: 1 member -> inline bisect, >1 -> freeze
 //     barrier. R and the arbiter are NOT consulted.
 //  3. Otherwise, is an arbiter wired (R>1 + ConditionalStore)? Then every
 //     reconcile tick steps any in-flight split/merge through observeReshard,
@@ -164,8 +166,8 @@
 //
 //   - docs/SPEC.md "v0.9" says the decentralized reshard "replaces" the
 //     imperative barrier "on the R>1 path", scoping the freeze barrier to R=1.
-//     The code does not scope it: Cluster.Reshard() branches on ring member
-//     count ONLY, so calling Reshard() (or the operator Reshard RPC, which the
+//     The code does not scope it: Cluster.Reshard() branches on member count
+//     ONLY, so calling Reshard() (or the operator Reshard RPC, which the
 //     SPEC documents as calling c.Reshard()) on a MULTI-NODE R>1 cluster runs
 //     reshardCoordinated(), arbiter or not. The decentralized driver is an
 //     ADDITIONAL path reached only from the reconcile tick, not a replacement.
@@ -175,13 +177,14 @@
 //
 //   - The same SPEC sentence says "the R=1 multi-node path keeps the coordinated
 //     freeze barrier". True, but incomplete in the other direction: R=1 is not
-//     what selects the barrier, ring size is.
+//     what selects the barrier, member count is.
 //
 // # File map
 //
 // Roughly in dependency order, so a first read can follow it top to bottom:
 //
-//	cluster.go                      Config, Open, mode validation, the public
+//	cluster.go                      Config, Open, mode validation, the coordination
+//	                                loops, and the public
 //	                                Put/Get/Delete/Scan/Aggregate surface and
 //	                                its dispatch
 //	kv.go, replicate.go             legacy per-node key path + R>1 replication

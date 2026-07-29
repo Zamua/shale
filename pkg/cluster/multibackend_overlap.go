@@ -44,7 +44,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -441,17 +441,17 @@ func (c *Cluster) ownOpenEpoch(ru storageunit.ReplicaUnit) storageunit.Epoch {
 // (pendingUnitReplicas) as replicaAt, sharing the core desiredReplicaUnitsVia.
 // Keeping it a thin call over the shared core is what guarantees the current and
 // pending sets stay in lockstep.
-func (c *Cluster) desiredPendingReplicaUnits(draining map[string]struct{}) []storageunit.ReplicaUnit {
+func (c *Cluster) desiredPendingReplicaUnits(draining map[storageunit.NodeID]struct{}) []storageunit.ReplicaUnit {
 	if len(draining) == 0 {
 		return c.desiredReplicaUnits()
 	}
-	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []ring.Member {
+	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []coord.Node {
 		return c.pendingUnitReplicas(gu, draining)
 	})
 }
 
 // desiredCurrentReplicaUnits returns the positions this node owns under the
-// CURRENT view (the ring EXCLUDING joining members, quorum-floored): the slots it
+// CURRENT view (placement EXCLUDING joining members, quorum-floored): the slots it
 // holds + must keep mounted RIGHT NOW as a stable current owner. It is the
 // entry-side mirror of desiredPendingReplicaUnits and the reconcile's current
 // input. With no joining members it is identical to desiredReplicaUnits (steady
@@ -463,15 +463,16 @@ func (c *Cluster) desiredPendingReplicaUnits(draining map[string]struct{}) []sto
 // exactly as desiredPendingReplicaUnits supplies the draining-excluded lookup.
 // Keeping current + pending as thin calls over the shared core guarantees they
 // stay in lockstep (the reconcile treats any spurious divergence as a transition).
-func (c *Cluster) desiredCurrentReplicaUnits(joining map[string]struct{}) []storageunit.ReplicaUnit {
+//
+// The per-unit exclusion lookup is asked once per unit; making that affordable
+// (the hypothetical placement is not cheap to compute) is the COORDINATOR's
+// concern, not this loop's, so there is no reason for the caller to hoist it.
+func (c *Cluster) desiredCurrentReplicaUnits(joining map[storageunit.NodeID]struct{}) []storageunit.ReplicaUnit {
 	if len(joining) == 0 {
 		return c.desiredReplicaUnits()
 	}
-	// Build the reduced (joining-excluded) ring ONCE and reuse it across every
-	// unit's replica lookup, rather than rebuilding per unit inside currentUnitReplicas.
-	reduced := c.buildReducedRing(joining)
-	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []ring.Member {
-		return c.currentReplicasFromReduced(reduced, gu)
+	return c.desiredReplicaUnitsVia(func(gu storageunit.GenUnit) []coord.Node {
+		return c.currentUnitReplicas(gu, joining)
 	})
 }
 

@@ -42,6 +42,7 @@ import (
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -98,14 +99,15 @@ func startReplicatedNodeCfg(
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 300 * time.Millisecond,
 	}
+	gcfg := gossip.Config{LogOutput: io.Discard}
 	if seedAddr != "" {
-		cfg.Seeds = []string{seedAddr}
+		gcfg.Seeds = []string{seedAddr}
 	}
 	if mutate != nil {
 		mutate(&cfg)
 	}
 
-	c, bindAddr := openClusterRetryBind(t, cfg)
+	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {

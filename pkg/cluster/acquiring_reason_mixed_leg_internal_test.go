@@ -52,7 +52,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -115,10 +115,10 @@ func TestAcquiringReason_MixedAcquiringAndUnreachableLegPrefersAcquiring(t *test
 	// failure than a dead node). Placement hashes on member ID, so re-adding the
 	// same IDs preserves which node holds which replica position.
 	peerAddr := deadAddr(t)
-	rg := ring.New()
-	rg.Add(ring.Member{ID: "mx1", Addr: "127.0.0.1:0"})
-	rg.Add(ring.Member{ID: "mx2", Addr: peerAddr})
-	c.ring = rg
+	setCoordMembers(c,
+		coord.Node{ID: "mx1", Addr: "127.0.0.1:0"},
+		coord.Node{ID: "mx2", Addr: peerAddr},
+	)
 
 	if err := c.mountReplicaUnits(); err != nil {
 		t.Fatalf("mount this node's replica positions: %v", err)
@@ -133,7 +133,7 @@ func TestAcquiringReason_MixedAcquiringAndUnreachableLegPrefersAcquiring(t *test
 	}
 	var seeded bool
 	for _, rr := range routed {
-		if rr.member.ID != c.cfg.NodeID {
+		if string(rr.member.ID) != c.cfg.NodeID {
 			continue
 		}
 		if b, ok := c.mounts.backendFor(rr.ru); ok {
@@ -211,10 +211,10 @@ func TestAcquiringReason_UnreachableOnlySweepDoesNotMatchErrAcquiring(t *testing
 		}
 	})
 
-	rg := ring.New()
-	rg.Add(ring.Member{ID: "mx2", Addr: deadAddr(t)})
-	rg.Add(ring.Member{ID: "mx3", Addr: deadAddr(t)})
-	c.ring = rg
+	setCoordMembers(c,
+		coord.Node{ID: "mx2", Addr: deadAddr(t)},
+		coord.Node{ID: "mx3", Addr: deadAddr(t)},
+	)
 
 	_, err := c.getReplicatedUnitOnce(time.Now().Add(3*time.Second), []byte("unreachable-only-key"))
 	if err == nil {

@@ -13,7 +13,7 @@ import (
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -144,8 +144,8 @@ func TestPutReshardDualWrite_LandsInBothGenerations(t *testing.T) {
 
 	// All legs local to self, so each dispatch applies to its mounted backend.
 	legs := reshardLegs{
-		auth:    []routedReplica{{member: ring.Member{ID: "n1"}, ru: parentRU}},
-		supp:    []routedReplica{{member: ring.Member{ID: "n1"}, ru: childRU}},
+		auth:    []routedReplica{{member: coord.Node{ID: "n1"}, ru: parentRU}},
+		supp:    []routedReplica{{member: coord.Node{ID: "n1"}, ru: childRU}},
 		stableR: 1,
 	}
 	env := Encode(Envelope{Stamp: Stamp{TimestampNanos: 1, NodeID: "n1"}, Payload: []byte("v1")})

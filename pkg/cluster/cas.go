@@ -21,7 +21,7 @@ import (
 // same shard. At R=1 the whole envelope / fan-out machinery is bypassed
 // and CommitCASApply behaves exactly as v0.6 did.
 func (c *Cluster) casReplicated() bool {
-	return c.replicationFactor() > 1 && c.ring != nil && !c.ring.Empty()
+	return c.replicationFactor() > 1 && c.coord != nil && !c.coord.View().Empty()
 }
 
 // CASMaxAttempts bounds how many times Transact re-runs its closure on a

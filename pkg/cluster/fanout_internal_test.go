@@ -13,15 +13,15 @@ import (
 	"testing"
 	"time"
 
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
 func TestFanout_AllSucceed(t *testing.T) {
-	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	reps := []coord.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	acks, errs, _, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ coord.Node) ([]byte, error) {
 			return []byte("ok"), nil
 		})
 	if acks < 2 {
@@ -36,10 +36,10 @@ func TestFanout_AllSucceed(t *testing.T) {
 // TestFanout_FailureBudgetExhausted: with R=3 + W=2, two failures
 // exhaust the budget + fanout returns with whatever acks are in hand.
 func TestFanout_FailureBudgetExhausted(t *testing.T) {
-	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	reps := []coord.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var nonAck int32
 	acks, errs, _, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ coord.Node) ([]byte, error) {
 			if atomic.AddInt32(&nonAck, 1) <= 2 {
 				return nil, errors.New("boom")
 			}
@@ -66,10 +66,10 @@ func TestFanout_FailureBudgetExhausted(t *testing.T) {
 // down (gRPC channel gone / deadline canceled) and DOES count as
 // failure -- TestFanout_UnavailableCountsAsFailure pins that.
 func TestFanout_TransientDoesNotCount(t *testing.T) {
-	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	reps := []coord.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var seq int32
 	acks, errs, _, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ coord.Node) ([]byte, error) {
 			n := atomic.AddInt32(&seq, 1)
 			if n == 1 {
 				return nil, status.Error(codes.ResourceExhausted, "transient")
@@ -91,10 +91,10 @@ func TestFanout_TransientDoesNotCount(t *testing.T) {
 // reason the legs carried instead of guessing. Dropping it here is what made an
 // R>1 acquiring shortfall unattributable.
 func TestFanout_TransientSurfacedAsEvidence(t *testing.T) {
-	reps := []ring.Member{{ID: "a"}, {ID: "b"}}
+	reps := []coord.Node{{ID: "a"}, {ID: "b"}}
 	var seq int32
 	acks, errs, transient, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ coord.Node) ([]byte, error) {
 			if atomic.AddInt32(&seq, 1) == 1 {
 				return nil, errUnitAcquiring("Put")
 			}
@@ -122,10 +122,10 @@ func TestFanout_TransientSurfacedAsEvidence(t *testing.T) {
 // that re-broadens isTransientReplicaErr to include Unavailable
 // would loop until every replica responded (the fail-fast path lost).
 func TestFanout_UnavailableCountsAsFailure(t *testing.T) {
-	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	reps := []coord.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	var seq int32
 	acks, errs, _, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ coord.Node) ([]byte, error) {
 			n := atomic.AddInt32(&seq, 1)
 			if n <= 2 {
 				return nil, status.Error(codes.Unavailable, "peer down")
@@ -145,10 +145,10 @@ func TestFanout_UnavailableCountsAsFailure(t *testing.T) {
 // land; the call returns at the moment the requiredth ack arrives.
 // Surplus replicas keep running + flow onto the result channel.
 func TestFanout_SuccessAcksClampToRequired(t *testing.T) {
-	reps := []ring.Member{{ID: "a"}, {ID: "b"}, {ID: "c"}}
+	reps := []coord.Node{{ID: "a"}, {ID: "b"}, {ID: "c"}}
 	// Slow one replica so the other two ack first.
 	acks, _, _, ch := fanout(context.Background(), reps, 2,
-		func(_ context.Context, _ int, m ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, m coord.Node) ([]byte, error) {
 			if m.ID == "c" {
 				time.Sleep(50 * time.Millisecond)
 			}
@@ -171,7 +171,7 @@ func TestFanout_SuccessAcksClampToRequired(t *testing.T) {
 // channel without panicking.
 func TestFanout_EmptyReplicas(t *testing.T) {
 	acks, errs, _, ch := fanout(context.Background(), nil, 1,
-		func(_ context.Context, _ int, _ ring.Member) ([]byte, error) {
+		func(_ context.Context, _ int, _ coord.Node) ([]byte, error) {
 			return nil, nil
 		})
 	if acks != 0 || len(errs) != 0 {

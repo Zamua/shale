@@ -14,7 +14,8 @@
 // Close() calls DrainForLeave at the TOP (gated on GracefulLeaveDrainTimeout >
 // 0 + multiReplicated()), BEFORE any teardown, while the reconcile loop +
 // drainCheck still run. Only after the drain completes (or its bounded timeout
-// fires) does the real membership.Leave() + transport Shutdown run.
+// fires) does the real departure (the coordinator Close that announces the
+// leave and tears the transport down) run.
 //
 // See docs/SPEC.md "v0.8 Phase 2e: Graceful leave (scale-down)" and
 // docs/design/overlap-handoff.md "Graceful leave (scale-down)".
@@ -42,7 +43,7 @@ const drainPollInterval = 50 * time.Millisecond
 // then BLOCKS until every position this node owns has a PENDING SUCCESSOR that is
 // PROVABLY SERVING (its serving marker is present at an epoch strictly above this
 // node's open epoch) OR ctx is cancelled / its deadline fires. The real
-// membership.Leave() + transport Shutdown happen later, in Close.
+// the real departure (coordinator Close) happens later, in Close.
 //
 // THE COMPLETION GATE (allOwnedPositionsHandedOff): this node stays a CURRENT
 // OWNER in the ring throughout the drain, so it KEEPS its positions mounted and
@@ -80,19 +81,18 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 		return nil
 	}
 
-	// SET THIS NODE DRAINING and gossip it. The node stays ALIVE, a full
-	// addressable member, AND a CURRENT OWNER in the ring (it is NOT removed from
+	// SET THIS NODE DRAINING and publish it. The node stays ALIVE, a full
+	// addressable member, AND a CURRENT OWNER (it is NOT removed from
 	// ownership - the include/exclude split is per-op in routedReplicasForKey).
-	// The moment the Draining Meta gossips, every node's routedReplicasForKey
-	// computes the
-	// PENDING split (ring-minus-this-node) for this node's positions, forms the
-	// routed union, and dual-writes this node + its pending successors. This node
-	// keeps serving its mounts (receiving union writes + reads) throughout the
-	// drain. The REAL membership.Leave() + transport Shutdown stay in the existing
-	// Close teardown, run AFTER this drain returns.
-	if c.membership != nil {
-		_ = c.membership.SetDraining(true)
-	}
+	// The moment the Draining role propagates, every node's routedReplicasForKey
+	// computes the PENDING split (placement EXCLUDING this node) for this node's
+	// positions, forms the routed union, and dual-writes this node + its pending
+	// successors. This node keeps serving its mounts (receiving union writes +
+	// reads) throughout the drain. The REAL departure (the coordinator's Close,
+	// which announces the leave and tears the transport down) stays in the
+	// existing Close teardown, run AFTER this drain returns.
+	c.selfDraining.Store(true)
+	c.publishRoles()
 
 	// Drive reconcile + drainCheck and poll for completion until every owned
 	// position has a serving successor or ctx is done. The first drive runs

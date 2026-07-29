@@ -24,7 +24,7 @@
 
 package cluster
 
-import "github.com/Zamua/shale/pkg/ring"
+import "github.com/Zamua/shale/pkg/coord"
 
 // casDesignatedOwner resolves the ONE node that serves the owner-side CAS
 // validate-and-apply for pinKey. Outside a join transition (and on every
@@ -36,7 +36,7 @@ import "github.com/Zamua/shale/pkg/ring"
 // mounts. Under the quorum floor (mass boot) the current set falls back to the
 // full ring, so the designation falls back to the full-ring head - the safe
 // wedge, unchanged from pre-fix behavior.
-func (c *Cluster) casDesignatedOwner(pinKey []byte) (ring.Member, bool) {
+func (c *Cluster) casDesignatedOwner(pinKey []byte) (coord.Node, bool) {
 	owner, isLocal := c.ownerOf(pinKey)
 	if !c.multiReplicated() {
 		return owner, isLocal
@@ -55,7 +55,7 @@ func (c *Cluster) casDesignatedOwner(pinKey []byte) (ring.Member, bool) {
 		return owner, isLocal
 	}
 	head := current[0]
-	return head, head.ID == c.cfg.NodeID
+	return head, string(head.ID) == c.cfg.NodeID
 }
 
 // OwnsCASPin reports whether THIS node is the designated CAS owner for pinKey

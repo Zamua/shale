@@ -44,7 +44,7 @@ func (c *Cluster) DebugState() string {
 	draining := c.drainingIDs()
 	dids := make([]string, 0, len(draining))
 	for id := range draining {
-		dids = append(dids, id)
+		dids = append(dids, string(id))
 	}
 	sort.Strings(dids)
 	fmt.Fprintf(&b, "draining-members=%v\n", dids)
@@ -52,7 +52,7 @@ func (c *Cluster) DebugState() string {
 	joining := c.joiningIDs()
 	jids := make([]string, 0, len(joining))
 	for id := range joining {
-		jids = append(jids, id)
+		jids = append(jids, string(id))
 	}
 	sort.Strings(jids)
 	fmt.Fprintf(&b, "joining-members=%v self-joining=%v\n", jids, c.selfJoining.Load())

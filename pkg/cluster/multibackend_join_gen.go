@@ -149,7 +149,7 @@ func (c *Cluster) genLearnBudget() time.Duration {
 func (c *Cluster) trySeedGenSweep() (committed bool, lastErr error) {
 	addrs := c.seedGRPCAddrs()
 	if len(addrs) == 0 {
-		return false, fmt.Errorf("cluster: no live peer visible yet to query for the cluster generation (seeds=%v)", c.cfg.Seeds)
+		return false, fmt.Errorf("cluster: no live peer visible yet to query for the cluster generation")
 	}
 	// Try each visible peer in turn. A momentarily-unreachable peer must not
 	// end the sweep while another healthy seed exists (e.g. a node joins while
@@ -189,12 +189,12 @@ func (c *Cluster) trySeedGenSweep() (committed bool, lastErr error) {
 }
 
 // seedGRPCAddrs returns the gRPC addresses of every visible non-self peer, for
-// learnGenerationFromSeed to query in turn. The join handshake (membership.Open
-// -> Join) has already populated the membership cache with every currently-
-// known node and its gRPC Addr (broadcast as the memberlist Meta payload), so
-// Members() here includes the seed(s) the joiner contacted. An empty result
-// (no peer visible) makes the join fail closed: a joiner that cannot learn the
-// generation must not serve at gen 0.
+// learnGenerationFromSeed to query in turn. The coordinator has already
+// populated its opening view with every currently-known node and its gRPC Addr
+// (Open starts the coordinator before this runs), so Members() here includes
+// the seed(s) the joiner reached. An empty result (no peer visible) makes the
+// join fail closed: a joiner that cannot learn the generation must not serve at
+// gen 0.
 func (c *Cluster) seedGRPCAddrs() []string {
 	self := c.cfg.NodeID
 	var addrs []string

@@ -22,12 +22,11 @@
 package cluster
 
 import (
-	"encoding/binary"
 	"fmt"
 	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
-	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -116,39 +115,24 @@ func (c *Cluster) acquireOpenPermit() (release func()) {
 	return c.mounts.openPermit(c.openConcurrency())
 }
 
-// genUnitBytes encodes a GenUnit (the generation-qualified storage identity)
-// as 12 fixed-width big-endian bytes: 8 bytes of Generation followed by 4
-// bytes of UnitID. This is the stable encoding fed to the ring (LocateKey
-// hashes it whole, since a generation-qualified id carries no "{...}" hash
-// tag) so a unit's owner is the same on every node. The generation is part
-// of the hash input, so the gen-g and gen-(g+1) ids of the SAME UnitID hash
-// to potentially DIFFERENT ring positions (hence potentially different
-// owners) - which is what lets a doubling reshard land the new generation's
-// units wherever the ring places them. The encoding MUST be identical
-// everywhere a unit owner is computed; centralizing it here is what
-// guarantees that.
-func genUnitBytes(gu storageunit.GenUnit) []byte {
-	var b [12]byte
-	binary.BigEndian.PutUint64(b[0:8], uint64(gu.Gen))
-	binary.BigEndian.PutUint32(b[8:12], uint32(gu.ID))
-	return b[:]
-}
-
 // genUnitOwner returns the node that owns the generation-qualified unit gu,
-// hashing genUnitBytes(gu) through the SAME ring the cluster routes keys with
-// (no second ring), so unit ownership and key routing agree by construction.
-// With an empty / nil ring (single-node multi-backend, before any peer is
-// known) it returns the local node (ok=true): with no ring to place units on,
-// this node owns them all.
+// asking the coordinator for the unit's primary. Unit ownership and key
+// routing agree by construction: routing resolves a key to its unit and then
+// asks this same question. With no coordination view (single-node
+// multi-backend, or before any member is known) it returns the local node
+// (ok=true).
 func (c *Cluster) genUnitOwner(gu storageunit.GenUnit) (storageunit.NodeID, bool) {
-	if c.ring == nil || c.ring.Empty() {
+	ns := c.locate(gu, 1, coord.Placement{})
+	if len(ns) == 0 {
+		// No coordination view at all (single-node, or a coordinator that has
+		// not seen a member yet): with nothing to place units on, this node
+		// owns them all.
 		return storageunit.NodeID(c.cfg.NodeID), true
 	}
-	m := c.ring.LocateKey(genUnitBytes(gu))
-	if m.ID == "" {
+	if ns[0].ID == "" {
 		return "", false
 	}
-	return storageunit.NodeID(m.ID), true
+	return ns[0].ID, true
 }
 
 // desiredGenUnits returns the generation-qualified units this node SHOULD
@@ -286,7 +270,7 @@ func (c *Cluster) initMultiBackend() error {
 				cutOver: make(map[storageunit.UnitID]struct{}),
 			})
 		}
-	} else if len(c.cfg.Seeds) > 0 {
+	} else if c.bootstrap == coord.BootstrapJoined {
 		if err := c.learnGenerationFromSeed(); err != nil {
 			return err
 		}
@@ -360,7 +344,7 @@ func (c *Cluster) localReplicaPos(gu storageunit.GenUnit) (pos uint8, ok bool) {
 		return 0, true
 	}
 	for i, m := range c.unitReplicas(gu) {
-		if m.ID == c.cfg.NodeID {
+		if string(m.ID) == c.cfg.NodeID {
 			return uint8(i), true
 		}
 	}
@@ -387,19 +371,17 @@ func (c *Cluster) closeMountedUnits() error {
 	return firstErr
 }
 
-// unitOwnerOf returns the ring member that owns key's generation-qualified
-// unit + whether the local node is that owner. Multi-backend analogue of
-// ownerOf: the ownership question goes through the unit (resolved
-// generation-aware), not the raw key. With an empty / nil ring the local node
-// owns everything (single-node multi-backend).
-func (c *Cluster) unitOwnerOf(key []byte) (owner ring.Member, isLocal bool) {
-	gu := c.genUnitForKey(key)
-	if c.ring == nil || c.ring.Empty() {
-		self := ring.Member{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}
-		return self, true
+// unitOwnerOf returns the node that owns key's generation-qualified unit +
+// whether the local node is that owner. Multi-backend analogue of ownerOf: the
+// ownership question goes through the unit (resolved generation-aware), not the
+// raw key. With no coordination view the local node owns everything
+// (single-node multi-backend).
+func (c *Cluster) unitOwnerOf(key []byte) (owner coord.Node, isLocal bool) {
+	ns := c.locate(c.genUnitForKey(key), 1, coord.Placement{})
+	if len(ns) == 0 {
+		return c.selfNode(), true
 	}
-	owner = c.ring.LocateKey(genUnitBytes(gu))
-	return owner, owner.ID == c.cfg.NodeID
+	return ns[0], c.isSelf(ns[0])
 }
 
 // localBackendForKey resolves the mounted backend a LOCAL operation on key

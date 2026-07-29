@@ -2,7 +2,7 @@ package cluster
 
 // White-box tests for multi-backend mode (v0.8 Phase 2). These live in
 // package cluster (not cluster_test) so they can reach the unexported
-// mode wiring: validateBackendMode, genUnitBytes, the mount table, and the
+// mode wiring: validateBackendMode, the mount table, and the
 // per-unit routing. The cross-node forwarding path is covered separately
 // by the in-process integration tests in tests/integration.
 
@@ -102,35 +102,6 @@ func TestValidateBackendMode(t *testing.T) {
 				t.Fatalf("multi = %v, want %v", multi, tc.wantMode)
 			}
 		})
-	}
-}
-
-// TestGenUnitBytesStableEncoding pins the fixed-width big-endian encoding fed
-// to the ring: 8 bytes of Generation followed by 4 bytes of UnitID. A drift in
-// this encoding would silently re-route every unit, so the test nails down
-// concrete bytes. The generation prefix is what makes a gen-g unit K and a
-// gen-(g+1) unit K hash to different ring positions.
-func TestGenUnitBytesStableEncoding(t *testing.T) {
-	cases := []struct {
-		gu   storageunit.GenUnit
-		want []byte
-	}{
-		{storageunit.NewGenUnit(0, 0), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0}},
-		{storageunit.NewGenUnit(0, 1), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}},
-		{storageunit.NewGenUnit(1, 1), []byte{0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1}},
-		{storageunit.NewGenUnit(0, 256), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0}},
-		{storageunit.NewGenUnit(0, 0xDEADBEEF), []byte{0, 0, 0, 0, 0, 0, 0, 0, 0xDE, 0xAD, 0xBE, 0xEF}},
-	}
-	for _, tc := range cases {
-		got := genUnitBytes(tc.gu)
-		if !bytes.Equal(got, tc.want) {
-			t.Fatalf("genUnitBytes(%s) = %v, want %v", tc.gu, got, tc.want)
-		}
-	}
-	// The same UnitID at two generations must encode to DIFFERENT bytes (so
-	// the ring places them potentially differently).
-	if bytes.Equal(genUnitBytes(storageunit.NewGenUnit(0, 5)), genUnitBytes(storageunit.NewGenUnit(1, 5))) {
-		t.Fatal("gen-0 and gen-1 of unit 5 encoded identically; generations would collide on the ring")
 	}
 }
 

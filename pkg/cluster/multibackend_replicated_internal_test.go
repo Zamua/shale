@@ -16,20 +16,15 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
-	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 // newReplicatedCluster builds a minimal R>1 multi-backend Cluster wired to a
-// per-replica shared-backing handle + a real ring containing memberIDs, with
-// no membership / gRPC. self is this node's id.
+// per-replica shared-backing handle + a transport-free coordinator over
+// memberIDs, with no gossip / gRPC. self is this node's id.
 func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfactory.Backing, memberIDs ...string) *Cluster {
 	t.Helper()
 	h := backing.Handle()
-	rg := ring.New()
-	for _, id := range memberIDs {
-		rg.Add(ring.Member{ID: id, Addr: id + ":0"})
-	}
 	c := &Cluster{
 		// LogOutput io.Discard: the acquire/mount transition logging added for
 		// the handoff observability would otherwise write to os.Stderr (logf's
@@ -39,7 +34,7 @@ func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfa
 		factory:    h,
 		unitCount:  storageunit.MustUnitCount(n),
 		pauseUnits: make(map[storageunit.UnitID]*sync.RWMutex),
-		ring:       rg,
+		coord:      staticCoord(self, nodesFor(memberIDs...)),
 		closeCh:    make(chan struct{}),
 	}
 	c.mounts.init(c)
@@ -144,7 +139,7 @@ func TestDesiredReplicaUnits_UnionCoversEveryUnitRTimes(t *testing.T) {
 			count[ru.Unit.ID]++
 			// The recorded position must match self's index in the replica set.
 			set := c.unitReplicas(ru.Unit)
-			if int(ru.Replica) >= len(set) || set[ru.Replica].ID != self {
+			if int(ru.Replica) >= len(set) || string(set[ru.Replica].ID) != self {
 				t.Fatalf("unit %d: recorded replica pos %d does not point at %q", ru.Unit.ID, ru.Replica, self)
 			}
 		}
