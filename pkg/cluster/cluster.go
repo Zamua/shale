@@ -888,6 +888,12 @@ func (c *Cluster) runEventsLoop() {
 					c.evictClient(oldAddr)
 				}
 				c.bumpRingGen()
+				// A join can CREATE positions that have never existed - on a
+				// growing cluster the ring hands this node replica positions
+				// nobody has ever mounted or marked. Those are acquired
+				// promptly rather than a settle-debounce later; see the
+				// method for the two independent safety gates.
+				c.promptAcquireFreshPositions()
 			case membership.EventLeave:
 				c.ring.Remove(ev.Member.ID)
 				// Drop any cached client for this departed peer so

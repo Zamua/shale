@@ -212,6 +212,100 @@ func TestClassifyWriteAttempt(t *testing.T) {
 	}
 }
 
+// classifyWriteAttempt must tell the two reasonless retryable shapes apart:
+// a shortfall whose transient legs simply carried no known reason (a
+// migration-guard-only pass) is EVIDENCE, while a shortfall with NO leg in
+// either slice is the deadline-truncated snapshot (fanout returned on
+// ctx.Done() before the refusing legs reported) and holds no evidence at all.
+// Only the latter may be discarded by the retry wrapper in favor of an earlier
+// evidence-bearing terminal.
+func TestClassifyWriteAttempt_NoLegEvidenceMarking(t *testing.T) {
+	truncated := classifyWriteAttempt(1, 2, nil, nil)
+	if !truncated.retryable || !truncated.noLegEvidence {
+		t.Fatalf("acks<w with EMPTY errs+transient is the truncated snapshot: want retryable+noLegEvidence, got %+v", truncated)
+	}
+	if errors.Is(truncated.err, ErrAcquiring) {
+		t.Fatalf("a truncated snapshot has no leg to inherit a reason from; terminal must not carry ErrAcquiring: %v", truncated.err)
+	}
+
+	guardOnly := classifyWriteAttempt(1, 2, nil, []error{
+		status.Error(codes.ResourceExhausted, "cluster: partition mid-handoff"),
+	})
+	if !guardOnly.retryable || guardOnly.noLegEvidence {
+		t.Fatalf("a transient leg without the reason is still EVIDENCE: want retryable+!noLegEvidence, got %+v", guardOnly)
+	}
+	if errors.Is(guardOnly.err, ErrAcquiring) {
+		t.Fatalf("migration-guard-only legs are a different reason; terminal must not claim acquiring: %v", guardOnly.err)
+	}
+
+	acq := classifyWriteAttempt(1, 2, nil, []error{errUnitAcquiring("Put")})
+	if !acq.retryable || acq.noLegEvidence {
+		t.Fatalf("an acquiring leg is evidence: want retryable+!noLegEvidence, got %+v", acq)
+	}
+	if !errors.Is(acq.err, ErrAcquiring) {
+		t.Fatalf("terminal over an acquiring leg must inherit the reason: %v", acq.err)
+	}
+}
+
+// THE BOOT-GAP RESIDUAL, pinned at the policy layer. Every real attempt of a
+// write riding a warming window produces a reason-carrying terminal (its legs
+// present the acquiring refusal), but the FINAL attempt's context shares the
+// WriteTimeout wall clock, so it can expire mid-fan-out and snapshot the
+// accounting BEFORE the mid-acquire replica's refusal lands: acks=1, errs=[],
+// transient=[]. The wrapper used to store that evidence-free terminal as
+// lastErr and return it VERBATIM on budget exhaustion, silently replacing the
+// reason-carrying terminals every earlier attempt produced - so a consumer
+// gating a bounded retry on errors.Is(err, cluster.ErrAcquiring) refused to
+// ride exactly the window this mechanism exists to make ridable.
+func TestRetryWriteThroughHandoff_TruncatedFinalAttemptKeepsReason(t *testing.T) {
+	c := retryTestCluster(150*time.Millisecond, 10)
+
+	var attempts int
+	err := c.retryWriteThroughHandoff(func(_ context.Context) writeAttempt {
+		attempts++
+		if attempts == 1 {
+			// A completed pass: the mid-acquire replica's refusal landed as a
+			// transient leg, so the terminal carries the reason.
+			return classifyWriteAttempt(1, 2, nil, []error{errUnitAcquiring("Put")})
+		}
+		// Every later pass is the deadline-truncated snapshot: the mounted
+		// replica acked, the refusing leg never reported.
+		return classifyWriteAttempt(1, 2, nil, nil)
+	})
+	if err == nil {
+		t.Fatalf("expected the exhausted budget to surface an error, got nil (attempts=%d)", attempts)
+	}
+	if attempts < 2 {
+		t.Fatalf("scenario did not arm: need at least one truncated attempt after the evidence-bearing one, got %d", attempts)
+	}
+	if !errors.Is(err, ErrAcquiring) {
+		t.Fatalf("the truncated final attempt stripped the reason: errors.Is(err, ErrAcquiring)=false for %v", err)
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("terminal must stay codes.Unavailable, got %v (%v)", status.Code(err), err)
+	}
+}
+
+// The mirror bound: when NO attempt ever produced leg evidence (every pass was
+// truncated), the surfaced terminal must NOT claim the acquiring reason - the
+// sentinel is only ever attached to something a leg actually presented.
+func TestRetryWriteThroughHandoff_AllTruncatedStaysReasonless(t *testing.T) {
+	c := retryTestCluster(100*time.Millisecond, 10)
+
+	err := c.retryWriteThroughHandoff(func(_ context.Context) writeAttempt {
+		return classifyWriteAttempt(1, 2, nil, nil)
+	})
+	if err == nil {
+		t.Fatalf("expected the exhausted budget to surface an error, got nil")
+	}
+	if errors.Is(err, ErrAcquiring) {
+		t.Fatalf("no leg ever presented the reason; the sentinel must not be attached: %v", err)
+	}
+	if status.Code(err) != codes.Unavailable {
+		t.Fatalf("terminal must stay codes.Unavailable, got %v (%v)", status.Code(err), err)
+	}
+}
+
 // jitteredBackoff stays in [0.5d, 1.0d) and never panics on a zero/negative d.
 func TestJitteredBackoff(t *testing.T) {
 	if got := jitteredBackoff(0); got != 0 {

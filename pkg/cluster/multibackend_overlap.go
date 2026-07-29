@@ -19,8 +19,9 @@
 //     release). There is NO predecessor to remember and NO per-position forward:
 //     the union routes writes + reads DIRECTLY to both the current and pending
 //     owners.
-//   - a pure NEW mount (initial convergence, no transition) -> the existing
-//     clean-cut acquire.
+//   - a pure NEW mount (initial convergence / boot-defer warm-up, no
+//     transition) -> the SAME background bounded acquire (no drain half; the
+//     inline clean-cut open survives only in the break-demo reconcile).
 //   - a position simply DROPPING OUT of this node's replica set with no pending
 //     successor taking its exact slot -> the existing plain clean-cut release.
 //
@@ -59,7 +60,7 @@ import (
 //   - ACQUIRE half: a position this node holds in PENDING but not in CURRENT, not
 //     yet mounted, is set Acquiring + mounted in the background (the gainer); on
 //     mount-complete it writes its serving marker. A pure new mount with no
-//     transition takes the clean-cut acquire.
+//     transition takes the same background acquire, just with no drain half.
 //
 // Caller MUST hold reconcileMu; mount + phase mutations go through the table.
 func (c *Cluster) reconcileReplicaUnitsOverlap() {
@@ -249,9 +250,22 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 
 	// ACQUIRE half (pure new mount / initial convergence): a CURRENT position not
 	// yet mounted with no transition. This is the Phase 2b initial convergence
-	// (each node mounting the units the ring assigns it as peers join). It is the
-	// clean-cut acquire (no overlap sequencing needed: no predecessor is serving
-	// this exact slot, so there is nothing to drain from).
+	// (each node mounting the units the ring assigns it as peers join) - and the
+	// boot-defer warm-up, when the quorum floor keeps a warming node's own
+	// deferred positions in CURRENT (a 2-node stagger floors current back to the
+	// full ring, so the warming node's positions land HERE, not in the
+	// pending-owner half). No overlap SEQUENCING is needed (no predecessor is
+	// draining this exact slot), but the MOUNT goes through the SAME background
+	// machinery as the pending-owner half: beginAcquire + acquireReplicaUnitOverlap
+	// (in-flight dedup'd, open-permit bounded, failure-redriven, serving-marked
+	// on the flip). It used to be the INLINE clean-cut acquireReplicaUnit, and
+	// that inline shape was the boot-gap residual: a node warming N deferred
+	// positions opened them STRICTLY SERIALLY under reconcileMu, one factory
+	// open per iteration, so with real open latency the warm-up took N x open
+	// while the write retry is sized to ride ONE open - the tail units' quorum
+	// gap outlived every consumer budget. Backgrounding makes this pass O(ms),
+	// runs the opens up to OpenConcurrency wide with event-driven chaining, and
+	// keeps reconcileMu free for drain checks while the mounts land.
 	for _, ru := range current {
 		if _, inPending := pendingSet[ru]; !inPending {
 			// Current-but-not-pending = being HANDED OFF (this node is itself
@@ -259,7 +273,7 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 			// + drainCheck own these positions; the ACQUIRE half must NOT (re-)mount
 			// one. After drainCheck RELEASES a drained position its phase is cleared
 			// to 0, so it is no longer caught by the IsLoser skip below - without this
-			// gate it would fall through to acquireReplicaUnit and the leaver would
+			// gate it would fall through to the fresh acquire and the leaver would
 			// RE-GRAB a position it just handed off (re-fencing the successor at a
 			// climbed epoch), so ownedPositionCount never reaches 0 and the graceful
 			// leave never completes (the leaver-side half of the #410 oscillation).
@@ -280,7 +294,8 @@ func (c *Cluster) reconcileReplicaUnitsOverlap() {
 			c.acquireReplicaUnitOverlap(ru)
 			continue
 		}
-		c.acquireReplicaUnit(ru)
+		c.beginAcquire(ru)
+		c.acquireReplicaUnitOverlap(ru)
 	}
 
 	c.logAcquireQueueSummary()
@@ -661,14 +676,17 @@ func flushableBackend(b backend.Backend) (backend.Flusher, bool) {
 	return fl, ok
 }
 
-// beginAcquire records PhaseAcquiring for a pending position MOVING IN. There is
-// NO predecessor address: under the pending-ranges model the union routes ops
-// DIRECTLY to both the current owner (still serving) and this pending owner, so a
-// routed op arriving on this node during the mount simply returns errUnitAcquiring
-// (the union covers the position via the current owner). The phase is set BEFORE
-// the mount starts so there is no instant where routing targets this node, the
-// mount is incomplete, AND no phase entry exists. Caller holds reconcileMu; the
-// phase write goes through the mount table.
+// beginAcquire records PhaseAcquiring for a position MOVING IN: a pending
+// position a draining peer is vacating, or a fresh CURRENT position with no
+// transition (initial convergence / boot-defer warm-up - same mount machinery,
+// no drain half). There is NO predecessor address: under the pending-ranges
+// model the union routes ops DIRECTLY to both the current owner (still serving)
+// and this pending owner, so a routed op arriving on this node during the mount
+// simply returns errUnitAcquiring (the union covers the position via the
+// current owner when one exists). The phase is set BEFORE the mount starts so
+// there is no instant where routing targets this node, the mount is incomplete,
+// AND no phase entry exists. Caller holds reconcileMu; the phase write goes
+// through the mount table.
 func (c *Cluster) beginAcquire(ru storageunit.ReplicaUnit) {
 	c.mounts.setPhase(ru, storageunit.HandoffState{Phase: storageunit.PhaseAcquiring})
 }
@@ -709,8 +727,16 @@ func (c *Cluster) openEpochForReplica(ru storageunit.ReplicaUnit) storageunit.Ep
 // Ready -> drops the phase entry (Owned) - and writes the durable SERVING MARKER
 // exactly once so the old owner's drainCheck poll releases. On open failure it
 // leaves the Acquiring phase in place (the union still covers the position via
-// the current owner) and the next reconcile / self-heal retries. Caller holds
-// reconcileMu.
+// the current owner) and the next reconcile / self-heal retries.
+//
+// TWO CALLER SHAPES, deliberately different locking: the reconcile calls this
+// under reconcileMu (the historical contract), and promptAcquireFreshPositions
+// calls it from a bare goroutine on a membership JOIN with NO reconcileMu. The
+// second is safe because every effect goes through the mount table's own
+// synchronization: startAcquire's in-flight set dedups a concurrent reconcile
+// re-drive, and the mount flip is one table critical section. What reconcileMu
+// buys the first caller is pass-level consistency of ITS OWN diff, not safety
+// of this function.
 //
 // acquireReplicaUnitOverlap spawns the GAINER's slow mount in a BACKGROUND
 // goroutine so a node gaining many positions at once mounts them CONCURRENTLY
@@ -806,6 +832,18 @@ func (c *Cluster) acquireReplicaUnitOverlap(ru storageunit.ReplicaUnit) {
 			if acqErr == nil {
 				c.logf("shale: acquire done %s: attempt %d took %s, %s total since armed",
 					ru, attempt, time.Since(attemptStart).Round(time.Millisecond), time.Since(spawned).Round(time.Millisecond))
+				// WARM-UP COMPLETION IS EDGE-TRIGGERED, not tick-quantized: on a
+				// still-Joining node this mount may have been the LAST position it
+				// owed, and the Joining bit is only re-derived inside a reconcile
+				// pass (maintainJoiningState). With the acquires running in the
+				// background, the pass that ARMED them has long returned, so
+				// without this nudge the bit would stay up until the next
+				// self-heal tick - keeping peers flooring this node's units for
+				// seconds after it is fully warmed. A zero-delay re-arm collapses
+				// into one pending pass however many acquires complete.
+				if c.selfJoining.Load() {
+					c.scheduleReconcileIn(0)
+				}
 				return // mounted (or superseded); done.
 			}
 			if redrive.exhausted() {

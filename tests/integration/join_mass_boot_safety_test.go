@@ -70,9 +70,10 @@ func TestJoinMassBoot_QuorumFloorNeverFalseAcks(t *testing.T) {
 	// MASS RESTART both nodes over the SAME backing with a slow mount armed BEFORE
 	// Open, so both boot-defer everything and warm slowly: for the warm window EVERY
 	// unit has BOTH replicas freshly-booted (owned-but-unmounted). The delay is
-	// moderate because the floored (clean-cut) mount path is synchronous in the
-	// reconcile; a very long delay would only serialize the heal, not strengthen the
-	// safety claim (the fully-unmounted instant already exercises the floor).
+	// moderate because the warm-up now runs through the background bounded
+	// acquire (concurrent under the open-permit pool, since v0.14.2); a very long
+	// delay would only stretch the heal, not strengthen the safety claim (the
+	// fully-unmounted instant already exercises the floor).
 	n1.Close()
 	n2.Close()
 	const mountDelay = 3 * time.Second
@@ -158,8 +159,9 @@ func TestJoinMassBoot_QuorumFloorNeverFalseAcks(t *testing.T) {
 	}
 
 	// HEAL: drop the slow mount so both nodes finish warming, and let the reconcile
-	// mount every deferred position before the durability sweep (the floored path is
-	// synchronous, so a brief settle lets both nodes finish).
+	// mount every deferred position before the durability sweep (the warm-up is
+	// asynchronous/bounded since v0.14.2; the poll below waits for it, so the
+	// settle is a head start rather than a completion guarantee).
 	for _, n := range []*sharedNode{r1, r2} {
 		n.Handle.SetAcquireDelay(0)
 	}

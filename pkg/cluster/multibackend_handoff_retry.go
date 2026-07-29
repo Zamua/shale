@@ -53,6 +53,16 @@ type writeAttempt struct {
 	// (transient) replicas - i.e. NO non-transient failure landed, W was simply
 	// not reachable yet. It is meaningless when err is nil.
 	retryable bool
+	// noLegEvidence is true only for a retryable shortfall whose accounting
+	// snapshot holds NO refusing leg at all (errs and transient both empty).
+	// That shape has exactly one producer: the attempt context expired
+	// mid-fan-out and fanout returned on ctx.Done() before the non-acking
+	// legs reported - a COMPLETED pass files every non-acking leg into errs
+	// or transient, so it can never look like this. The terminal minted for
+	// it summarizes nothing (there is no leg whose refusal reason it could
+	// inherit), which is why the retry wrapper must not let it REPLACE an
+	// earlier attempt's evidence-bearing terminal; see retryWriteThroughHandoff.
+	noLegEvidence bool
 }
 
 // classifyWriteAttempt turns a fan-out's (acks, w, errs, transient) into a
@@ -88,6 +98,19 @@ type writeAttempt struct {
 // retry against a genuine outage - the false positive this whole mechanism exists
 // to prevent - and would also contradict shale's own judgment, since this branch
 // is precisely the one that sets retryable=false and refuses to retry internally.
+//
+// THE DEADLINE-TRUNCATED SNAPSHOT (acks < w with NO leg in errs OR transient)
+// is a third, distinct shape: fanout returned on ctx.Done() before the
+// refusing legs reported, so the pass holds no evidence of WHY W was missed -
+// not because the legs carried no reason, but because they never landed. A
+// completed pass files every non-acking leg into one of the two slices, so
+// emptiness of both IS the truncation signature. Its terminal stays the plain
+// status (with no leg present there is nothing whose reason could be
+// inherited, and the sentinel must only ever be attached to something a leg
+// actually presented), but it is MARKED noLegEvidence so the retry wrapper
+// can refuse to let this evidence-free terminal silently replace an earlier
+// attempt's evidence-bearing one - the collapse that stripped the reason from
+// an exhausted budget exactly when the window was demonstrably a handoff.
 func classifyWriteAttempt(acks, w int, errs, transient []error) writeAttempt {
 	if acks >= w {
 		return writeAttempt{}
@@ -102,8 +125,9 @@ func classifyWriteAttempt(acks, w int, errs, transient []error) writeAttempt {
 			}
 		}
 		return writeAttempt{
-			err:       status.Error(codes.Unavailable, msg),
-			retryable: true,
+			err:           status.Error(codes.Unavailable, msg),
+			retryable:     true,
+			noLegEvidence: len(transient) == 0,
 		}
 	}
 	return writeAttempt{
@@ -183,7 +207,19 @@ func (c *Cluster) retryWriteThroughHandoff(attempt func(ctx context.Context) wri
 			// not paper over a real outage by spinning. Return immediately.
 			return res.err
 		}
-		lastErr = res.err
+		// EVIDENCE DISCIPLINE ACROSS ATTEMPTS: a deadline-truncated pass
+		// (noLegEvidence) heard from no refusing leg, so its terminal carries
+		// no reason BY CONSTRUCTION - while every earlier attempt's terminal
+		// reports exactly what its legs presented. Letting the truncated one
+		// overwrite lastErr would strip the reason from an exhausted budget
+		// precisely when the window was demonstrably a handoff, and the
+		// consumer's errors.Is(err, ErrAcquiring) gate would false-negative
+		// on the final, surfaced error (the boot-gap residual). Keep the
+		// evidence-bearing terminal; the truncated shape is surfaced only
+		// when it is all this call ever observed.
+		if !res.noLegEvidence || lastErr == nil {
+			lastErr = res.err
+		}
 
 		// Retryable handoff blip: back off (bounded by the remaining budget),
 		// then re-run. The shared schedule re-checks the budget BEFORE sleeping

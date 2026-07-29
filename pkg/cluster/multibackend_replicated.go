@@ -310,6 +310,25 @@ func (c *Cluster) mountReplicaUnits() error {
 	// graceful leave. The reconcile clears the bit once every owned position is
 	// mounted (maintainJoiningState). A cold start defers nothing, so the bit is
 	// never set and first-cluster convergence is unchanged.
+	if deferred.Load() == 0 {
+		// FULLY WARMED BY CONSTRUCTION: every position this node owns is
+		// mounted, so clear the Joining bit NOW rather than a reconcile tick
+		// later. startJoining raises the bit at membership-open (before any
+		// mount) so peers exclude a warming node from CURRENT; leaving it up
+		// after a clean boot is stale state, and it is not harmless: a peer
+		// booting into this node during that window reads it as "not
+		// established" and downgrades its own warm-up to the slow debounce
+		// path (hasEstablishedPeer below). Observed downstream: node A booted
+		// cleanly, node B arrived one second later, saw A still advertising
+		// Joining, and spent a full settle delay in a write-quorum gap that
+		// the prompt path exists to close.
+		//
+		// Deliberately NOT routed through maintainJoiningState: that helper
+		// re-derives warmth from the pending set on the reconcile cadence,
+		// while here warmth is a boot-completion FACT - zero positions were
+		// deferred, so there is nothing to re-derive.
+		c.setSelfJoining(false)
+	}
 	if deferred.Load() > 0 {
 		c.setSelfJoining(true)
 		// ACQUIRE THE DEFERRED POSITIONS NOW - but ONLY when there is an
@@ -351,31 +370,99 @@ func (c *Cluster) mountReplicaUnits() error {
 		// Routed through the settle machinery with a zero delay rather than
 		// called inline: Open must not block on acquires, and the
 		// settlePending accounting keeps WaitForRebalanceIdle honest.
-		if c.hasEstablishedPeer() {
+		peers, joining := c.peerJoiningCounts()
+		if peers > joining {
+			c.logf("shale: boot-defer warm-up: PROMPT (peers=%d joining=%d - an established peer exists; "+
+				"arming the reconcile immediately to close the deferred-position quorum gap)", peers, joining)
 			c.scheduleReconcileIn(0)
+		} else {
+			c.logf("shale: boot-defer warm-up: DEBOUNCED (peers=%d joining=%d - no established peer visible; "+
+				"a fleet-wide boot must wait for ring convergence, the settle cadence handles it)", peers, joining)
 		}
 	}
 	return nil
 }
 
-// hasEstablishedPeer reports whether the membership snapshot contains at least
-// one OTHER node that is fully warmed into the ring (not Joining). That is the
-// safety condition for acting on this node's boot state immediately: an
-// established peer proves there is a converged topology to warm into, rather
-// than a fleet-wide boot still negotiating one.
-func (c *Cluster) hasEstablishedPeer() bool {
+// promptAcquireFreshPositions immediately warms every position this node
+// desires, does not hold, and that NOBODY HAS EVER SERVED - no serving marker
+// exists for it. Called from the membership events loop on a join, because a
+// join is the event that CREATES such positions: a cluster growing from N to
+// N+1 nodes mints replica positions that have never been mounted anywhere,
+// and the only thing standing between them and a write quorum is this node
+// getting around to its settle-debounced reconcile. For a fresh position that
+// wait buys nothing - the debounce exists to keep churn from thrashing
+// CONTESTED state, and a markerless position is uncontested by definition.
+//
+// TWO INDEPENDENT SAFETY GATES, each sufficient on its own:
+//
+//   - SELF-ESTABLISHED ONLY: a node that is itself still warming (Joining)
+//     skips this entirely. Its view of the ring is a booting node's view, and
+//     acting promptly on a partial view is how the mass-boot data loss
+//     happened (acked writes lost, 8 of 8 runs, before the boot-side gate).
+//   - MARKERLESS ONLY: a position with a serving marker has (or had) a
+//     holder; acquiring it promptly would fence live peers mid-transition -
+//     the other half of the same mass-boot failure. Marked positions keep
+//     the deliberate, debounced, drain-gated path. In a mass RESTART every
+//     position carries a marker, so this pass is a no-op there by
+//     construction.
+//
+// The acquire itself goes through acquireReplicaUnitOverlap: dedup'd via
+// startAcquire, marker-written on completion, loopWG-tracked - the same
+// machinery the reconcile uses, just sooner.
+//
+// Runs in a goroutine because the marker reads are backing-store I/O and this
+// is called from the membership events loop, which must never block on I/O.
+func (c *Cluster) promptAcquireFreshPositions() {
+	if !c.multiReplicated() || c.selfJoining.Load() || c.closed.Load() {
+		return
+	}
+	c.loopWG.Add(1)
+	go func() {
+		defer c.loopWG.Done()
+		for _, ru := range c.desiredReplicaUnits() {
+			if c.closed.Load() {
+				return
+			}
+			if _, mounted := c.mounts.backendFor(ru); mounted {
+				continue
+			}
+			epoch, ok, err := c.factory.ReadServingMarker(storageunit.ReplicaMount(ru))
+			if err != nil || (ok && epoch > 0) {
+				// Marked (or unreadable, which reads as "assume contested"):
+				// leave it to the debounced path. Fail-safe in the direction
+				// of the old behavior.
+				continue
+			}
+			c.logf("shale: prompt fresh acquire: %s (desired, unmounted, no serving marker - "+
+				"a join created this position; acquiring now instead of a settle-delay later)", ru)
+			c.acquireReplicaUnitOverlap(ru)
+		}
+	}()
+}
+
+// peerJoiningCounts reports how many OTHER nodes the membership snapshot
+// contains and how many of those advertise Joining. peers > joining means at
+// least one established peer exists - the safety condition for acting on this
+// node's boot state immediately: an established peer proves there is a
+// converged topology to warm into, rather than a fleet-wide boot still
+// negotiating one. Returned as counts rather than a bool so the caller can LOG
+// what the decision saw; the one lesson this incident repeated at every layer
+// is that a guard which cannot report its own reasoning costs a night of
+// diagnosis when it fires unexpectedly.
+func (c *Cluster) peerJoiningCounts() (peers, joining int) {
 	if c.membership == nil {
-		return false
+		return 0, 0
 	}
 	for _, m := range c.membership.Snapshot() {
 		if m.ID == c.cfg.NodeID {
 			continue
 		}
-		if !m.Joining {
-			return true
+		peers++
+		if m.Joining {
+			joining++
 		}
 	}
-	return false
+	return peers, joining
 }
 
 // logf writes a one-line cluster-level event to cfg.LogOutput, FALLING BACK to
@@ -496,14 +583,25 @@ func (c *Cluster) unitApplyErrMaps(ru storageunit.ReplicaUnit, b backend.Backend
 // replica is left unmounted (a routed op gets the retryable acquiring-window
 // error and the next reconcile retries). Caller MUST hold reconcileMu.
 //
+// It is the INLINE (synchronous, one-open-at-a-time) acquire. Its only
+// remaining production caller is the break-demo clean-cut reconcile
+// (reconcileReplicaUnitsCleanCut, behind TestingForceCleanCut): the live
+// reconcile's pure-new-mount half routes through the background bounded
+// acquireReplicaUnitOverlap instead, because opening N positions serially
+// under reconcileMu made a boot-defer warm-up take N x open latency (the
+// boot-gap residual).
+//
 // It writes the durable SERVING MARKER after mounting, EXACTLY as the overlap
-// acquire does. This is REQUIRED for the graceful-leave (scale-down) drain to
-// complete: a position moving OFF a leaving node can land on its successor via
-// THIS clean-cut path (initial-convergence / pure-new-mount), not only the
-// pending-owner overlap path. The leaving node is DRAINING that exact position
-// and releases ONLY on a serving marker strictly above its open epoch; if this
-// path mounted silently (no marker, the old behavior) the draining leaver would
-// wait out the full grace timeout. The clean-cut gainer opens at durable+1
+// acquire does. Since v0.14.2 the reconcile routes every real successor mount
+// through the background bounded acquire, so in production this clean-cut path
+// no longer lands positions moving off a leaving node - the break-demo is its
+// one remaining caller shape. The marker write stays anyway, for the same
+// reason it was added: any path that CAN mount a position a leaver is draining
+// must publish the release signal, or the leaver waits out its full grace
+// timeout against a marker that is not coming. Keeping the write here makes
+// that property a property of MOUNTING rather than of one caller's routing,
+// which is exactly how the original omission (boot mounted, published nothing,
+// wedged production for 41 days) became possible. The clean-cut gainer opens at durable+1
 // (strictly above the leaver's open epoch), so the marker it writes here releases
 // the draining leaver. The marker is monotonic + idempotent, so writing it on a
 // pure new mount (no draining leaver) is a harmless no-op observer-wise.
