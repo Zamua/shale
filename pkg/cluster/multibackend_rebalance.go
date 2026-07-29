@@ -231,8 +231,9 @@ func (c *Cluster) reconcileUnits() {
 		// handoff controller (acquire-then-release, sequenced by the per-
 		// ReplicaUnit FSM), and every Draining position is polled for release on
 		// this same cadence (drainCheck reads the durable serving marker). The
-		// initial-convergence pure-new-mount and plain drop-out cases stay the
-		// clean-cut acquire/release. See multibackend_overlap.go.
+		// initial-convergence pure-new-mount case takes the same background
+		// bounded acquire (no drain half); plain drop-out stays the clean-cut
+		// release. See multibackend_overlap.go.
 		if c.cfg.TestingForceCleanCut {
 			// Break-demo only (docs/SPEC.md "v0.8 Phase 2e" gate): the pre-2e
 			// clean-cut RELEASE-then-ACQUIRE, no overlap, no forwarding. A

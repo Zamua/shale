@@ -583,6 +583,14 @@ func (c *Cluster) unitApplyErrMaps(ru storageunit.ReplicaUnit, b backend.Backend
 // replica is left unmounted (a routed op gets the retryable acquiring-window
 // error and the next reconcile retries). Caller MUST hold reconcileMu.
 //
+// It is the INLINE (synchronous, one-open-at-a-time) acquire. Its only
+// remaining production caller is the break-demo clean-cut reconcile
+// (reconcileReplicaUnitsCleanCut, behind TestingForceCleanCut): the live
+// reconcile's pure-new-mount half routes through the background bounded
+// acquireReplicaUnitOverlap instead, because opening N positions serially
+// under reconcileMu made a boot-defer warm-up take N x open latency (the
+// boot-gap residual).
+//
 // It writes the durable SERVING MARKER after mounting, EXACTLY as the overlap
 // acquire does. This is REQUIRED for the graceful-leave (scale-down) drain to
 // complete: a position moving OFF a leaving node can land on its successor via

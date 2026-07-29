@@ -337,9 +337,11 @@ func TestOverlap_Reconcile_PositionMoveHold_HeldUntilSameUnitMounts(t *testing.T
 	c.mounts.mountUndecorated(held, b)
 
 	// PASS 1: the release half must HOLD the stale copy (same-unit desire not
-	// yet mounted when the release half runs), while the acquire half mounts
-	// the desired position (sharedfactory mounts instantly).
+	// yet mounted when the release half runs), while the acquire half arms the
+	// desired position's background mount; wait for the flip to land before
+	// asserting (the fresh-mount acquire is backgrounded, not inline).
 	c.reconcileReplicaUnitsOverlap()
+	c.loopWG.Wait()
 	if _, mounted := c.localBackendForReplicaUnit(held); !mounted {
 		t.Fatalf("position-move hold: stale same-unit copy must stay mounted while the desired position is unmounted")
 	}
@@ -347,7 +349,7 @@ func TestOverlap_Reconcile_PositionMoveHold_HeldUntilSameUnitMounts(t *testing.T
 		t.Fatalf("held copy must NOT enter a handoff phase, got %v", st.Phase)
 	}
 	if _, mounted := c.localBackendForReplicaUnit(want); !mounted {
-		t.Fatalf("desired position %v must have been acquired in the same pass", want)
+		t.Fatalf("desired position %v must have been acquired by the pass's background mount", want)
 	}
 
 	// PASS 2: the desired position is mounted, the hold lapses, the stale copy
@@ -415,10 +417,14 @@ func TestOverlap_Reconcile_PendingOwner_AcquiresAndMarks(t *testing.T) {
 	}
 }
 
-// TestOverlap_Reconcile_PureNewMount_FallsThroughToCleanAcquire: a desired
-// CURRENT position not mounted with no transition (initial convergence) is
-// acquired clean-cut (no Acquiring phase) and writes its serving marker.
-func TestOverlap_Reconcile_PureNewMount_FallsThroughToCleanAcquire(t *testing.T) {
+// TestOverlap_Reconcile_PureNewMount_BackgroundAcquiresAndMarks: a desired
+// CURRENT position not mounted with no transition (initial convergence /
+// boot-defer warm-up) is acquired through the BACKGROUND bounded machinery -
+// the reconcile pass arms it (Acquiring) and returns; the flip mounts it,
+// resolves the phase to Owned, and writes the serving marker. The inline
+// serial acquire this replaced was the boot-gap residual (N deferred
+// positions warmed at N x open latency under reconcileMu).
+func TestOverlap_Reconcile_PureNewMount_BackgroundAcquiresAndMarks(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
 
@@ -432,13 +438,13 @@ func TestOverlap_Reconcile_PureNewMount_FallsThroughToCleanAcquire(t *testing.T)
 		t.Fatalf("pure-new-mount position must be acquired (mounted)")
 	}
 	if st := c.handoffPhaseOf(target); st.Phase != 0 {
-		t.Fatalf("pure new mount must not enter a handoff phase, got %v", st.Phase)
+		t.Fatalf("after the mount flip a pure new mount is Owned (no phase), got %v", st.Phase)
 	}
-	// The clean-cut acquire must ALSO write the serving marker so a draining
-	// leaver of this position (whose slot landed here via the non-overlap path)
+	// The fresh-mount acquire must ALSO write the serving marker so a draining
+	// leaver of this position (whose slot landed here via the fresh-mount path)
 	// can release.
 	if _, ok := backing.ServingMarker(target); !ok {
-		t.Fatalf("clean-cut acquire must write the serving marker so a draining leaver releases")
+		t.Fatalf("fresh-mount acquire must write the serving marker so a draining leaver releases")
 	}
 }
 

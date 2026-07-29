@@ -38,7 +38,6 @@ package integration
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -334,14 +333,22 @@ func putRideAcquiring(entry *cluster.Cluster, key, val []byte, budget time.Durat
 // settle cadence, so the Joining-bit lifecycle matches a real pod's.
 func startReplicatedNodeHomog(t *testing.T, id, seedAddr string, unitCount, rf int, backing *sharedfactory.Backing, cond storageunit.ConditionalStore) *sharedNode {
 	t.Helper()
-	// A 3-second write budget: comfortably rides an in-process OPEN (micro-
-	// seconds) but NOT the production settle debounce (5s). That asymmetry is
-	// the test's teeth - the contract is that a write rides out a mount, not a
-	// mount plus an idle debounce parked in front of it.
-	return startReplicatedNodeSlowAcquireCfg(t, id, seedAddr, unitCount, rf, backing, 0, 3*time.Second,
+	// REAL OPEN LATENCY (500ms per open) is load-bearing: it is what makes the
+	// warm-up's CONCURRENCY observable. Node B boot-defers ~12 of its 16
+	// positions; a warm-up that opens them serially takes ~12 x 500ms = 6s and
+	// blows the 3s budget below, while the bounded-concurrency background
+	// acquire (OpenConcurrency 8) rides it in ~1s. With a 0 delay both shapes
+	// finish in microseconds and the serial regression is invisible (the
+	// boot-gap residual shipped exactly that way).
+	//
+	// A 3-second write budget: comfortably rides a bounded-concurrency warm-up
+	// (~2 open waves) but NOT a serialized one, and NOT the production settle
+	// debounce (5s). That asymmetry is the test's teeth - the contract is that
+	// a write rides out a mount window, not a mount times the position count,
+	// nor a mount plus an idle debounce parked in front of it.
+	return startReplicatedNodeSlowAcquireCfg(t, id, seedAddr, unitCount, rf, backing, 500*time.Millisecond, 3*time.Second,
 		func(cfg *cluster.Config) {
 			cfg.RebalanceSettleDelay = 0 // 0 = the production default debounce
 			cfg.ConditionalStore = cond
-			cfg.LogOutput = os.Stderr // TEMP
 		})
 }
