@@ -144,12 +144,25 @@ func OpenClusterRetryBind(t *testing.T, cfg cluster.Config, gcfg gossip.Config, 
 func WaitForRingSize(c *cluster.Cluster, want int, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if len(c.Members()) == want {
+		if converged(c, want) {
 			return nil
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
-	return fmt.Errorf("ring size %d != want %d (members=%v)", len(c.Members()), want, c.Members())
+	return fmt.Errorf("convergence: members=%v placement=%v, want %d of each",
+		c.Members(), c.PlacementMembers(), want)
+}
+
+// converged reports whether BOTH member bases hold exactly want members: the
+// membership VIEW (gossip truth, where a join/leave lands first) and the
+// PLACEMENT basis (the ring routing is computed over, which trails the view
+// by an event-loop hop). Readiness must gate on both - the view alone is
+// satisfied before the ring has absorbed the change, so a test that proceeds
+// on it races the takeover its "converged" cluster has not started
+// (post-leave, WaitForRebalanceIdle reads vacuously idle in that window
+// because the un-evicted ring never scheduled a reconcile).
+func converged(c *cluster.Cluster, want int) bool {
+	return len(c.Members()) == want && len(c.PlacementMembers()) == want
 }
 
 // WaitForMembersAll polls every cluster in cs until they each report
@@ -162,7 +175,7 @@ func WaitForMembersAll(cs []*cluster.Cluster, want int, timeout time.Duration) e
 	for time.Now().Before(deadline) {
 		allOK := true
 		for _, c := range cs {
-			if len(c.Members()) != want {
+			if !converged(c, want) {
 				allOK = false
 				break
 			}
