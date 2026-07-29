@@ -409,6 +409,14 @@ type Membership struct {
 	events *eventDelegate
 	meta   *metaDelegate
 
+	// contactedAtOpen is how many seeds the startup Join actually reached.
+	// 0 with seeds configured means this node came up ALONE (solo start) and
+	// therefore FOUNDED rather than joined - a fact only the startup Join
+	// knows, recorded here so the coordination layer can report bootstrap
+	// truthfully instead of inferring it from seed CONFIG. Written once,
+	// before Open returns; read-only after.
+	contactedAtOpen int
+
 	mu     sync.Mutex
 	closed bool
 	// leaving is set by Leave(): once the node has gracefully announced
@@ -696,6 +704,12 @@ func (e *eventDelegate) shutdown() {
 // Open brings the local memberlist up + (if seeds are non-empty)
 // joins an existing cluster. On error, any partially-initialized
 // resources are released before returning.
+// ContactedAtOpen reports how many seeds the startup Join reached. 0 with
+// seeds configured means the node started ALONE (nothing answered) and so
+// founded the cluster it now anchors; >0 means it genuinely joined an
+// existing one. Constant after Open.
+func (m *Membership) ContactedAtOpen() int { return m.contactedAtOpen }
+
 func Open(cfg Config) (*Membership, error) {
 	if cfg.NodeID == "" {
 		return nil, errors.New("membership: NodeID is required")
@@ -773,6 +787,7 @@ func Open(cfg Config) (*Membership, error) {
 
 	if len(cfg.Seeds) > 0 {
 		contacted, err := ml.Join(cfg.Seeds)
+		m.contactedAtOpen = contacted
 		// AllowSoloStart (homogeneous bootstrap): unreachable seeds are EXPECTED.
 		// The headless Service lists peers that may be down, and the first pod up
 		// reaches none - memberlist.Join then returns contacted==0 AND a dial err.

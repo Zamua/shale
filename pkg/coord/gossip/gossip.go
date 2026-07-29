@@ -9,14 +9,14 @@
 // which is what makes a second adapter - a lease/CAS coordinator over the same
 // conditional store shale already uses for reshard agreement - a drop-in.
 //
-// TWO SOURCES, ONE VIEW. Placement runs off the RING; roles and the declared
-// unit count come from the LIVE membership cache. A View therefore lists the
-// ring's members (the placement basis, which is what a caller comparing two
-// nodes' topology must see) and enriches each with its current gossiped role
-// set. The ring trails membership by one event-loop hop, so a member gossip
-// knows but the ring has not yet absorbed is absent from the View - which is
-// exactly right for the routing split: a node the ring does not place cannot
-// be in any replica set, so its role could not affect one.
+// TWO BASES, SPLIT BY QUESTION. Placement (Locate) runs off the RING; the
+// View and every stance query (roles, TransitionSets, declared counts) run
+// off the LIVE membership snapshot, presence and roles from the same rows.
+// The ring trails the snapshot by one event-loop hop and heals a dropped
+// event only on the reconcile cadence - tolerable for placement (a node the
+// ring does not place cannot be in any replica set), but never for stance:
+// serving membership questions from the ring is how an unknown-stance
+// phantom once read as an established peer. See View for the full argument.
 //
 // ADVISORY, NOT AUTHORITATIVE. Nothing here fences anything. A stale or
 // split-brained ring costs availability (ops route to a node that refuses them
@@ -182,11 +182,20 @@ func (c *Coordinator) Start(p coord.Params) (coord.Bootstrap, error) {
 		return 0, errors.New("gossip: Params.Self.Addr is required (peers dial it)")
 	}
 
-	// A node with no seeds FOUNDS the cluster. It must not advertise the
-	// Joining role: there is no incumbent serving the positions it is about to
-	// mount, so "warming against a live holder" describes nothing, and a
-	// founder that advertised it would exclude itself from its own CURRENT set
-	// with nobody left to be current.
+	// A node that FOUNDS the cluster must not advertise the Joining role:
+	// there is no incumbent serving the positions it is about to mount, so
+	// "warming against a live holder" describes nothing, and a founder that
+	// advertised it would exclude itself from its own CURRENT set with nobody
+	// left to be current.
+	//
+	// Whether this node founds is a DISCOVERY question, not a config one, and
+	// it is only answered by the startup Join below (a node with seeds
+	// configured but nobody up yet - the first pod of a homogeneous solo-start
+	// boot - FOUNDS despite its config). The Meta payload has to be chosen
+	// before that answer exists, so seeds>0 tentatively advertises Joining
+	// and the solo-found case corrects itself right after Open: safe, because
+	// a node that contacted nobody has no peer that could have observed the
+	// tentative stance.
 	bootstrap := coord.BootstrapFounded
 	roles := p.InitialRoles &^ coord.RoleJoining
 	if len(c.cfg.Seeds) > 0 {
@@ -212,6 +221,21 @@ func (c *Coordinator) Start(p coord.Params) (coord.Bootstrap, error) {
 	})
 	if err != nil {
 		return 0, fmt.Errorf("gossip: membership: %w", err)
+	}
+
+	// The discovery correction: seeds were configured but the startup Join
+	// reached NOBODY (the solo-start first pod). This node FOUNDED the
+	// cluster, whatever its config says, so report that - and retract the
+	// tentatively-advertised Joining role, which described warming against an
+	// incumbent that does not exist. No peer can have observed the tentative
+	// stance (there were no peers), so the retraction is unobservable.
+	if bootstrap == coord.BootstrapJoined && mem.ContactedAtOpen() == 0 {
+		bootstrap = coord.BootstrapFounded
+		roles = roles &^ coord.RoleJoining
+		if err := mem.SetJoining(false); err != nil {
+			_ = mem.Close()
+			return 0, fmt.Errorf("gossip: retracting solo-found Joining role: %w", err)
+		}
 	}
 
 	c.self = p.Self
@@ -365,34 +389,65 @@ func (c *Coordinator) signal() {
 // Changed returns the coalescing change-hint channel. See coord.Coordinator.
 func (c *Coordinator) Changed() <-chan struct{} { return c.changed }
 
-// View returns the current snapshot: the ring's members (the placement basis),
-// each enriched with its live gossiped role set and declared unit count.
+// View returns the current membership snapshot: every member gossip currently
+// knows, presence and roles read from the SAME snapshot rows.
+//
+// THE BASIS IS MEMBERSHIP, NOT THE RING. The ring (Locate's basis) trails the
+// snapshot by one event-loop hop and heals a backpressure-dropped event only
+// on the reconcile cadence - tolerable for placement (a node the ring does not
+// place cannot be in any replica set), but wrong for every stance question the
+// storage layer asks of View: a ring member with no snapshot row would surface
+// with ZERO roles, so an unknown-stance phantom would read as an ESTABLISHED
+// peer to the boot-defer gate, and a snapshot member the ring has not absorbed
+// would be invisible to the reshard unanimity guard it should be vetoing.
+// Reading presence and roles from one snapshot makes both divergences
+// structurally impossible: a member is either in the view with its true
+// gossiped stance, or not in it at all.
 func (c *Coordinator) View() coord.View {
 	v := coord.View{Self: c.self, Epoch: c.epoch.Load()}
-	if c.r == nil {
-		return v
-	}
-	placed := c.r.Members()
-	if len(placed) == 0 {
-		return v
-	}
-	// Roles + declared counts come from the LIVE gossip cache, not from a
-	// snapshot taken when the ring last moved: a peer flipping its Draining
-	// bit must be visible the instant gossip delivers it, even if the event
-	// that carried it was dropped before the ring loop saw it.
-	facts := c.memberFacts()
-	v.Members = make([]coord.Member, 0, len(placed))
-	for _, p := range placed {
-		id := storageunit.NodeID(p.ID)
-		m := coord.Member{Node: coord.Node{ID: id, Addr: p.Addr}}
-		if f, ok := facts[id]; ok {
-			m.Roles = f.Roles
-			m.DeclaredUnitCount = f.DeclaredUnitCount
+	if c.mem == nil {
+		// Static mode: the fixed ring IS the member truth; roles come from
+		// the facts override.
+		if c.r == nil {
+			return v
 		}
-		v.Members = append(v.Members, m)
+		placed := c.r.Members()
+		if len(placed) == 0 {
+			return v
+		}
+		facts := c.memberFacts()
+		v.Members = make([]coord.Member, 0, len(placed))
+		for _, p := range placed {
+			id := storageunit.NodeID(p.ID)
+			m := coord.Member{Node: coord.Node{ID: id, Addr: p.Addr}}
+			if f, ok := facts[id]; ok {
+				m.Roles = f.Roles
+				m.DeclaredUnitCount = f.DeclaredUnitCount
+			}
+			v.Members = append(v.Members, m)
+		}
+		sort.Slice(v.Members, func(i, j int) bool { return v.Members[i].ID < v.Members[j].ID })
+		return v
 	}
-	// ring.Members() already sorts by ID; re-assert it so the port's contract
-	// does not silently depend on the ring's internal choice.
+	snap := c.mem.Snapshot()
+	if len(snap) == 0 {
+		return v
+	}
+	v.Members = make([]coord.Member, 0, len(snap))
+	for _, m := range snap {
+		var roles coord.Role
+		if m.Joining {
+			roles |= coord.RoleJoining
+		}
+		if m.Draining {
+			roles |= coord.RoleDraining
+		}
+		v.Members = append(v.Members, coord.Member{
+			Node:              coord.Node{ID: storageunit.NodeID(m.ID), Addr: m.Addr},
+			Roles:             roles,
+			DeclaredUnitCount: m.DeclaredUnitCount,
+		})
+	}
 	sort.Slice(v.Members, func(i, j int) bool { return v.Members[i].ID < v.Members[j].ID })
 	return v
 }
@@ -400,18 +455,20 @@ func (c *Coordinator) View() coord.View {
 // Populated reports whether the view has at least one member. See
 // coord.Coordinator: this is the per-operation routing predicate, so it reads
 // the ring directly instead of paying View's snapshot construction. The ring
-// is internally synchronized; before Start (nil ring) the view is empty by
-// definition.
+// is a different BASIS than the (snapshot-based) View, but the boolean is
+// equivalent at all times: before Start both are empty, and after Start both
+// always contain at least this node (Start seeds the ring with self; the
+// snapshot upserts self at Open). The ring is internally synchronized.
 func (c *Coordinator) Populated() bool {
 	return c.r != nil && !c.r.Empty()
 }
 
 // TransitionSets returns the joining / draining member-ID sets. See
 // coord.Coordinator: per-operation, so it does ONE membership scan and builds
-// only the (steady-state nil) result maps - none of View's ring copy, facts
-// map, or sort. Liveness matches View exactly: both read the same live gossip
-// snapshot, so a role flip is visible here the moment gossip delivers it,
-// hint or no hint.
+// only the (steady-state nil) result maps - none of View's snapshot
+// construction. Liveness matches View exactly: both read the same live
+// membership snapshot, so a role flip is visible here the moment gossip
+// delivers it, hint or no hint.
 func (c *Coordinator) TransitionSets() (joining, draining map[storageunit.NodeID]struct{}) {
 	if c.mem == nil {
 		// Static / test mode: roles live in the facts override.
@@ -450,35 +507,17 @@ func (c *Coordinator) TransitionSets() (joining, draining map[storageunit.NodeID
 	return joining, draining
 }
 
-// memberFacts collects the per-member roles + declared counts, LIVE from the
-// gossip cache when there is one and from the static override otherwise.
+// memberFacts collects the per-member roles + declared counts from the STATIC
+// facts override. Gossip mode never calls it: the snapshot-based View reads
+// presence and roles from the same membership rows directly.
 func (c *Coordinator) memberFacts() map[storageunit.NodeID]coord.Member {
-	if c.mem == nil {
-		// Copy: the caller reads the result outside the lock, and a test may be
-		// writing the static override concurrently.
-		c.factsMu.Lock()
-		defer c.factsMu.Unlock()
-		out := make(map[storageunit.NodeID]coord.Member, len(c.facts))
-		for id, m := range c.facts {
-			out[id] = m
-		}
-		return out
-	}
-	snap := c.mem.Snapshot()
-	out := make(map[storageunit.NodeID]coord.Member, len(snap))
-	for _, m := range snap {
-		var roles coord.Role
-		if m.Joining {
-			roles |= coord.RoleJoining
-		}
-		if m.Draining {
-			roles |= coord.RoleDraining
-		}
-		out[storageunit.NodeID(m.ID)] = coord.Member{
-			Node:              coord.Node{ID: storageunit.NodeID(m.ID), Addr: m.Addr},
-			Roles:             roles,
-			DeclaredUnitCount: m.DeclaredUnitCount,
-		}
+	// Copy: the caller reads the result outside the lock, and a test may be
+	// writing the static override concurrently.
+	c.factsMu.Lock()
+	defer c.factsMu.Unlock()
+	out := make(map[storageunit.NodeID]coord.Member, len(c.facts))
+	for id, m := range c.facts {
+		out[id] = m
 	}
 	return out
 }

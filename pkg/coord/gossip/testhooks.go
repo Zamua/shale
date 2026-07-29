@@ -68,8 +68,17 @@ func (c *Coordinator) TestingInjectUpdate(id, newAddr string) {
 
 // TestingReconcileRing runs one ring-vs-gossip reconciliation pass
 // synchronously and reports whether the ring moved. It lets a test drive the
-// heal explicitly instead of waiting out a background tick.
-func (c *Coordinator) TestingReconcileRing() bool { return c.reconcileRing() }
+// heal explicitly instead of waiting out a background tick. A heal that moved
+// the ring bumps the epoch exactly as the background loop does - every ring
+// mutation must, or a memoized hypothetical placement (reducedRing's memo is
+// keyed on the epoch) could outlive the membership it was built from.
+func (c *Coordinator) TestingReconcileRing() bool {
+	changed := c.reconcileRing()
+	if changed {
+		c.epoch.Add(1)
+	}
+	return changed
+}
 
 // TestingRingMembers returns the raw placement basis, for a test asserting on
 // the ring directly rather than through the enriched View.

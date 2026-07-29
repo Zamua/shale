@@ -14,7 +14,7 @@ import (
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
-func freePort(t *testing.T) int {
+func freePort(t testing.TB) int {
 	t.Helper()
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -82,16 +82,23 @@ func TestReconcileRing_RestoresMissingMember(t *testing.T) {
 	}
 
 	co.TestingRemoveFromRing("solo")
-	if got := co.View().Members; len(got) != 0 {
-		t.Fatalf("post-remove view should be empty, got %+v", got)
+	// The ring drop is a PLACEMENT divergence only: the View answers from the
+	// membership snapshot, which still (correctly) knows the member - a
+	// dropped ring event must never make a live member vanish from stance
+	// questions. The divergence is visible where placement is asked.
+	if got := co.View().Members; len(got) != 1 || got[0].ID != "solo" {
+		t.Fatalf("post-remove view must still show the snapshot member, got %+v", got)
+	}
+	if got := co.TestingRingMembers(); len(got) != 0 {
+		t.Fatalf("post-remove ring should be empty, got %+v", got)
 	}
 
 	if !co.TestingReconcileRing() {
 		t.Fatal("reconcile reported no change after the member was dropped from the ring")
 	}
-	members := co.View().Members
-	if len(members) != 1 || members[0].ID != "solo" {
-		t.Fatalf("reconcile did not restore the local member; view=%+v", members)
+	ringMembers := co.TestingRingMembers()
+	if len(ringMembers) != 1 || ringMembers[0].ID != "solo" {
+		t.Fatalf("reconcile did not restore the local member to the ring; ring=%+v", ringMembers)
 	}
 }
 

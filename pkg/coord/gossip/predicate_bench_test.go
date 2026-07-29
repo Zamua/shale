@@ -2,7 +2,10 @@ package gossip_test
 
 import (
 	"fmt"
+	"io"
+	"strconv"
 	"testing"
+	"time"
 
 	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/coord/gossip"
@@ -18,9 +21,9 @@ import (
 // BenchmarkPopulated ever grows an allocation or approaches
 // BenchmarkViewEmpty, the port has regressed into that shape again.
 //
-// Static mode keeps them hermetic (no mesh); the delta they guard - answering
-// without building a snapshot - is identical in gossip mode, where the
-// membership scan appears on both sides of the comparison.
+// The static variants are hermetic (no transport); the Gossip variants run
+// the PRODUCTION code path on a real solo memberlist so the guard covers the
+// branch production actually executes, not only the static one.
 
 func staticN(n int) *gossip.Coordinator {
 	members := make([]coord.Node, 0, n)
@@ -105,4 +108,56 @@ func BenchmarkViewTransitionScan(b *testing.B) {
 			}
 		}
 	})
+}
+
+// benchSolo stands up a real solo gossip coordinator (production code path:
+// live membership snapshot, not the static facts override).
+func benchSolo(b *testing.B) *gossip.Coordinator {
+	b.Helper()
+	co := gossip.New(gossip.Config{
+		BindAddr:            "127.0.0.1:" + strconv.Itoa(freePort(b)),
+		LogOutput:           io.Discard,
+		ReconcileInterval:   time.Hour,
+		RejoinInterval:      -1,
+		MetaRefreshInterval: -1,
+	})
+	if _, err := co.Start(coord.Params{Self: coord.Node{ID: "bench-solo", Addr: "127.0.0.1:1"}}); err != nil {
+		b.Fatalf("Start: %v", err)
+	}
+	b.Cleanup(func() { _ = co.Close() })
+	return co
+}
+
+func BenchmarkPopulatedGossip(b *testing.B) {
+	co := benchSolo(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if !co.Populated() {
+			b.Fatal("solo coordinator must be populated")
+		}
+	}
+}
+
+func BenchmarkViewEmptyGossip(b *testing.B) {
+	co := benchSolo(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if co.View().Empty() {
+			b.Fatal("solo coordinator must be populated")
+		}
+	}
+}
+
+func BenchmarkTransitionSetsGossip(b *testing.B) {
+	co := benchSolo(b)
+	b.ReportAllocs()
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		j, d := co.TransitionSets()
+		if j != nil || d != nil {
+			b.Fatal("steady-state solo coordinator must have nil transition sets")
+		}
+	}
 }
