@@ -443,8 +443,30 @@ func (e *acquiringError) Unwrap() error { return errAcquiringSentinel }
 // it does here. The code stays codes.Unavailable; the detail is purely
 // additive, so nothing that reads the code is affected.
 func errUnitAcquiring(op string) error {
+	return errUnitAcquiringBecause(op, "handing off to this node")
+}
+
+// errUnitAcquiringBecause is errUnitAcquiring with the CAUSE named. Same
+// sentinel, same code, same wire detail - only the message differs.
+//
+// It exists because several structurally different conditions used to produce a
+// byte-identical string, which made the message actively misleading rather than
+// merely vague. A cross-shard scan can be refused because this node's mount map
+// does not cover its owned positions (scanCoverageErr, keyed on
+// MountReadiness().PendingUnits) or because a mounted handle turned out to be
+// FENCED (fenceToTransient, keyed on backend.ErrFenced). Those have different
+// causes, different fixes, and - critically - different observable state: the
+// first raises PendingUnits, the second does not. An operator who reads the
+// shared message, checks the documented PendingUnits relationship, finds zero,
+// and concludes the invariant is violated has done everything right and still
+// been sent the wrong way. That happened in production, and cost hours.
+//
+// The cause is prose in the MESSAGE only. Nothing programmatic keys on it: the
+// sentinel, the gRPC code, and the ReasonAcquiring detail are identical across
+// every cause, so errors.Is and every consumer match are unaffected.
+func errUnitAcquiringBecause(op, cause string) error {
 	st := status.Newf(codes.Unavailable,
-		"cluster: %s: unit for key is handing off to this node; retry shortly", op)
+		"cluster: %s: unit for key is %s; retry shortly", op, cause)
 	return &acquiringError{st: withReason(st, ReasonAcquiring)}
 }
 

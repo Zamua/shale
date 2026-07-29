@@ -12,11 +12,29 @@ import (
 // state, for LIVE diagnosis on the SHALE_DEBUG_ADDR /debug/shale/state endpoint.
 // For every ReplicaUnit this node desires (current owner), pending-owns, has
 // mounted, or holds a handoff phase for, it reports desired / pending / mounted
-// + the current handoff phase. The auto-recovery wedge signature is a position
-// that is DESIRED (this node owns it now) but NOT mounted - a write to it cannot
-// get a local ack, and if it is parked in a loser phase (Draining) the
-// acquire-half skips it while drainCheck waits for a successor marker that never
-// comes. Read-only; takes the read locks briefly.
+// + the current handoff phase.
+//
+// THERE ARE TWO WEDGE SIGNATURES, and they are mirror images. Both are a
+// position stuck in a loser phase (Draining) whose drainCheck waits on a
+// successor serving marker that never comes; they differ in which half of
+// desired/mounted is the surprising one, and they starve different paths:
+//
+//   - DESIRED but NOT mounted - starves the WRITE path: a write to the position
+//     cannot get a local ack, and the acquire half skips it because it is parked
+//     in a loser phase.
+//   - MOUNTED but NOT desired - starves the SCAN path: the ring says the
+//     position is not this node's, but the mount is still in the mount map, and
+//     mountedUnits() is pure mount-map presence, so EVERY cross-shard scan walks
+//     it. If the handle is fenced, every such scan is refused. Point reads and
+//     writes are unaffected (they route to a specific position and never touch
+//     this one), so the cluster looks healthy while all fan-out work dies.
+//
+// The second shape went undocumented and was found in production, where it had
+// killed every background cross-shard job for many hours while reads and writes
+// stayed correct throughout. If you are diagnosing "everything works except the
+// fan-out", look for mounted-but-not-desired.
+//
+// Read-only; takes the read locks briefly.
 func (c *Cluster) DebugState() string {
 	var b strings.Builder
 	gs := c.genSnapshot()

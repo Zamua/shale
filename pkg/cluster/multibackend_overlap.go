@@ -399,7 +399,7 @@ func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
 	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at THIS
 	// node's EXACT open epoch (the recorded factory return) - exactly what the
 	// in-goroutine flip would have written, NOT a re-read of the climbing durable.
-	_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), c.ownOpenEpoch(ru))
+	c.writeServingMarker(ru, c.ownOpenEpoch(ru), "overlap-rearm")
 }
 
 // ownOpenEpoch returns the EXACT epoch this node opened ru at (recorded from
@@ -890,7 +890,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	case flipMountedResolved:
 		// The phase entry was already resolved elsewhere (or the FSM edge was
 		// illegal). The mount is installed either way; still publish the marker.
-		_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), openedEpoch)
+		c.writeServingMarker(ru, openedEpoch, "overlap-flip")
 		return nil
 	}
 
@@ -898,7 +898,7 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	// lock: it is shared-storage I/O). This is the durable, poll-observable release
 	// signal the old owner's drainCheck polls. No RPC is sent.
 	markStart := time.Now()
-	_ = c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), openedEpoch)
+	c.writeServingMarker(ru, openedEpoch, "overlap-mount")
 	c.logf("shale: mounted %s at epoch %d: open %s, serving-mark %s",
 		ru, openedEpoch, markStart.Sub(openStart).Round(time.Millisecond), time.Since(markStart).Round(time.Millisecond))
 	return nil

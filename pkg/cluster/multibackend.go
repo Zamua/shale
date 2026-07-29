@@ -526,7 +526,12 @@ func (c *Cluster) scanCoverageErr(op string) error {
 		return nil
 	}
 	if c.MountReadiness().PendingUnits > 0 {
-		return errUnitAcquiring(op)
+		// Name the cause: this is the coverage gap (desired positions this node
+		// has not mounted), which DOES raise PendingUnits. The fenced-mount
+		// refusal below reaches the same sentinel by a different route and does
+		// NOT raise it, so a shared message makes the two indistinguishable to
+		// anyone diagnosing from the error text.
+		return errUnitAcquiringBecause(op, "not fully mounted on this node (owned positions still acquiring)")
 	}
 	return nil
 }
