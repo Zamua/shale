@@ -67,18 +67,35 @@ func (c *Cluster) scheduleReconcileIn(d time.Duration) {
 	c.settleMu.Lock()
 	defer c.settleMu.Unlock()
 	if c.settleTimer != nil {
+		if c.settleImmediate && d > 0 {
+			// An IMMEDIATE pass is pending (the boot-defer prompt, or the
+			// stale-mount evict): a consumer-visible unavailability window is
+			// open RIGHT NOW and that arm exists to close it. A debounced
+			// re-arm must NOT postpone it - last-writer-wins here is how the
+			// prompt got silently pushed out a full settle delay when a
+			// coalesced view hint landed just after boot (the port delivers
+			// boot-time hints after Open returns), turning "arming the
+			// reconcile immediately" into a multi-second write-refusal window
+			// that outlived consumer retry budgets. The debounced pass's
+			// obligation is subsumed: the immediate pass IS the same single
+			// reconcile, sooner.
+			return
+		}
 		// Re-arm: a still-live (or already-firing) timer already owns a
 		// pending obligation; the replacement inherits it. Do NOT
 		// double-count. Mirrors scheduleEvaluate.
 		//
 		// A zero-delay re-arm deliberately WINS over a pending debounced one:
-		// the obligation is the same single pass, sooner.
+		// the obligation is the same single pass, sooner. Debounced-over-
+		// debounced also replaces, preserving the debounce's extend-on-burst
+		// semantics (the pass runs one settle delay after the LAST change).
 		c.settleTimer.Stop()
 	} else {
 		// Fresh arm: this reconcile is pending until the timer callback
 		// below releases it, so WaitForRebalanceIdle blocks through it.
 		c.settlePending.Add(1)
 	}
+	c.settleImmediate = d == 0
 	c.settleTimer = time.AfterFunc(d, c.runScheduledReconcile)
 }
 
@@ -99,6 +116,7 @@ func (c *Cluster) runScheduledReconcile() {
 	if c.settleTimer != nil {
 		c.settleTimer = nil
 	}
+	c.settleImmediate = false
 	c.settleMu.Unlock()
 	c.runReconcile()
 }
