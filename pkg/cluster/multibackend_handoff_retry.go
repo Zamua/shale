@@ -216,6 +216,16 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 	base := time.Duration(c.retryAfterMs()) * time.Millisecond
 	backoff := newBudgetRetryWait(base, handoffRetryBackoffCap, deadline)
 	var unreachableRunStart time.Time
+	// sawAcquiring records that THIS call observed a handoff in progress. It is
+	// the difference between "the read was slow" and "the read was slow BECAUSE
+	// a unit was moving", which the terminal error would otherwise discard: as
+	// the budget runs out the final attempt's context expires, its legs report
+	// DeadlineExceeded, and that hard error is returned in place of the
+	// acquiring evidence already gathered. The caller then cannot tell a
+	// transient handoff from a genuinely overloaded read, so it must either
+	// treat every deadline as retryable (a retry storm during a real outage) or
+	// none of them (giving up on a window that would have healed).
+	var sawAcquiring bool
 
 	for {
 		v, err := attempt(deadline)
@@ -224,6 +234,7 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 		}
 		switch {
 		case isAcquiringErr(err):
+			sawAcquiring = true
 			// Handoff-class evidence: full-budget re-poll; reset the
 			// unreachable-only run (a live transition is in progress).
 			unreachableRunStart = time.Time{}
@@ -241,12 +252,52 @@ func retryReadThroughHandoff[T any](c *Cluster, attempt func(deadline time.Time)
 				return v, unwrapUnreachableOnly(err)
 			}
 		default:
-			return v, err
+			return v, attributeToAcquiring(err, sawAcquiring)
 		}
 		if backoff.wait(nil) != retryWaitProceed {
-			return v, unwrapUnreachableOnly(err)
+			return v, attributeToAcquiring(unwrapUnreachableOnly(err), sawAcquiring)
 		}
 	}
+}
+
+// attributeToAcquiring restores the reason a read failed when the terminal
+// error has lost it. It joins ErrAcquiring onto err ONLY when this call
+// actually observed a handoff in progress AND the terminal error is a deadline
+// expiry - i.e. the budget ran out while a unit was demonstrably moving.
+//
+// It is deliberately EVIDENCE-BASED rather than a blanket widening. Treating
+// every DeadlineExceeded as retryable is unsafe: it collides with a genuinely
+// overloaded read and turns a real outage into a retry storm, which is exactly
+// why a consumer cannot simply match on the code themselves. The `sawAcquiring`
+// guard is the discriminator only shale can supply, because only shale saw the
+// earlier attempts.
+//
+// errors.Join keeps the original error intact and matchable, so a caller can
+// still see the deadline; it only ADDS the reason that was already known.
+func attributeToAcquiring(err error, sawAcquiring bool) error {
+	if err == nil || !sawAcquiring {
+		return err
+	}
+	if errors.Is(err, ErrAcquiring) {
+		return err
+	}
+	if !isDeadlineErr(err) {
+		return err
+	}
+	return errors.Join(err, ErrAcquiring)
+}
+
+// isDeadlineErr reports whether err is a budget expiry, in either of the two
+// shapes a fan-out leg produces: the local context deadline, or the gRPC status
+// a remote leg returns when ITS context expired.
+func isDeadlineErr(err error) bool {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if st, ok := status.FromError(err); ok && st != nil {
+		return st.Code() == codes.DeadlineExceeded
+	}
+	return false
 }
 
 // unreachableOnlyGrace bounds how long the read retry re-polls consecutive
