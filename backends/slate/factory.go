@@ -373,7 +373,7 @@ func (b *Backing) writeServingMarker(r unitRef, epoch storageunit.Epoch) error {
 		return err
 	}
 	key := servingMarkerKeyForRef(b.cfg.KeyPrefix, r)
-	payload := []byte(strconv.FormatUint(uint64(epoch), 10))
+	payload := encodeServingMarker(epoch)
 	_, err = mc.PutObject(context.Background(), b.cfg.Bucket, key,
 		bytes.NewReader(payload), int64(len(payload)),
 		minio.PutObjectOptions{ContentType: "text/plain"})
@@ -410,11 +410,16 @@ func (b *Backing) readServingMarker(r unitRef) (storageunit.Epoch, bool, error) 
 		}
 		return 0, false, fmt.Errorf("slate: read serving marker %s: %w", r, err)
 	}
-	parsed, err := strconv.ParseUint(strings.TrimSpace(string(raw)), 10, 64)
-	if err != nil {
-		return 0, false, fmt.Errorf("slate: parse serving marker %s (%q): %w", r, raw, err)
+	epoch, ok := parseServingMarker(raw)
+	if !ok {
+		// An unreadable marker is NO USABLE MARKER, not a failure - see
+		// parseServingMarker for why reporting an error here is unrecoverable.
+		// Logged because a format mismatch is a real event, not an expected one.
+		Logf("slate: UNREADABLE serving marker %s (%d bytes, %q) - treating as absent; "+
+			"the next mount overwrites it with the current encoding", r, len(raw), truncMarker(raw))
+		return 0, false, nil
 	}
-	return storageunit.Epoch(parsed), true, nil
+	return epoch, true, nil
 }
 
 // isNotFound reports whether err is the S3 "object does not exist" error, which
