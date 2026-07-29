@@ -12,7 +12,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
-	github.com/Zamua/shale v0.13.0
+	github.com/Zamua/shale v0.14.0
 	github.com/Zamua/shale/backends/pebble v0.1.0
 	github.com/Zamua/shale/backends/slate v0.11.1
 	google.golang.org/grpc v1.81.1
@@ -80,18 +80,3 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 	gopkg.in/ini.v1 v1.67.2 // indirect
 )
-
-// TEMPORARY, and the mirror of the pebble sequencing in the core go.mod.
-// The published core v0.13.0 still CONTAINS cmd/, so requiring it here makes
-// github.com/Zamua/shale/cmd/shaled resolve from two modules at once. Until a
-// core version without cmd/ is published, resolve the core locally.
-//
-// A replace in THIS module harms no one: cmd is a leaf that nothing requires,
-// so the directive can never reach a consumer (unlike the core replaces that
-// #21 and #22 removed). The one real cost is that `go install
-// github.com/Zamua/shale/cmd/shale@latest` will not work until the sequence
-// below completes.
-//
-// Sequence: land this -> tag core v0.14.0 (first core without cmd/) ->
-// require v0.14.0 here -> delete this replace.
-replace github.com/Zamua/shale => ../

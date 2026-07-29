@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
-	github.com/Zamua/shale v0.13.0
+	github.com/Zamua/shale v0.14.0
 	github.com/cockroachdb/pebble v1.1.5
 )
 
