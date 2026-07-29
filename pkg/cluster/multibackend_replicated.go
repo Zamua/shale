@@ -481,7 +481,10 @@ func (c *Cluster) logf(format string, args ...any) {
 	if w == nil {
 		w = os.Stderr
 	}
-	_, _ = fmt.Fprintf(w, format+"\n", args...)
+	// Prefix the node identity: these lines exist to be read during multi-node
+	// diagnosis (in-process test clusters, aggregated pod logs), where a line
+	// that cannot name its node is unattributable exactly when it matters.
+	_, _ = fmt.Fprintf(w, "["+string(c.cfg.NodeID)+"] "+format+"\n", args...)
 }
 
 // applyEnvelopeIfNewerToUnit is the multi-backend analogue of
