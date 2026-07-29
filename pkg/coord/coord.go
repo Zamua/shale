@@ -194,6 +194,29 @@ type Coordinator interface {
 	// View returns the current snapshot. MUST NOT block and MUST NOT do I/O.
 	View() View
 
+	// Populated reports whether the view currently contains at least one
+	// member. It exists because the storage layer asks this question ON EVERY
+	// OPERATION (it is the replicated-vs-single-owner routing predicate), so
+	// it MUST be answerable without constructing a View: an adapter that
+	// implements it as View().Empty() has not implemented it. MUST NOT block
+	// and MUST NOT do I/O. Equivalent to !View().Empty() at all times.
+	Populated() bool
+
+	// TransitionSets returns the IDs of members currently advertising
+	// RoleJoining and RoleDraining, as two independent sets. Either or both
+	// are nil when no member advertises that role - the common steady state -
+	// and callers rely on nil meaning "allocation-free no-op", so an adapter
+	// MUST NOT return empty non-nil maps.
+	//
+	// The storage layer calls this ON EVERY OPERATION to split current from
+	// pending ownership, so it MUST cost no more than one membership scan.
+	// Role LIVENESS matches View: a role flip MUST be visible here as soon as
+	// the coordination mechanism delivers it, NOT merely after the next
+	// change hint (hints are lossy; roles are not). MUST NOT block and MUST
+	// NOT do I/O. The returned maps are the caller's to keep: an adapter MUST
+	// NOT retain or mutate them after returning.
+	TransitionSets() (joining, draining map[storageunit.NodeID]struct{})
+
 	// Locate returns up to n nodes for the generation-qualified unit u,
 	// PRIMARY FIRST. It returns min(n, |eligible|) nodes and never duplicates
 	// one; n <= 0 or an empty eligible set returns nil. MUST NOT block and

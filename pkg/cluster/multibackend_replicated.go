@@ -59,7 +59,7 @@ import (
 // empty view (single-node) collapses to the single-mount R=1 path, which is
 // correct: with one node there is one replica.
 func (c *Cluster) multiReplicated() bool {
-	return c.multi && c.replicationFactor() > 1 && c.coord != nil && !c.coord.View().Empty()
+	return c.multi && c.replicationFactor() > 1 && c.coord != nil && c.coord.Populated()
 }
 
 // unitReplicas returns the ordered replica set for the generation-qualified

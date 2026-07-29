@@ -54,15 +54,7 @@ func (c *Cluster) drainingIDs() map[storageunit.NodeID]struct{} {
 	if c.coord == nil {
 		return nil
 	}
-	var draining map[storageunit.NodeID]struct{}
-	for _, m := range c.coord.View().Members {
-		if m.Draining() {
-			if draining == nil {
-				draining = make(map[storageunit.NodeID]struct{}, 2)
-			}
-			draining[m.ID] = struct{}{}
-		}
-	}
+	_, draining := c.coord.TransitionSets()
 	return draining
 }
 
@@ -80,25 +72,16 @@ func (c *Cluster) joiningIDs() map[storageunit.NodeID]struct{} {
 	if c.coord == nil {
 		return nil
 	}
-	var joining map[storageunit.NodeID]struct{}
-	for _, m := range c.coord.View().Members {
-		if m.Joining() {
-			if joining == nil {
-				joining = make(map[storageunit.NodeID]struct{}, 2)
-			}
-			joining[m.ID] = struct{}{}
-		}
-	}
+	joining, _ := c.coord.TransitionSets()
 	return joining
 }
 
-// transitionSets returns the joining and draining ID sets from a SINGLE view
-// scan. The hot routing path needs BOTH per op; calling joiningIDs +
-// drainingIDs separately would scan (and allocate) the view twice on every
-// Put/Get. It preserves the individual methods' white-box test-hook semantics
-// exactly: when either hook is injected (test path), it defers to them; in
-// production (no hooks) it does one combined scan. Both are nil in the common
-// steady state, so the routing fast path short-circuits.
+// transitionSets returns the joining and draining ID sets. The hot routing
+// path needs BOTH per op, so production defers straight to the coordinator's
+// TransitionSets - ONE membership scan, nil maps in steady state, none of
+// View's snapshot construction (see the port contract). It preserves the
+// individual methods' white-box test-hook semantics exactly: when either hook
+// is injected (test path), it defers to them.
 func (c *Cluster) transitionSets() (joining, draining map[storageunit.NodeID]struct{}) {
 	if c.joining != nil || c.draining != nil {
 		return c.joiningIDs(), c.drainingIDs()
@@ -106,21 +89,7 @@ func (c *Cluster) transitionSets() (joining, draining map[storageunit.NodeID]str
 	if c.coord == nil {
 		return nil, nil
 	}
-	for _, m := range c.coord.View().Members {
-		if m.Joining() {
-			if joining == nil {
-				joining = make(map[storageunit.NodeID]struct{}, 2)
-			}
-			joining[m.ID] = struct{}{}
-		}
-		if m.Draining() {
-			if draining == nil {
-				draining = make(map[storageunit.NodeID]struct{}, 2)
-			}
-			draining[m.ID] = struct{}{}
-		}
-	}
-	return joining, draining
+	return c.coord.TransitionSets()
 }
 
 // currentUnitReplicas resolves the CURRENT replica set for gu: the ring EXCLUDING
