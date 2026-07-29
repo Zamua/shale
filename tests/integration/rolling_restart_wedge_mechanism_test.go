@@ -203,8 +203,15 @@ func TestRollingRestartWedge_MembershipDivergence(t *testing.T) {
 	// (a correct-ring node that forwards to both replicas), classifying each
 	// outcome. Each Put returns within the short WriteTimeout, so this collects
 	// many samples across the window.
+	// Two samples, not one. sampleErr is "what the window looked like"; otherErr
+	// is the error that actually TRIPS the failure-purity assertion below.
+	// Sharing one variable makes the failure unreadable: mid-acquire refusals are
+	// the common case, so a single first-error-wins sample is almost always a
+	// mid-acquire error, and the assertion then reports "this failure was NOT the
+	// mid-acquire class" while printing a mid-acquire error. That is worse than
+	// no sample, because it sends the reader after the wrong bug.
 	var success, midAcquire, other int
-	var sampleErr error
+	var sampleErr, otherErr error
 	probeEnd := time.Now().Add(6 * time.Second)
 	for time.Now().Before(probeEnd) {
 		err := byID[entryID].Cluster.Put([]byte(wedgeKey), []byte("probe"))
@@ -220,6 +227,9 @@ func TestRollingRestartWedge_MembershipDivergence(t *testing.T) {
 			other++
 			if sampleErr == nil {
 				sampleErr = err
+			}
+			if otherErr == nil {
+				otherErr = err
 			}
 		}
 		time.Sleep(15 * time.Millisecond)
@@ -263,8 +273,11 @@ func TestRollingRestartWedge_MembershipDivergence(t *testing.T) {
 		t.Fatalf("no probes ran")
 	}
 	if other != 0 {
-		t.Fatalf("%d probe failures were NOT the safe mid-acquire class while diverged (sample=%v); "+
-			"the wedge must be lossless-and-retryable or covered, never eclectic.\nstate:%s", other, sampleErr, stateDump)
+		t.Fatalf("%d of %d probe failures were NOT the safe mid-acquire class while diverged.\n"+
+			"  offending error: %v\n"+
+			"  (for contrast, a mid-acquire refusal from the same window: %v; %d of those)\n"+
+			"the wedge must be lossless-and-retryable or covered, never eclectic.\nstate:%s",
+			other, other+midAcquire, otherErr, sampleErr, midAcquire, stateDump)
 	}
 	t.Logf("DIVERGENCE OUTCOME (membership arm): orphaned unit %d - %d/%d writes ok, %d safe mid-acquire refusals; "+
 		"union covers when a mounted holder overlaps, quorum floor holds the safe arm when none does", wedgeUnit, success, total, midAcquire)
