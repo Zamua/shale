@@ -36,12 +36,16 @@ package integration
 // as MinIO's are in the downstream test.
 
 import (
+	"errors"
 	"fmt"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 func TestFreshBoot_StaggeredJoin_NoWriteGap(t *testing.T) {
@@ -84,7 +88,7 @@ func TestFreshBoot_StaggeredJoin_NoWriteGap(t *testing.T) {
 		if i%2 == 1 {
 			entry = b.Cluster
 		}
-		if err := entry.Put(key, []byte("v")); err != nil {
+		if err := putRideAcquiring(entry, key, []byte("v"), 3*time.Second); err != nil {
 			t.Fatalf("write %q via %s failed during the post-boot window: %v\n"+
 				"nodeA state:\n%s\nnodeB state:\n%s",
 				key, map[bool]string{true: "boot-a", false: "boot-b"}[i%2 == 0], err,
@@ -184,4 +188,160 @@ func countScan(n *sharedNode, prefix []byte) (int, error) {
 		}
 		nKeys++
 	}
+}
+
+// TestFreshBoot_HomogeneousStagger_NoWriteGap is the SAME property on the
+// HOMOGENEOUS deployment shape, and the difference is the whole point.
+//
+// In the plain-stagger test above, node A boots with NO seeds, so it never
+// advertises the Joining bit. In a homogeneous deployment EVERY node carries
+// the same seed list and a ConditionalStore (solo-start), so node A boots
+// seeded - which raises Joining at membership-open - and the bit clears only
+// once A's boot completes cleanly. The first version of the prompt warm-up
+// validated only the seedless shape: A never said Joining, the established-
+// peer gate passed, the test went green - while the downstream homogeneous
+// test kept failing, because THEIR node A was still advertising Joining when
+// node B booted one second later. The repro reproduced the SYMPTOM but not
+// the SETUP. Failure parity is not setup parity; this test is the setup.
+func TestFreshBoot_HomogeneousStagger_NoWriteGap(t *testing.T) {
+	const (
+		// 16 units, not 4: with 2 nodes the primary split is decided by ID
+		// hashing, and at 4 units an unlucky pair of IDs can leave node B
+		// primary for NOTHING - then B defers nothing, the gap never exists,
+		// and the test passes without testing anything. (The first version of
+		// this test did exactly that.) At 16 units both nodes get primaries
+		// with near-certainty, and the vacuity guard below makes the residual
+		// case loud instead of silently green.
+		unitCount = 16
+		rf        = 2
+	)
+	backing := sharedfactory.NewBacking()
+	cond := storageunit.NewMemConditionalStore()
+
+	// Node A boots HOMOGENEOUS: seeded (with a peer that is not up yet, the
+	// headless-service shape) + a ConditionalStore, so solo-start is allowed
+	// and - critically - startJoining raises the Joining bit at membership
+	// open. A mounts everything (no markers yet), and must UN-advertise
+	// Joining at boot completion; if that clear waits for a reconcile tick,
+	// node B below reads A as not-established and the warm-up degrades to the
+	// settle debounce - the downstream failure.
+	a := startReplicatedNodeHomog(t, "hg-a", "127.0.0.1:1", unitCount, rf, backing, cond)
+
+	deadlineA := time.Now().Add(10 * time.Second)
+	for !a.Cluster.MountReadiness().Ready(1.0) {
+		if time.Now().After(deadlineA) {
+			t.Fatalf("node A never reached fully-mounted solo state: %+v", a.Cluster.MountReadiness())
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Node B boots one second later, seeded at A - the staggered pod of the
+	// same homogeneous deployment.
+	time.Sleep(1 * time.Second)
+	b := startReplicatedNodeHomog(t, "hg-b", a.BindAddr, unitCount, rf, backing, cond)
+
+	// VACUITY GUARD: the whole scenario is "B boot-deferred positions a live
+	// peer holds". If B deferred nothing (ID hashing gave it no primaries, or
+	// a future change stops the defer firing), this test would pass while
+	// testing nothing - the exact vacuous-green shape that hid this bug class
+	// for months. DebugState names boot-deferred positions explicitly.
+	if !strings.Contains(b.Cluster.DebugState(), "boot-deferred") {
+		t.Fatalf("node B deferred nothing at boot - the scenario did not arm, "+
+			"so a pass would be vacuous. B state:\n%s", b.Cluster.DebugState())
+	}
+
+	// Writes the moment B's Open returns, through both entry points.
+	for i := 0; i < unitCount*4; i++ {
+		key := []byte(fmt.Sprintf("hg-%03d", i))
+		entry := a.Cluster
+		if i%2 == 1 {
+			entry = b.Cluster
+		}
+		if err := putRideAcquiring(entry, key, []byte("v"), 3*time.Second); err != nil {
+			t.Fatalf("write %q failed during the post-boot window: %v\nnodeA:\n%s\nnodeB:\n%s",
+				key, err, a.Cluster.DebugState(), b.Cluster.DebugState())
+		}
+	}
+
+	// Settle, read back through both, scans converge - same bar as the
+	// plain-stagger test.
+	deadlineSettle := time.Now().Add(30 * time.Second)
+	for {
+		ra, rb := a.Cluster.MountReadiness(), b.Cluster.MountReadiness()
+		if ra.PendingUnits == 0 && rb.PendingUnits == 0 && ra.FailedOpenUnits == 0 && rb.FailedOpenUnits == 0 {
+			break
+		}
+		if time.Now().After(deadlineSettle) {
+			t.Fatalf("topology never settled:\nA: %+v\nB: %+v", ra, rb)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	for i := 0; i < unitCount*4; i++ {
+		key := []byte(fmt.Sprintf("hg-%03d", i))
+		for _, n := range []*sharedNode{a, b} {
+			got, err := n.Cluster.Get(key)
+			if err != nil || string(got) != "v" {
+				t.Fatalf("read-back %q via %s: got %q err %v", key, n.ID, got, err)
+			}
+		}
+	}
+	scanDeadline := time.Now().Add(20 * time.Second)
+	for _, n := range []*sharedNode{a, b} {
+		for {
+			nKeys, serr := countScan(n, []byte("hg-"))
+			if serr == nil && nKeys == unitCount*4 {
+				break
+			}
+			if time.Now().After(scanDeadline) {
+				t.Fatalf("scan via %s never converged (err=%v keys=%d)\n%s", n.ID, serr, nKeys, n.Cluster.DebugState())
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+}
+
+// putRideAcquiring writes key through entry, retrying ONLY the documented
+// transient class (errors.Is(err, cluster.ErrAcquiring)) with backoff inside
+// budget. This is the CONSUMER CONTRACT, verbatim from the taxonomy docs
+// ("bounded retry with backoff; the handoff will finish") and from how the
+// downstream consumer actually wires it. A bare Put would fail on the first
+// W-shortfall of a warming window and assert nothing about the gap's LENGTH -
+// the property under test is that the gap closes within a consumer-sized
+// budget, not that it never exists for a microsecond.
+func putRideAcquiring(entry *cluster.Cluster, key, val []byte, budget time.Duration) error {
+	deadline := time.Now().Add(budget)
+	wait := 25 * time.Millisecond
+	for {
+		err := entry.Put(key, val)
+		if err == nil {
+			return nil
+		}
+		if !errors.Is(err, cluster.ErrAcquiring) {
+			return err
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("acquiring window outlived the %s consumer budget: %w", budget, err)
+		}
+		time.Sleep(wait)
+		if wait < 400*time.Millisecond {
+			wait *= 2
+		}
+	}
+}
+
+// startReplicatedNodeHomog boots a node the way a homogeneous deployment does:
+// seeded (solo-start tolerated via the ConditionalStore) with the production
+// settle cadence, so the Joining-bit lifecycle matches a real pod's.
+func startReplicatedNodeHomog(t *testing.T, id, seedAddr string, unitCount, rf int, backing *sharedfactory.Backing, cond storageunit.ConditionalStore) *sharedNode {
+	t.Helper()
+	// A 3-second write budget: comfortably rides an in-process OPEN (micro-
+	// seconds) but NOT the production settle debounce (5s). That asymmetry is
+	// the test's teeth - the contract is that a write rides out a mount, not a
+	// mount plus an idle debounce parked in front of it.
+	return startReplicatedNodeSlowAcquireCfg(t, id, seedAddr, unitCount, rf, backing, 0, 3*time.Second,
+		func(cfg *cluster.Config) {
+			cfg.RebalanceSettleDelay = 0 // 0 = the production default debounce
+			cfg.ConditionalStore = cond
+			cfg.LogOutput = os.Stderr // TEMP
+		})
 }
