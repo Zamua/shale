@@ -2048,6 +2048,63 @@ changed in `BindStdFlags`, because that constructor is shared with
 `shaled-slate`, whose multi-backend mode is a legitimate multi-node
 configuration.
 
+## The coordination port (pkg/coord)
+
+The cluster no longer talks to gossip, the ring, or membership directly: it
+asks a `coord.Coordinator` port, and `pkg/coord/gossip` is the one shipping
+adapter (memberlist + the consistent-hash ring + the event/reconcile loops
+that mirror one into the other). Everything the "Cluster model" section above
+says about memberlist mechanics - seed rejoin, meta refresh, incarnation
+staleness, drop-tolerant event channels - remains exactly true, but it is now
+a description of the GOSSIP ADAPTER's interior, invisible through the port.
+`pkg/coord` itself imports only `errors` and `pkg/storageunit`.
+
+**The boundary.** The port answers WHO and WHERE questions: who is a member
+right now (`View`, and the per-op forms below), where does a unit sit
+(`Locate`), what transitional stance does each member advertise (roles:
+`Joining`, `Draining`), and a coalescing hint that any of it may have changed
+(`Changed`). The storage layer keeps every protocol built ON those answers:
+boot/join orchestration, the settle debounce, serving markers, the drain gate,
+overlap warm-up. A different coordinator (the planned CAS/lease adapter backed
+by conditional writes) replaces how the answers are produced, never what the
+storage layer does with them.
+
+**Contract points that carry the safety weight:**
+
+- **Hints are lossy; roles are not.** `Changed` may coalesce or drop; every
+  consumer re-reads the view and reconciles on a cadence. Role visibility is
+  NOT allowed to ride the hint channel: a role flip must be visible to the
+  query methods the moment the coordination mechanism delivers it, hint or no
+  hint. (This is why the adapter may not serve roles from a change-invalidated
+  cache: a dropped role-flip event would freeze a stale answer in place.)
+- **Per-operation queries are specified per-op-cheap.** `Populated()` (the
+  replicated-vs-single-owner routing predicate) and `TransitionSets()` (the
+  joining/draining split behind current/pending routing) run on EVERY
+  Put/Get/Delete. Both are contract-bound to answer without constructing a
+  view snapshot, and steady-state `TransitionSets` returns nil maps
+  (allocation-free fast path). `predicate_bench_test.go` pins both against
+  the snapshot-built shape they replaced.
+- **`Locate` is deterministic.** Two nodes holding the same view compute the
+  same replica set in the same order; routing correctness rests on it.
+- **`Placement.Exclude` is a POST-TRANSITION promise, in protocol terms.**
+  Locate with an Exclude set must return the placement that WILL HOLD once
+  those nodes are no longer members - the same answer the coordinator itself
+  will give after their departure - never the current placement with the
+  excluded nodes filtered out of the result. The hashing adapter meets it by
+  genuinely rebuilding a reduced ring (bounded-load consistent hashing is not
+  removal-invariant, so filter-after-locate is a DIFFERENT and wrong
+  placement that can strand a handoff on nodes that will never own the unit);
+  a table coordinator meets it by reading its coordinated post-departure
+  assignment. Phrasing the contract as the outcome rather than the mechanism
+  ("as if these nodes were not members") is what lets both adapters implement
+  it honestly.
+- **`Start` owns bootstrap truth.** "Did anyone else already exist" is
+  answered by the coordinator (it is a fact about how the cluster was
+  discovered), and `Params.InitialRoles` lets a node advertise `Joining`
+  atomically with its own first announcement - closing the race where a peer
+  learns "the newcomer exists" before "the newcomer is warming" and
+  clean-cuts a position the newcomer displaces.
+
 ## Roadmap
 
 - [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.

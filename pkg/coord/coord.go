@@ -112,17 +112,35 @@ func (v View) Member(id storageunit.NodeID) (Member, bool) {
 	return Member{}, false
 }
 
-// Placement narrows a Locate to a HYPOTHETICAL membership.
+// Placement asks Locate for the POST-TRANSITION placement instead of the
+// current one.
 //
-// Excluding nodes is NOT the same as locating over everyone and filtering the
-// result afterwards. Bounded-load consistent hashing is not removal-invariant:
-// the assignment a set of nodes computes among themselves differs from the
-// assignment they get as a subset of a larger set. A Coordinator MUST answer
-// "where would this unit sit if these nodes were not members", which is what
-// makes the current/pending split exact in both transition directions.
+// Exclude names nodes that are on their way OUT of the placement basis -
+// draining leavers, or joiners deliberately held out of the ack-bar set.
+// Locate with a non-empty Exclude MUST return the placement that WILL HOLD
+// once those nodes are no longer members: the same answer this coordinator
+// will give after their departure, computed now. The storage layer routes the
+// overlap handoff on that promise - current owners keep serving from the
+// placement WITH the leavers while successors warm toward the placement
+// WITHOUT them - so the predicted set and the eventual real set must be
+// IDENTICAL, or the handoff strands on nodes that will never own the unit.
+//
+// EXACTNESS IS THE CONTRACT: the answer must be what the coordinator's own
+// placement mechanism will produce after the departure, NEVER the current
+// placement with the excluded nodes filtered out of the result. The two
+// differ whenever the mechanism is not removal-invariant - bounded-load
+// consistent hashing is the standing example: the assignment a set of nodes
+// computes among themselves differs from the assignment they get as a subset
+// of a larger set. A coordinator backed by an explicit assignment table meets
+// the same contract differently: its post-departure assignment is coordinated
+// state, and this call is a read (or deterministic plan) of it.
+//
+// Determinism carries over from Locate unchanged: two nodes holding the same
+// view and the same Exclude set MUST compute the same placement, in the same
+// order.
 type Placement struct {
-	// Exclude computes placement AS IF these nodes were not members. Nil or
-	// empty means the full membership.
+	// Exclude is the set of departing nodes the placement must be computed
+	// without. Nil or empty asks for the current placement.
 	Exclude map[storageunit.NodeID]struct{}
 }
 
