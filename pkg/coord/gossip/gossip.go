@@ -397,6 +397,59 @@ func (c *Coordinator) View() coord.View {
 	return v
 }
 
+// Populated reports whether the view has at least one member. See
+// coord.Coordinator: this is the per-operation routing predicate, so it reads
+// the ring directly instead of paying View's snapshot construction. The ring
+// is internally synchronized; before Start (nil ring) the view is empty by
+// definition.
+func (c *Coordinator) Populated() bool {
+	return c.r != nil && !c.r.Empty()
+}
+
+// TransitionSets returns the joining / draining member-ID sets. See
+// coord.Coordinator: per-operation, so it does ONE membership scan and builds
+// only the (steady-state nil) result maps - none of View's ring copy, facts
+// map, or sort. Liveness matches View exactly: both read the same live gossip
+// snapshot, so a role flip is visible here the moment gossip delivers it,
+// hint or no hint.
+func (c *Coordinator) TransitionSets() (joining, draining map[storageunit.NodeID]struct{}) {
+	if c.mem == nil {
+		// Static / test mode: roles live in the facts override.
+		c.factsMu.Lock()
+		defer c.factsMu.Unlock()
+		for id, m := range c.facts {
+			if m.Joining() {
+				if joining == nil {
+					joining = make(map[storageunit.NodeID]struct{}, 2)
+				}
+				joining[id] = struct{}{}
+			}
+			if m.Draining() {
+				if draining == nil {
+					draining = make(map[storageunit.NodeID]struct{}, 2)
+				}
+				draining[id] = struct{}{}
+			}
+		}
+		return joining, draining
+	}
+	for _, m := range c.mem.Snapshot() {
+		if m.Joining {
+			if joining == nil {
+				joining = make(map[storageunit.NodeID]struct{}, 2)
+			}
+			joining[storageunit.NodeID(m.ID)] = struct{}{}
+		}
+		if m.Draining {
+			if draining == nil {
+				draining = make(map[storageunit.NodeID]struct{}, 2)
+			}
+			draining[storageunit.NodeID(m.ID)] = struct{}{}
+		}
+	}
+	return joining, draining
+}
+
 // memberFacts collects the per-member roles + declared counts, LIVE from the
 // gossip cache when there is one and from the static override otherwise.
 func (c *Coordinator) memberFacts() map[storageunit.NodeID]coord.Member {
