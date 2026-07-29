@@ -12,7 +12,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
-	github.com/Zamua/shale v0.14.1
+	github.com/Zamua/shale v0.14.2
 	github.com/Zamua/shale/backends/pebble v0.1.0
 	github.com/Zamua/shale/backends/slate v0.11.1
 	google.golang.org/grpc v1.81.1
