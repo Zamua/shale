@@ -727,8 +727,16 @@ func (c *Cluster) openEpochForReplica(ru storageunit.ReplicaUnit) storageunit.Ep
 // Ready -> drops the phase entry (Owned) - and writes the durable SERVING MARKER
 // exactly once so the old owner's drainCheck poll releases. On open failure it
 // leaves the Acquiring phase in place (the union still covers the position via
-// the current owner) and the next reconcile / self-heal retries. Caller holds
-// reconcileMu.
+// the current owner) and the next reconcile / self-heal retries.
+//
+// TWO CALLER SHAPES, deliberately different locking: the reconcile calls this
+// under reconcileMu (the historical contract), and promptAcquireFreshPositions
+// calls it from a bare goroutine on a membership JOIN with NO reconcileMu. The
+// second is safe because every effect goes through the mount table's own
+// synchronization: startAcquire's in-flight set dedups a concurrent reconcile
+// re-drive, and the mount flip is one table critical section. What reconcileMu
+// buys the first caller is pass-level consistency of ITS OWN diff, not safety
+// of this function.
 //
 // acquireReplicaUnitOverlap spawns the GAINER's slow mount in a BACKGROUND
 // goroutine so a node gaining many positions at once mounts them CONCURRENTLY

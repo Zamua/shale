@@ -592,13 +592,16 @@ func (c *Cluster) unitApplyErrMaps(ru storageunit.ReplicaUnit, b backend.Backend
 // boot-gap residual).
 //
 // It writes the durable SERVING MARKER after mounting, EXACTLY as the overlap
-// acquire does. This is REQUIRED for the graceful-leave (scale-down) drain to
-// complete: a position moving OFF a leaving node can land on its successor via
-// THIS clean-cut path (initial-convergence / pure-new-mount), not only the
-// pending-owner overlap path. The leaving node is DRAINING that exact position
-// and releases ONLY on a serving marker strictly above its open epoch; if this
-// path mounted silently (no marker, the old behavior) the draining leaver would
-// wait out the full grace timeout. The clean-cut gainer opens at durable+1
+// acquire does. Since v0.14.2 the reconcile routes every real successor mount
+// through the background bounded acquire, so in production this clean-cut path
+// no longer lands positions moving off a leaving node - the break-demo is its
+// one remaining caller shape. The marker write stays anyway, for the same
+// reason it was added: any path that CAN mount a position a leaver is draining
+// must publish the release signal, or the leaver waits out its full grace
+// timeout against a marker that is not coming. Keeping the write here makes
+// that property a property of MOUNTING rather than of one caller's routing,
+// which is exactly how the original omission (boot mounted, published nothing,
+// wedged production for 41 days) became possible. The clean-cut gainer opens at durable+1
 // (strictly above the leaver's open epoch), so the marker it writes here releases
 // the draining leaver. The marker is monotonic + idempotent, so writing it on a
 // pure new mount (no draining leaver) is a harmless no-op observer-wise.
