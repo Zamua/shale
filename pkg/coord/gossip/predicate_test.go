@@ -171,8 +171,8 @@ func TestPlacementMembers_ExposesTheBasisSplit(t *testing.T) {
 	}
 
 	co := openSolo(t, "pm-solo", time.Hour)
-	if !waitForMember(co, "pm-solo", 2*time.Second) {
-		t.Fatal("local member never landed in the view")
+	if !waitForRingMember(co, "pm-solo", 2*time.Second) {
+		t.Fatal("local member never landed in the ring")
 	}
 	co.TestingRemoveFromRing("pm-solo")
 	if got := co.PlacementMembers(); len(got) != 0 {

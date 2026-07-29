@@ -49,6 +49,25 @@ func openSolo(t *testing.T, id string, reconcile time.Duration) *gossip.Coordina
 	return co
 }
 
+// waitForRingMember polls the PLACEMENT basis until it holds id. Tests that
+// manipulate the ring (TestingRemoveFromRing + reconcile-heal assertions) MUST
+// gate on this, not on the view: the view answers from the membership
+// snapshot, which is populated at Open BEFORE the events loop has mirrored the
+// join into the ring - so a view-gated test can remove the member while its
+// join event is still in flight and watch the event re-add it immediately.
+func waitForRingMember(co *gossip.Coordinator, id storageunit.NodeID, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for _, m := range co.PlacementMembers() {
+			if m.ID == id {
+				return true
+			}
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return false
+}
+
 // waitForMember polls the view until it holds id.
 func waitForMember(co *gossip.Coordinator, id storageunit.NodeID, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
@@ -77,8 +96,8 @@ func waitForMember(co *gossip.Coordinator, id storageunit.NodeID, timeout time.D
 func TestReconcileRing_RestoresMissingMember(t *testing.T) {
 	co := openSolo(t, "solo", time.Hour)
 
-	if !waitForMember(co, "solo", 2*time.Second) {
-		t.Fatalf("local member never landed in the view; view=%+v", co.View().Members)
+	if !waitForRingMember(co, "solo", 2*time.Second) {
+		t.Fatalf("local member never landed in the ring; placement=%+v", co.PlacementMembers())
 	}
 
 	co.TestingRemoveFromRing("solo")
