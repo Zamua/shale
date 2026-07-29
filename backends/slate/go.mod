@@ -5,7 +5,7 @@ go 1.26.0
 toolchain go1.26.4
 
 require (
-	github.com/Zamua/shale v0.13.0
+	github.com/Zamua/shale v0.14.0
 	github.com/minio/minio-go/v7 v7.2.0
 	github.com/testcontainers/testcontainers-go/modules/minio v0.42.0
 	go.uber.org/goleak v1.3.0
@@ -97,12 +97,6 @@ require (
 	gopkg.in/ini.v1 v1.67.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )
-
-// Pre-tag development: the core module isn't yet published at a version
-// that hosts the backends/* split, so per-module builds resolve the
-// core (and the sibling backend module the core's cmd/* transitively
-// references) through the in-repo paths. Removed once both are tagged.
-replace github.com/Zamua/shale/backends/pebble => ../pebble
 
 // cockroachdb/errors (transitive via pebble, which slate's
 // cmd/shaled-slate pulls in via github.com/Zamua/shale/pkg/shaled →
