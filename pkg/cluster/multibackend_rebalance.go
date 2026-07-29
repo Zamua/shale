@@ -52,6 +52,15 @@ import (
 // lock + timer scheduleEvaluate uses, so the two never both arm a live
 // timer - a cluster is in exactly one mode).
 func (c *Cluster) scheduleReconcile() {
+	c.scheduleReconcileIn(c.settleDelay())
+}
+
+// scheduleReconcileIn is scheduleReconcile with an explicit delay. The one
+// caller that passes anything but the settle debounce is the boot-defer path
+// (mountReplicaUnits): a node that booted missing owned positions has KNOWN,
+// non-churn work whose delay directly extends a write-quorum gap, so it arms
+// the pass at zero. Everything else debounces as before.
+func (c *Cluster) scheduleReconcileIn(d time.Duration) {
 	if c.closed.Load() {
 		return
 	}
@@ -61,13 +70,16 @@ func (c *Cluster) scheduleReconcile() {
 		// Re-arm: a still-live (or already-firing) timer already owns a
 		// pending obligation; the replacement inherits it. Do NOT
 		// double-count. Mirrors scheduleEvaluate.
+		//
+		// A zero-delay re-arm deliberately WINS over a pending debounced one:
+		// the obligation is the same single pass, sooner.
 		c.settleTimer.Stop()
 	} else {
 		// Fresh arm: this reconcile is pending until the timer callback
 		// below releases it, so WaitForRebalanceIdle blocks through it.
 		c.settlePending.Add(1)
 	}
-	c.settleTimer = time.AfterFunc(c.settleDelay(), c.runScheduledReconcile)
+	c.settleTimer = time.AfterFunc(d, c.runScheduledReconcile)
 }
 
 // runScheduledReconcile is the settle-timer callback for multi-backend

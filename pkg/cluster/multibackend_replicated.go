@@ -312,6 +312,27 @@ func (c *Cluster) mountReplicaUnits() error {
 	// never set and first-cluster convergence is unchanged.
 	if deferred.Load() > 0 {
 		c.setSelfJoining(true)
+		// ACQUIRE THE DEFERRED POSITIONS NOW, not a settle-debounce later. The
+		// debounce exists to absorb membership CHURN - several joins collapsing
+		// into one reconcile pass - but a boot-defer is not churn: this node
+		// already knows, at this instant, exactly which owned positions it is
+		// missing, and until they are warmed the cluster may not be able to
+		// assemble a write quorum for their units (the displaced peer holds ONE
+		// copy; this node's copy does not exist yet). Every debounce tick
+		// therefore extends a KNOWN quorum gap on the write path for no
+		// batching benefit. Observed downstream before this line existed: a
+		// 2-node bootstrap deferred 3 of 4 positions, the acquire arrived a
+		// full production settle delay later, and a write issued in the gap
+		// exhausted its entire retry budget. The write retry is sized to ride
+		// an OPEN (seconds); it is not sized to ride an open PLUS an idle
+		// debounce in front of it.
+		//
+		// Routed through the normal settle machinery with a zero delay rather
+		// than calling the reconcile inline: Open must not block on acquires
+		// (the whole point of the defer is that warming is background work),
+		// and the settlePending accounting keeps WaitForRebalanceIdle honest
+		// about the pass this schedules.
+		c.scheduleReconcileIn(0)
 	}
 	return nil
 }
