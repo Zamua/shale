@@ -142,7 +142,7 @@ func (c *Cluster) warnUnderReplicated(pinKey []byte, detail string) {
 //     (commitCAS) logs the degraded replication once before this maps to nil.
 //   - Conflict: the OCC retry signal, backend.ErrCASConflict.
 //   - Err (with Committed==false): a genuine not-committed failure - a
-//     backend / ownership error, or a pre-commit retryable freeze / fence /
+//     backend / ownership error, or a pre-commit retryable cut-over / fence /
 //     reshard-cutover refusal that applied nothing and IS re-run by Transact.
 //
 // See docs/SPEC.md "The four commit outcomes".

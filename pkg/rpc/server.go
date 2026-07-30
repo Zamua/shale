@@ -312,34 +312,19 @@ func (s *Server) ApplyBatch(_ context.Context, req *pb.ApplyBatchRequest) (*pb.A
 	return &pb.ApplyBatchResponse{}, nil
 }
 
-// ReshardControl is the cluster-internal control RPC for the v0.8 multi-node
-// doubling reshard (cluster-wide freeze barrier). The COORDINATOR (the node
-// where Reshard() was called on a multi-node cluster) calls this once per
-// barrier phase (FREEZE / BISECT / FLIP / RESUME / ABORT). The handler delegates
-// to the cluster's idempotent phase handler; a phase that cannot be applied
-// (wrong generation, not frozen, closed) travels back as the response error
-// string so the coordinator ABORTS, rather than as a gRPC error code (matching
-// the CommitCAS / ApplyBatch wire convention of carrying an expected control-
-// flow outcome in the response field). Never called from outside the cluster.
-func (s *Server) ReshardControl(_ context.Context, req *pb.ReshardControlRequest) (*pb.ReshardControlResponse, error) {
-	if err := s.c.ApplyReshardPhase(req.GetPhase(), req.GetTargetGen()); err != nil {
-		return &pb.ReshardControlResponse{Error: err.Error()}, nil
-	}
-	return &pb.ReshardControlResponse{}, nil
-}
-
 // GenState is the cluster-internal generation-propagation RPC for the v0.8
 // join-after-reshard fix. A node opening in multi-backend mode WITH seeds (a
-// JOINER) calls this on a live seed exactly once during Open - before it
-// mounts any unit - to learn the cluster's live {generation, unit-count} and
-// seed its own routing state from it (so it never routes / owns a key at gen 0
-// after the cluster has resharded). The handler delegates to the cluster's
-// snapshot accessor; the live value is coherent because a join only ever lands
-// at a stable generation (a membership change mid-reshard ABORTS the reshard).
-// Never called from outside the cluster.
+// JOINER) calls this on a live seed during Open - before it mounts any unit -
+// to learn the cluster's live {generation, unit-count} and seed its own
+// routing state from it (so it never routes / owns a key at gen 0 after the
+// cluster has resharded). The handler delegates to the cluster's snapshot
+// accessor. The response additionally reports whether a reshard is IN FLIGHT
+// on this node (nextCount set): an in-flight {gen, count} is about to change,
+// so the joiner DEFERS (retries within its GenLearnBudget) rather than seed
+// from it. Never called from outside the cluster.
 func (s *Server) GenState(_ context.Context, _ *pb.GenStateRequest) (*pb.GenStateResponse, error) {
 	gen, count := s.c.GenStateSnapshot()
-	return &pb.GenStateResponse{Generation: gen, UnitCount: count}, nil
+	return &pb.GenStateResponse{Generation: gen, UnitCount: count, ReshardInFlight: s.c.ReshardInFlight()}, nil
 }
 
 // -- Cluster RPCs ----------------------------------------------------

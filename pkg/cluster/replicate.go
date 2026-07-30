@@ -360,13 +360,6 @@ func (c *Cluster) LocalReplicaPut(key, bytesToWrite []byte) error {
 		return backend.ErrClosed
 	}
 	if c.multi {
-		// FREEZE gate (v0.8 multi-node reshard): a forwarded write that lands on
-		// a frozen node is refused with the retryable error, same as a first-hop
-		// write, so the originating node retries (and eventually re-forwards)
-		// after RESUME. No forwarded write is acked during the static bisect.
-		if c.isFrozen() {
-			return errWriteFrozen("Put")
-		}
 		// Multi-backend mode at R>1 (replicated, v0.8 Phase 2b): the incoming
 		// bytes are an LWW envelope; apply them APPLY-IF-NEWER against the
 		// key's mounted unit so a reordered older fan-out or a stale read-
@@ -412,11 +405,6 @@ func (c *Cluster) LocalReplicaDelete(key []byte) error {
 		return backend.ErrClosed
 	}
 	if c.multi {
-		// FREEZE gate (v0.8 multi-node reshard): a forwarded delete on a frozen
-		// node is refused with the retryable error, same as a forwarded Put.
-		if c.isFrozen() {
-			return errWriteFrozen("Delete")
-		}
 		// Apply under the reshard write-pause (Phase 4). Owner-but-unmounted
 		// (handoff landing on us) and a stale mount (lease moved) both give
 		// the retryable acquiring-window error, same as Put, so the forwarded

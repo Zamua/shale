@@ -105,8 +105,8 @@ type Config struct {
 
 	// ConditionalStore is the create-if-absent + compare-and-set object
 	// store backing the DECLARATIVE, DECENTRALIZED reshard agreement (v0.9;
-	// see docs/decentralized-reshard-design.md). When set on an R>1
-	// multi-backend cluster, Open constructs and seeds a reshard.Arbiter over
+	// see docs/decentralized-reshard-design.md). When set on a multi-backend
+	// cluster (ANY R), Open constructs and seeds a reshard.Arbiter over
 	// it: the cluster's agreed reshard epoch ({count, target, plan}) lives in
 	// a single durable object every node reads and advances by a
 	// conditional-write race, replacing an elected coordinator. The same
@@ -114,11 +114,11 @@ type Config struct {
 	// manifest fencing (backends/slate supplies MinioConditionalStore; tests
 	// use storageunit.MemConditionalStore).
 	//
-	// Optional and decoupled: nil leaves the arbiter unconstructed and the
-	// cluster on the existing static / coordinated-freeze reshard paths
-	// (byte-for-byte unchanged). It is a no-op outside R>1 multi-backend mode
-	// (the decentralized online reshard is R>1 only; the R=1 multi-node path
-	// keeps the coordinated freeze barrier).
+	// Optional for a single-node cluster (the inline bisect needs no
+	// agreement), REQUIRED for a multi-node reshard: Reshard() on a multi-node
+	// cluster refuses with ErrReshardNeedsConditionalStore when nil (the
+	// arbiter is the only multi-node reshard mechanism). Nil leaves the
+	// arbiter unconstructed; everything else is byte-for-byte unchanged.
 	ConditionalStore storageunit.ConditionalStore
 
 	// DeclarativeReshard makes the cluster DRIVE the arbiter target from the
@@ -551,40 +551,12 @@ type Cluster struct {
 	// agreed reshard epoch ({count, target, plan}) in a single CAS-guarded
 	// durable object every node reads + advances by a conditional-write race
 	// (no elected coordinator; see docs/decentralized-reshard-design.md). Non-
-	// nil only when cfg.ConditionalStore is set AND this is an R>1 multi-backend
-	// cluster (initReshardArbiter); nil leaves the cluster on the existing
-	// static / coordinated-freeze reshard paths. It holds no per-node state, so
-	// no extra lock: the durable object's CAS version is the concurrency
-	// control. Reads/retargets/advances go through reshard.Arbiter.
+	// nil whenever cfg.ConditionalStore is set on a multi-backend cluster
+	// (initReshardArbiter); nil leaves the cluster on the single-node /
+	// static reshard paths only. It holds no per-node state, so no extra
+	// lock: the durable object's CAS version is the concurrency control.
+	// Reads/retargets/advances go through reshard.Arbiter.
 	arbiter *reshard.Arbiter
-
-	// freeze is the cluster-wide WRITE-FREEZE flag for the v0.8 multi-node
-	// reshard (cluster-wide freeze barrier; see multibackend_reshard_barrier.go).
-	// While a node is frozen, every WRITE path (Put / Delete / the CAS commit
-	// write path) returns the retryable acquiring-window error (codes.Unavailable)
-	// so no write is acked during the static bisect; READS continue. The
-	// coordinator's FREEZE phase sets it on every node, RESUME / ABORT clears it.
-	// freezeMu guards both fields. All zero / nil in legacy mode (the barrier
-	// never runs there); zero-value (frozen=false) is the steady state in multi
-	// mode, so steady-state writes pay only one cheap atomic-free locked read.
-	freezeMu        sync.Mutex
-	frozen          bool
-	freezeTargetGen storageunit.Generation
-	// frozenAt records when this node most recently ENTERED the freeze (the
-	// false->true edge in reshardFreeze). The self-heal loop uses it to age out a
-	// STALE freeze: a node that FLIPPED to the target generation but never got
-	// RESUME (a dropped RESUME RPC) would otherwise reject every write forever, so
-	// once it has been frozen-past-its-flip longer than staleFreezeGrace the
-	// self-heal clears the freeze. Zero in legacy mode.
-	frozenAt time.Time
-
-	// testingAfterFreezeHook, when non-nil, runs on the COORDINATOR exactly once
-	// after the FREEZE barrier completes and BEFORE the pre-BISECT membership
-	// re-check. Test-only seam (nil in every production path, so it costs one nil
-	// compare): it lets a test inject a membership change across the barrier and
-	// assert the coordinator ABORTS on it deterministically, without racing a real
-	// node join/leave against the phase timing. See TestingSetAfterFreezeHook.
-	testingAfterFreezeHook func()
 
 	// reconcileMu serializes the Phase 3 lease-handoff reconcile
 	// (multibackend_rebalance.go): at most one reconcile mutates the mount
@@ -1188,14 +1160,6 @@ func (c *Cluster) localBeginForKey(key []byte, level backend.IsolationLevel) (ba
 		return nil, backend.ErrClosed
 	}
 	if c.multi {
-		// FREEZE gate (v0.8 multi-node reshard): the CAS commit write path is a
-		// WRITE, so a frozen node refuses it with the retryable error - even a
-		// transaction opened BEFORE the freeze is refused at commit, so no CAS
-		// write is acked during the static bisect. The client retries the whole
-		// transaction (Transact's loop) after RESUME, at the new generation.
-		if c.isFrozen() {
-			return nil, errWriteFrozen("CommitCASApply")
-		}
 		b, ru, unlock, ok := c.localWriteBackendForKey(key)
 		if !ok {
 			unlock()
@@ -1531,19 +1495,10 @@ func (c *Cluster) Put(key, value []byte) error {
 		// R>1 (replicated multi-backend, v0.8 Phase 2b): stamp + envelope +
 		// fan out to the unit's R replica nodes, waiting for W acks. The legacy
 		// envelope / fan-out machinery, re-keyed per unit. Static topology, so
-		// no freeze / reshard window applies here.
+		// no reshard window applies here.
 		return c.putReplicatedUnit(key, value)
 	}
 	if c.multi {
-		// FREEZE gate (v0.8 multi-node reshard): while a cluster-wide reshard
-		// has this node write-frozen, refuse with the retryable error so the
-		// write is NEVER acked. It succeeds on the client's retry after RESUME,
-		// at the new generation. This is what makes the static bisect safe: no
-		// write is in flight during it. Checked before routing so a frozen node
-		// does no work; reads are never gated.
-		if c.isFrozen() {
-			return errWriteFrozen("Put")
-		}
 		owner, local := c.ownerOf(key)
 		if local {
 			// Apply UNDER the reshard write-pause (Phase 4): if a cut-over
@@ -1626,7 +1581,7 @@ func (c *Cluster) forwardGet(addr string, key []byte) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// Bound the forwarded read: a peer that is alive-but-frozen (or whose
+	// Bound the forwarded read: a peer that is alive-but-wedged (or whose
 	// link is half-open) must surface a deadline error the caller can act
 	// on, not block this goroutine forever. Mirrors replicate.go's pattern.
 	ctx, cancel := context.WithTimeout(context.Background(), c.cfg.ReadTimeout)
@@ -1677,12 +1632,6 @@ func (c *Cluster) Delete(key []byte) error {
 		return c.putReplicatedUnit(key, nil)
 	}
 	if c.multi {
-		// FREEZE gate (v0.8 multi-node reshard): a frozen node refuses Delete
-		// with the retryable error so it is never acked, succeeding on retry
-		// after RESUME. See Put for the full rationale.
-		if c.isFrozen() {
-			return errWriteFrozen("Delete")
-		}
 		owner, local := c.ownerOf(key)
 		if local {
 			// Delete is a write: apply under the reshard write-pause so a
@@ -1765,17 +1714,6 @@ func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 func (c *Cluster) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed
-	}
-	// FREEZE gate (v0.8 multi-node reshard): a frozen node refuses Begin with
-	// the retryable error so a client does not buffer a transaction that is
-	// doomed to fail at Commit (the CAS commit write path is itself frozen). The
-	// client retries Begin after RESUME and commits at the new generation. The
-	// CAS commit write path (localBeginForKey, below) is ALSO gated, so a tx
-	// that was opened before the freeze and commits during it is refused too -
-	// belt and suspenders, since this gate alone cannot cover a pre-freeze
-	// Begin. Reads outside a tx are never gated.
-	if c.multi && c.isFrozen() {
-		return nil, errWriteFrozen("Begin")
 	}
 	return c.newCASTx(level), nil
 }

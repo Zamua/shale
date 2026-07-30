@@ -436,10 +436,10 @@ func TestApplyBatch_WireAppliesVerbatim(t *testing.T) {
 }
 
 // newMultiBackendServer spins up an rpc.Server over a MULTI-BACKEND cluster
-// (single node, owns the whole unit space) so a test can freeze it for a
-// cluster-wide reshard and exercise the freeze-window wire behavior. Returns the
-// dial address, the cluster (so the test can drive ApplyReshardPhase), and a
-// cleanup func.
+// (single node, owns the whole unit space) so a test can put a unit into the
+// owner-but-unmounted acquiring window and exercise the retryable-refusal wire
+// behavior. Returns the dial address, the cluster (so the test can drive
+// TestingClearMount / TestingRunReconcile), and a cleanup func.
 func newMultiBackendServer(t *testing.T) (addr string, c *cluster.Cluster, cleanup func()) {
 	t.Helper()
 	c, err := cluster.Open(cluster.Config{
@@ -468,13 +468,15 @@ func newMultiBackendServer(t *testing.T) (addr string, c *cluster.Cluster, clean
 	}
 }
 
-// TestCommitCAS_FrozenIsRetryableUnavailableOverWire is the P2-A regression: a
-// CAS commit against a FROZEN multi-backend owner must reach the client as a
-// gRPC status with codes.Unavailable (the retryable freeze-window code), NOT a
-// flattened response-error string that the client would wrap as codes.Unknown.
-// Without preserving the status across CommitCAS, a client classifying frozen
-// writes as retryable would treat a frozen remote CAS commit as a hard failure.
-func TestCommitCAS_FrozenIsRetryableUnavailableOverWire(t *testing.T) {
+// TestCommitCAS_AcquiringIsRetryableUnavailableOverWire pins the wire contract
+// the CAS retry loop rests on: a CAS commit refused by the owner's retryable
+// acquiring window (owner-but-unmounted, the same codes.Unavailable family the
+// retired freeze window used) must reach the client as a gRPC STATUS with
+// codes.Unavailable, NOT a flattened response-error string that the client
+// would wrap as codes.Unknown. Without preserving the status across CommitCAS,
+// a client classifying retryable writes would treat the refusal as a hard
+// failure.
+func TestCommitCAS_AcquiringIsRetryableUnavailableOverWire(t *testing.T) {
 	addr, c, cleanup := newMultiBackendServer(t)
 	defer cleanup()
 	cli := newTestClient(t, addr)
@@ -482,49 +484,44 @@ func TestCommitCAS_FrozenIsRetryableUnavailableOverWire(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	// Freeze the node for a cluster-wide reshard toward gen 1.
-	if err := c.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FREEZE, 1); err != nil {
-		t.Fatalf("freeze: %v", err)
-	}
+	// Put the pin key's unit into the owner-but-unmounted acquiring window
+	// deterministically (the mount is cleared; the lease is NOT released, so
+	// the next reconcile self-heals by re-acquiring).
+	pinUnit := storageunit.UnitForShardKey([]byte("k"), storageunit.MustUnitCount(4))
+	c.TestingClearMount(pinUnit)
 
-	// A CAS commit while frozen: the write path refuses with errWriteFrozen
-	// (codes.Unavailable). It must arrive as a gRPC status error, NOT a typed
-	// response field, so the client can classify it retryable.
+	// A CAS commit into the acquiring window: the write path refuses with the
+	// retryable errUnitAcquiring (codes.Unavailable). It must arrive as a gRPC
+	// status error, NOT a typed response field, so the client can classify it
+	// retryable.
 	_, err := cli.CommitCAS(ctx, &pb.CommitCASRequest{
 		PinKey: []byte("k"),
 		Reads:  []*pb.ReadCheck{{Key: []byte("k"), ExpectAbsent: true}},
 		Writes: []*pb.WriteOp{{Key: []byte("k"), Value: []byte("v1")}},
 	})
 	if err == nil {
-		t.Fatal("P2-A VIOLATED: frozen CommitCAS returned no error; want a retryable Unavailable status")
+		t.Fatal("acquiring CommitCAS returned no error; want a retryable Unavailable status")
 	}
 	st, ok := status.FromError(err)
 	if !ok {
-		t.Fatalf("P2-A VIOLATED: frozen CommitCAS error is not a gRPC status: %v", err)
+		t.Fatalf("acquiring CommitCAS error is not a gRPC status: %v", err)
 	}
 	if st.Code() != codes.Unavailable {
-		t.Fatalf("P2-A VIOLATED: frozen CommitCAS code = %v, want codes.Unavailable (retryable freeze window)", st.Code())
+		t.Fatalf("acquiring CommitCAS code = %v, want codes.Unavailable (retryable acquiring window)", st.Code())
 	}
 
-	// Unfreeze (RESUME) and confirm the same commit now succeeds at the new gen.
-	if err := c.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_BISECT, 1); err != nil {
-		t.Fatalf("bisect: %v", err)
-	}
-	if err := c.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FLIP, 1); err != nil {
-		t.Fatalf("flip: %v", err)
-	}
-	if err := c.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_RESUME, 1); err != nil {
-		t.Fatalf("resume: %v", err)
-	}
+	// Self-heal the mount (one reconcile pass re-acquires the cleared unit) and
+	// confirm the same commit now succeeds.
+	c.TestingRunReconcile()
 	resp, err := cli.CommitCAS(ctx, &pb.CommitCASRequest{
 		PinKey: []byte("k"),
 		Reads:  []*pb.ReadCheck{{Key: []byte("k"), ExpectAbsent: true}},
 		Writes: []*pb.WriteOp{{Key: []byte("k"), Value: []byte("v1")}},
 	})
 	if err != nil {
-		t.Fatalf("CommitCAS after RESUME: %v", err)
+		t.Fatalf("CommitCAS after reconcile: %v", err)
 	}
 	if !resp.GetCommitted() {
-		t.Fatalf("CommitCAS after RESUME: want committed, got %+v", resp)
+		t.Fatalf("CommitCAS after reconcile: want committed, got %+v", resp)
 	}
 }

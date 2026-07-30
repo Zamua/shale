@@ -37,8 +37,8 @@ func TestCommitRetryable_ClassifiesReshardWindowSignals(t *testing.T) {
 			want: true,
 		},
 		{
-			name: "Unavailable (freeze / handoff window) is retryable",
-			err:  status.Error(codes.Unavailable, "cluster: writes are frozen for a cluster-wide reshard; retry shortly"),
+			name: "Unavailable (handoff / acquiring window) is retryable",
+			err:  status.Error(codes.Unavailable, "cluster: CommitCASApply: unit for key is handing off to this node; retry shortly"),
 			want: true,
 		},
 		{

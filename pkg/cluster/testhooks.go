@@ -1,12 +1,45 @@
 package cluster
 
-import "github.com/Zamua/shale/pkg/coord"
+import (
+	"github.com/Zamua/shale/pkg/coord"
+	"github.com/Zamua/shale/pkg/ring"
+	"github.com/Zamua/shale/pkg/storageunit"
+)
 
 // Test-only seams for the cluster layer. Nothing here is called by production
 // code; the exported functions exist so tests in other packages can simulate
 // failure modes the normal lifecycle API does not expose. They follow the
 // established Testing* convention (TestingClearMount / TestingSetRingMembers /
 // TestingDropAllPeerClients). Adding them changes NO production behavior.
+
+// TestingRunReconcile runs ONE reconcile pass (the same runReconcile the
+// periodic self-heal loop ticks), synchronously. Test-only white-box hook: it
+// lets a test drive the reconcile - including the arbiter-driven reshard step
+// (observeReshard) - on demand instead of waiting out the production reconcile
+// interval. Follows the Testing* convention.
+func (c *Cluster) TestingRunReconcile() {
+	c.runReconcile()
+}
+
+// TestingSetRingMembers replaces the local node's placement basis with the
+// given members, modelling a node whose topology view has DIVERGED from its
+// peers'. Test-only white-box hook; multi-node mode only, and only for a
+// coordinator that offers the seam - a no-op otherwise. Follows the Testing*
+// convention.
+//
+// It keeps taking ring.Member so the existing white-box call sites are
+// unchanged; the value is just an (id, addr) pair.
+func (c *Cluster) TestingSetRingMembers(members []ring.Member) {
+	setter, ok := c.coord.(coord.MemberSetter)
+	if !ok {
+		return
+	}
+	nodes := make([]coord.Node, 0, len(members))
+	for _, m := range members {
+		nodes = append(nodes, coord.Node{ID: storageunit.NodeID(m.ID), Addr: m.Addr})
+	}
+	setter.TestingSetMembers(nodes)
+}
 
 // TestingHardKill tears this node down like Close BUT WITHOUT the graceful
 // membership Leave, modeling a SIGKILLed process / a k8s pod delete: peers do

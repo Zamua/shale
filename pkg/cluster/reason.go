@@ -22,7 +22,7 @@
 // undecodable.
 //
 // FIRST SLICE, NOT A ONE-OFF. Only ReasonAcquiring is implemented. Siblings
-// (fenced, frozen, migration-guard, conflict) join by adding a constant, an
+// (fenced, acquiring, migration-guard, conflict) join by adding a constant, an
 // exported sentinel, and one table row - no redesign, and no change to the
 // encode/decode plumbing.
 //

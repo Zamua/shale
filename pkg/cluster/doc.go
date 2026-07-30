@@ -93,8 +93,8 @@
 //	------------------ ---------------------- ---------------------------- ------------------------------
 //	predicate          !c.multi               c.multi, !replicaLayout()    c.multiReplicated() (r/w) or
 //	                                                                       replicaLayout() (mount)
-//	Put / Delete       c.backend directly     ownerOf + forward, freeze    putReplicatedUnit
-//	                   (+ legacy R>1 replicate)  gate applies              multibackend_replicated.go
+//	Put / Delete       c.backend directly     ownerOf + forward, under     putReplicatedUnit
+//	                   (+ legacy R>1 replicate)  the per-unit write-pause  multibackend_replicated.go
 //	                   cluster.go, replicate.go  cluster.go                cluster.go entry
 //	Get                c.backend / replicated getUnit via ownerOf          getReplicatedUnit
 //	                   read path (replicate.go)  cluster.go                multibackend_replicated.go
@@ -106,31 +106,38 @@
 //	                                          (release then acquire)       gated by a serving marker
 //
 // The reconcile dispatch lives in one place, reconcileUnits
-// (multibackend_rebalance.go): it branches on replicaLayout() into the
-// R>1 half (declarative target, decentralized reshard step, overlap reconcile,
-// drain checks, joining-state maintenance) and otherwise falls through to the
-// R=1 GenUnit loop. Config.TestingForceCleanCut is a break-demo escape hatch in
-// the R>1 half that swaps the overlap reconcile for the pre-overlap clean-cut
-// one; it is never set in production.
+// (multibackend_rebalance.go): the arbiter-driven reshard step (declarative
+// target + observeReshard) runs FIRST on every tick regardless of R, then the
+// pass branches on replicaLayout() into the R>1 half (overlap reconcile, drain
+// checks, joining-state maintenance) or the R=1 GenUnit acquire/release loop
+// plus the orphaned-hold sweep. Config.TestingForceCleanCut is a break-demo
+// escape hatch in the R>1 half that swaps the overlap reconcile for the
+// pre-overlap clean-cut one; it is never set in production.
 //
 // # Reshard decision matrix
 //
-// There are THREE reshard mechanisms. Which one runs is NOT a single switch:
-// two of them are reached by an imperative call and one only by the reconcile
-// tick, so an R>1 cluster can have two of them wired at once.
+// There are TWO reshard mechanisms: the single-node inline bisect (an
+// imperative call, nobody to agree with) and the decentralized CAS arbiter
+// (driven from the reconcile tick, for ANY R). The imperative multi-node entry
+// DELEGATES to the arbiter.
 //
 //	MECHANISM                  ENTRY                       PREDICATE                        FILE
 //	-------------------------- --------------------------- -------------------------------- -----------------------------
 //	single-node online bisect  Cluster.Reshard()           multi && len(Members()) <= 1     multibackend_reshard.go
-//	coordinated freeze barrier Cluster.Reshard()           multi && len(Members()) > 1      multibackend_reshard_barrier.go
-//	                           -> reshardCoordinated()     (NO R check, NO arbiter check)
-//	decentralized arbiter      reconcileUnits() tick       replicaLayout() (R>1) &&         multibackend_reshard_driver.go
-//	                           -> observeReshard()         c.arbiter != nil, which needs    (+ _arbiter, _declared,
-//	                                                       Config.ConditionalStore != nil   _copy, _marker, _route)
+//	decentralized arbiter      reconcileUnits() tick       c.arbiter != nil, which needs    multibackend_reshard_driver.go
+//	                           -> observeReshard();        Config.ConditionalStore != nil;  (R>1 drive; + _arbiter,
+//	                           Cluster.Reshard() on a      the drive branches on            _declared, _copy, _marker,
+//	                           multi-node cluster          replicaLayout(): R>1 envelope    _route) and
+//	                           -> reshardDelegated()       dual-write vs R=1 parent-        multibackend_reshard_r1.go
+//	                           (Retarget + converge)       anchored raw-bytes               (R=1 drive + delegation)
 //
-// Cluster.Reshard() itself refuses in legacy mode and is serialized by
-// reshardMu; the arbiter driver takes reshardMu too, so the imperative and
-// decentralized paths cannot interleave, only alternate.
+// Cluster.Reshard() refuses in legacy mode, and on a multi-node cluster
+// refuses with ErrReshardNeedsConditionalStore when no arbiter is wired. The
+// single-node bisect is serialized by reshardMu; the arbiter driver runs under
+// reshardMu + reconcileMu on the reconcile tick, so the two cannot interleave.
+// At R=1 the arbiter drive supports SPLIT only: a merge target is refused
+// (never entered, never advanced toward) because R=1 stores raw bytes and the
+// cross-node merge copy needs the R>1 envelope ordering.
 //
 // The arbiter's TARGET (what the decentralized driver converges toward) is set
 // one of two ways:
@@ -152,32 +159,14 @@
 // So, to answer "which reshard runs" for a given deployment, ask in this order:
 //
 //  1. Is it legacy mode? Reshard() errors; there is no reshard.
-//  2. Did something call Reshard() (or the operator-facing Reshard RPC)? Then
-//     member count alone decides: 1 member -> inline bisect, >1 -> freeze
-//     barrier. R and the arbiter are NOT consulted.
-//  3. Otherwise, is an arbiter wired (R>1 + ConditionalStore)? Then every
+//  2. Did something call Reshard()? On a single-node cluster the inline bisect
+//     runs. On a multi-node cluster it DELEGATES to the arbiter (Retarget the
+//     agreed count + wait for local convergence), refusing with a typed error
+//     when no ConditionalStore is configured.
+//  3. Otherwise, is an arbiter wired (ConditionalStore, any R)? Then every
 //     reconcile tick steps any in-flight split/merge through observeReshard,
-//     with the target set externally or from the declared count.
-//
-// # Where the SPEC disagrees with the code
-//
-// Derived 2026-07 by reading the predicates; recorded here rather than silently
-// "fixing" either side.
-//
-//   - docs/SPEC.md "v0.9" says the decentralized reshard "replaces" the
-//     imperative barrier "on the R>1 path", scoping the freeze barrier to R=1.
-//     The code does not scope it: Cluster.Reshard() branches on member count
-//     ONLY, so calling Reshard() (or the operator Reshard RPC, which the
-//     SPEC documents as calling c.Reshard()) on a MULTI-NODE R>1 cluster runs
-//     reshardCoordinated(), arbiter or not. The decentralized driver is an
-//     ADDITIONAL path reached only from the reconcile tick, not a replacement.
-//     Either Reshard() should refuse (or delegate) when an arbiter is wired, or
-//     the SPEC should describe the two as coexisting. Not changed here: picking
-//     between those is a behavior decision, not a documentation one.
-//
-//   - The same SPEC sentence says "the R=1 multi-node path keeps the coordinated
-//     freeze barrier". True, but incomplete in the other direction: R=1 is not
-//     what selects the barrier, member count is.
+//     with the target set externally (Retarget / a delegated Reshard) or from
+//     the declared count.
 //
 // # File map
 //
@@ -201,7 +190,8 @@
 //	multibackend_replicated.go      R>1 mount, replicated read/write paths
 //	multibackend_overlap*.go        R>1 overlap handoff (acquire-then-release)
 //	multibackend_reshard.go         Reshard() entry + single-node online bisect
-//	multibackend_reshard_barrier.go the coordinated cluster-wide freeze barrier
+//	multibackend_reshard_r1.go      the R=1 parent-anchored drive + the
+//	                                delegated multi-node Reshard entry
 //	multibackend_reshard_arbiter.go arbiter construction/seeding + the pure
 //	                                genState step function
 //	multibackend_reshard_driver.go  the per-tick decentralized split/merge driver

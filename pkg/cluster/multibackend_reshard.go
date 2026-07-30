@@ -40,19 +40,17 @@
 // unit's backing store before its ack, so after the reshard every acked write
 // is visible. The phase is built to this invariant.
 //
-// Scope: multi-backend mode ONLY. THIS FILE is the R=1 / single-node inline
-// bisect; it is not the only resharder. Agreement on advancing the generation
-// has three implementations today, selected by what the cluster was given:
+// Scope: multi-backend mode ONLY. THIS FILE is the single-node inline bisect
+// plus the Reshard() operator entry; it is not the only resharder. Agreement on
+// advancing the generation has two implementations, selected by what the
+// cluster was given:
 //
-//   - single-node:              this file's inline bisect (nobody to agree with)
-//   - R=1 multi-node:           the coordinated freeze barrier
-//                               (multibackend_reshard_barrier.go)
-//   - R>1 with a ConditionalStore: the decentralized CAS arbiter
-//                               (multibackend_reshard_arbiter.go + pkg/reshard)
-//
-// So resharding at R>1 DOES exist - via the arbiter, not via this file. An
-// earlier version of this comment said "R=1 only" without that qualifier,
-// which read as "shale cannot reshard at R>1" and is false.
+//   - single-node:  this file's inline bisect (nobody to agree with)
+//   - multi-node:   the decentralized CAS arbiter, for ANY R
+//                   (multibackend_reshard_arbiter.go + pkg/reshard; the R=1
+//                   drive is multibackend_reshard_r1.go, the R>1 drive is
+//                   multibackend_reshard_driver.go). Requires a
+//                   Config.ConditionalStore; Reshard() refuses without one.
 //
 // Assumes STABLE membership for the duration of a reshard (concurrent
 // membership-change + reshard is out of scope - a later concern).
@@ -232,20 +230,6 @@ func (c *Cluster) localWriteBackendForKey(key []byte) (be backend.Backend, ru st
 	oldK := storageunit.UnitForHash(h, c.genSnapshot().count)
 	pause := c.pauseLockFor(oldK)
 	pause.RLock()
-	// Re-check the freeze AFTER taking the pause RLock. The caller checks
-	// isFrozen() first, but a writer can pass that gate and then be descheduled
-	// (GC, preemption, ring-lock contention spanning the ownerOf lookup) before
-	// reaching this RLock. Such a writer is INVISIBLE to bisectUnitStatic's
-	// WRITE-side drain (which only blocks RLocks already held): it would wake
-	// after the bisect copied + released, resolve at gen g (FLIP runs after the
-	// BISECT barrier, so genState is still g), land its Put in the old unit, ack,
-	// and be LOST when FLIP retires old-K. Re-checking under the RLock makes the
-	// drain structural: either the writer holds the RLock when the bisect Locks
-	// (its value is copied) OR it takes the RLock after and is refused here
-	// (ok=false -> the retryable acquiring-window error, never an ack).
-	if c.isFrozen() {
-		return nil, storageunit.ReplicaUnit{}, pause.RUnlock, false
-	}
 	gu := c.genSnapshot().resolveGenUnit(h)
 	pos, ok := c.localReplicaPos(gu)
 	if ok {
@@ -323,9 +307,8 @@ func (c *Cluster) evictStaleMount(ru storageunit.ReplicaUnit, failed backend.Bac
 //     unit before it is drained, or resolves to the gen-(g+1) child. It can
 //     never land in a just-retired unit (NO ACKED WRITE LOST).
 //   - NOT MOUNTED (ok=false) means this node is the ring owner but the unit's
-//     lease is still handing off to it (the Phase 3 acquiring window), or a
-//     late writer was refused by the post-RLock freeze re-check. Either way
-//     the caller gets the RETRYABLE acquiring-window error, never an ack.
+//     lease is still handing off to it (the Phase 3 acquiring window). The
+//     caller gets the RETRYABLE acquiring-window error, never an ack.
 //   - fn FAILED on an owned+mounted unit means the mount is STALE (its lease
 //     moved to a higher epoch during the reshard redistribution window).
 //     Evict it so the next reconcile re-acquires fresh, and return the same
@@ -371,9 +354,12 @@ func (c *Cluster) withLocalWriteBackend(key []byte, op string, fn func(backend.B
 }
 
 // Reshard performs ONE doubling reshard: it advances the cluster from the
-// current generation g (N units) to g+1 (2N units) by bisecting every old
-// gen-g unit this node currently mounts into its two gen-(g+1) children,
-// online and per-unit. It is the explicit operator trigger.
+// current generation g (N units) to g+1 (2N units). It is the explicit
+// operator trigger. On a MULTI-NODE cluster it delegates to the arbiter
+// (reshardDelegated): retarget the agreed count, pump the reconcile driver
+// until the local generation advances, bounded. On a SINGLE-NODE cluster it
+// runs the inline online bisect below, bisecting every old gen-g unit this
+// node mounts into its two gen-(g+1) children, per-unit:
 //
 // For each old unit K this node mounts at gen g:
 //
@@ -402,23 +388,21 @@ func (c *Cluster) Reshard() error {
 	if !c.multi {
 		return fmt.Errorf("cluster: Reshard is only valid in multi-backend mode")
 	}
-	c.reshardMu.Lock()
-	defer c.reshardMu.Unlock()
 
 	// MULTI-NODE: a cross-node doubling cannot be made safe by the node-LOCAL
-	// write-pause this single-node path uses (each node advances its generation
-	// independently, so a concurrent write could route at the old generation on
-	// one node while another has flipped, and be lost). Drive the cluster-wide
-	// FREEZE barrier instead: freeze writes everywhere, bisect under the freeze
-	// (a STATIC copy, no catch-up), flip all nodes atomically, resume, then
-	// redistribute the 2N units via the Phase 3 lease handoff. The coordinator
-	// flow lives in multibackend_reshard_barrier.go and is built to the same
-	// NO-ACKED-WRITE-LOST invariant (writes during the freeze are refused with a
-	// retryable error, never acked). The SINGLE-NODE path below stays unchanged.
+	// write-pause alone, so it is DELEGATED to the decentralized CAS arbiter
+	// (retarget the agreed count, then the per-tick reconcile driver converges
+	// every node online - parent-anchored at R=1, dual-write at R>1 - built to
+	// the same NO-ACKED-WRITE-LOST invariant). reshardDelegated does NOT hold
+	// reshardMu: the reconcile passes it pumps take reshardMu themselves, and
+	// the arbiter's CAS target makes concurrent Reshard calls idempotent. The
+	// SINGLE-NODE inline path below stays unchanged, serialized by reshardMu.
 	if len(c.Members()) > 1 {
-		return c.reshardCoordinated()
+		return c.reshardDelegated()
 	}
 
+	c.reshardMu.Lock()
+	defer c.reshardMu.Unlock()
 	start := c.genSnapshot()
 	// Reject if a doubling would exceed the unit-count ceiling. Checking up
 	// front means a reshard either fully proceeds or fully refuses; it never
@@ -546,7 +530,7 @@ func (c *Cluster) bisectUnit(gen storageunit.Generation, k storageunit.UnitID, o
 	// two children EXACTLY MATCH old-K's current contents. Clear them first,
 	// then full-copy: this captures every write AND every DELETE that landed in
 	// old-K after the bulk copy (step 2). A delete is a key present in a child
-	// from step 2 but absent from frozen old-K; clearing the children before
+	// from step 2 but absent from drained old-K; clearing the children before
 	// the re-copy removes that stale value (an incremental re-copy alone would
 	// leave a deleted key resurrected in the child). The clear+copy is bounded
 	// by old-K's size, the same cost as the bulk pass; it runs only during the
@@ -623,7 +607,7 @@ func (c *Cluster) copyUnitInto(src, lowBE, highBE backend.Backend, oldCount, new
 }
 
 // clearBackend deletes every key in b. Used by the catch-up drain to reset a
-// child before the authoritative re-copy from the frozen old unit, so a key
+// child before the authoritative re-copy from the drained old unit, so a key
 // deleted in the old unit after the bulk copy does not survive in the child.
 // It materializes the key list first (do not delete while iterating the same
 // backend's open iterator). Bounded by the child's current size.

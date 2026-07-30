@@ -291,21 +291,12 @@ func (c *peerClient) ApplyBatch(ctx context.Context, writes []EnvelopeWrite) err
 	return nil
 }
 
-// ReshardControl drives one barrier phase of the v0.8 multi-node reshard
-// (cluster-wide freeze) to a peer node. Cluster-internal: only the coordinator
-// (the node where Reshard was called on a multi-node cluster) calls it, once
-// per phase per peer. The receiving node's idempotent phase handler acks via an
-// empty response error; a non-empty error string travels back as an ABORT
-// trigger for the coordinator.
-func (c *peerClient) ReshardControl(ctx context.Context, phase pb.ReshardPhase, targetGen uint64) (*pb.ReshardControlResponse, error) {
-	return c.api.ReshardControl(ctx, &pb.ReshardControlRequest{Phase: phase, TargetGen: targetGen})
-}
-
 // GenState asks a seed for its live {generation, unit-count}. A JOINER calls
-// it exactly once during Open (before mounting any unit) to learn the
-// cluster's live generation, so it never routes / owns a key at gen 0 after
-// the cluster has resharded. Cluster-internal: only a multi-backend Open WITH
-// seeds calls it; never from outside the cluster.
+// it during Open (before mounting any unit) to learn the cluster's live
+// generation, so it never routes / owns a key at gen 0 after the cluster has
+// resharded; an in-flight answer (reshard_in_flight) makes the joiner retry.
+// Cluster-internal: only a multi-backend Open WITH seeds calls it; never from
+// outside the cluster.
 func (c *peerClient) GenState(ctx context.Context) (*pb.GenStateResponse, error) {
 	return c.api.GenState(ctx, &pb.GenStateRequest{})
 }

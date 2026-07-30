@@ -149,31 +149,6 @@ func (c *Cluster) runReconcile() {
 	}
 	c.reshardMu.Lock()
 	defer c.reshardMu.Unlock()
-	// FREEZE guard (v0.8 multi-node reshard): on a NON-coordinator node the
-	// barrier phase handlers (FREEZE / BISECT / FLIP) run via RPC WITHOUT
-	// holding this node's reshardMu, so reshardMu alone does not exclude the
-	// self-heal reconcile here from the in-flight bisect. While frozen, the
-	// bisect owns the mount map (it transiently mounts the gen-(g+1) children
-	// the live-generation reconcile would otherwise see as mounted-but-not-
-	// desired and RELEASE). Skip the reconcile until RESUME / ABORT unfreezes;
-	// RESUME then bumps the ring generation, which schedules a fresh reconcile
-	// that does the post-flip redistribution against the advanced generation.
-	//
-	// STALE-FREEZE SELF-HEAL: first try to clear a freeze that is STRANDED - a
-	// node that FLIPPED to its target generation but never got RESUME (a dropped
-	// RESUME RPC) would otherwise reject every write forever. clearStaleFreeze
-	// only clears a freeze the node has already flipped past AND that has aged
-	// beyond the coordinator's RESUME retry budget, so it never races a normal
-	// in-flight reshard. When it clears one, do the re-key the missed RESUME
-	// would have done (bumpRingGen) and fall through to the post-flip reconcile.
-	if c.isFrozen() {
-		if !c.clearStaleFreeze() {
-			return
-		}
-		if c.coord != nil {
-			c.bumpRingGen()
-		}
-	}
 	c.reconcileMu.Lock()
 	defer c.reconcileMu.Unlock()
 	c.reconcileUnits()
@@ -225,26 +200,27 @@ func (c *Cluster) runReconcile() {
 // running concurrently could release those mid-bisect. The mount mutations
 // inside acquireUnit / releaseUnit go through the mount table.
 func (c *Cluster) reconcileUnits() {
+	// Decentralized online reshard (v0.9, extended to R=1 multi-node): when an
+	// Arbiter is wired (opt-in via ConditionalStore), drive this node's share of
+	// any in-flight split FIRST - enter/finalize the generation, copy owned
+	// parents into their children, publish/observe the durable markers, flip
+	// routing, retire finalized parents. No-op without an Arbiter / split. Runs
+	// on BOTH the R>1 and R=1 branches (the driver picks the per-R copy
+	// mechanics), before the mount reconcile so a just-entered split's children
+	// are in the desired set this same pass, and a just-finalized generation's
+	// redistribution runs against the advanced generation.
+	//
+	// First, reconcile the agreed target toward the cluster-wide DECLARED
+	// unit count (the operator's SHALE_UNIT_COUNT, gossiped in membership
+	// metadata): when the cluster is steady AND every live member agrees on
+	// the same declared count, CAS the arbiter target to it. observeReshard
+	// below then picks the new target up THIS SAME tick and enters the
+	// split/merge. No-op without an arbiter, or until the live set is
+	// unanimous (the rolling-deploy flap guard). See
+	// multibackend_reshard_declared.go.
+	c.observeDeclaredReshardTarget()
+	c.observeReshard()
 	if c.replicaLayout() {
-		// v0.9 decentralized online reshard: when an Arbiter is wired (opt-in via
-		// ConditionalStore), drive this node's share of any in-flight split FIRST -
-		// enter/finalize the generation, copy owned parents into their children,
-		// publish/observe the durable markers, flip routing, retire finalized
-		// parents. No-op without an Arbiter / split, so the existing R>1 paths are
-		// unchanged. Run before the overlap reconcile so a just-entered split's
-		// children are in the desired set this same pass, and a just-finalized
-		// generation's redistribution runs against the advanced generation.
-		//
-		// First, reconcile the agreed target toward the cluster-wide DECLARED
-		// unit count (the operator's SHALE_UNIT_COUNT, gossiped in membership
-		// metadata): when the cluster is steady AND every live member agrees on
-		// the same declared count, CAS the arbiter target to it. observeReshard
-		// below then picks the new target up THIS SAME tick and enters the
-		// split/merge. No-op without an arbiter, or until the live set is
-		// unanimous (the rolling-deploy flap guard). See
-		// multibackend_reshard_declared.go.
-		c.observeDeclaredReshardTarget()
-		c.observeReshard()
 		// R>1 (replicated multi-backend, v0.8 Phase 2b): the desired set is the
 		// replica-set membership, not single ownership. This runs on the INITIAL
 		// multi-node convergence (each node mounting the units it replicates as
@@ -310,6 +286,39 @@ func (c *Cluster) reconcileUnits() {
 		if _, have := mounted[gu]; !have {
 			c.acquireUnit(gu)
 		}
+	}
+
+	// ORPHAN SWEEP: close factory holds that are neither mounted nor desired.
+	// A FENCED stale mount is EVICTED from the mount table only (evictStaleMount
+	// keeps the factory handle open, since a close by MountRef could tear down a
+	// concurrently re-acquired healthy handle); when this node then never
+	// re-acquires the unit - its ownership moved away, e.g. a co-located reshard
+	// child redistributing to its gen-(g+1) ring home fenced this node's copy -
+	// nothing else ever closes that handle, leaking the open (and its lease
+	// record) for the life of the process. Under reconcileMu nothing else opens
+	// units, so a ref that is absent from BOTH the (post-diff) mount table and
+	// the desired set is provably orphaned: release it. This is the
+	// held-but-not-owned close the storage port's OpenUnits contract names.
+	desiredNow := make(map[storageunit.GenUnit]struct{}, len(desired))
+	for _, gu := range desired {
+		desiredNow[gu] = struct{}{}
+	}
+	tableNow := make(map[storageunit.GenUnit]struct{})
+	for _, ru := range c.mounts.mountedList() {
+		tableNow[ru.Unit] = struct{}{}
+	}
+	for _, m := range c.factory.OpenUnits() {
+		if m.Replicated() {
+			continue // defensive: this is the R=1 sole-mount branch
+		}
+		gu := m.Unit()
+		if _, ok := tableNow[gu]; ok {
+			continue
+		}
+		if _, ok := desiredNow[gu]; ok {
+			continue // an evicted-but-desired unit re-acquires instead
+		}
+		_ = c.factory.CloseUnit(m)
 	}
 }
 
