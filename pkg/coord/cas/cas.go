@@ -482,7 +482,15 @@ func (c *Coordinator) bootstrap(p coord.Params) (coord.Bootstrap, *document, str
 // so concurrent editors interleave without losing each other's rows. An
 // absent document is edited from empty and created with PutIfAbsent (the
 // renewal loop uses that to re-found after an over-eager GC).
-func (c *Coordinator) mutate(edit func(d *document)) error {
+//
+// edit reports whether the document it saw needs writing: false skips the
+// write entirely (the document already carries the intended state, or the
+// edit no longer applies), keeping a no-op from churning the version - every
+// churned write is a CAS conflict some peer must retry through. Because edit
+// re-runs on every CAS retry against the winner's fresh document, closures
+// must derive what they write from CURRENT state (their own records, the
+// re-read document), never from values captured before the loop.
+func (c *Coordinator) mutate(edit func(d *document) bool) error {
 	for attempt := 0; attempt < casAttempts; attempt++ {
 		data, ver, err := c.cfg.Store.Get(c.cfg.Key)
 		var d *document
@@ -497,7 +505,9 @@ func (c *Coordinator) mutate(edit func(d *document)) error {
 				return err
 			}
 		}
-		edit(d)
+		if !edit(d) {
+			return nil
+		}
 		out, err := encodeDocument(d)
 		if err != nil {
 			return err
@@ -536,17 +546,22 @@ func (c *Coordinator) runRenewalLoop(iv time.Duration) {
 
 // renewOnce advances self's leaseGen by one read-modify-write cycle. If a
 // peer GC'd this node's row (an over-eager expiry, e.g. after a long stall),
-// the renewal RE-ADDS it with the currently advertised roles: renewal is
-// also the self-heal path back into the membership.
+// the renewal RE-ADDS it with the currently desired roles: renewal is also
+// the self-heal path back into the membership. The in-place renewal also
+// REPAIRS a row whose roles drifted from the locally desired set (the local
+// record is the single source of truth for self's roles; the document is a
+// projection of it), so any divergence this adapter has not imagined heals
+// on the renewal cadence instead of sticking until an unrelated role change.
 func (c *Coordinator) renewOnce() error {
-	return c.mutate(func(d *document) {
-		if i := d.find(c.self.ID); i >= 0 {
-			d.Members[i].LeaseGen++
-			return
-		}
+	return c.mutate(func(d *document) bool {
 		c.rolesMu.Lock()
 		roles := c.roles
 		c.rolesMu.Unlock()
+		if i := d.find(c.self.ID); i >= 0 {
+			d.Members[i].LeaseGen++
+			d.Members[i].Roles = uint8(roles) // drift heal: desired is authoritative
+			return true
+		}
 		d.upsert(docRow{
 			ID:                string(c.self.ID),
 			Addr:              c.self.Addr,
@@ -555,6 +570,7 @@ func (c *Coordinator) renewOnce() error {
 			LeaseGen:          1,
 			Inc:               newInc(), // a fresh incarnation: observers reset their expiry count
 		})
+		return true
 	})
 }
 
@@ -904,11 +920,18 @@ func excludeKey(exclude map[storageunit.NodeID]struct{}) string {
 	return strings.Join(ids, "\x00")
 }
 
-// SetRole publishes this node's complete role set by CAS-updating its own
-// row, deduping a no-op. The flip becomes visible to the query methods when
-// a poll next refreshes the snapshot (roles ride the poll, never the change
-// hint). On a write failure the previous local record is restored, so a
-// caller's retry is not silently deduped into never publishing.
+// SetRole publishes this node's complete role set. The LOCAL DESIRED record
+// (c.roles) is the single source of truth: SetRole records the desire under
+// the mutex, then projects it into the document - and the mutate closure
+// RE-READS the current desired value on every execution (initial and each
+// CAS retry), so unordered concurrent SetRoles converge the document to the
+// LAST desired state instead of whichever mutate happened to land last. The
+// dedup compares desired-vs-desired only; whether the document agrees is the
+// renewal loop's business (its drift heal repairs a diverged row), so a
+// failed or skipped write can delay a flip by a renewal interval but can
+// never make a wrong advertised role stick. The flip becomes visible to the
+// query methods when a poll next refreshes the snapshot (roles ride the
+// poll, never the change hint).
 func (c *Coordinator) SetRole(want coord.Role) error {
 	c.rolesMu.Lock()
 	if c.roles == want || !c.started.Load() {
@@ -916,26 +939,27 @@ func (c *Coordinator) SetRole(want coord.Role) error {
 		c.rolesMu.Unlock()
 		return nil
 	}
-	prev := c.roles
 	c.roles = want
 	c.rolesMu.Unlock()
 
-	err := c.mutate(func(d *document) {
-		if i := d.find(c.self.ID); i >= 0 {
-			d.Members[i].Roles = uint8(want)
+	return c.mutate(func(d *document) bool {
+		i := d.find(c.self.ID)
+		if i < 0 {
+			// Row absent (a peer GC'd us): nothing to edit - the renewal's
+			// re-add carries the desired roles from the local record.
+			return false
 		}
-		// Row absent (a peer GC'd us): nothing to edit - the renewal's
-		// re-add carries the new roles from the local record.
-	})
-	if err != nil {
 		c.rolesMu.Lock()
-		if c.roles == want {
-			c.roles = prev
-		}
+		cur := uint8(c.roles)
 		c.rolesMu.Unlock()
-		return err
-	}
-	return nil
+		if d.Members[i].Roles == cur {
+			// Already converged: a racing setter's write landed the current
+			// desired state while this one waited out a CAS retry.
+			return false
+		}
+		d.Members[i].Roles = cur
+		return true
+	})
 }
 
 // Generation reports no opinion: generation agreement stays with the
@@ -961,10 +985,13 @@ func (c *Coordinator) Close() error {
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	c.loopWG.Wait()
 	if c.started.Load() && !c.hardStopped.Load() {
-		_ = c.mutate(func(d *document) {
-			if i := d.find(c.self.ID); i >= 0 {
-				d.Members = append(d.Members[:i], d.Members[i+1:]...)
+		_ = c.mutate(func(d *document) bool {
+			i := d.find(c.self.ID)
+			if i < 0 {
+				return false // already gone (a peer's GC): nothing to remove
 			}
+			d.Members = append(d.Members[:i], d.Members[i+1:]...)
+			return true
 		})
 	}
 	return nil
