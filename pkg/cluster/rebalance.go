@@ -27,6 +27,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -78,12 +79,28 @@ func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if c.settlePending.Load() == 0 {
+		// <= 0, not == 0: the counter is maintained to never go negative,
+		// but if an accounting bug ever drifts it below zero the failure
+		// must degrade to EARLY idle (a caller proceeds a beat soon), never
+		// to PERMANENTLY not-idle (== 0 is unsatisfiable from -1, and every
+		// idle-waiter times out forever after - the exact wedge the
+		// fired-timer double-decrement produced).
+		if c.settlePending.Load() <= 0 {
 			return nil
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// A timeout here has ONE proximate cause - settlePending held
+			// above zero - but several distinct mechanisms behind it (a
+			// pending timer that has not fired, a reconcile pass blocked
+			// mid-run, an accounting leak). An error that cannot say which
+			// costs a debugging session; report the settle machinery's state.
+			c.settleMu.Lock()
+			armed := c.settleTimer != nil
+			immediate := c.settleImmediate
+			c.settleMu.Unlock()
+			return fmt.Errorf("%w (settlePending=%d timerArmed=%v immediate=%v reconcileRunning=%v)",
+				ctx.Err(), c.settlePending.Load(), armed, immediate, c.reconcileRunning.Load())
 		case <-ticker.C:
 		}
 	}
