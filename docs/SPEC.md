@@ -2213,9 +2213,19 @@ never freeze a stale role answer. Roles are exactly as live as membership
 itself - one snapshot - and `TransitionSets` can never disagree with `View`.
 
 **`Changed()` is the same lossy hint.** The poll fires the depth-1 coalescing
-channel when the document version it read differs from the one behind the
-snapshot it last published. Coalesced and droppable by contract; consumers
-re-read and reconcile on a cadence, exactly as under gossip.
+channel when the PUBLISHED SNAPSHOT moved - membership, addresses, roles,
+declared counts, including an expiry (which changes the view without any
+document write) - never on document-version movement alone. The distinction
+is load-bearing: lease renewals advance the document version on virtually
+every poll while leaving the view unchanged, because renewals are the
+mechanism's HEARTBEAT, not a view change. A version-keyed hint would
+therefore fire at poll cadence, and a consumer that debounces view changes
+with extend-on-burst semantics (the cluster's settle timer) would have its
+debounced reconcile re-armed forever and never run it - reconcile
+starvation, pinned as a regression by the adapter's
+`TestChanged_FiresOnObservedChangeAndCoalesces`. Coalesced and droppable by
+contract; consumers re-read and reconcile on a cadence, exactly as under
+gossip.
 
 **Close is the graceful fast path; expiry is the crash path.** Close stops
 both loops, then best-effort CAS-removes self's row. A crash, a partition or
