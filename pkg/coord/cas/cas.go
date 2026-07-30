@@ -74,6 +74,9 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
+	"os"
 	"sort"
 	"strings"
 	"sync"
@@ -132,7 +135,22 @@ type Config struct {
 	// ExpiryPolls overrides DefaultExpiryPolls (0 = default). Tests that
 	// need membership pinned stable park it very high.
 	ExpiryPolls int
+
+	// LogOutput is where the adapter's own diagnostics write - a
+	// rate-limited line when consecutive store failures cross the
+	// degradation threshold, and the matching recovery line. nil means
+	// stderr (the gossip adapter's LogOutput convention); tests pass
+	// io.Discard.
+	LogOutput io.Writer
 }
+
+// degradedThreshold is the consecutive-failure count at which a loop logs
+// its degradation (and, on the next success, its recovery). Five failed
+// polls at the production cadence is ~5s of serving a stale view - the same
+// order as the expiry window, i.e. long enough to be a real outage signal
+// and short enough to catch a creds rotation / bucket policy / network ACL
+// break before peers have long since expired this node.
+const degradedThreshold = 5
 
 // docRow is one member's row in the membership document. The JSON field
 // names are a WIRE FORMAT shared by every node reading the document: changing
@@ -278,6 +296,17 @@ type Coordinator struct {
 	reducedEpoch uint64
 	reduced      *ring.Ring
 
+	// log receives the adapter's own diagnostics (see Config.LogOutput).
+	log *log.Logger
+
+	// I/O health watermarks (see Health). Success counters are monotone;
+	// failure counters count the run currently in progress and reset to 0
+	// on any success.
+	pollOK    atomic.Uint64
+	renewOK   atomic.Uint64
+	pollFail  atomic.Uint64
+	renewFail atomic.Uint64
+
 	closeCh     chan struct{}
 	closeOnce   sync.Once
 	loopWG      sync.WaitGroup
@@ -285,6 +314,38 @@ type Coordinator struct {
 	started     atomic.Bool
 	closed      atomic.Bool
 	hardStopped atomic.Bool
+}
+
+// Health is the adapter's I/O health surface: the two store loops' success
+// watermarks and current failure runs. The success counters are MONOTONE
+// watermarks in the adapter's own no-clocks idiom - an operator (or a
+// debug endpoint) samples Health twice and judges liveness by whether the
+// counters ADVANCED, never by comparing a timestamp. Counters count
+// pollOnce / renewOnce passes (background loops and Testing seams alike);
+// Start's synchronous first observation is not a poll and is not counted.
+type Health struct {
+	// PollSuccesses / RenewSuccesses are the monotone success watermarks.
+	// A PollSuccesses that stops advancing means the served view is frozen
+	// at its last snapshot; a stalled RenewSuccesses means peers will
+	// expire this node after their ExpiryPolls windows.
+	PollSuccesses  uint64
+	RenewSuccesses uint64
+	// ConsecutivePollFailures / ConsecutiveRenewFailures are the failure
+	// run currently in progress; any success resets them to 0. Crossing
+	// degradedThreshold also emits the rate-limited log line.
+	ConsecutivePollFailures  uint64
+	ConsecutiveRenewFailures uint64
+}
+
+// Health returns the current I/O health watermarks. Safe concurrently; no
+// locks, no I/O.
+func (c *Coordinator) Health() Health {
+	return Health{
+		PollSuccesses:            c.pollOK.Load(),
+		RenewSuccesses:           c.renewOK.Load(),
+		ConsecutivePollFailures:  c.pollFail.Load(),
+		ConsecutiveRenewFailures: c.renewFail.Load(),
+	}
 }
 
 // New returns an unstarted Coordinator. Nothing touches the store until
@@ -297,8 +358,13 @@ func New(cfg Config) *Coordinator {
 	if cfg.ExpiryPolls <= 0 {
 		cfg.ExpiryPolls = DefaultExpiryPolls
 	}
+	out := cfg.LogOutput
+	if out == nil {
+		out = os.Stderr
+	}
 	c := &Coordinator{
 		cfg:     cfg,
+		log:     log.New(out, "", log.LstdFlags),
 		changed: make(chan struct{}, 1),
 		closeCh: make(chan struct{}),
 		tracker: make(map[storageunit.NodeID]*leaseTrack),
@@ -539,7 +605,10 @@ func (c *Coordinator) runRenewalLoop(iv time.Duration) {
 		case <-c.closeCh:
 			return
 		case <-t.C:
-			_ = c.renewOnce() // transient store errors: the next tick retries
+			// The next tick retries a failed renewal; the failure itself is
+			// not swallowed - renewOnce advanced the Health watermark and
+			// logs when a run crosses the degradation threshold.
+			_ = c.renewOnce()
 		}
 	}
 }
@@ -553,7 +622,7 @@ func (c *Coordinator) runRenewalLoop(iv time.Duration) {
 // projection of it), so any divergence this adapter has not imagined heals
 // on the renewal cadence instead of sticking until an unrelated role change.
 func (c *Coordinator) renewOnce() error {
-	return c.mutate(func(d *document) bool {
+	err := c.mutate(func(d *document) bool {
 		c.rolesMu.Lock()
 		roles := c.roles
 		c.rolesMu.Unlock()
@@ -572,6 +641,17 @@ func (c *Coordinator) renewOnce() error {
 		})
 		return true
 	})
+	if err != nil {
+		if n := c.renewFail.Add(1); n == degradedThreshold {
+			c.log.Printf("cas: %d consecutive renewal failures; lease not advancing since renewal success #%d (peers expire this node after their ExpiryPolls windows): %v", n, c.renewOK.Load(), err)
+		}
+		return err
+	}
+	c.renewOK.Add(1)
+	if n := c.renewFail.Swap(0); n >= degradedThreshold {
+		c.log.Printf("cas: renewal recovered after %d consecutive failures", n)
+	}
+	return nil
 }
 
 // runPollLoop re-reads the document on the poll cadence. The adapter's other
@@ -595,17 +675,34 @@ func (c *Coordinator) runPollLoop(iv time.Duration) {
 // document, or a document that unexpectedly vanished - the store has no
 // delete, so that cannot normally happen) keeps serving the LAST snapshot:
 // stale answers cost availability, never correctness, and tearing the view
-// down on a blip would.
+// down on a blip would. What a failure does NOT do is stay invisible: it
+// advances the consecutive-failure watermark (see Health) and, when the run
+// crosses degradedThreshold, logs once - a node whose store access degrades
+// must be distinguishable from a quiet cluster.
 func (c *Coordinator) pollOnce() {
 	data, ver, err := c.cfg.Store.Get(c.cfg.Key)
 	if err != nil {
+		c.pollFailed(err)
 		return
 	}
 	d, err := decodeDocument(data)
 	if err != nil {
+		c.pollFailed(err)
 		return
 	}
+	c.pollOK.Add(1)
+	if n := c.pollFail.Swap(0); n >= degradedThreshold {
+		c.log.Printf("cas: poll recovered after %d consecutive failures; view is fresh again", n)
+	}
 	c.observe(d, ver)
+}
+
+// pollFailed records one failed observation pass, logging exactly once per
+// degradation episode (when the run crosses degradedThreshold).
+func (c *Coordinator) pollFailed(err error) {
+	if n := c.pollFail.Add(1); n == degradedThreshold {
+		c.log.Printf("cas: %d consecutive poll failures; serving a stale view since poll success #%d: %v", n, c.pollOK.Load(), err)
+	}
 }
 
 // observe is the single observation step both Start and the poll go
