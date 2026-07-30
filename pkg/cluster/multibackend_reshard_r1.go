@@ -129,10 +129,19 @@ func (c *Cluster) driveR1SplitCopies(gs genState) {
 	for _, ru := range c.ownedParentSlots(gs) {
 		k := ru.Unit.ID
 		if gs.hasCutOver(k) {
-			// Already flipped locally. Re-publish the durable marker (create-only,
-			// idempotent): a publish that failed after the local flip would
-			// otherwise never be retried, and peers need the marker to converge.
-			_ = c.publishCutoverMarker(gs.gen, k)
+			continue
+		}
+		// THE DURABLE MARKER IS THE FLIP AUTHORITY (review P0, reproduced):
+		// genState is in-memory only, so a node that crashed AFTER flipping K
+		// restarts with an empty cutOver set - and re-bisecting a flipped unit
+		// clear+copies the children back to a pre-flip parent image, silently
+		// reverting every write acked into them since the flip. Bisect ONLY
+		// when the marker is PROVABLY ABSENT: present means adopt (observe
+		// folds it into genState), and an ERROR means we cannot distinguish
+		// absent from unreadable - acting on absence-of-proof here is the
+		// exact mistake the serving-marker incident taxonomy warns about, so
+		// skip and let the next tick retry the read.
+		if present, err := c.cutoverMarkerPresent(gs.gen, k); err != nil || present {
 			continue
 		}
 		_ = c.bisectUnitOnlineR1(gs, k) // a failed unit retries next tick
@@ -200,15 +209,25 @@ func (c *Cluster) bisectUnitOnlineR1(gs genState, k storageunit.UnitID) error {
 			return fmt.Errorf("catch-up %s: %w", oldGU, err)
 		}
 	}
+	// DURABLE MARKER FIRST, LOCAL FLIP SECOND - the ordering is the crash
+	// safety (review P1). The pause WRITE side is still held, so no writer
+	// has passed the cut-over boundary yet: if the publish fails we simply do
+	// NOT flip - the children never took a post-flip write, and the next
+	// tick's re-bisect re-runs the clear+copy over them (exactly the
+	// interrupted-run case CLEAR-BEFORE-COPY already covers). Flipping first
+	// would open a window where writers ack into the children with NO durable
+	// record of the flip; a crash there re-bisects on restart and silently
+	// reverts every one of those acked writes - and no marker-present check
+	// can save them, because the marker never existed.
+	if err := c.publishCutoverMarker(gs.gen, k); err != nil {
+		return fmt.Errorf("cut-over marker for %s: %w (flip not committed; retrying next tick)", oldGU, err)
+	}
 	// ATOMIC CUT-OVER: flip K's routing while still holding the pause. Writers
 	// blocked on the pause wake after this and resolve the gen-(g+1) child.
 	cur := c.genSnapshot().clone()
 	cur.cutOver[k] = struct{}{}
 	c.commitGenState(cur)
-	// Publish the durable marker (create-only; exactly one node's create wins).
-	// On failure the local flip stands and driveR1SplitCopies re-publishes next
-	// tick, so a transient store error cannot strand peers.
-	return c.publishCutoverMarker(gs.gen, k)
+	return nil
 }
 
 // mountChildR1 returns the mounted backend for the gen-(g+1) child gu, opening

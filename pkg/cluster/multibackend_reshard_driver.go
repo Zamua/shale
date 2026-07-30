@@ -68,6 +68,16 @@ func (c *Cluster) observeReshard() {
 	}
 
 	if !gs.nextCount.IsZero() {
+		// OBSERVE BEFORE DRIVE (review P0): fold durable cut-over markers -
+		// peers' flips AND this node's own prior-life flips - into the
+		// in-memory view before driving any copy. A restarted node re-enters
+		// the split with an empty cutOver set; driving first would re-bisect
+		// its own already-flipped units and revert their post-flip acked
+		// writes. The drive functions also self-defend per unit, but the
+		// ordering makes the common restart path correct without relying on
+		// the per-unit check.
+		c.observeCutoverMarkers(gs)
+		gs = c.genSnapshot()
 		switch {
 		case !c.replicaLayout():
 			// R=1: the parent-anchored raw-bytes drive (split only; a merge

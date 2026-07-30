@@ -389,16 +389,33 @@ func (c *Cluster) Reshard() error {
 		return fmt.Errorf("cluster: Reshard is only valid in multi-backend mode")
 	}
 
-	// MULTI-NODE: a cross-node doubling cannot be made safe by the node-LOCAL
-	// write-pause alone, so it is DELEGATED to the decentralized CAS arbiter
-	// (retarget the agreed count, then the per-tick reconcile driver converges
-	// every node online - parent-anchored at R=1, dual-write at R>1 - built to
-	// the same NO-ACKED-WRITE-LOST invariant). reshardDelegated does NOT hold
-	// reshardMu: the reconcile passes it pumps take reshardMu themselves, and
-	// the arbiter's CAS target makes concurrent Reshard calls idempotent. The
-	// SINGLE-NODE inline path below stays unchanged, serialized by reshardMu.
-	if len(c.Members()) > 1 {
+	// DELEGATE WHENEVER THE ARBITER IS WIRED - not merely when the live
+	// member count exceeds one (review P1). The arbiter path (retarget the
+	// agreed count, then the per-tick reconcile driver converges every node
+	// online - parent-anchored at R=1, dual-write at R>1) is what advances
+	// the durable __cluster/init marker and the arbiter record, so a restart
+	// resumes the post-reshard generation. The inline path advances NEITHER,
+	// which on a ConditionalStore cluster is two real failures: a single-node
+	// cluster that reshards inline and restarts authoritatively adopts the
+	// STALE marker (acked-write loss: the retired generation's units serve
+	// again), and a member whose gossip view momentarily collapses to itself
+	// mid-partition would fork the cluster with a local-only generation the
+	// healed peers never converge to. Gating on the wiring, not the member
+	// VIEW, removes the view from the decision entirely. reshardDelegated
+	// does NOT hold reshardMu: the reconcile passes it pumps take reshardMu
+	// themselves, and the arbiter's CAS target makes concurrent Reshard calls
+	// idempotent. The INLINE path below survives only for storeless
+	// (arbiter-less) single-node clusters, where no durable marker or arbiter
+	// record exists to go stale.
+	if c.arbiter != nil {
 		return c.reshardDelegated()
+	}
+	if len(c.Members()) > 1 {
+		// Multi-node with NO ConditionalStore: the node-local write-pause
+		// cannot make a cross-node doubling safe, and there is no arbiter to
+		// delegate to. Typed refusal (the deployable slate backing already
+		// requires CAS-capable storage for manifest fencing).
+		return ErrReshardNeedsConditionalStore
 	}
 
 	c.reshardMu.Lock()
