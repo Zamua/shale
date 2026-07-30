@@ -2095,6 +2095,151 @@ storage layer does with them.
   learns "the newcomer exists" before "the newcomer is warming" and
   clean-cuts a position the newcomer displaces.
 
+## The CAS coordinator (pkg/coord/cas)
+
+The port's second adapter: `pkg/coord/cas` produces the same answers from ONE
+shared membership document in a `storageunit.ConditionalStore` (`PutIfAbsent` /
+`CompareAndSet` / `Get` - the same conditional-write seam the reshard arbiter
+runs on, implemented by slate's MinIO adapter and the in-process
+`MemConditionalStore`) instead of from a SWIM mesh. Both adapters are
+first-class and permanent: gossip serves every store (it needs no conditional
+writes); CAS serves deployments that already pay for a conditional store (a k8s
+deployment on MinIO/S3) and want one truth channel with no UDP mesh to
+operate. Nothing above the port moves when the adapter is swapped: serving
+markers, the drain protocol and `DrainForLeave`, overlap warm-up, boot-defer /
+generation learning, the settle debounce are all built on the port's ANSWERS
+and behave identically under either adapter.
+
+**The membership document.** All coordination state is one JSON document at a
+well-known key (`__coord/members`): a member list of rows `{id, addr, roles,
+declaredUnitCount, leaseGen}`. The store's opaque version token (an ETag on
+the real store) is the document's CAS handle. Every mutation - join, role
+change, lease renewal, expired-member GC, graceful leave - is a
+read-modify-write `CompareAndSet`, retried on `ErrPrecondition` with bounded
+backoff: one racer wins, the loser re-reads the winner's document and
+re-applies its edit, so concurrent editors interleave without ever losing each
+other's rows.
+
+**The lease model: counters, not clocks.** Each node renews its own lease by
+CAS-incrementing its OWN row's `leaseGen` on a fixed cadence (production
+default ~2s). Liveness is a monotone counter advancing in the document. No
+member ever writes a wall-clock timestamp and no observer ever compares one.
+
+**Failure detection is observer-side lease expiry.** Every node polls the
+document on its own cadence (production default ~1s; the poll and the renewal
+are the adapter's only two I/O loops, and both stop at Close). An observer
+tracks each member's `leaseGen` across its own poll ticks; a member whose
+`leaseGen` has not advanced for K consecutive observed polls (default 5) is
+EXPIRED: dropped from the view THIS OBSERVER serves. The judgment compares two
+rates the observer itself witnesses (its polls vs the member's renewals),
+never two clocks, so clock skew between nodes cannot false-expire anyone -
+and a stalled observer cannot either, because its poll ticks stall with it and
+the count restarts from the current `leaseGen` when it resumes. The tuning
+constraint is `K * pollInterval` comfortably above the renewal interval (the
+defaults give 5s of observed silence against a 2s renewal, a 2.5x margin);
+the port makes even a mis-tuned expiry an availability cost, never a
+correctness one. Any live member may GC an expired member's row out of the
+document via CAS - idempotent, and racing GCs resolve by CAS (one wins; the
+rest re-read a document that is already correct).
+
+**The tradeoff vs SWIM, stated honestly.** Detection latency is
+`K * pollInterval` (default ~5s) plus up to one renewal interval of slack -
+deliberately more conservative than SWIM's probe + suspicion pipeline, which
+reaps a dead peer in a couple of seconds. In exchange: no gossip port, no
+seed list, no mesh to operate, and a liveness that means exactly "this node
+can write the shared store" - for a store-backed deployment the liveness that
+matters, because a node that cannot reach the store cannot serve anyway. The
+document is also a serialization point: renewals are CAS writes to one
+object, so the document's write rate grows as N / renewalInterval and
+contention retries grow with N. Right for the small fleets this adapter
+targets; wrong for a hundred-node mesh, which is gossip's territory.
+
+**One snapshot, one basis: the dual-basis class is structurally absent.** The
+poll rebuilds a `pkg/ring` from the live (non-expired) member set whenever
+the observed membership changes and publishes `{view, ring}` as ONE immutable
+pair behind an atomic pointer swap. Every per-op query (`View`, `Populated`,
+`TransitionSets`, `PlacementMembers`, `Locate`) reads the currently published
+pair: no locks, no I/O, per the port. Because view and ring are one artifact
+derived from one source, `PlacementMembers()` equals `View()`'s member set
+ALWAYS - there is no event channel to drop and no reconcile cadence to wait
+out, so the gossip adapter's documented window (ring trails the snapshot,
+heals on reconcile) cannot exist here. `PlacementMembers` stays on the port
+because the guards that read it must work under either adapter; under CAS it
+simply never deviates.
+
+**Placement is the same math.** Same `pkg/ring`, same `GenUnitBytes` hash
+input, same bounded-load construction. `Placement.Exclude` is honored by the
+same genuinely-rebuilt reduced ring the gossip adapter uses, meeting the
+exactness contract (the placement that WILL HOLD after departure, never
+filter-after-locate). Given the same live member set, the two adapters answer
+Locate identically.
+
+**Bootstrap is discovery, and it is exact.** `Start` attempts `PutIfAbsent`
+of a document containing only self. Success IS founding (`BootstrapFounded`);
+`ErrPrecondition` means an incumbent document exists, so Start CAS-appends
+self's row and reports `BootstrapJoined`. `Params.InitialRoles` ride in that
+first row, atomic with the node's first appearance - the same atomicity the
+gossip adapter gets from the first Meta payload, closing the same
+member-before-warming race (and a founder still drops a requested
+`RoleJoining`, per the port). `SoloStart` collapses to store reachability:
+the conditional write makes founded-vs-joined a definitive answer rather than
+a could-not-reach-peers guess, so there is no tentative-then-correct dance
+(the gossip solo-found retraction has no CAS counterpart) and no silent-fork
+risk for the flag to guard. An unreachable STORE fails Start - the store is
+this adapter's one required peer.
+
+**Role visibility rides the poll, never the hint.** `SetRole` CAS-updates
+self's row (bounded retries) and returns; the flip becomes visible to the
+query methods when a poll next refreshes the snapshot - this node's own
+within one poll interval, each peer's within theirs. That satisfies the
+port's liveness clause the same way View does: the poll IS this mechanism's
+delivery, and the change hint plays no part in it, so a dropped hint can
+never freeze a stale role answer. Roles are exactly as live as membership
+itself - one snapshot - and `TransitionSets` can never disagree with `View`.
+
+**`Changed()` is the same lossy hint.** The poll fires the depth-1 coalescing
+channel when the document version it read differs from the one behind the
+snapshot it last published. Coalesced and droppable by contract; consumers
+re-read and reconcile on a cadence, exactly as under gossip.
+
+**Close is the graceful fast path; expiry is the crash path.** Close stops
+both loops, then best-effort CAS-removes self's row. A crash, a partition or
+a failed removal falls through to observer-side expiry - the same
+graceful-leave-vs-reaping split gossip has with Leave vs SWIM suspicion.
+
+**Generation agreement stays cluster-side.** The reshard arbiter already
+drives generation + cut-over agreement over the same `ConditionalStore`,
+above the port. The CAS coordinator does not absorb it: `Generation()`
+returns 0 and `ProposeGeneration` refuses with `ErrGenerationUnsupported`,
+exactly like gossip. (One document and one truth channel make this adapter
+the natural future home, but moving the arbiter is a separate change with its
+own migration story.)
+
+**Choosing an adapter.** Operational fit, not capability:
+
+- **CAS (`pkg/coord/cas`)** - needs a `ConditionalStore`. One truth channel:
+  membership, roles and liveness live in the store the data lives in, so
+  "coordinator says alive" and "can actually serve" cannot silently diverge.
+  No SWIM mesh, no seed lists, no extra open port: the k8s-friendly shape
+  (hostthis migrates to it). Slower failure detection (`K * poll`, ~5s
+  default) and a per-document CAS rate that grows with N.
+- **gossip (`pkg/coord/gossip`)** - works over ANY store; keeps every backend
+  without conditional writes fully supported. Faster failure detection (SWIM
+  probe + suspicion, seconds) and no central serialization point under
+  membership churn. Carries the documented dual-basis window and the
+  operational surface of a mesh: a bind port, seed lists, UDP reachability.
+
+**One contract, two adapters.** The port-contract tests that grew up inside
+the gossip suite are extracted to a shared harness, `internal/coordcontract`:
+`RunContract(t, adapter)` pins Populated tracking View, TransitionSets
+matching View's roles (nil-map steady state, retraction back to nil,
+caller-owned maps), the PlacementMembers basis agreement, Locate determinism
+across instances, primary-stable-across-N, clamping and degenerate n,
+exclusion as a genuinely reduced placement, and exclude-everyone-returns-nil.
+Every adapter runs the harness and keeps its adapter-specific suite on top
+(gossip: ring-drop heal, reconcile idempotence, bootstrap discovery; cas:
+lease expiry, document GC, bootstrap races).
+
 ## Roadmap
 
 - [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.
