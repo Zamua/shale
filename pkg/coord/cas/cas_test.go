@@ -14,6 +14,7 @@ package cas_test
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"strings"
 	"sync"
 	"testing"
@@ -957,6 +958,94 @@ func drain(ch <-chan struct{}) {
 		default:
 			return
 		}
+	}
+}
+
+// TestDuplicateIdentity_ReplacementDisplacesOldProcess pins the
+// displacement protocol: two processes with the SAME stable ID over one
+// store (the k8s StatefulSet replacement overlap - the old pod alive behind
+// a partitioned kubelet while its replacement bootstraps) must NOT silently
+// merge into one row. The replacement's bootstrap upsert takes the row over
+// (fresh incarnation, its addr); the old process's next renewal detects the
+// foreign incarnation and STEPS DOWN: renewals refuse and stop advancing
+// the row (a zombie renewing a dead replacement's lease is exactly what
+// would defeat expiry), polls freeze the last snapshot, SetRole refuses,
+// Health surfaces Displaced, and Close leaves the replacement's row alone.
+func TestDuplicateIdentity_ReplacementDisplacesOldProcess(t *testing.T) {
+	st := storageunit.NewMemConditionalStore()
+	oldCfg := manualCfg(st, 5)
+	oldCfg.LogOutput = io.Discard // the step-down logs; keep test output quiet
+	old := cas.New(oldCfg)
+	mustStart(t, old, "n", 0, 0)
+	if err := old.TestingRenewOnce(); err != nil {
+		t.Fatalf("pre-displacement renewal: %v", err)
+	}
+
+	// The replacement: same stable ID, new addr, same store.
+	replCfg := manualCfg(st, 5)
+	replCfg.LogOutput = io.Discard
+	repl := cas.New(replCfg)
+	if _, err := repl.Start(coord.Params{Self: coord.Node{ID: "n", Addr: "n:2"}}); err != nil {
+		t.Fatalf("replacement Start: %v", err)
+	}
+	t.Cleanup(func() { _ = repl.Close() })
+
+	// The bootstrap upsert replaced the row: the replacement's addr, a
+	// fresh incarnation, leaseGen advanced past the old one.
+	d := readDoc(t, st)
+	if len(d.Members) != 1 || d.Members[0].Addr != "n:2" {
+		t.Fatalf("document after the replacement's bootstrap = %+v, want one row at n:2", d.Members)
+	}
+	genTaken := d.Members[0].LeaseGen
+	incTaken := d.Members[0].Inc
+
+	// The old process's next renewal detects the foreign incarnation: it
+	// refuses, steps down, and the row does NOT advance.
+	if err := old.TestingRenewOnce(); err == nil {
+		t.Fatal("the displaced process's renewal reported success")
+	}
+	if !old.Health().Displaced {
+		t.Fatalf("Health after the displaced renewal = %+v, want Displaced", old.Health())
+	}
+	for i := 0; i < 3; i++ {
+		_ = old.TestingRenewOnce() // stays refused: renewals must never advance the row again
+	}
+	d = readDoc(t, st)
+	if d.Members[0].LeaseGen != genTaken || d.Members[0].Inc != incTaken || d.Members[0].Addr != "n:2" {
+		t.Fatalf("row after the displaced process's renewals = %+v, want untouched {gen %d inc %s addr n:2}",
+			d.Members[0], genTaken, incTaken)
+	}
+
+	// The displaced process keeps serving reads from its last snapshot but
+	// refuses every mutation surface.
+	if !old.Populated() || !sameIDs(viewIDs(old.View()), []string{"n"}) {
+		t.Fatalf("displaced view = %v, want the last snapshot [n] still served", viewIDs(old.View()))
+	}
+	verBefore := docVersion(t, st)
+	old.TestingPollOnce() // frozen: no observation, no GC on the replacement's behalf
+	if got := docVersion(t, st); got != verBefore {
+		t.Fatalf("a displaced poll moved the document %s -> %s", verBefore, got)
+	}
+	if err := old.SetRole(coord.RoleDraining); err == nil {
+		t.Fatal("SetRole on a displaced process reported success")
+	}
+
+	// The replacement renews normally: it owns the incarnation.
+	if err := repl.TestingRenewOnce(); err != nil {
+		t.Fatalf("replacement renewal: %v", err)
+	}
+	if got := readDoc(t, st).Members[0].LeaseGen; got != genTaken+1 {
+		t.Fatalf("replacement's renewal moved leaseGen to %d, want %d", got, genTaken+1)
+	}
+
+	// The old process's Close must NOT remove the row: it is the
+	// replacement's membership now.
+	if err := old.Close(); err != nil {
+		t.Fatalf("displaced Close: %v", err)
+	}
+	d = readDoc(t, st)
+	if len(d.Members) != 1 || d.Members[0].Inc != incTaken {
+		t.Fatalf("document after the displaced Close = %+v, want the replacement's row intact", d.Members)
 	}
 }
 
