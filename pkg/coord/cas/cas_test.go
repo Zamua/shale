@@ -408,6 +408,77 @@ func TestLeaseExpiry_DropsSilentMemberAndGCsItsRow(t *testing.T) {
 	}
 }
 
+// TestObserve_PeerGCdSelfRowKeepsSelfInView pins the port's "View always
+// contains Self once started" shape against the one document state that
+// used to break it: a peer expired this node (an over-eager expiry after a
+// stall) and GC'd its row, so this node's own poll reads a document WITHOUT
+// its row. The published view must still contain Self - with the locally
+// desired roles - because consumers compute their own position from it (a
+// self-less view silently drops a Draining stance and releases every
+// mounted unit). The renewal loop then re-inserts the row (self-heal).
+func TestObserve_PeerGCdSelfRowKeepsSelfInView(t *testing.T) {
+	const k = 2
+	store := storageunit.NewMemConditionalStore()
+	a := cas.New(manualCfg(store, k))
+	mustStart(t, a, "a", 0, 0)
+	b := cas.New(manualCfg(store, k))
+	mustStart(t, b, "b", 0, 0)
+
+	// b is mid-drain: the stance a self-less view would silently lose.
+	if err := b.SetRole(coord.RoleDraining); err != nil {
+		t.Fatalf("SetRole: %v", err)
+	}
+
+	// a expires b (baseline + k silent polls; the role write does not move
+	// b's leaseGen, so it does not reset a's count) and GCs b's row.
+	a.TestingPollOnce()
+	for i := 0; i < k; i++ {
+		a.TestingPollOnce()
+	}
+	if got := docIDs(readDoc(t, store)); !sameIDs(got, []string{"a"}) {
+		t.Fatalf("document rows after a's GC = %v, want [a] (b's row reaped)", got)
+	}
+
+	// b polls the document that lacks its own row: Self must stay in the
+	// view, carrying the locally-known Draining stance, and the placement
+	// basis must keep self too (one snapshot, one basis).
+	b.TestingPollOnce()
+	if got := viewIDs(b.View()); !sameIDs(got, []string{"a", "b"}) {
+		t.Fatalf("b's view after its row was GC'd = %v, want [a b]: View must always contain Self", got)
+	}
+	m, ok := b.View().Member("b")
+	if !ok || !m.Draining() {
+		t.Fatalf("synthesized self = %+v ok=%v, want present with the locally-desired Draining stance", m, ok)
+	}
+	if _, d := b.TransitionSets(); len(d) != 1 {
+		t.Fatalf("b's draining set with a GC'd self row = %v, want {b}: the drain stance must not silently vanish", d)
+	}
+	foundSelf := false
+	for _, n := range b.PlacementMembers() {
+		if n.ID == "b" {
+			foundSelf = true
+		}
+	}
+	if !foundSelf {
+		t.Fatalf("placement members %v lost self", b.PlacementMembers())
+	}
+
+	// The renewal re-inserts the document row, roles included: the self-heal
+	// path back into the membership.
+	if err := b.TestingRenewOnce(); err != nil {
+		t.Fatalf("renewal after the GC: %v", err)
+	}
+	d := readDoc(t, store)
+	if got := docIDs(d); !sameIDs(got, []string{"a", "b"}) {
+		t.Fatalf("document rows after b's renewal = %v, want [a b]: the renewal must re-insert self", got)
+	}
+	for _, r := range d.Members {
+		if r.ID == "b" && coord.Role(r.Roles) != coord.RoleDraining {
+			t.Fatalf("re-inserted row roles = %d, want Draining carried from the local record", r.Roles)
+		}
+	}
+}
+
 // TestLeaseExpiry_RenewalResetsTheCounter pins the observer-side judgment:
 // expiry counts CONSECUTIVE unadvanced polls, so a renewal observed at any
 // point restarts the count and a member renewing slower than the poll (but

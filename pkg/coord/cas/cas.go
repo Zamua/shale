@@ -610,13 +610,15 @@ func (c *Coordinator) observe(d *document, ver string) {
 	// itself alive (its renewal advances its own counter, and a node that
 	// cannot write the store cannot poll it either), which also keeps the
 	// port's "View always contains Self once started" shape.
-	live := make([]docRow, 0, len(d.Members))
+	live := make([]docRow, 0, len(d.Members)+1)
+	selfSeen := false
 	var expired []storageunit.NodeID
 	seen := make(map[storageunit.NodeID]struct{}, len(d.Members))
 	for _, row := range d.Members {
 		id := storageunit.NodeID(row.ID)
 		seen[id] = struct{}{}
 		if id == c.self.ID {
+			selfSeen = true
 			live = append(live, row)
 			continue
 		}
@@ -647,6 +649,28 @@ func (c *Coordinator) observe(d *document, ver string) {
 		if _, ok := seen[id]; !ok {
 			delete(c.tracker, id)
 		}
+	}
+
+	// SELF-EXEMPTION MUST SURVIVE A MISSING ROW. A peer that judged this
+	// node expired (an over-eager expiry after a stall) GC's its row, so the
+	// document this poll read may lack self entirely - and the row-driven
+	// loop above then produces a view WITHOUT Self, breaking the port's
+	// "View always contains Self once started" shape (consumers compute
+	// their own position from the view: a self-less view silently drops a
+	// Draining stance and releases every mounted unit). Synthesize self from
+	// local knowledge - identity, locally-desired roles, declared count -
+	// and let the renewal loop re-insert the document row (the self-heal
+	// path renewOnce already owns).
+	if !selfSeen {
+		c.rolesMu.Lock()
+		roles := c.roles
+		c.rolesMu.Unlock()
+		live = append(live, docRow{
+			ID:                string(c.self.ID),
+			Addr:              c.self.Addr,
+			Roles:             uint8(roles),
+			DeclaredUnitCount: c.declaredUnitCount,
+		})
 	}
 
 	snapMoved := c.publish(live)
