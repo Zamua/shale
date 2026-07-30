@@ -26,7 +26,6 @@
 package gossip
 
 import (
-	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -37,6 +36,7 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/pkg/coord"
+	"github.com/Zamua/shale/pkg/coord/internal/placement"
 	"github.com/Zamua/shale/pkg/membership"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -665,14 +665,9 @@ func (c *Coordinator) Close() error {
 // GenUnitBytes is the STABLE ring-input encoding of a generation-qualified
 // unit: 8 big-endian bytes of Generation followed by 4 of UnitID.
 //
-// It must be identical on every node, so it lives in exactly one place. The
-// generation is part of the hash input, so a unit's gen-g and gen-(g+1) ids
-// hash to different ring positions - which is what lets a doubling reshard
-// land the new generation's units wherever the ring places them. The id
-// carries no "{...}" hash tag, so ShardKey passes it through whole.
-func GenUnitBytes(gu storageunit.GenUnit) []byte {
-	var b [12]byte
-	binary.BigEndian.PutUint64(b[0:8], uint64(gu.Gen))
-	binary.BigEndian.PutUint32(b[8:12], uint32(gu.ID))
-	return b[:]
-}
+// It must be identical on every node AND under every adapter (a cluster
+// migrated between coordinators must keep its placement), so the
+// implementation lives in exactly one place - the adapter-shared
+// pkg/coord/internal/placement - and this export forwards to it, kept for
+// existing callers and the encoding-stability test.
+func GenUnitBytes(gu storageunit.GenUnit) []byte { return placement.GenUnitBytes(gu) }
