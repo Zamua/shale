@@ -26,6 +26,25 @@
 // deliberately more conservative than SWIM; the port makes even a mis-tuned
 // expiry an availability cost, never a correctness one.
 //
+// THE STORE OUTLIVES THE CLUSTER: RUN THIS ADAPTER WITH THE MARKER PATH.
+// A full-cluster crash (SIGKILL, power loss) removes no rows and leaves no
+// live observer to expire them, so every restarting node finds the prior
+// generation's rows and bootstrap reports BootstrapJoined even though every
+// "incumbent" is dead. The CAS coordinator is therefore DESIGNED to run with
+// cluster.Config.ConditionalStore wired to the SAME store: on that path a
+// joiner learns the generation from the durable bootstrap marker instead of
+// dialing a live incumbent, which makes all-nodes-crash recovery BOUNDED -
+// the zombie rows pollute the view for at most ExpiryPolls*PollInterval,
+// because bootstrap seeds every incumbent row's expiry baseline at Start
+// itself (observation begins at Start, not at the first poll), then expiry
+// drops them and GC reaps them. WITHOUT the marker path (ConditionalStore
+// nil), a joiner must learn the generation from a live peer that only serves
+// after its own Open returns: after a full-cluster crash all N nodes
+// mutually wait, each fails Open on the generation-learn budget, and
+// recovery degrades to the supervisor-restart cycle escaping only if some
+// node's bootstrap read lands in an all-rows-removed window. See the CAS
+// section of docs/SPEC.md.
+//
 // ONE SNAPSHOT, ONE BASIS - THE DUAL-BASIS CLASS IS STRUCTURALLY ABSENT.
 // The poll derives the live member set and rebuilds the placement ring from
 // it, publishing {view, ring} as ONE immutable pair behind an atomic pointer

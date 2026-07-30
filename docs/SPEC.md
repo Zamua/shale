@@ -2203,6 +2203,28 @@ a could-not-reach-peers guess, so there is no tentative-then-correct dance
 risk for the flag to guard. An unreachable STORE fails Start - the store is
 this adapter's one required peer.
 
+**The store outlives the cluster: run CAS with the marker path.** A
+full-cluster crash (SIGKILL, power loss) removes no rows and leaves no live
+observer to expire them, so every restarting node finds the prior
+generation's rows and bootstrap reports `BootstrapJoined` even though every
+"incumbent" is dead - the zero-rows founding rationale above applies
+verbatim to all-rows-dead, but the adapter cannot tell a dead incumbent
+from a slow one at Start. The CAS coordinator is therefore DESIGNED to run
+with `cluster.Config.ConditionalStore` wired to the SAME store (the shape
+the integration fixtures wire, and the production shape): on that path a
+joiner learns the generation from the durable bootstrap marker instead of
+dialing a live incumbent, which makes all-nodes-crash recovery BOUNDED -
+the zombie rows pollute the view for at most `ExpiryPolls * pollInterval`,
+because bootstrap seeds every incumbent row's expiry baseline at Start
+itself (observation begins at Start, not at the first poll), then expiry
+drops them and GC reaps their rows. WITHOUT the marker path
+(`ConditionalStore` nil), a joiner must learn the generation from a live
+peer that only begins serving after its own Open returns: after a
+full-cluster crash all N nodes mutually wait, each fails Open on the
+generation-learn budget, and recovery degrades to the supervisor-restart
+cycle escaping only if some node's bootstrap read lands in an
+all-rows-removed window. Deploy the CAS adapter with the marker path.
+
 **Role visibility rides the poll, never the hint.** `SetRole` CAS-updates
 self's row (bounded retries) and returns; the flip becomes visible to the
 query methods when a poll next refreshes the snapshot - this node's own

@@ -235,6 +235,64 @@ func TestStart_EmptyMembershipDocumentFounds(t *testing.T) {
 	}
 }
 
+// TestBootstrap_AllZombieDocumentExpiresInExactlyKPolls pins the bounded
+// zombie window after a full-cluster crash. The store outlives the cluster:
+// SIGKILL/power-loss of every node leaves all rows in the document, so a
+// restarting node finds only dead incumbents and reports BootstrapJoined
+// (the documented degradation - the marker path, cluster.Config
+// ConditionalStore wired to the SAME store, is what makes recovery bounded;
+// see the package doc). What THIS adapter guarantees is that the window is
+// structurally tight: bootstrap seeds the expiry baseline for every
+// incumbent row at Start itself, so the zombies drop from the view after
+// exactly ExpiryPolls observed polls - not ExpiryPolls polls after the
+// first poll - the view collapses to self, and the node GCs the zombie
+// rows out of the document.
+func TestBootstrap_AllZombieDocumentExpiresInExactlyKPolls(t *testing.T) {
+	const k = 3
+	store := storageunit.NewMemConditionalStore()
+
+	// Two nodes crash hard: their rows linger, nobody left to renew or reap.
+	for _, id := range []string{"z1", "z2"} {
+		z := cas.New(manualCfg(store, k))
+		mustStart(t, z, id, 0, 0)
+		if err := z.TestingShutdownNoLeave(); err != nil {
+			t.Fatalf("hard-killing %s: %v", id, err)
+		}
+	}
+	if got := docIDs(readDoc(t, store)); !sameIDs(got, []string{"z1", "z2"}) {
+		t.Fatalf("crash left document rows %v, want [z1 z2]", got)
+	}
+
+	// The restarting node joins the all-zombie document (the degradation the
+	// package doc documents: rows exist, so bootstrap cannot vouch nobody is
+	// alive) and sees the zombies in its first view.
+	n := cas.New(manualCfg(store, k))
+	if got := mustStart(t, n, "n", 0, 0); got != coord.BootstrapJoined {
+		t.Fatalf("starter into the zombie document reported %v, want BootstrapJoined", got)
+	}
+	if got := viewIDs(n.View()); !sameIDs(got, []string{"n", "z1", "z2"}) {
+		t.Fatalf("first view = %v, want [n z1 z2]", got)
+	}
+
+	// The baselines were seeded AT START: k-1 polls are not enough...
+	for i := 0; i < k-1; i++ {
+		n.TestingPollOnce()
+	}
+	if got := viewIDs(n.View()); !sameIDs(got, []string{"n", "z1", "z2"}) {
+		t.Fatalf("view after %d polls = %v, want zombies still present (expiry needs %d)", k-1, got, k)
+	}
+
+	// ...and the k-th poll drops both zombies: the view collapses to self and
+	// the GC reaps the zombie rows from the document.
+	n.TestingPollOnce()
+	if got := viewIDs(n.View()); !sameIDs(got, []string{"n"}) {
+		t.Fatalf("view after %d polls = %v, want [n] (zombie window must be exactly ExpiryPolls polls from Start)", k, got)
+	}
+	if got := docIDs(readDoc(t, store)); !sameIDs(got, []string{"n"}) {
+		t.Fatalf("document rows after the zombie GC = %v, want [n]", got)
+	}
+}
+
 // TestStart_Validation pins the fail-fast contract: a coordinator that
 // cannot establish itself must error rather than come up partial.
 func TestStart_Validation(t *testing.T) {
