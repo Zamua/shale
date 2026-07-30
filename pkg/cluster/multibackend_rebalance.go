@@ -93,11 +93,27 @@ func (c *Cluster) scheduleReconcileIn(d time.Duration) {
 		// pending obligation; the replacement inherits it. Do NOT
 		// double-count. Mirrors scheduleEvaluate.
 		//
+		// THE OBLIGATION ACCOUNTING TURNS ON WHETHER THE OLD TIMER FIRED
+		// (found as settlePending=-1 wedging every later idle-wait; CI R2
+		// boots, 3-in-12 under load). A LIVE timer we stop here never runs
+		// its callback, so the replacement INHERITS its obligation - no
+		// increment. A timer that already FIRED has a callback in flight
+		// that owns - and will release - that same obligation; if the
+		// replacement rode it without incrementing, the callback's release
+		// plus the replacement's own release double-decremented the single
+		// increment, the counter went NEGATIVE, and WaitForRebalanceIdle
+		// (checking ==0) never saw idle again. Boot is exactly this
+		// interleaving: the boot-defer prompt arms immediate, its zero-delay
+		// timer fires, and the join view hint re-arms before the callback
+		// takes settleMu.
+		//
 		// A zero-delay re-arm deliberately WINS over a pending debounced one:
 		// the obligation is the same single pass, sooner. Debounced-over-
 		// debounced also replaces, preserving the debounce's extend-on-burst
 		// semantics (the pass runs one settle delay after the LAST change).
-		c.settleTimer.Stop()
+		if !c.settleTimer.Stop() {
+			c.settlePending.Add(1)
+		}
 	} else {
 		// Fresh arm: this reconcile is pending until the timer callback
 		// below releases it, so WaitForRebalanceIdle blocks through it.

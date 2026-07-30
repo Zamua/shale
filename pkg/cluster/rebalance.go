@@ -79,7 +79,13 @@ func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
 	ticker := time.NewTicker(10 * time.Millisecond)
 	defer ticker.Stop()
 	for {
-		if c.settlePending.Load() == 0 {
+		// <= 0, not == 0: the counter is maintained to never go negative,
+		// but if an accounting bug ever drifts it below zero the failure
+		// must degrade to EARLY idle (a caller proceeds a beat soon), never
+		// to PERMANENTLY not-idle (== 0 is unsatisfiable from -1, and every
+		// idle-waiter times out forever after - the exact wedge the
+		// fired-timer double-decrement produced).
+		if c.settlePending.Load() <= 0 {
 			return nil
 		}
 		select {

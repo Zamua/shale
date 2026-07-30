@@ -416,3 +416,66 @@ func TestScheduleReconcileIn_DebouncedRearmMustNotPostponeImmediate(t *testing.T
 		time.Sleep(10 * time.Millisecond)
 	}
 }
+
+// TestScheduleReconcileIn_FiredTimerRearmOwnsFreshObligation pins the
+// obligation accounting across the fired-timer re-arm race (found live as
+// settlePending=-1 wedging every subsequent WaitForRebalanceIdle: CI R2
+// boots, 3-in-12 under 6-core load). A timer that already FIRED has a
+// callback in flight that owns - and will release - the pending obligation it
+// was armed with; a replacement arm landing in that window must therefore
+// count as a FRESH obligation. Riding the old one double-releases a single
+// increment and the counter goes negative.
+func TestScheduleReconcileIn_FiredTimerRearmOwnsFreshObligation(t *testing.T) {
+	c := &Cluster{}
+	c.cfg.RebalanceSettleDelay = time.Hour
+
+	// A FIRED timer whose callback has not yet cleared the field: the timer
+	// object has run (empty func - we play the callback's bookkeeping
+	// ourselves below), the field still references it, one obligation
+	// outstanding.
+	fired := time.AfterFunc(0, func() {})
+	time.Sleep(20 * time.Millisecond) // let it fire; Stop() now returns false
+	c.settleMu.Lock()
+	c.settlePending.Add(1)
+	c.settleImmediate = true
+	c.settleTimer = fired
+	c.settleMu.Unlock()
+
+	// The racing re-arm (the join view hint behind the boot-defer prompt).
+	c.scheduleReconcile()
+
+	if got := c.settlePending.Load(); got != 2 {
+		t.Fatalf("re-arm over a FIRED timer must own a fresh obligation: settlePending=%d, want 2", got)
+	}
+
+	// The in-flight callback releases the ORIGINAL obligation; the
+	// replacement timer's callback will release its own. Nothing can reach
+	// -1 from here.
+	c.settlePending.Add(-1)
+	c.settleMu.Lock()
+	if c.settleTimer != nil {
+		c.settleTimer.Stop()
+		c.settleTimer = nil
+	}
+	c.settleImmediate = false
+	c.settleMu.Unlock()
+	c.settlePending.Add(-1)
+	if got := c.settlePending.Load(); got != 0 {
+		t.Fatalf("balanced release should land at 0, got %d", got)
+	}
+}
+
+// TestWaitForRebalanceIdle_NegativePendingDegradesToIdle pins the defense
+// polarity: if the obligation counter ever drifts below zero despite the
+// accounting fix, the idle-wait must degrade to EARLY idle, never spin until
+// deadline (==0 is unsatisfiable from -1, which is how one boot-time race
+// turned into every later readiness wait timing out).
+func TestWaitForRebalanceIdle_NegativePendingDegradesToIdle(t *testing.T) {
+	c := &Cluster{}
+	c.settlePending.Store(-1)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	if err := c.WaitForRebalanceIdle(ctx); err != nil {
+		t.Fatalf("negative pending must read as idle, got %v", err)
+	}
+}
