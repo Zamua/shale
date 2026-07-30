@@ -305,3 +305,73 @@ func TestR1PlacementParentAnchored_InFlightSplit(t *testing.T) {
 		t.Fatalf("post-finalize local resolve = %s, want child %s", got, child)
 	}
 }
+
+// TestR1RestartMidSplit_MarkerIsFlipAuthority pins the crash-recovery
+// authority rule (review P0, originally REPRODUCED as a live loss): genState
+// is in-memory only, so a node that crashes AFTER flipping unit K re-enters
+// the split with an EMPTY cutOver set. The drive must treat K's DURABLE
+// cut-over marker as the flip authority and refuse to re-bisect - a re-bisect
+// clear+copies the children back to a pre-flip parent image, which silently
+// reverts every write acked into them since the flip and resurrects every
+// post-flip delete.
+//
+// Sequence (fully controlled, no timing): flip K, ack a Put and a Delete into
+// K's child through the public surface, then simulate the restart by
+// committing a genState whose cutOver is EMPTY (exactly what re-entering the
+// split from the arbiter's agreed count produces), and drive. The acked Put
+// must survive, the Delete must stay deleted, and observing markers must fold
+// the flip back into the in-memory view.
+func TestR1RestartMidSplit_MarkerIsFlipAuthority(t *testing.T) {
+	oldInterval := reconcileInterval
+	reconcileInterval = time.Hour
+	t.Cleanup(func() { reconcileInterval = oldInterval })
+
+	const n = 4
+	c, _ := openReshardCluster(t, n)
+	store := storageunit.NewMemConditionalStore()
+	c.cfg.ConditionalStore = store
+
+	preKey, postKey, unit := keysInSameUnit(t, c)
+	if err := c.Put([]byte(preKey), []byte("pre-split")); err != nil {
+		t.Fatalf("pre-split Put: %v", err)
+	}
+
+	gs := enterR1Split(t, c)
+	if err := c.bisectUnitOnlineR1(gs, unit); err != nil {
+		t.Fatalf("bisect %d: %v", unit, err)
+	}
+
+	// Acked writes that exist ONLY in the child: a new Put and a Delete of
+	// the pre-split key (both resolve the gen-(g+1) child now that cutOver
+	// holds the unit).
+	if err := c.Put([]byte(postKey), []byte("acked-after-flip")); err != nil {
+		t.Fatalf("post-flip Put: %v", err)
+	}
+	if err := c.Delete([]byte(preKey)); err != nil {
+		t.Fatalf("post-flip Delete: %v", err)
+	}
+
+	// THE RESTART: a fresh process re-enters the split from the arbiter's
+	// agreed count with an EMPTY in-memory cutOver set.
+	restarted := c.genSnapshot().clone()
+	restarted.cutOver = map[storageunit.UnitID]struct{}{}
+	c.commitGenState(restarted)
+
+	// Drive. Pre-fix this re-bisected the flipped unit and reverted both
+	// acked writes; the marker-authority check must skip it.
+	c.driveR1SplitCopies(c.genSnapshot())
+
+	// The restart path folds durable flips back into the in-memory view.
+	c.observeCutoverMarkers(c.genSnapshot())
+	if !c.genSnapshot().hasCutOver(unit) {
+		t.Fatalf("observe did not re-adopt unit %d's durable flip after the restart", unit)
+	}
+
+	got, err := c.Get([]byte(postKey))
+	if err != nil || !bytes.Equal(got, []byte("acked-after-flip")) {
+		t.Fatalf("acked post-flip Put was reverted by the restart drive: val=%q err=%v", got, err)
+	}
+	if _, err := c.Get([]byte(preKey)); err == nil {
+		t.Fatalf("post-flip Delete was resurrected by the restart drive")
+	}
+}
