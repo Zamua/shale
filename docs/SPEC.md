@@ -2153,6 +2153,22 @@ correctness one. Any live member may GC an expired member's row out of the
 document via CAS - idempotent, and racing GCs resolve by CAS (one wins; the
 rest re-read a document that is already correct).
 
+**Duplicate identity is displacement, and the old process steps down.** Each
+node records the incarnation nonce it minted for its own row; every renewal
+verifies the row still carries it. A row wearing a different `inc` means a
+replacement process with the same stable ID took the identity over (the k8s
+StatefulSet overlap: the old pod still running behind a partitioned kubelet
+while its replacement bootstraps). Blindly renewing would merge the two
+processes into one lease - and if the replacement then dies non-gracefully,
+the zombie keeps the row's counter advancing forever, so no observer ever
+expires a row whose address points at a dead pod. The old process STEPS
+DOWN instead: it marks itself displaced (surfaced through the adapter's
+`Health()` accessor), stops renewing, polling and GC'ing, keeps serving
+reads from its last published snapshot, and never mutates the document
+again - Close skips the graceful row removal too, because the row now
+belongs to the replacement. Terminal state; the supervisor retires the
+displaced process.
+
 **The tradeoff vs SWIM, stated honestly.** Detection latency is
 `K * pollInterval` (default ~5s) plus up to one renewal interval of slack -
 deliberately more conservative than SWIM's probe + suspicion pipeline, which

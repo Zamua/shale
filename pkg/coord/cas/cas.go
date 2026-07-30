@@ -26,6 +26,19 @@
 // deliberately more conservative than SWIM; the port makes even a mis-tuned
 // expiry an availability cost, never a correctness one.
 //
+// DUPLICATE IDENTITY IS DISPLACEMENT, AND THE OLD PROCESS STEPS DOWN. Self
+// records the incarnation nonce it minted for its own row; every renewal
+// verifies the row still carries it. A row wearing a DIFFERENT inc means a
+// replacement process with the same stable ID took the identity over (the
+// k8s StatefulSet overlap: the old pod still running behind a partitioned
+// kubelet while its replacement bootstraps). The old process must not merge
+// into the new row - blindly incrementing it would keep a dead
+// replacement's lease advancing forever, defeating expiry - so it steps
+// down: marks itself displaced (surfaced via Health), stops renewing,
+// polling and GC'ing, keeps serving reads from its last snapshot, and
+// never mutates the document again (Close skips the row removal too: the
+// row is the replacement's membership).
+//
 // THE STORE OUTLIVES THE CLUSTER: RUN THIS ADAPTER WITH THE MARKER PATH.
 // A full-cluster crash (SIGKILL, power loss) removes no rows and leaves no
 // live observer to expire them, so every restarting node finds the prior
@@ -284,6 +297,19 @@ type Coordinator struct {
 	rolesMu sync.Mutex
 	roles   coord.Role
 
+	// selfInc is the incarnation nonce this process last WROTE for its own
+	// row (minted at bootstrap, re-minted by a renewal re-add). The renewal
+	// verifies the row still carries it: a different inc means a
+	// replacement process with the same stable ID displaced this one.
+	// incMu guards it.
+	incMu   sync.Mutex
+	selfInc string
+
+	// displaced is latched by stepDown when a renewal finds self's row
+	// wearing another process's incarnation. Once set, this process never
+	// mutates the document again and serves reads from its last snapshot.
+	displaced atomic.Bool
+
 	// pollMu serializes observation passes (the background loop vs the
 	// Testing seam) and guards the observer state below.
 	pollMu  sync.Mutex
@@ -335,6 +361,13 @@ type Health struct {
 	// degradedThreshold also emits the rate-limited log line.
 	ConsecutivePollFailures  uint64
 	ConsecutiveRenewFailures uint64
+	// Displaced reports that a replacement process with this node's stable
+	// ID took the membership row over (a renewal found the row wearing a
+	// different incarnation nonce). This process has stepped down: it
+	// serves reads from its last snapshot and never mutates the document
+	// again. Terminal: the honest exit is for the supervisor to retire
+	// this process.
+	Displaced bool
 }
 
 // Health returns the current I/O health watermarks. Safe concurrently; no
@@ -345,6 +378,7 @@ func (c *Coordinator) Health() Health {
 		RenewSuccesses:           c.renewOK.Load(),
 		ConsecutivePollFailures:  c.pollFail.Load(),
 		ConsecutiveRenewFailures: c.renewFail.Load(),
+		Displaced:                c.displaced.Load(),
 	}
 }
 
@@ -486,6 +520,10 @@ func (c *Coordinator) bootstrap(p coord.Params) (coord.Bootstrap, *document, str
 		LeaseGen:          1,
 		Inc:               newInc(),
 	}
+	// Record the incarnation this process is about to write: renewals
+	// verify the row still carries it, and a mismatch means a replacement
+	// process with the same stable ID displaced us (see renewOnce).
+	c.setSelfInc(founderRow.Inc)
 	for attempt := 0; attempt < casAttempts; attempt++ {
 		// Attempt the founding write: a document holding only self.
 		d := &document{Members: []docRow{founderRow}}
@@ -609,8 +647,42 @@ func (c *Coordinator) runRenewalLoop(iv time.Duration) {
 			// not swallowed - renewOnce advanced the Health watermark and
 			// logs when a run crosses the degradation threshold.
 			_ = c.renewOnce()
+			if c.displaced.Load() {
+				return // stepped down: this process never writes the document again
+			}
 		}
 	}
+}
+
+// errDisplaced is returned by mutating entry points after stepDown: a
+// replacement process with this node's stable ID owns the membership row,
+// and this process must never write the document again.
+var errDisplaced = errors.New("cas: displaced: a newer process with this node's ID owns the membership row")
+
+// selfIncarnation returns the incarnation nonce this process last wrote for
+// its own row.
+func (c *Coordinator) selfIncarnation() string {
+	c.incMu.Lock()
+	defer c.incMu.Unlock()
+	return c.selfInc
+}
+
+func (c *Coordinator) setSelfInc(inc string) {
+	c.incMu.Lock()
+	c.selfInc = inc
+	c.incMu.Unlock()
+}
+
+// stepDown latches the displaced state (idempotent) and logs it once. A
+// displaced process keeps serving reads from its last published snapshot -
+// tearing the view down would turn an identity handover into an outage for
+// in-flight readers - but stops renewing, polling, GC'ing and role-writing:
+// the document, row included, belongs to the replacement now.
+func (c *Coordinator) stepDown() {
+	if !c.displaced.CompareAndSwap(false, true) {
+		return
+	}
+	c.log.Printf("cas: node %s: membership row carries a different incarnation - a replacement process with this ID displaced us; stepping down (serving the last snapshot, no further document writes)", c.self.ID)
 }
 
 // renewOnce advances self's leaseGen by one read-modify-write cycle. If a
@@ -621,31 +693,61 @@ func (c *Coordinator) runRenewalLoop(iv time.Duration) {
 // record is the single source of truth for self's roles; the document is a
 // projection of it), so any divergence this adapter has not imagined heals
 // on the renewal cadence instead of sticking until an unrelated role change.
+//
+// RENEWAL IS ALSO WHERE DISPLACEMENT IS DETECTED. The renewal verifies the
+// row still carries the incarnation THIS process wrote; a different inc
+// means a replacement process with the same stable ID took the identity
+// over (the k8s StatefulSet overlap: this pod still running behind a
+// partitioned kubelet while its replacement bootstraps). Blindly
+// incrementing that row would merge the two processes into one lease - and
+// if the replacement then dies non-gracefully, this zombie keeps the row's
+// counter advancing forever, so no observer ever expires a row whose Addr
+// points at a dead pod. The old process steps down instead (see stepDown).
 func (c *Coordinator) renewOnce() error {
+	if c.displaced.Load() {
+		return errDisplaced
+	}
+	var (
+		displaced bool
+		addedInc  string
+	)
 	err := c.mutate(func(d *document) bool {
+		displaced, addedInc = false, "" // reset: the closure re-runs on CAS retries
 		c.rolesMu.Lock()
 		roles := c.roles
 		c.rolesMu.Unlock()
 		if i := d.find(c.self.ID); i >= 0 {
+			if d.Members[i].Inc != c.selfIncarnation() {
+				displaced = true
+				return false // the row is the replacement's: do not touch it
+			}
 			d.Members[i].LeaseGen++
 			d.Members[i].Roles = uint8(roles) // drift heal: desired is authoritative
 			return true
 		}
+		addedInc = newInc() // a fresh incarnation: observers reset their expiry count
 		d.upsert(docRow{
 			ID:                string(c.self.ID),
 			Addr:              c.self.Addr,
 			Roles:             uint8(roles),
 			DeclaredUnitCount: c.declaredUnitCount,
 			LeaseGen:          1,
-			Inc:               newInc(), // a fresh incarnation: observers reset their expiry count
+			Inc:               addedInc,
 		})
 		return true
 	})
+	if displaced {
+		c.stepDown()
+		return errDisplaced
+	}
 	if err != nil {
 		if n := c.renewFail.Add(1); n == degradedThreshold {
 			c.log.Printf("cas: %d consecutive renewal failures; lease not advancing since renewal success #%d (peers expire this node after their ExpiryPolls windows): %v", n, c.renewOK.Load(), err)
 		}
 		return err
+	}
+	if addedInc != "" {
+		c.setSelfInc(addedInc) // the re-add landed: that inc is ours now
 	}
 	c.renewOK.Add(1)
 	if n := c.renewFail.Swap(0); n >= degradedThreshold {
@@ -665,6 +767,9 @@ func (c *Coordinator) runPollLoop(iv time.Duration) {
 		case <-c.closeCh:
 			return
 		case <-t.C:
+			if c.displaced.Load() {
+				return // stepped down: the last snapshot is frozen (see stepDown)
+			}
 			c.pollOnce()
 		}
 	}
@@ -680,6 +785,13 @@ func (c *Coordinator) runPollLoop(iv time.Duration) {
 // crosses degradedThreshold, logs once - a node whose store access degrades
 // must be distinguishable from a quiet cluster.
 func (c *Coordinator) pollOnce() {
+	if c.displaced.Load() {
+		// Stepped down: the document (self's row included) belongs to the
+		// replacement process. Observing it would adopt the replacement's
+		// row as "self" and GC on its behalf; the honest behavior is a
+		// frozen last snapshot and no document access at all.
+		return
+	}
 	data, ver, err := c.cfg.Store.Get(c.cfg.Key)
 	if err != nil {
 		c.pollFailed(err)
@@ -1030,6 +1142,9 @@ func excludeKey(exclude map[storageunit.NodeID]struct{}) string {
 // query methods when a poll next refreshes the snapshot (roles ride the
 // poll, never the change hint).
 func (c *Coordinator) SetRole(want coord.Role) error {
+	if c.displaced.Load() {
+		return errDisplaced // stepped down: the row is the replacement's to write
+	}
 	c.rolesMu.Lock()
 	if c.roles == want || !c.started.Load() {
 		c.roles = want
@@ -1073,7 +1188,10 @@ func (c *Coordinator) ProposeGeneration(storageunit.Generation) error {
 // graceful fast path; a crash, partition or failed removal falls through to
 // observer-side expiry). Idempotent, and a safe no-op before Start. After a
 // TestingShutdownNoLeave the removal is skipped: a SIGKILLed process runs
-// nothing, so its row must linger for peers to reap.
+// nothing, so its row must linger for peers to reap. After a displacement
+// step-down the removal is skipped too: the row wearing the replacement's
+// incarnation is the REPLACEMENT's membership, and removing it would tear
+// the live process out of the cluster on the dead one's way out.
 func (c *Coordinator) Close() error {
 	if !c.closed.CompareAndSwap(false, true) {
 		c.loopWG.Wait()
@@ -1081,7 +1199,7 @@ func (c *Coordinator) Close() error {
 	}
 	c.closeOnce.Do(func() { close(c.closeCh) })
 	c.loopWG.Wait()
-	if c.started.Load() && !c.hardStopped.Load() {
+	if c.started.Load() && !c.hardStopped.Load() && !c.displaced.Load() {
 		_ = c.mutate(func(d *document) bool {
 			i := d.find(c.self.ID)
 			if i < 0 {
