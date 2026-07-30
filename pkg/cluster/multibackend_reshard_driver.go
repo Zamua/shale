@@ -51,6 +51,15 @@ func (c *Cluster) observeReshard() {
 
 	gs := c.genSnapshot()
 	if gs.nextCount.IsZero() {
+		// R=1 MERGE SCOPING: the R=1 driver supports SPLIT only. A merge needs a
+		// cross-node copy into the survivor, and the R=1 write path stores RAW
+		// bytes (no LWW envelopes), so the R>1 quorum-forward merge machinery
+		// cannot run on R=1 data. Refuse to enter (and, below, to advance
+		// toward) a merge target rather than half-build a raw-bytes forward.
+		// See docs/SPEC.md "R=1 multi-node reshard".
+		if !c.replicaLayout() && s.Count.N() < gs.count.N() {
+			return
+		}
 		// Steady: enter a split (set nextCount) if the agreed count is ahead.
 		if next, changed := reshardGenStep(gs, s); changed {
 			c.commitGenState(next)
@@ -59,9 +68,14 @@ func (c *Cluster) observeReshard() {
 	}
 
 	if !gs.nextCount.IsZero() {
-		if gs.nextCount.N() > gs.count.N() {
+		switch {
+		case !c.replicaLayout():
+			// R=1: the parent-anchored raw-bytes drive (split only; a merge
+			// never enters at R=1 per the gate above).
+			c.driveR1SplitCopies(gs)
+		case gs.nextCount.N() > gs.count.N():
 			c.driveSplitCopies(gs)
-		} else {
+		default:
 			c.driveMergeCopies(gs)
 		}
 		c.observeCutoverMarkers(gs)
@@ -73,6 +87,9 @@ func (c *Cluster) observeReshard() {
 	}
 
 	if shouldAdvanceArbiter(gs, s) {
+		if !c.replicaLayout() && s.Target.N() < gs.count.N() {
+			return // R=1 merge target: refuse to advance (see the gate above)
+		}
 		_, _, _ = c.arbiter.Advance()
 	}
 }
@@ -256,7 +273,22 @@ func (c *Cluster) finalizeParent(ru storageunit.ReplicaUnit, gs genState) bool {
 // holds its write-pause). A SPLIT copies into the co-located children and
 // requires a clean re-scan; a MERGE forwards into the survivor with a quorum ack
 // per key. Returns whether it succeeded (false defers the retire).
+//
+// At R=1 there is NO final copy, by design, and running one would be WRONG, not
+// merely wasteful: R=1 units store RAW bytes (no LWW envelopes), so re-copying
+// the parent over the children at finalize would clobber every post-cut-over
+// child write with the stale parent image and resurrect post-cut-over deletes
+// (copyUnitInto is a bare Put with no apply-if-newer to shield it). It is also
+// unnecessary: the R=1 cut-over already ran the clear+copy UNDER the parent's
+// write-pause WRITE side (bisectUnitOnlineR1), so the children exactly matched
+// the parent at the flip, and after the flip no write can reach the parent -
+// the owner's local resolve honors cutOver, and parent-anchored placement
+// funnels every write for the key-space to this owner. The parent is provably
+// static; retire it as-is.
 func (c *Cluster) finalCopyUnderPause(ru storageunit.ReplicaUnit, gs genState) bool {
+	if !c.replicaLayout() {
+		return true // R=1: the pause-held cut-over copy was the final copy
+	}
 	if gs.nextCount.N() > gs.count.N() { // SPLIT
 		clean, err := c.copyParentUntilCaughtUp(ru, gs)
 		return err == nil && clean

@@ -650,13 +650,18 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	c.writeServingMarker(ru, openedEpoch, "acquire")
 }
 
-// releaseReplicaUnit unmounts the ReplicaUnit ru via the per-replica factory.
-// The mount entry is removed BEFORE the close so a routed op stops resolving
-// the local backend immediately. Caller MUST hold reconcileMu.
+// releaseReplicaUnit unmounts the ReplicaUnit ru via the factory. The mount
+// entry is removed BEFORE the close so a routed op stops resolving the local
+// backend immediately. The close addresses the mount by mountRefFor - the
+// per-replica ref at R>1, the unit's sole ref at R=1 - so the ref matches the
+// one the mount was OPENED with (the R=1 arbiter-driven finalize retires
+// parents through here; closing the R>1 ReplicaMount ref on an R=1 cluster
+// would silently miss the open handle and leak it). Caller MUST hold
+// reconcileMu.
 func (c *Cluster) releaseReplicaUnit(ru storageunit.ReplicaUnit) {
 	c.mounts.unmount(ru)
 	c.mounts.forgetOpenEpoch(ru) // a re-acquire records a fresh open epoch.
-	_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
+	_ = c.factory.CloseUnit(c.mountRefFor(ru))
 }
 
 // applyBatchToUnit is the multi-backend analogue of ApplyBatchLocal's apply
@@ -794,8 +799,8 @@ func (c *Cluster) putReplicatedUnitAttempt(ctx context.Context, key, envBytes []
 // the local-self branch applies the envelope APPLY-IF-NEWER into the key's
 // MOUNTED unit (applyEnvelopeIfNewerToUnit) instead of c.applyEnvelopeIfNewer;
 // the remote branch dispatches PutForwarded to the replica node, whose RPC
-// handler lands in LocalReplicaPut (multi R>1 branch). A frozen / acquiring
-// replica returns the transient code the fan-out tolerates.
+// handler lands in LocalReplicaPut (multi R>1 branch). An acquiring replica
+// returns the transient code the fan-out tolerates.
 func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica coord.Node, ru storageunit.ReplicaUnit, key, envBytes []byte) error {
 	if string(replica.ID) == c.cfg.NodeID {
 		// v0.8 Phase 2e (pending ranges): apply the union dual-write to the EXPLICIT
@@ -808,12 +813,7 @@ func (c *Cluster) dispatchReplicaPutUnit(ctx context.Context, replica coord.Node
 		// current owner and the fan-out tolerates the transient. There is NO
 		// per-position forward (the union routes directly to both current and
 		// pending owners).
-		if c.isFrozen() {
-			// Reshard write-freeze (Phase 4 / multi-node reshard): refuse with the
-			// retryable error, same as the remote leg, so no write is acked during
-			// the static bisect.
-			return errWriteFrozen("Put")
-		}
+		//
 		// resolveAndApplyReplicaPut quiesces a parent-slot write around the v0.9
 		// finalize retire (pause read side) so no acked write lands on a retiring
 		// parent; outside a split it is the plain resolve + apply.

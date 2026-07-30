@@ -137,46 +137,52 @@ func (c *Cluster) genUnitOwner(gu storageunit.GenUnit) (storageunit.NodeID, bool
 
 // desiredGenUnits returns the generation-qualified units this node SHOULD
 // have mounted right now: for the cluster's CURRENT generation + count, every
-// unit whose GenUnit the ring assigns to self. Mid-reshard a unit that has
-// already cut over is resolved at the NEW generation (its gen-(g+1) children),
-// so the desired set is the union of the not-yet-cut-over gen-g units and the
-// cut-over units' gen-(g+1) children that this node owns. It is the
-// generation-aware, ring-backed derivation of the desired mount set (at R=1;
+// unit whose GenUnit the ring assigns to self. It is the generation-aware,
+// ring-backed derivation of the desired mount set (at R=1;
 // desiredReplicaUnits is its R>1 sibling); the Phase 3 reconcile diffs it
 // against the factory's OpenUnits() to decide acquire / release.
+//
+// While an arbiter-driven SPLIT is in flight (nextCount != 0), the desired set
+// is PARENT-ANCHORED (the R=1 analogue of splitChildrenVia): every gen-g
+// parent this node owns on the ring - cut over or not, since parents retire
+// only at finalize - plus BOTH gen-(g+1) children of each owned parent,
+// CO-LOCATED with it. Co-location keeps the bisect copy local and, with
+// parent-anchored placement (placementGenUnitForKey), keeps the whole split
+// window's writes on one node per unit. cutOver governs ROUTING (which
+// generation a key resolves to on the owner), not which units are mounted, so
+// a reconcile running mid-split never releases an in-flight child or a
+// flipped-but-not-finalized parent. After finalize the children redistribute
+// to their gen-(g+1) ring homes by the normal copy-free lease handoff.
 func (c *Cluster) desiredGenUnits() []storageunit.GenUnit {
 	gs := c.genSnapshot()
 	want := make(map[storageunit.GenUnit]struct{})
 	self := storageunit.NodeID(c.cfg.NodeID)
 	ownerOf := c.genOwner // ring-backed by default; test-overridable
 
-	// Old-generation units that have NOT cut over are still live at gen g.
-	for _, u := range gs.count.IDs() {
-		if gs.hasCutOver(u) {
-			// This old unit has been retired; its key-space now lives in the
-			// gen-(g+1) children, handled by the new-count pass below.
-			continue
-		}
-		gu := storageunit.NewGenUnit(gs.gen, u)
-		if owner, ok := ownerOf(gu); ok && owner == self {
+	if !gs.nextCount.IsZero() && gs.nextCount.N() > gs.count.N() {
+		// IN-FLIGHT SPLIT: parents this node owns at gen g, plus their two
+		// co-located gen-(g+1) children each.
+		for _, u := range gs.count.IDs() {
+			gu := storageunit.NewGenUnit(gs.gen, u)
+			owner, ok := ownerOf(gu)
+			if !ok || owner != self {
+				continue
+			}
 			want[gu] = struct{}{}
-		}
-	}
-
-	// Cut-over units contribute their two gen-(g+1) children. nextCount is the
-	// doubled count; with no reshard in flight the cut-over set is empty and
-	// this loop adds nothing (steady state is the old-gen pass only).
-	if !gs.nextCount.IsZero() {
-		for u := range gs.cutOver {
 			low, high, err := storageunit.ChildUnits(u, gs.count)
 			if err != nil {
 				continue
 			}
-			for _, child := range []storageunit.UnitID{low, high} {
-				gu := storageunit.NewGenUnit(gs.gen+1, child)
-				if owner, ok := ownerOf(gu); ok && owner == self {
-					want[gu] = struct{}{}
-				}
+			want[storageunit.NewGenUnit(gs.gen+1, low)] = struct{}{}
+			want[storageunit.NewGenUnit(gs.gen+1, high)] = struct{}{}
+		}
+	} else {
+		// STEADY STATE (or a defensive non-split in-flight shape): every gen-g
+		// unit the ring assigns to self.
+		for _, u := range gs.count.IDs() {
+			gu := storageunit.NewGenUnit(gs.gen, u)
+			if owner, ok := ownerOf(gu); ok && owner == self {
+				want[gu] = struct{}{}
 			}
 		}
 	}
@@ -262,8 +268,13 @@ func (c *Cluster) initMultiBackend() error {
 			return err
 		}
 		if !founded {
-			// Adopt the marker's durable {gen, count}. (A founder wrote
-			// {gen:0, count:N}; initGenState already seeded that, nothing to do.)
+			// Adopt the marker's durable {gen, count} - DEFERRING (bounded) while
+			// the durable reshard state reports a reshard in flight, so a joiner
+			// does not seed from a value the reshard is about to advance (the
+			// marker-path join gate; see deferAdoptionWhileReshardInFlight).
+			// (A founder wrote {gen:0, count:N}; initGenState already seeded
+			// that, nothing to do.)
+			gen, count = c.deferAdoptionWhileReshardInFlight(gen, count)
 			c.commitGenState(genState{
 				gen:     gen,
 				count:   count,
@@ -376,8 +387,14 @@ func (c *Cluster) closeMountedUnits() error {
 // ownership question goes through the unit (resolved generation-aware), not the
 // raw key. With no coordination view the local node owns everything
 // (single-node multi-backend).
+//
+// Ownership resolves through placementGenUnitForKey, NOT genUnitForKey: during
+// an R=1 in-flight split, placement is PARENT-ANCHORED (ignores cutOver) so
+// every node forwards a splitting unit's key-space to the same gen-g owner for
+// the whole window, while only that owner's LOCAL db resolve honors cutOver.
+// See multibackend_reshard_r1.go. Steady state the two resolvers agree.
 func (c *Cluster) unitOwnerOf(key []byte) (owner coord.Node, isLocal bool) {
-	ns := c.locate(c.genUnitForKey(key), 1, coord.Placement{})
+	ns := c.locate(c.placementGenUnitForKey(key), 1, coord.Placement{})
 	if len(ns) == 0 {
 		return c.selfNode(), true
 	}

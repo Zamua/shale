@@ -1,16 +1,17 @@
-// Decentralized reshard agreement wiring for multi-backend mode (v0.9).
+// Decentralized reshard agreement wiring for multi-backend mode (v0.9+).
 //
 // This file is the cluster-side seam between the agreement layer (pkg/reshard's
 // Arbiter, a CAS-guarded epoch object in shared storage) and the per-unit
 // routing substrate (genState). It owns ONLY the construction + seeding of the
 // Arbiter here; the routing, online copy, and per-unit cut-over machinery the
-// Arbiter drives land in sibling files as later phases.
+// Arbiter drives land in sibling files.
 //
-// Scope: the decentralized online reshard is R>1 multi-backend ONLY. The R=1
-// multi-node path keeps the coordinated freeze barrier
-// (multibackend_reshard_barrier.go); the single-node path keeps the inline
-// online bisect (multibackend_reshard.go). So the Arbiter is constructed only
-// when cfg.ConditionalStore is set AND replicaFactory != nil (R>1).
+// Scope: the decentralized online reshard covers EVERY multi-backend cluster
+// with a ConditionalStore - R>1 (envelope dual-write driver) AND R=1 (the
+// parent-anchored raw-bytes driver, multibackend_reshard_r1.go). The
+// single-node path keeps the inline online bisect (multibackend_reshard.go).
+// The Arbiter is constructed whenever cfg.ConditionalStore is set on a
+// multi-backend cluster.
 
 package cluster
 
@@ -24,9 +25,10 @@ import (
 
 // initReshardArbiter constructs and seeds the decentralized reshard Arbiter when
 // this cluster opts into the declarative path: a ConditionalStore is configured
-// AND this is an R>1 multi-backend cluster (replicaFactory wired). It is a no-op
-// (leaves c.arbiter nil) otherwise, so a cluster without a ConditionalStore, or
-// at R=1 / legacy, stays byte-for-byte on the existing reshard paths.
+// on a multi-backend cluster (ANY R - the R=1 multi-node reshard is arbiter-
+// driven too, via the parent-anchored driver). It is a no-op (leaves c.arbiter
+// nil) otherwise, so a cluster without a ConditionalStore, or legacy, stays
+// byte-for-byte on the existing reshard paths.
 //
 // Called from initMultiBackend AFTER initReplicatedFactory (which sets
 // replicaFactory) and BEFORE the unit mount, so the agreed epoch object exists
@@ -39,7 +41,7 @@ import (
 // leaving a node that opted into the decentralized path without its agreement
 // object.
 func (c *Cluster) initReshardArbiter() error {
-	if c.cfg.ConditionalStore == nil || !c.replicaLayout() {
+	if c.cfg.ConditionalStore == nil {
 		return nil
 	}
 	a := reshard.NewArbiter(c.cfg.ConditionalStore)

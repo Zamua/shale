@@ -51,18 +51,26 @@ func TestInitReshardArbiter_NilStoreNoArbiter(t *testing.T) {
 	}
 }
 
-// TestInitReshardArbiter_R1NoArbiter pins that even WITH a ConditionalStore an
-// R=1 multi-backend cluster does NOT construct an Arbiter: the decentralized
-// online reshard is R>1 only and R=1 keeps the coordinated freeze barrier.
-func TestInitReshardArbiter_R1NoArbiter(t *testing.T) {
+// TestInitReshardArbiter_SeedsOnR1 pins that WITH a ConditionalStore an R=1
+// multi-backend cluster constructs + seeds the Arbiter too: the R=1 multi-node
+// reshard is arbiter-driven (the parent-anchored driver replaced the retired
+// coordinated freeze barrier).
+func TestInitReshardArbiter_SeedsOnR1(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 8, 1, backing, "n1", "n2")
 	c.cfg.ConditionalStore = storageunit.NewMemConditionalStore()
 	if err := c.initReshardArbiter(); err != nil {
 		t.Fatalf("initReshardArbiter: %v", err)
 	}
-	if c.arbiter != nil {
-		t.Fatalf("R=1 cluster should not construct an arbiter (R>1-only feature)")
+	if c.arbiter == nil {
+		t.Fatalf("R=1 cluster with a ConditionalStore should construct an arbiter (the R=1 multi-node reshard is arbiter-driven)")
+	}
+	st, _, err := c.arbiter.Read()
+	if err != nil {
+		t.Fatalf("read seeded state: %v", err)
+	}
+	if st.Epoch != 0 || st.Count.N() != 8 || st.Target.N() != 8 || st.Plan != reshard.PlanNone {
+		t.Fatalf("seeded state = %+v, want epoch0 count8 target8 none", st)
 	}
 }
 

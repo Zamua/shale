@@ -172,7 +172,7 @@ func (w *retryWait) advance() {
 
 // jitteredBackoff returns d scaled by a uniform factor in [0.5, 1.0), so a
 // thundering herd of simultaneously-retrying callers does not re-collide on the
-// same retry tick. Matches the v0.3 cutover / freeze-window retry shape.
+// same retry tick. Matches the v0.3 cutover / acquiring-window retry shape.
 func jitteredBackoff(d time.Duration) time.Duration {
 	if d <= 0 {
 		return 0

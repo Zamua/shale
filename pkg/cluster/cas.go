@@ -39,11 +39,10 @@ var CASMaxAttempts = 10
 var casBaseBackoff = 2 * time.Millisecond
 
 // transactUnavailableTimeout bounds how long Transact keeps re-running its
-// closure through a retryable codes.Unavailable commit (the cluster is briefly
-// write-frozen for a reshard, or the pin unit's lease is mid-handoff) before
-// surfacing the Unavailable to the caller. Generous enough to ride out a
-// cluster-wide freeze (bounded by the reshard's per-phase timeout). var so
-// tests can shrink it.
+// closure through a retryable codes.Unavailable commit (a reshard cut-over
+// pause, or the pin unit's lease mid-handoff) before surfacing the
+// Unavailable to the caller. Generous enough to ride out a whole reshard
+// window. var so tests can shrink it.
 var transactUnavailableTimeout = 30 * time.Second
 
 // transactRetryableBackoffCap bounds the exponential backoff the retryable-
@@ -64,7 +63,7 @@ var transactUnavailableTimeout = 30 * time.Second
 //   - BUDGET SHAPE. The bound here is not one wall clock. It is a wall clock
 //     (transactUnavailableTimeout) AND a re-run cap (transactRetryableMaxRuns)
 //     AND the conflict budget (CASMaxAttempts) - and the retryable branch
-//     deliberately DECREMENTS the loop counter so a transient freeze does not
+//     deliberately DECREMENTS the loop counter so a transient window does not
 //     consume a conflict attempt. The shared wait assumes one monotonic
 //     schedule; this loop's attempt counter is not monotonic.
 //   - INJECTION POINT. The retryable branch sleeps through the transactSleep
@@ -78,16 +77,16 @@ var transactRetryableBackoffCap = 500 * time.Millisecond
 // transactRetryableMaxRuns caps how many times Transact re-runs fn through a
 // retryable commit status before giving up with ErrTransactRetriesExhausted.
 // The retryable statuses that reach this loop are outcome (d) only: a PRE-
-// commit refusal that applied nothing (a cluster-wide freeze / lease mid-
-// handoff codes.Unavailable, a reshard-cutover codes.FailedPrecondition, a
+// commit refusal that applied nothing (a cut-over / lease mid-handoff
+// codes.Unavailable, a reshard-cutover codes.FailedPrecondition, a
 // graceful-leave fence recoded to codes.Unavailable). A committed-but-under-
 // replicated commit (outcome (c)) is NO LONGER one of them: it is classified as
 // success-under-replication at the source (CommitCASApply / casResultToError),
 // so it never enters this loop. The cap therefore bounds how many times one
 // Transact re-runs fn while riding out a genuine transient window; an unbounded
 // loop on an aggressive flat backoff re-runs every few milliseconds for the
-// whole transactUnavailableTimeout, and a herd of callers behind one freeze
-// hammers the (unfreezing) owner. transactUnavailableTimeout remains the outer
+// whole transactUnavailableTimeout, and a herd of callers behind one reshard
+// window hammers the recovering owner. transactUnavailableTimeout remains the outer
 // wall-clock bound; whichever trips first ends the loop. var so tests can
 // shrink it.
 var transactRetryableMaxRuns = 24
@@ -558,7 +557,7 @@ func (c *Cluster) casFenceToTransient(tx backend.Transaction, op string, err err
 // (re-resolving the owner from the live ring each attempt), rather than a
 // terminal failure. Two gRPC status codes qualify:
 //
-//   - codes.Unavailable: the cluster-wide write-freeze window, or the pin
+//   - codes.Unavailable: a reshard cut-over / acquiring window, or the pin
 //     unit's lease mid-handoff. The owner refuses the commit retryably.
 //   - codes.FailedPrecondition: a forwarded CommitCAS reached the node that
 //     just lost ownership of pin_key across the reshard FLIP/redistribution
@@ -694,23 +693,23 @@ func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error)
 		if err == nil {
 			return nil
 		}
-		// A retryable commit status (freeze / handoff Unavailable, or the
+		// A retryable commit status (cut-over / handoff Unavailable, or the
 		// reshard-cutover re-pin FailedPrecondition) is transient: back off and
 		// re-run fn from scratch without spending a conflict attempt, until the
 		// deadline or the re-run cap, whichever trips first. This makes a
-		// reshard barrier invisible to Transact callers - the commit
+		// reshard invisible to Transact callers - the commit
 		// re-resolves the owner from the live ring each attempt, so a re-run
 		// after a cutover lands on the new owner (the commit's gRPC status
 		// survives the wire per the CAS server's status-preserving path).
 		//
-		// Only outcome (d) reaches here - a PRE-commit refusal (freeze /
-		// handoff / reshard-cutover / recoded fence) that applied nothing.
+		// Only outcome (d) reaches here - a PRE-commit refusal (cut-over /
+		// handoff / reshard re-pin / recoded fence) that applied nothing.
 		// Outcome (c), a committed-but-under-replicated commit, is classified as
 		// success at the source (CommitCASApply -> casResultToError / the wire
 		// mapping return nil), so it never enters this loop and fn is never re-
 		// run for an already-durable write. The loop stays POLITE anyway (see
-		// docs/SPEC.md "The four commit outcomes"): a herd behind one multi-
-		// second freeze would otherwise hammer the owner. The backoff grows
+		// docs/SPEC.md "The four commit outcomes"): a herd behind one reshard
+		// window would otherwise hammer the owner. The backoff grows
 		// exponentially with full jitter (uniform in (0, backoff], doubling per
 		// consecutive retryable failure up to transactRetryableBackoffCap) and
 		// the re-runs are capped at transactRetryableMaxRuns, past which the
@@ -733,7 +732,7 @@ func (c *Cluster) Transact(pinKey []byte, fn func(tx backend.Transaction) error)
 			if retryableBackoff > transactRetryableBackoffCap {
 				retryableBackoff = transactRetryableBackoffCap
 			}
-			attempt-- // do not consume the conflict budget for a transient freeze
+			attempt-- // do not consume the conflict budget for a transient window
 			continue
 		}
 		if !errors.Is(err, backend.ErrCASConflict) {

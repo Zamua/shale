@@ -74,9 +74,6 @@ func (c *Cluster) LocalReplicaPutAt(ru storageunit.ReplicaUnit, key, bytesToWrit
 	if c.notReady() {
 		return backend.ErrClosed
 	}
-	if c.isFrozen() {
-		return errWriteFrozen("Put")
-	}
 	// resolveAndApplyReplicaPut quiesces a parent-slot write around the v0.9
 	// finalize retire (pause read side) so a forwarded dual-write cannot land on a
 	// retiring parent and be lost; outside a split it is the plain resolve + apply.
@@ -146,9 +143,6 @@ func (c *Cluster) LocalReplicaScanAt(ru storageunit.ReplicaUnit, prefix []byte) 
 func (c *Cluster) LocalReplicaDeleteAt(ru storageunit.ReplicaUnit, key, _ []byte) error {
 	if c.notReady() {
 		return backend.ErrClosed
-	}
-	if c.isFrozen() {
-		return errWriteFrozen("Delete")
 	}
 	b, ok := c.localBackendForReplicaUnit(ru)
 	if !ok {

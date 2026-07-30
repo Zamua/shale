@@ -82,13 +82,13 @@ func (s *Server) CommitCAS(ctx context.Context, req *pb.CommitCASRequest) (*pb.C
 //   - Conflict: the OCC retry signal, a typed bool (not a gRPC error), same
 //     convention GetResponse uses for not-found.
 //   - Err with Committed==false: a genuine NOT-committed failure. A commit
-//     error carrying a gRPC status (the freeze-window / acquiring-window
+//     error carrying a gRPC status (the cut-over / acquiring-window
 //     retryable codes.Unavailable, the reshard-cutover codes.FailedPrecondition,
 //     the migration-guard codes.ResourceExhausted) must reach the client AS a
 //     gRPC status error so status.Code() classifies it - exactly the convention
 //     ApplyBatch uses for its migration-guard rejection. Flattening it to
 //     resp.Error would erase the code (the client would wrap the string as
-//     status.Code()==Unknown and mis-read a retryable freeze as a hard
+//     status.Code()==Unknown and mis-read a retryable refusal as a hard
 //     failure). A plain backend failure (no status) travels as the response
 //     error string (the wire convention for an unexpected apply error -> the
 //     owner rolled back).

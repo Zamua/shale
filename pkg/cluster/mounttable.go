@@ -23,7 +23,7 @@ import (
 // it across arbitrary cluster code. Every multi-step read-modify-write that the
 // old call sites performed inside ONE shared-mutex hold is a single method here (see
 // armDrain, completeAcquireFlip, releaseDrained, evictIfSame, finishStuckGainer,
-// clearOrphanedDrain, dropGeneration, takeAll), so those critical sections keep
+// clearOrphanedDrain, takeAll), so those critical sections keep
 // their atomicity without exposing the lock.
 //
 // NO RE-ENTRANCY. No method calls back into cluster code while holding mu. The
@@ -584,37 +584,6 @@ func (t *mountTable) evictIfSame(ru storageunit.ReplicaUnit, failed backend.Back
 		return true
 	}
 	return false
-}
-
-// dropGeneration removes every mount at generation gen and returns the GenUnits
-// it dropped, so the caller closes them OUTSIDE the lock. Collect-and-delete is
-// one critical section so a concurrent mount cannot slip a position past the
-// sweep between the two halves.
-//
-// It deletes the POSITIONS it collected rather than re-deriving replica 0 from
-// each unit. The inline predecessor derived replica0(gu), which is the same key
-// on the only path that reaches this (the R=1 reshard barrier, where every
-// mount is at replica 0) but silently wrong above R=1: a position at replica 1
-// would be REPORTED dropped - so the caller closes its backend - while its table
-// entry survived, leaving a mount pointing at a closed database. Extracting this
-// into a named, reusable method is what makes that worth correcting now: the
-// quirk was invisible while it was four lines inside one caller, and is a trap
-// once it has a name and a doc comment inviting a second one.
-func (t *mountTable) dropGeneration(gen storageunit.Generation) []storageunit.GenUnit {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	dropped := make([]storageunit.GenUnit, 0)
-	positions := make([]storageunit.ReplicaUnit, 0)
-	for ru := range t.mounts {
-		if ru.Unit.Gen == gen {
-			dropped = append(dropped, ru.Unit)
-			positions = append(positions, ru)
-		}
-	}
-	for _, ru := range positions {
-		delete(t.mounts, ru)
-	}
-	return dropped
 }
 
 // takeAll empties the table and returns every position it held, so the caller

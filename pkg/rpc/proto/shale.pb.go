@@ -40,83 +40,6 @@ const (
 	_ = protoimpl.EnforceVersion(protoimpl.MaxVersion - 20)
 )
 
-// ReshardPhase is the barrier phase the coordinator is driving. The
-// receiving node's per-phase handler is idempotent (a repeated FREEZE is
-// a no-op while already frozen for the same target generation, etc.).
-type ReshardPhase int32
-
-const (
-	// RESHARD_PHASE_UNSPECIFIED is the proto3 zero value; the server rejects
-	// it with an error so a malformed request never silently no-ops.
-	ReshardPhase_RESHARD_PHASE_UNSPECIFIED ReshardPhase = 0
-	// FREEZE pauses writes cluster-wide: Put / Delete / Begin (and the CAS
-	// commit write path) return a retryable error (codes.Unavailable) until
-	// RESUME or ABORT. Reads continue, served from the live gen-g units.
-	ReshardPhase_RESHARD_PHASE_FREEZE ReshardPhase = 1
-	// BISECT runs the local per-node bisect under the freeze: for each gen-g
-	// unit this node owns, copy its keys into fresh gen-(g+1) units K and
-	// K+N (created in the shared backing). With writes frozen the copy is
-	// static, so there is no catch-up window.
-	ReshardPhase_RESHARD_PHASE_BISECT ReshardPhase = 2
-	// FLIP atomically advances this node's genState to the target generation
-	// (routing now resolves the 2N units) and retires its old gen-g units.
-	// No node flips until every node has bisected; the freeze still holds.
-	ReshardPhase_RESHARD_PHASE_FLIP ReshardPhase = 3
-	// RESUME unfreezes: writes resume at the new generation. The 2N units
-	// then redistribute across nodes via the Phase 3 lease handoff.
-	ReshardPhase_RESHARD_PHASE_RESUME ReshardPhase = 4
-	// ABORT is the fail-safe: unfreeze, discard any half-built gen-(g+1)
-	// units (harmless, never routed), and STAY at the current generation.
-	ReshardPhase_RESHARD_PHASE_ABORT ReshardPhase = 5
-)
-
-// Enum value maps for ReshardPhase.
-var (
-	ReshardPhase_name = map[int32]string{
-		0: "RESHARD_PHASE_UNSPECIFIED",
-		1: "RESHARD_PHASE_FREEZE",
-		2: "RESHARD_PHASE_BISECT",
-		3: "RESHARD_PHASE_FLIP",
-		4: "RESHARD_PHASE_RESUME",
-		5: "RESHARD_PHASE_ABORT",
-	}
-	ReshardPhase_value = map[string]int32{
-		"RESHARD_PHASE_UNSPECIFIED": 0,
-		"RESHARD_PHASE_FREEZE":      1,
-		"RESHARD_PHASE_BISECT":      2,
-		"RESHARD_PHASE_FLIP":        3,
-		"RESHARD_PHASE_RESUME":      4,
-		"RESHARD_PHASE_ABORT":       5,
-	}
-)
-
-func (x ReshardPhase) Enum() *ReshardPhase {
-	p := new(ReshardPhase)
-	*p = x
-	return p
-}
-
-func (x ReshardPhase) String() string {
-	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
-}
-
-func (ReshardPhase) Descriptor() protoreflect.EnumDescriptor {
-	return file_shale_proto_enumTypes[0].Descriptor()
-}
-
-func (ReshardPhase) Type() protoreflect.EnumType {
-	return &file_shale_proto_enumTypes[0]
-}
-
-func (x ReshardPhase) Number() protoreflect.EnumNumber {
-	return protoreflect.EnumNumber(x)
-}
-
-// Deprecated: Use ReshardPhase.Descriptor instead.
-func (ReshardPhase) EnumDescriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{0}
-}
-
 // ReplicaUnitRef POSITION-ADDRESSES one leg of a routed op (v0.8 Phase 2e,
 // pending ranges). It is live and load-bearing on every union write and read.
 //
@@ -1557,110 +1480,6 @@ func (x *ApplyBatchResponse) GetError() string {
 	return ""
 }
 
-// ReshardControlRequest carries one barrier phase + the target generation
-// g+1 the coordinator is driving toward. target_gen lets a node reject a
-// request that disagrees with its own current generation (a stale or
-// crossed reshard) rather than apply it blindly.
-type ReshardControlRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Phase         ReshardPhase           `protobuf:"varint,1,opt,name=phase,proto3,enum=shale.v1.ReshardPhase" json:"phase,omitempty"`
-	TargetGen     uint64                 `protobuf:"varint,2,opt,name=target_gen,json=targetGen,proto3" json:"target_gen,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ReshardControlRequest) Reset() {
-	*x = ReshardControlRequest{}
-	mi := &file_shale_proto_msgTypes[25]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ReshardControlRequest) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ReshardControlRequest) ProtoMessage() {}
-
-func (x *ReshardControlRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[25]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ReshardControlRequest.ProtoReflect.Descriptor instead.
-func (*ReshardControlRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{25}
-}
-
-func (x *ReshardControlRequest) GetPhase() ReshardPhase {
-	if x != nil {
-		return x.Phase
-	}
-	return ReshardPhase_RESHARD_PHASE_UNSPECIFIED
-}
-
-func (x *ReshardControlRequest) GetTargetGen() uint64 {
-	if x != nil {
-		return x.TargetGen
-	}
-	return 0
-}
-
-// ReshardControlResponse is the node's ack. An empty error means the phase
-// was applied (the barrier ack the coordinator waits for); a non-empty
-// error means the node could not apply the phase, which the coordinator
-// treats as an ABORT trigger.
-type ReshardControlResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Error         string                 `protobuf:"bytes,1,opt,name=error,proto3" json:"error,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
-}
-
-func (x *ReshardControlResponse) Reset() {
-	*x = ReshardControlResponse{}
-	mi := &file_shale_proto_msgTypes[26]
-	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-	ms.StoreMessageInfo(mi)
-}
-
-func (x *ReshardControlResponse) String() string {
-	return protoimpl.X.MessageStringOf(x)
-}
-
-func (*ReshardControlResponse) ProtoMessage() {}
-
-func (x *ReshardControlResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[26]
-	if x != nil {
-		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
-		if ms.LoadMessageInfo() == nil {
-			ms.StoreMessageInfo(mi)
-		}
-		return ms
-	}
-	return mi.MessageOf(x)
-}
-
-// Deprecated: Use ReshardControlResponse.ProtoReflect.Descriptor instead.
-func (*ReshardControlResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{26}
-}
-
-func (x *ReshardControlResponse) GetError() string {
-	if x != nil {
-		return x.Error
-	}
-	return ""
-}
-
 // GenStateRequest carries no parameters: the joiner just asks the seed for
 // its current generation state. The seed answers from its own genSnapshot().
 type GenStateRequest struct {
@@ -1671,7 +1490,7 @@ type GenStateRequest struct {
 
 func (x *GenStateRequest) Reset() {
 	*x = GenStateRequest{}
-	mi := &file_shale_proto_msgTypes[27]
+	mi := &file_shale_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1683,7 +1502,7 @@ func (x *GenStateRequest) String() string {
 func (*GenStateRequest) ProtoMessage() {}
 
 func (x *GenStateRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[27]
+	mi := &file_shale_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1696,7 +1515,7 @@ func (x *GenStateRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenStateRequest.ProtoReflect.Descriptor instead.
 func (*GenStateRequest) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{27}
+	return file_shale_proto_rawDescGZIP(), []int{25}
 }
 
 // GenStateResponse carries the responder's live {generation, unit-count}.
@@ -1705,17 +1524,26 @@ func (*GenStateRequest) Descriptor() ([]byte, []int) {
 // than re-derived from the joiner's configured UnitCount doubled `generation`
 // times) so the contract is unambiguous and a future non-doubling resize
 // cannot silently desync the count from the generation.
+//
+// reshard_in_flight reports that the responder has a reshard IN FLIGHT
+// (genState.nextCount set): its {generation, unit_count} is about to change,
+// so it is NOT a stable value to seed a joiner's routing state from. The
+// joiner treats an in-flight answer as not-an-answer and retries (within its
+// GenLearnBudget) until a responder is steady - the join-defers-while-
+// resharding gate. An older responder that does not set the field reads as
+// steady (false), matching its pre-field behavior.
 type GenStateResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Generation    uint64                 `protobuf:"varint,1,opt,name=generation,proto3" json:"generation,omitempty"`
-	UnitCount     uint32                 `protobuf:"varint,2,opt,name=unit_count,json=unitCount,proto3" json:"unit_count,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	Generation      uint64                 `protobuf:"varint,1,opt,name=generation,proto3" json:"generation,omitempty"`
+	UnitCount       uint32                 `protobuf:"varint,2,opt,name=unit_count,json=unitCount,proto3" json:"unit_count,omitempty"`
+	ReshardInFlight bool                   `protobuf:"varint,3,opt,name=reshard_in_flight,json=reshardInFlight,proto3" json:"reshard_in_flight,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
 }
 
 func (x *GenStateResponse) Reset() {
 	*x = GenStateResponse{}
-	mi := &file_shale_proto_msgTypes[28]
+	mi := &file_shale_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1727,7 +1555,7 @@ func (x *GenStateResponse) String() string {
 func (*GenStateResponse) ProtoMessage() {}
 
 func (x *GenStateResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_shale_proto_msgTypes[28]
+	mi := &file_shale_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1740,7 +1568,7 @@ func (x *GenStateResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GenStateResponse.ProtoReflect.Descriptor instead.
 func (*GenStateResponse) Descriptor() ([]byte, []int) {
-	return file_shale_proto_rawDescGZIP(), []int{28}
+	return file_shale_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *GenStateResponse) GetGeneration() uint64 {
@@ -1755,6 +1583,13 @@ func (x *GenStateResponse) GetUnitCount() uint32 {
 		return x.UnitCount
 	}
 	return 0
+}
+
+func (x *GenStateResponse) GetReshardInFlight() bool {
+	if x != nil {
+		return x.ReshardInFlight
+	}
+	return false
 }
 
 var File_shale_proto protoreflect.FileDescriptor
@@ -1846,27 +1681,15 @@ const file_shale_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x1a\n" +
 	"\benvelope\x18\x02 \x01(\fR\benvelope\"*\n" +
 	"\x12ApplyBatchResponse\x12\x14\n" +
-	"\x05error\x18\x01 \x01(\tR\x05error\"d\n" +
-	"\x15ReshardControlRequest\x12,\n" +
-	"\x05phase\x18\x01 \x01(\x0e2\x16.shale.v1.ReshardPhaseR\x05phase\x12\x1d\n" +
-	"\n" +
-	"target_gen\x18\x02 \x01(\x04R\ttargetGen\".\n" +
-	"\x16ReshardControlResponse\x12\x14\n" +
 	"\x05error\x18\x01 \x01(\tR\x05error\"\x11\n" +
-	"\x0fGenStateRequest\"Q\n" +
+	"\x0fGenStateRequest\"}\n" +
 	"\x10GenStateResponse\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\x04R\n" +
 	"generation\x12\x1d\n" +
 	"\n" +
-	"unit_count\x18\x02 \x01(\rR\tunitCount*\xac\x01\n" +
-	"\fReshardPhase\x12\x1d\n" +
-	"\x19RESHARD_PHASE_UNSPECIFIED\x10\x00\x12\x18\n" +
-	"\x14RESHARD_PHASE_FREEZE\x10\x01\x12\x18\n" +
-	"\x14RESHARD_PHASE_BISECT\x10\x02\x12\x16\n" +
-	"\x12RESHARD_PHASE_FLIP\x10\x03\x12\x18\n" +
-	"\x14RESHARD_PHASE_RESUME\x10\x04\x12\x17\n" +
-	"\x13RESHARD_PHASE_ABORT\x10\x052\x9e\x06\n" +
+	"unit_count\x18\x02 \x01(\rR\tunitCount\x12*\n" +
+	"\x11reshard_in_flight\x18\x03 \x01(\bR\x0freshardInFlight2\xc9\x05\n" +
 	"\tShaleNode\x122\n" +
 	"\x03Put\x12\x14.shale.v1.PutRequest\x1a\x15.shale.v1.PutResponse\x122\n" +
 	"\x03Get\x12\x14.shale.v1.GetRequest\x1a\x15.shale.v1.GetResponse\x12;\n" +
@@ -1879,8 +1702,7 @@ const file_shale_proto_rawDesc = "" +
 	"\x04Ping\x12\x15.shale.v1.PingRequest\x1a\x16.shale.v1.PingResponse\x12D\n" +
 	"\tCommitCAS\x12\x1a.shale.v1.CommitCASRequest\x1a\x1b.shale.v1.CommitCASResponse\x12G\n" +
 	"\n" +
-	"ApplyBatch\x12\x1b.shale.v1.ApplyBatchRequest\x1a\x1c.shale.v1.ApplyBatchResponse\x12S\n" +
-	"\x0eReshardControl\x12\x1f.shale.v1.ReshardControlRequest\x1a .shale.v1.ReshardControlResponse\x12A\n" +
+	"ApplyBatch\x12\x1b.shale.v1.ApplyBatchRequest\x1a\x1c.shale.v1.ApplyBatchResponse\x12A\n" +
 	"\bGenState\x12\x19.shale.v1.GenStateRequest\x1a\x1a.shale.v1.GenStateResponseB.Z,github.com/Zamua/shale/pkg/rpc/proto;shalepbb\x06proto3"
 
 var (
@@ -1895,79 +1717,72 @@ func file_shale_proto_rawDescGZIP() []byte {
 	return file_shale_proto_rawDescData
 }
 
-var file_shale_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 29)
+var file_shale_proto_msgTypes = make([]protoimpl.MessageInfo, 27)
 var file_shale_proto_goTypes = []any{
-	(ReshardPhase)(0),              // 0: shale.v1.ReshardPhase
-	(*ReplicaUnitRef)(nil),         // 1: shale.v1.ReplicaUnitRef
-	(*PutRequest)(nil),             // 2: shale.v1.PutRequest
-	(*PutResponse)(nil),            // 3: shale.v1.PutResponse
-	(*GetRequest)(nil),             // 4: shale.v1.GetRequest
-	(*GetResponse)(nil),            // 5: shale.v1.GetResponse
-	(*DeleteRequest)(nil),          // 6: shale.v1.DeleteRequest
-	(*DeleteResponse)(nil),         // 7: shale.v1.DeleteResponse
-	(*ScanPrefixRequest)(nil),      // 8: shale.v1.ScanPrefixRequest
-	(*ScanPrefixResponse)(nil),     // 9: shale.v1.ScanPrefixResponse
-	(*LocalScanRequest)(nil),       // 10: shale.v1.LocalScanRequest
-	(*LocalScanResponse)(nil),      // 11: shale.v1.LocalScanResponse
-	(*TopologyRequest)(nil),        // 12: shale.v1.TopologyRequest
-	(*TopologyResponse)(nil),       // 13: shale.v1.TopologyResponse
-	(*NodeInfo)(nil),               // 14: shale.v1.NodeInfo
-	(*StatsRequest)(nil),           // 15: shale.v1.StatsRequest
-	(*StatsResponse)(nil),          // 16: shale.v1.StatsResponse
-	(*PingRequest)(nil),            // 17: shale.v1.PingRequest
-	(*PingResponse)(nil),           // 18: shale.v1.PingResponse
-	(*CommitCASRequest)(nil),       // 19: shale.v1.CommitCASRequest
-	(*ReadCheck)(nil),              // 20: shale.v1.ReadCheck
-	(*WriteOp)(nil),                // 21: shale.v1.WriteOp
-	(*CommitCASResponse)(nil),      // 22: shale.v1.CommitCASResponse
-	(*ApplyBatchRequest)(nil),      // 23: shale.v1.ApplyBatchRequest
-	(*EnvelopeWrite)(nil),          // 24: shale.v1.EnvelopeWrite
-	(*ApplyBatchResponse)(nil),     // 25: shale.v1.ApplyBatchResponse
-	(*ReshardControlRequest)(nil),  // 26: shale.v1.ReshardControlRequest
-	(*ReshardControlResponse)(nil), // 27: shale.v1.ReshardControlResponse
-	(*GenStateRequest)(nil),        // 28: shale.v1.GenStateRequest
-	(*GenStateResponse)(nil),       // 29: shale.v1.GenStateResponse
+	(*ReplicaUnitRef)(nil),     // 0: shale.v1.ReplicaUnitRef
+	(*PutRequest)(nil),         // 1: shale.v1.PutRequest
+	(*PutResponse)(nil),        // 2: shale.v1.PutResponse
+	(*GetRequest)(nil),         // 3: shale.v1.GetRequest
+	(*GetResponse)(nil),        // 4: shale.v1.GetResponse
+	(*DeleteRequest)(nil),      // 5: shale.v1.DeleteRequest
+	(*DeleteResponse)(nil),     // 6: shale.v1.DeleteResponse
+	(*ScanPrefixRequest)(nil),  // 7: shale.v1.ScanPrefixRequest
+	(*ScanPrefixResponse)(nil), // 8: shale.v1.ScanPrefixResponse
+	(*LocalScanRequest)(nil),   // 9: shale.v1.LocalScanRequest
+	(*LocalScanResponse)(nil),  // 10: shale.v1.LocalScanResponse
+	(*TopologyRequest)(nil),    // 11: shale.v1.TopologyRequest
+	(*TopologyResponse)(nil),   // 12: shale.v1.TopologyResponse
+	(*NodeInfo)(nil),           // 13: shale.v1.NodeInfo
+	(*StatsRequest)(nil),       // 14: shale.v1.StatsRequest
+	(*StatsResponse)(nil),      // 15: shale.v1.StatsResponse
+	(*PingRequest)(nil),        // 16: shale.v1.PingRequest
+	(*PingResponse)(nil),       // 17: shale.v1.PingResponse
+	(*CommitCASRequest)(nil),   // 18: shale.v1.CommitCASRequest
+	(*ReadCheck)(nil),          // 19: shale.v1.ReadCheck
+	(*WriteOp)(nil),            // 20: shale.v1.WriteOp
+	(*CommitCASResponse)(nil),  // 21: shale.v1.CommitCASResponse
+	(*ApplyBatchRequest)(nil),  // 22: shale.v1.ApplyBatchRequest
+	(*EnvelopeWrite)(nil),      // 23: shale.v1.EnvelopeWrite
+	(*ApplyBatchResponse)(nil), // 24: shale.v1.ApplyBatchResponse
+	(*GenStateRequest)(nil),    // 25: shale.v1.GenStateRequest
+	(*GenStateResponse)(nil),   // 26: shale.v1.GenStateResponse
 }
 var file_shale_proto_depIdxs = []int32{
-	1,  // 0: shale.v1.PutRequest.ru:type_name -> shale.v1.ReplicaUnitRef
-	1,  // 1: shale.v1.GetRequest.ru:type_name -> shale.v1.ReplicaUnitRef
-	1,  // 2: shale.v1.DeleteRequest.ru:type_name -> shale.v1.ReplicaUnitRef
-	1,  // 3: shale.v1.ScanPrefixRequest.ru:type_name -> shale.v1.ReplicaUnitRef
-	14, // 4: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
-	20, // 5: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
-	21, // 6: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
-	24, // 7: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
-	0,  // 8: shale.v1.ReshardControlRequest.phase:type_name -> shale.v1.ReshardPhase
-	2,  // 9: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
-	4,  // 10: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
-	6,  // 11: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
-	8,  // 12: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
-	10, // 13: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
-	12, // 14: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
-	15, // 15: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
-	17, // 16: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
-	19, // 17: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
-	23, // 18: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
-	26, // 19: shale.v1.ShaleNode.ReshardControl:input_type -> shale.v1.ReshardControlRequest
-	28, // 20: shale.v1.ShaleNode.GenState:input_type -> shale.v1.GenStateRequest
-	3,  // 21: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
-	5,  // 22: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
-	7,  // 23: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
-	9,  // 24: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
-	11, // 25: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
-	13, // 26: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
-	16, // 27: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
-	18, // 28: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
-	22, // 29: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
-	25, // 30: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
-	27, // 31: shale.v1.ShaleNode.ReshardControl:output_type -> shale.v1.ReshardControlResponse
-	29, // 32: shale.v1.ShaleNode.GenState:output_type -> shale.v1.GenStateResponse
-	21, // [21:33] is the sub-list for method output_type
-	9,  // [9:21] is the sub-list for method input_type
-	9,  // [9:9] is the sub-list for extension type_name
-	9,  // [9:9] is the sub-list for extension extendee
-	0,  // [0:9] is the sub-list for field type_name
+	0,  // 0: shale.v1.PutRequest.ru:type_name -> shale.v1.ReplicaUnitRef
+	0,  // 1: shale.v1.GetRequest.ru:type_name -> shale.v1.ReplicaUnitRef
+	0,  // 2: shale.v1.DeleteRequest.ru:type_name -> shale.v1.ReplicaUnitRef
+	0,  // 3: shale.v1.ScanPrefixRequest.ru:type_name -> shale.v1.ReplicaUnitRef
+	13, // 4: shale.v1.TopologyResponse.nodes:type_name -> shale.v1.NodeInfo
+	19, // 5: shale.v1.CommitCASRequest.reads:type_name -> shale.v1.ReadCheck
+	20, // 6: shale.v1.CommitCASRequest.writes:type_name -> shale.v1.WriteOp
+	23, // 7: shale.v1.ApplyBatchRequest.writes:type_name -> shale.v1.EnvelopeWrite
+	1,  // 8: shale.v1.ShaleNode.Put:input_type -> shale.v1.PutRequest
+	3,  // 9: shale.v1.ShaleNode.Get:input_type -> shale.v1.GetRequest
+	5,  // 10: shale.v1.ShaleNode.Delete:input_type -> shale.v1.DeleteRequest
+	7,  // 11: shale.v1.ShaleNode.ScanPrefix:input_type -> shale.v1.ScanPrefixRequest
+	9,  // 12: shale.v1.ShaleNode.LocalScan:input_type -> shale.v1.LocalScanRequest
+	11, // 13: shale.v1.ShaleNode.Topology:input_type -> shale.v1.TopologyRequest
+	14, // 14: shale.v1.ShaleNode.Stats:input_type -> shale.v1.StatsRequest
+	16, // 15: shale.v1.ShaleNode.Ping:input_type -> shale.v1.PingRequest
+	18, // 16: shale.v1.ShaleNode.CommitCAS:input_type -> shale.v1.CommitCASRequest
+	22, // 17: shale.v1.ShaleNode.ApplyBatch:input_type -> shale.v1.ApplyBatchRequest
+	25, // 18: shale.v1.ShaleNode.GenState:input_type -> shale.v1.GenStateRequest
+	2,  // 19: shale.v1.ShaleNode.Put:output_type -> shale.v1.PutResponse
+	4,  // 20: shale.v1.ShaleNode.Get:output_type -> shale.v1.GetResponse
+	6,  // 21: shale.v1.ShaleNode.Delete:output_type -> shale.v1.DeleteResponse
+	8,  // 22: shale.v1.ShaleNode.ScanPrefix:output_type -> shale.v1.ScanPrefixResponse
+	10, // 23: shale.v1.ShaleNode.LocalScan:output_type -> shale.v1.LocalScanResponse
+	12, // 24: shale.v1.ShaleNode.Topology:output_type -> shale.v1.TopologyResponse
+	15, // 25: shale.v1.ShaleNode.Stats:output_type -> shale.v1.StatsResponse
+	17, // 26: shale.v1.ShaleNode.Ping:output_type -> shale.v1.PingResponse
+	21, // 27: shale.v1.ShaleNode.CommitCAS:output_type -> shale.v1.CommitCASResponse
+	24, // 28: shale.v1.ShaleNode.ApplyBatch:output_type -> shale.v1.ApplyBatchResponse
+	26, // 29: shale.v1.ShaleNode.GenState:output_type -> shale.v1.GenStateResponse
+	19, // [19:30] is the sub-list for method output_type
+	8,  // [8:19] is the sub-list for method input_type
+	8,  // [8:8] is the sub-list for extension type_name
+	8,  // [8:8] is the sub-list for extension extendee
+	0,  // [0:8] is the sub-list for field type_name
 }
 
 func init() { file_shale_proto_init() }
@@ -1980,14 +1795,13 @@ func file_shale_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_shale_proto_rawDesc), len(file_shale_proto_rawDesc)),
-			NumEnums:      1,
-			NumMessages:   29,
+			NumEnums:      0,
+			NumMessages:   27,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
 		GoTypes:           file_shale_proto_goTypes,
 		DependencyIndexes: file_shale_proto_depIdxs,
-		EnumInfos:         file_shale_proto_enumTypes,
 		MessageInfos:      file_shale_proto_msgTypes,
 	}.Build()
 	File_shale_proto = out.File
