@@ -70,28 +70,36 @@ func New() *Factory {
 // doc), so re-opening returns the SAME underlying store with whatever was
 // written before.
 //
-// This factory takes the caller's intended epoch AS the open epoch rather than
-// re-deriving max(intended, durable+1): with no cross-process backing there is
-// no other writer for a higher floor to fence, and tests drive the epoch
-// arithmetic explicitly. A factory over shared storage (slate,
-// internal/sharedfactory) MUST do the derivation, since there the durable epoch
-// is the cross-node source of truth.
+// This factory derives the open epoch EXACTLY as slate does:
+// opened = max(intended, durable+1), where the durable floor is the highest
+// epoch this mount has ever been opened at. It used to take the caller's
+// intended epoch VERBATIM ("tests drive the epoch arithmetic explicitly") -
+// which meant every epoch assertion against this double asserted its own
+// input, and a stale writer could re-open BELOW the historical fence after a
+// close, a state the real backing store makes impossible. That fidelity gap
+// is part of why the serving-marker wedge reached production: the bug class
+// was structurally invisible to memfactory-based tests. The double must be
+// allowed to disagree with the caller, because the real store does.
 func (f *Factory) OpenUnit(m storageunit.MountRef, epoch storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if cur, ok := f.open[m]; ok && epoch <= cur {
-		return nil, 0, fmt.Errorf("memfactory: %s already open at epoch %d, refusing open at %d", m, cur, epoch)
+	opened := epoch
+	if floor := f.fenced[m]; opened <= floor {
+		opened = floor + 1
+	}
+	if cur, ok := f.open[m]; ok && opened <= cur {
+		return nil, 0, fmt.Errorf("memfactory: %s already open at epoch %d, refusing open at %d (intended %d)", m, cur, opened, epoch)
 	}
 	b, ok := f.store[m]
 	if !ok {
 		b = memory.New()
 		f.store[m] = b
 	}
-	f.open[m] = epoch
-	if epoch > f.fenced[m] {
-		f.fenced[m] = epoch
+	f.open[m] = opened
+	if opened > f.fenced[m] {
+		f.fenced[m] = opened
 	}
-	return b, epoch, nil
+	return b, opened, nil
 }
 
 // CloseUnit unmounts m. Idempotent: closing a mount that is not open is a
