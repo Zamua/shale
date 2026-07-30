@@ -784,6 +784,105 @@ func TestSetRole_DedupsNoOpWrite(t *testing.T) {
 	}
 }
 
+// TestSetRole_ConcurrentSettersConvergeOnLastDesired pins the single-source
+// -of-truth contract for roles: the LOCAL DESIRED set is authoritative, and
+// the document converges to it no matter how concurrent SetRoles interleave.
+//
+// The deterministic interleaving (via hookStore): inside SetRole(Joining)'s
+// CAS window - after its edit closure ran, before its write lands - a LATER
+// SetRole(Draining) completes fully. The first writer's CAS fails on the
+// moved version and retries; the retried closure must re-read the CURRENT
+// desired set (Draining), not replay its captured argument. Replaying the
+// argument ends with doc=Joining while the local record says Draining, and
+// because dedup consults the local record, a later SetRole(Draining) is
+// swallowed as a no-op: the wrong advertised role sticks until an unrelated
+// role change.
+func TestSetRole_ConcurrentSettersConvergeOnLastDesired(t *testing.T) {
+	mem := storageunit.NewMemConditionalStore()
+	hooked := &hookStore{ConditionalStore: mem}
+	a := cas.New(manualCfg(hooked, 5))
+	mustStart(t, a, "a", 0, 0)
+
+	hooked.arm(func() {
+		if err := a.SetRole(coord.RoleDraining); err != nil {
+			t.Errorf("inner SetRole(Draining): %v", err)
+		}
+	})
+	if err := a.SetRole(coord.RoleJoining); err != nil {
+		t.Fatalf("outer SetRole(Joining): %v", err)
+	}
+
+	// The document must hold the LAST DESIRED state (Draining), not
+	// whichever mutate happened to land last.
+	for _, r := range readDoc(t, mem).Members {
+		if r.ID == "a" && coord.Role(r.Roles) != coord.RoleDraining {
+			t.Fatalf("document roles after the interleaved setters = %d, want Draining: the doc diverged from the desired record", r.Roles)
+		}
+	}
+
+	// And re-stating the desired set stays a genuine no-op (dedup compares
+	// desired-vs-desired, and doc == desired, so nothing needs to move).
+	ver := docVersion(t, mem)
+	if err := a.SetRole(coord.RoleDraining); err != nil {
+		t.Fatalf("re-stating SetRole(Draining): %v", err)
+	}
+	if got := docVersion(t, mem); got != ver {
+		t.Fatalf("re-stating the converged role moved the document %s -> %s", ver, got)
+	}
+
+	// The writer's own view serves the desired stance after its poll.
+	a.TestingPollOnce()
+	if m, _ := a.View().Member("a"); !m.Draining() || m.Joining() {
+		t.Fatalf("view member = %+v, want Draining only", m)
+	}
+}
+
+// TestRenew_HealsDocRoleDrift pins the renewal loop's drift heal: when
+// self's document row advertises roles that differ from the locally desired
+// set (any lost interleaving this adapter has not imagined yet), the next
+// renewal repairs the row instead of blindly incrementing the counter next
+// to wrong roles.
+func TestRenew_HealsDocRoleDrift(t *testing.T) {
+	store := storageunit.NewMemConditionalStore()
+	a := cas.New(manualCfg(store, 5))
+	mustStart(t, a, "a", 0, 0)
+	if err := a.SetRole(coord.RoleDraining); err != nil {
+		t.Fatalf("SetRole: %v", err)
+	}
+
+	// Corrupt the row behind the adapter's back: flip roles to steady state.
+	data, ver, err := store.Get(cas.DefaultKey)
+	if err != nil {
+		t.Fatalf("reading document: %v", err)
+	}
+	var d wireDoc
+	if err := json.Unmarshal(data, &d); err != nil {
+		t.Fatalf("decoding document: %v", err)
+	}
+	for i := range d.Members {
+		if d.Members[i].ID == "a" {
+			d.Members[i].Roles = 0
+		}
+	}
+	out, err := json.Marshal(d)
+	if err != nil {
+		t.Fatalf("encoding corrupted document: %v", err)
+	}
+	if _, err := store.CompareAndSet(cas.DefaultKey, out, ver); err != nil {
+		t.Fatalf("planting the drift: %v", err)
+	}
+
+	// One renewal heals the drift back to the desired record.
+	if err := a.TestingRenewOnce(); err != nil {
+		t.Fatalf("renewal: %v", err)
+	}
+	for _, r := range readDoc(t, store).Members {
+		if r.ID == "a" && coord.Role(r.Roles) != coord.RoleDraining {
+			t.Fatalf("row roles after the renewal = %d, want Draining: the renewal must repair drift", r.Roles)
+		}
+	}
+}
+
 // TestChanged_FiresOnObservedChangeAndCoalesces pins the hint semantics: a
 // poll that observes nothing new fires nothing, a poll that observes ONLY a
 // lease renewal fires nothing, polls that observe genuine VIEW changes fire,
