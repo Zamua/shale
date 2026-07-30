@@ -2112,8 +2112,16 @@ and behave identically under either adapter.
 
 **The membership document.** All coordination state is one JSON document at a
 well-known key (`__coord/members`): a member list of rows `{id, addr, roles,
-declaredUnitCount, leaseGen}`. The store's opaque version token (an ETag on
-the real store) is the document's CAS handle. Every mutation - join, role
+declaredUnitCount, leaseGen, inc}`. The store's opaque version token (an ETag
+on the real store) is the document's CAS handle. `inc` is the row's
+INCARNATION nonce: minted fresh every time a row is CREATED (bootstrap, or
+the renewal re-add after a GC) and carried unchanged by in-place edits. It
+closes an ABA hole in expiry: a member GC'd and rejoining between two of an
+observer's polls restarts `leaseGen` at 1, which can equal the counter the
+observer last tracked - without the nonce that observer reads "still not
+advancing", keeps the member expired, and its GC reaps every fresh row the
+rejoiner writes. Observers compare nonces for INEQUALITY only (never order
+them), preserving the no-clocks property. Every mutation - join, role
 change, lease renewal, expired-member GC, graceful leave - is a
 read-modify-write `CompareAndSet`, retried on `ErrPrecondition` with bounded
 backoff: one racer wins, the loser re-reads the winner's document and
@@ -2128,9 +2136,12 @@ member ever writes a wall-clock timestamp and no observer ever compares one.
 **Failure detection is observer-side lease expiry.** Every node polls the
 document on its own cadence (production default ~1s; the poll and the renewal
 are the adapter's only two I/O loops, and both stop at Close). An observer
-tracks each member's `leaseGen` across its own poll ticks; a member whose
-`leaseGen` has not advanced for K consecutive observed polls (default 5) is
-EXPIRED: dropped from the view THIS OBSERVER serves. The judgment compares two
+tracks each member's `(inc, leaseGen)` across its own poll ticks; a member
+whose pair has not changed for K consecutive observed polls (default 5) is
+EXPIRED: dropped from the view THIS OBSERVER serves. A node never expires
+ITSELF: its renewal advances its own counter, and a node that cannot write
+the store cannot poll it either, so self-exemption also keeps the port's
+"View always contains Self once started" shape. The judgment compares two
 rates the observer itself witnesses (its polls vs the member's renewals),
 never two clocks, so clock skew between nodes cannot false-expire anyone -
 and a stalled observer cannot either, because its poll ticks stall with it and
@@ -2177,7 +2188,11 @@ Locate identically.
 **Bootstrap is discovery, and it is exact.** `Start` attempts `PutIfAbsent`
 of a document containing only self. Success IS founding (`BootstrapFounded`);
 `ErrPrecondition` means an incumbent document exists, so Start CAS-appends
-self's row and reports `BootstrapJoined`. `Params.InitialRoles` ride in that
+self's row and reports `BootstrapJoined`. A document that exists but holds
+ZERO rows also founds: everyone left gracefully, so there is no incumbent to
+learn a generation from, and "did anyone else already exist" is answered no
+(reporting joined there would leave the starter waiting forever on a departed
+incumbent). `Params.InitialRoles` ride in that
 first row, atomic with the node's first appearance - the same atomicity the
 gossip adapter gets from the first Meta payload, closing the same
 member-before-warming race (and a founder still drops a requested
