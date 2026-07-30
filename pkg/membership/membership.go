@@ -701,15 +701,15 @@ func (e *eventDelegate) shutdown() {
 	close(e.out)
 }
 
-// Open brings the local memberlist up + (if seeds are non-empty)
-// joins an existing cluster. On error, any partially-initialized
-// resources are released before returning.
 // ContactedAtOpen reports how many seeds the startup Join reached. 0 with
 // seeds configured means the node started ALONE (nothing answered) and so
 // founded the cluster it now anchors; >0 means it genuinely joined an
 // existing one. Constant after Open.
 func (m *Membership) ContactedAtOpen() int { return m.contactedAtOpen }
 
+// Open brings the local memberlist up + (if seeds are non-empty)
+// joins an existing cluster. On error, any partially-initialized
+// resources are released before returning.
 func Open(cfg Config) (*Membership, error) {
 	if cfg.NodeID == "" {
 		return nil, errors.New("membership: NodeID is required")

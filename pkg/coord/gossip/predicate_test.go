@@ -174,9 +174,20 @@ func TestPlacementMembers_ExposesTheBasisSplit(t *testing.T) {
 	if !waitForRingMember(co, "pm-solo", 2*time.Second) {
 		t.Fatal("local member never landed in the ring")
 	}
-	co.TestingRemoveFromRing("pm-solo")
-	if got := co.PlacementMembers(); len(got) != 0 {
-		t.Fatalf("placement basis should be empty after the ring drop, got %v", got)
+	// Re-remove until the drop sticks: a queued membership event delivered
+	// after the removal re-adds the member (same shape as the reconcile-heal
+	// test; the queue is finite and quiesced, so this converges).
+	dropped := false
+	for attempt := 0; attempt < 50; attempt++ {
+		co.TestingRemoveFromRing("pm-solo")
+		if len(co.PlacementMembers()) == 0 {
+			dropped = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !dropped {
+		t.Fatalf("ring drop never stuck; placement=%v", co.PlacementMembers())
 	}
 	if _, ok := co.View().Member("pm-solo"); !ok {
 		t.Fatal("view lost the member on a ring-only drop; it must keep answering from the snapshot")

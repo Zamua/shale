@@ -100,16 +100,30 @@ func TestReconcileRing_RestoresMissingMember(t *testing.T) {
 		t.Fatalf("local member never landed in the ring; placement=%+v", co.PlacementMembers())
 	}
 
-	co.TestingRemoveFromRing("solo")
+	// Induce the divergence STABLY: a queued membership event (the initial
+	// join, an incarnation refresh) delivered between the removal and the
+	// probe re-adds the member through the EVENT path, which is a different
+	// heal than the one under test. Re-remove until the drop sticks - the
+	// event queue is finite and quiesced (meta refresh and rejoin disabled),
+	// so this converges within a few attempts.
+	dropped := false
+	for attempt := 0; attempt < 50; attempt++ {
+		co.TestingRemoveFromRing("solo")
+		if len(co.TestingRingMembers()) == 0 {
+			dropped = true
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if !dropped {
+		t.Fatalf("ring drop never stuck; events kept re-adding the member (ring=%+v)", co.TestingRingMembers())
+	}
 	// The ring drop is a PLACEMENT divergence only: the View answers from the
 	// membership snapshot, which still (correctly) knows the member - a
 	// dropped ring event must never make a live member vanish from stance
 	// questions. The divergence is visible where placement is asked.
 	if got := co.View().Members; len(got) != 1 || got[0].ID != "solo" {
 		t.Fatalf("post-remove view must still show the snapshot member, got %+v", got)
-	}
-	if got := co.TestingRingMembers(); len(got) != 0 {
-		t.Fatalf("post-remove ring should be empty, got %+v", got)
 	}
 
 	if !co.TestingReconcileRing() {
