@@ -106,28 +106,42 @@ func TestReconcileRing_RestoresMissingMember(t *testing.T) {
 	// heal than the one under test. Re-remove until the drop sticks - the
 	// event queue is finite and quiesced (meta refresh and rejoin disabled),
 	// so this converges within a few attempts.
-	dropped := false
-	for attempt := 0; attempt < 50; attempt++ {
+	// Drop-then-probe as ONE retryable cycle: a queued membership event (the
+	// initial join, an incarnation refresh) can heal the ring through the
+	// EVENT path at any point before the reconcile probe runs - including
+	// between "the drop stuck" and the probe itself (the interleaving a
+	// drop-only retry loop still lost to under -race). The cycle
+	// distinguishes the two no-change outcomes: ring repopulated = an event
+	// healed it first (not the path under test - retry the cycle); ring
+	// still empty = the reconcile heal is genuinely broken (the regression
+	// this test exists to catch).
+	healed := false
+	for attempt := 0; attempt < 50 && !healed; attempt++ {
 		co.TestingRemoveFromRing("solo")
-		if len(co.TestingRingMembers()) == 0 {
-			dropped = true
+		if len(co.TestingRingMembers()) != 0 {
+			// An event re-added the member before the drop even stuck.
+			time.Sleep(10 * time.Millisecond)
+			continue
+		}
+		// The ring drop is a PLACEMENT divergence only: the View answers
+		// from the membership snapshot, which still (correctly) knows the
+		// member - a dropped ring event must never make a live member vanish
+		// from stance questions.
+		if got := co.View().Members; len(got) != 1 || got[0].ID != "solo" {
+			t.Fatalf("post-remove view must still show the snapshot member, got %+v", got)
+		}
+		if co.TestingReconcileRing() {
+			healed = true
 			break
 		}
-		time.Sleep(10 * time.Millisecond)
+		if len(co.TestingRingMembers()) == 0 {
+			t.Fatal("reconcile reported no change while the member was still missing from the ring")
+		}
+		// No-change AND ring repopulated: an event healed it between our
+		// emptiness check and the probe. Retry the cycle.
 	}
-	if !dropped {
-		t.Fatalf("ring drop never stuck; events kept re-adding the member (ring=%+v)", co.TestingRingMembers())
-	}
-	// The ring drop is a PLACEMENT divergence only: the View answers from the
-	// membership snapshot, which still (correctly) knows the member - a
-	// dropped ring event must never make a live member vanish from stance
-	// questions. The divergence is visible where placement is asked.
-	if got := co.View().Members; len(got) != 1 || got[0].ID != "solo" {
-		t.Fatalf("post-remove view must still show the snapshot member, got %+v", got)
-	}
-
-	if !co.TestingReconcileRing() {
-		t.Fatal("reconcile reported no change after the member was dropped from the ring")
+	if !healed {
+		t.Fatalf("never completed a clean drop-then-reconcile cycle; events healed the ring every time (ring=%+v)", co.TestingRingMembers())
 	}
 	ringMembers := co.TestingRingMembers()
 	if len(ringMembers) != 1 || ringMembers[0].ID != "solo" {
