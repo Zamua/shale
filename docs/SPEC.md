@@ -2095,6 +2095,31 @@ storage layer does with them.
   learns "the newcomer exists" before "the newcomer is warming" and
   clean-cuts a position the newcomer displaces.
 
+**MIGRATING TO v0.15.0 (a BREAKING construction change).** `Config.BindAddr`
+and `Config.Seeds` were REMOVED from `cluster.Config` when coordination moved
+behind this port: they are gossip transport details, and the port exists so the
+cluster does not name them. A consumer that set either field no longer
+compiles, and the fix is one construction line - hand them to the adapter
+instead:
+
+```go
+// before v0.15.0
+cluster.Open(cluster.Config{ /* ... */ BindAddr: bind, Seeds: seeds })
+
+// v0.15.0 onward
+cluster.Open(cluster.Config{ /* ... */ Coordinator: gossip.New(gossip.Config{
+    BindAddr: bind,
+    Seeds:    seeds,
+})})
+```
+
+`Coordinator: nil` means SINGLE-NODE, exactly as an empty `BindAddr` did before,
+so a single-node consumer drops the fields and passes nothing. Behavior is
+otherwise unchanged: the gossip adapter runs the same memberlist, the same
+seed bootstrap, the same ring. A consumer that never set `BindAddr` / `Seeds`
+(single-node, or one that already constructed a coordinator) upgrades with no
+source change at all.
+
 ## The CAS coordinator (pkg/coord/cas)
 
 The port's second adapter: `pkg/coord/cas` produces the same answers from ONE
