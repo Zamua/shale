@@ -960,6 +960,111 @@ func drain(ch <-chan struct{}) {
 	}
 }
 
+// outageStore wraps a ConditionalStore with a toggleable full outage: while
+// tripped, every Get fails (which also fails renewals - mutate reads before
+// it writes). The seam for the silent-I/O-degradation finding: a store that
+// starts rejecting this node's access (creds rotation, bucket policy,
+// network ACL) with no crash anywhere.
+type outageStore struct {
+	storageunit.ConditionalStore
+	mu   sync.Mutex
+	down bool
+}
+
+func (o *outageStore) setDown(down bool) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.down = down
+}
+
+func (o *outageStore) Get(key string) ([]byte, string, error) {
+	o.mu.Lock()
+	down := o.down
+	o.mu.Unlock()
+	if down {
+		return nil, "", errors.New("injected store outage")
+	}
+	return o.ConditionalStore.Get(key)
+}
+
+// TestHealth_SurfacesStoreDegradationAndRecovery pins the health surface:
+// both I/O loops previously swallowed every error, leaving a node whose
+// store access degraded serving a frozen view indistinguishable from a
+// healthy quiet cluster. Health() must expose monotone success watermarks
+// plus the consecutive-failure run for each loop, the served view must keep
+// answering from the last snapshot throughout (availability, never a
+// teardown), and crossing the threshold must emit the rate-limited log line.
+func TestHealth_SurfacesStoreDegradationAndRecovery(t *testing.T) {
+	mem := storageunit.NewMemConditionalStore()
+	outage := &outageStore{ConditionalStore: mem}
+	var logBuf strings.Builder
+	a := cas.New(cas.Config{
+		Store:           outage,
+		PollInterval:    -1,
+		RenewalInterval: -1,
+		ExpiryPolls:     5,
+		LogOutput:       &logBuf,
+	})
+	mustStart(t, a, "a", 0, 0)
+
+	// Healthy passes advance the success watermarks.
+	a.TestingPollOnce()
+	if err := a.TestingRenewOnce(); err != nil {
+		t.Fatalf("healthy renewal: %v", err)
+	}
+	h := a.Health()
+	if h.PollSuccesses != 1 || h.RenewSuccesses != 1 || h.ConsecutivePollFailures != 0 || h.ConsecutiveRenewFailures != 0 {
+		t.Fatalf("healthy Health = %+v, want 1/1 successes and no failures", h)
+	}
+
+	// The outage: five failed polls and renewals each - the watermarks
+	// freeze, the failure runs count up, the view keeps serving the last
+	// snapshot, and the threshold crossing logs.
+	outage.setDown(true)
+	for i := 0; i < 5; i++ {
+		a.TestingPollOnce()
+		if err := a.TestingRenewOnce(); err == nil {
+			t.Fatalf("renewal %d during the outage reported success", i)
+		}
+	}
+	h = a.Health()
+	if h.PollSuccesses != 1 || h.RenewSuccesses != 1 {
+		t.Fatalf("Health during outage = %+v: success watermarks moved without a success", h)
+	}
+	if h.ConsecutivePollFailures != 5 || h.ConsecutiveRenewFailures != 5 {
+		t.Fatalf("Health during outage = %+v, want 5 consecutive failures on both loops", h)
+	}
+	if !a.Populated() || !sameIDs(viewIDs(a.View()), []string{"a"}) {
+		t.Fatalf("view during outage = %v, want the last snapshot still served", viewIDs(a.View()))
+	}
+	logged := logBuf.String()
+	if !strings.Contains(logged, "5 consecutive poll failures") || !strings.Contains(logged, "stale view") {
+		t.Fatalf("threshold crossing did not log the degradation line; log:\n%s", logged)
+	}
+	if !strings.Contains(logged, "5 consecutive renewal failures") {
+		t.Fatalf("renewal threshold crossing did not log; log:\n%s", logged)
+	}
+	// Rate-limited: one degradation line per episode, not one per failure.
+	if got := strings.Count(logged, "consecutive poll failures"); got != 1 {
+		t.Fatalf("poll degradation logged %d times for one episode, want 1; log:\n%s", got, logged)
+	}
+
+	// Recovery: the next successful passes reset the runs and advance the
+	// watermarks again.
+	outage.setDown(false)
+	a.TestingPollOnce()
+	if err := a.TestingRenewOnce(); err != nil {
+		t.Fatalf("renewal after recovery: %v", err)
+	}
+	h = a.Health()
+	if h.PollSuccesses != 2 || h.RenewSuccesses != 2 || h.ConsecutivePollFailures != 0 || h.ConsecutiveRenewFailures != 0 {
+		t.Fatalf("Health after recovery = %+v, want 2/2 successes and cleared failure runs", h)
+	}
+	if !strings.Contains(logBuf.String(), "poll recovered after 5 consecutive failures") {
+		t.Fatalf("recovery did not log; log:\n%s", logBuf.String())
+	}
+}
+
 // TestGeneration_IsUnsupported pins the split the spec keeps: generation
 // agreement stays with the cluster-side arbiter, so this adapter holds no
 // opinion and refuses proposals.
