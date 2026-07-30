@@ -656,8 +656,20 @@ func TestSetRole_DedupsNoOpWrite(t *testing.T) {
 }
 
 // TestChanged_FiresOnObservedChangeAndCoalesces pins the hint semantics: a
-// poll that observes nothing new fires nothing, polls that observe changes
-// fire, and undelivered hints coalesce to depth one - lossy by contract.
+// poll that observes nothing new fires nothing, a poll that observes ONLY a
+// lease renewal fires nothing, polls that observe genuine VIEW changes fire,
+// and undelivered hints coalesce to depth one - lossy by contract.
+//
+// The renewal clause is a regression pin, not a nicety. A renewal moves the
+// document version on every renewal interval while leaving the view
+// unchanged, so a hint keyed on version movement fires on virtually every
+// poll. The storage layer debounces view changes with extend-on-burst
+// semantics (the settle timer runs one settle delay after the LAST hint), so
+// a hint stream at poll cadence re-arms that debounce forever: the reconcile
+// never runs and rebalance-idle is never reached - on the production knobs
+// (poll 1s, renewal 2s, settle 5s) as surely as on test knobs. The
+// integration tree's CAS lifecycle test is where that starvation actually
+// bit; this pins it at the adapter boundary.
 func TestChanged_FiresOnObservedChangeAndCoalesces(t *testing.T) {
 	st := storageunit.NewMemConditionalStore()
 	a := cas.New(manualCfg(st, 5))
@@ -677,19 +689,31 @@ func TestChanged_FiresOnObservedChangeAndCoalesces(t *testing.T) {
 	default:
 	}
 
-	// Two observed changes, no consumer in between: exactly one pending.
-	if err := b.TestingRenewOnce(); err != nil {
-		t.Fatal(err)
-	}
-	a.TestingPollOnce()
+	// A renewal is the mechanism's heartbeat, not a view change: the version
+	// moved, the snapshot did not, so the poll must fire NOTHING.
 	if err := b.TestingRenewOnce(); err != nil {
 		t.Fatal(err)
 	}
 	a.TestingPollOnce()
 	select {
 	case <-a.Changed():
+		t.Fatal("a poll that observed only a lease renewal fired a hint; a renewal-cadence hint stream starves the consumer's change debounce")
 	default:
-		t.Fatal("observed changes fired no hint")
+	}
+
+	// Two observed VIEW changes, no consumer in between: exactly one pending.
+	if err := b.SetRole(coord.RoleDraining); err != nil {
+		t.Fatal(err)
+	}
+	a.TestingPollOnce()
+	if err := b.SetRole(0); err != nil {
+		t.Fatal(err)
+	}
+	a.TestingPollOnce()
+	select {
+	case <-a.Changed():
+	default:
+		t.Fatal("observed view changes fired no hint")
 	}
 	select {
 	case <-a.Changed():

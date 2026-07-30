@@ -250,7 +250,6 @@ type Coordinator struct {
 	// pollMu serializes observation passes (the background loop vs the
 	// Testing seam) and guards the observer state below.
 	pollMu  sync.Mutex
-	lastVer string
 	tracker map[storageunit.NodeID]*leaseTrack
 
 	// reduced memoizes the last hypothetical-placement ring (see Locate),
@@ -576,14 +575,17 @@ func (c *Coordinator) pollOnce() {
 
 // observe is the single observation step both Start and the poll go
 // through: track lease advancement, expire the silent, publish one {view,
-// ring} snapshot, GC expired rows, and fire the change hint if anything
-// observably moved.
+// ring} snapshot, GC expired rows, and fire the change hint if the PUBLISHED
+// SNAPSHOT moved - never on document-version movement alone. Lease renewals
+// move the version on every renewal interval without changing the view, so a
+// hint keyed on the version would fire on essentially every poll; a consumer
+// that debounces view changes with extend-on-burst semantics (the cluster's
+// settle timer does) would then have its debounced response re-armed forever
+// and never run it. The snapshot is the view; only its movement is a "view
+// may have changed" fact worth hinting.
 func (c *Coordinator) observe(d *document, ver string) {
 	c.pollMu.Lock()
 	defer c.pollMu.Unlock()
-
-	versionMoved := ver != c.lastVer
-	c.lastVer = ver
 
 	// Judge liveness observer-side. SELF IS EXEMPT: a node always believes
 	// itself alive (its renewal advances its own counter, and a node that
@@ -634,7 +636,7 @@ func (c *Coordinator) observe(d *document, ver string) {
 		c.gcExpired(expired, d, ver)
 	}
 
-	if versionMoved || snapMoved {
+	if snapMoved {
 		c.signal()
 	}
 }
@@ -729,8 +731,13 @@ func (c *Coordinator) signal() {
 }
 
 // Changed returns the coalescing change-hint channel: the poll fires it when
-// the document version moved or the published snapshot changed (an expiry
-// can change the view without a document write). Lossy by contract.
+// the published snapshot changed - membership, addresses, roles, declared
+// counts, INCLUDING an expiry (which changes the view without any document
+// write). A document write that leaves the snapshot unchanged (a peer's lease
+// renewal - one lands on virtually every poll) deliberately fires nothing:
+// renewals are the mechanism's heartbeat, not a view change, and hinting them
+// would turn the channel into a poll-cadence metronome that keeps a consumer's
+// change-debounce permanently re-armed. Lossy by contract.
 func (c *Coordinator) Changed() <-chan struct{} { return c.changed }
 
 // View returns the published snapshot's view. No locks, no I/O: the pair is
