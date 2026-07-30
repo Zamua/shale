@@ -27,6 +27,7 @@ package cluster
 
 import (
 	"context"
+	"fmt"
 	"time"
 )
 
@@ -83,7 +84,17 @@ func (c *Cluster) WaitForRebalanceIdle(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			return ctx.Err()
+			// A timeout here has ONE proximate cause - settlePending held
+			// above zero - but several distinct mechanisms behind it (a
+			// pending timer that has not fired, a reconcile pass blocked
+			// mid-run, an accounting leak). An error that cannot say which
+			// costs a debugging session; report the settle machinery's state.
+			c.settleMu.Lock()
+			armed := c.settleTimer != nil
+			immediate := c.settleImmediate
+			c.settleMu.Unlock()
+			return fmt.Errorf("%w (settlePending=%d timerArmed=%v immediate=%v reconcileRunning=%v)",
+				ctx.Err(), c.settlePending.Load(), armed, immediate, c.reconcileRunning.Load())
 		case <-ticker.C:
 		}
 	}

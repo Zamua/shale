@@ -676,6 +676,11 @@ type Cluster struct {
 	ringGen     atomic.Uint64
 	settleMu    sync.Mutex
 	settleTimer *time.Timer
+	// reconcileRunning marks a runScheduledReconcile callback as INSIDE its
+	// runReconcile call, so an idle-wait timeout can distinguish "a pass is
+	// blocked mid-run" from "a timer never fired" - two very different bugs
+	// that present identically as settlePending stuck above zero.
+	reconcileRunning atomic.Bool
 	// settleImmediate marks the pending settleTimer as an IMMEDIATE (zero
 	// delay) arm - the boot-defer prompt and the stale-mount evict path use
 	// these to close a consumer-visible unavailability window NOW. A later

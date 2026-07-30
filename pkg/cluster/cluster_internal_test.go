@@ -6,6 +6,7 @@ package cluster
 
 import (
 	"context"
+	"errors"
 	"io"
 	"net"
 	"strconv"
@@ -310,8 +311,10 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 	defer cancelBlock()
 	if err := c.WaitForRebalanceIdle(ctxBlock); err == nil {
 		t.Fatal("WaitForRebalanceIdle returned nil while a debounce was pending; expected it to block")
-	} else if err != context.DeadlineExceeded {
-		t.Fatalf("expected DeadlineExceeded while pending, got %v", err)
+	} else if !errors.Is(err, context.DeadlineExceeded) {
+		// The timeout is WRAPPED (it carries the settle machinery's state so
+		// a stuck idle-wait names its stuck component); identity via Is.
+		t.Fatalf("expected a DeadlineExceeded-wrapping error while pending, got %v", err)
 	}
 
 	// Re-arming a still-live timer must NOT double-count the pending

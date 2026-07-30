@@ -126,6 +126,18 @@ func (c *Cluster) runScheduledReconcile() {
 	}
 	c.settleImmediate = false
 	c.settleMu.Unlock()
+	// Stall visibility: a pass that blocks mid-run holds the pending
+	// obligation, and every idle-waiter with it. Log once past a generous
+	// bound so a wedged pass names itself instead of presenting as a bare
+	// deadline-exceeded in whoever was waiting.
+	c.reconcileRunning.Store(true)
+	stall := time.AfterFunc(5*time.Second, func() {
+		c.logf("shale: reconcile pass running >5s - an idle-waiter blocked on it sees settlePending>0; see /debug/shale/state for acquire-in-flight")
+	})
+	defer func() {
+		stall.Stop()
+		c.reconcileRunning.Store(false)
+	}()
 	c.runReconcile()
 }
 
