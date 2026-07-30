@@ -336,9 +336,9 @@ func (h *harness) doReshard() bool {
 		h.met.evReshard.Add(1)
 		return true
 	}
-	// A reshard can legitimately fail/abort if a membership change is racing it;
-	// that is the abort path, counted separately. Not committing is fine - the
-	// oracle proves no write was lost either way.
+	// A reshard can legitimately report still-in-progress (the synchronous wait
+	// budget expired while peers converge) or refuse; counted separately. Not
+	// committing is fine - the oracle proves no write was lost either way.
 	h.met.evReshardAbrt.Add(1)
 	return false
 }
@@ -390,12 +390,13 @@ func (h *harness) doReshardWhileDown(rng *rand.Rand) bool {
 }
 
 // doLeaveMidReshard is the SECOND combination: kick off a reshard ASYNC, then -
-// while the freeze barrier is in flight - fire a membership change (a graceful
-// leave). The concurrent membership change must ABORT the reshard cleanly: every
-// node unfreezes, discards half-built children, stays at gen g, writes resume.
-// The oracle then proves zero loss. On the rare timing where the reshard
-// committed before the leave landed, it counts as a committed reshard. Returns
-// true iff the reshard committed.
+// while it is in flight - fire a membership change (a graceful leave). Under
+// the delegated (arbiter-driven) flow there is no abort: the leave's handoff
+// moves the departing node's parents to survivors, whose drives finish the
+// split, so the reshard normally COMMITS (possibly after the synchronous call
+// reports still-in-progress, which counts as an abort here for bookkeeping;
+// the cluster converges regardless and the oracle proves zero loss either
+// way). Returns true iff the reshard call reported committed.
 func (h *harness) doLeaveMidReshard(rng *rand.Rand) bool {
 	// Record that the COMBINATION fired (a reshard kicked off with a membership
 	// change to land mid-barrier), distinct from a plain leave/reshard, so the

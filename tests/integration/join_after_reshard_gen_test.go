@@ -19,11 +19,14 @@ package integration
 // becomes unreachable, and nothing in the steady-state machinery raises a
 // passive joiner's generation, so the loss does not self-heal.
 //
-// The fix: a multi-backend joiner (Open WITH seeds) queries a seed's GenState
-// RPC for the live {generation, unit-count} BEFORE it mounts any unit, and
-// seeds its routing state from the answer. This test exercises that path
-// directly: stand up a multi-node cluster, write a recorded dataset, reshard
-// it (so the live generation is g >= 1), then ADD a node and assert
+// The fix: a multi-backend joiner learns the live {generation, unit-count}
+// BEFORE it mounts any unit - from the __cluster/init durable marker when a
+// ConditionalStore is wired (this test's shape: a multi-node reshard requires
+// the store), or from a seed's GenState RPC otherwise - and seeds its routing
+// state from the answer, deferring while a reshard is in flight. This test
+// exercises the path end to end: stand up a multi-node cluster, write a
+// recorded dataset, reshard it (so the live generation is g >= 1), then ADD a
+// node and assert
 //
 //  1. THE JOINER LEARNED THE LIVE GENERATION. Its GenStateSnapshot() reports
 //     the post-reshard generation + unit-count, not gen 0 / N.
@@ -50,10 +53,12 @@ import (
 func TestJoinAfterReshard_JoinerLearnsGenerationNoLoss(t *testing.T) {
 	const unitCount = 8 // N; one reshard doubles it to 16 at gen 1
 	backing := sharedfactory.NewBacking()
+	store := storageunit.NewMemConditionalStore()
 
-	// --- Stand up 2 nodes, multi-backend, N=8 units, and converge. ---
-	n1 := startSharedNode(t, "jar1", "", unitCount, backing)
-	n2 := startSharedNode(t, "jar2", n1.BindAddr, unitCount, backing)
+	// --- Stand up 2 nodes, multi-backend, N=8 units, sharing one conditional
+	// store (the arbiter-driven multi-node reshard requires it), and converge. ---
+	n1 := startR1StoreNode(t, "jar1", "", unitCount, backing, store)
+	n2 := startR1StoreNode(t, "jar2", n1.BindAddr, unitCount, backing, store)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster}, 2, 20*time.Second); err != nil {
 		t.Fatalf("initial 2-node convergence: %v", err)
 	}
@@ -73,11 +78,15 @@ func TestJoinAfterReshard_JoinerLearnsGenerationNoLoss(t *testing.T) {
 		want[k] = v
 	}
 
-	// --- RESHARD the 2-node cluster: N=8 -> 16 at gen 1, cluster-wide. ---
-	if err := n1.Cluster.Reshard(); err != nil {
-		t.Fatalf("multi-node Reshard (coordinator n1): %v", err)
+	// --- RESHARD the 2-node cluster: N=8 -> 16 at gen 1, cluster-wide (the
+	// delegated arbiter flow; the pump stands in for the reconcile cadence). ---
+	stopPump := startReconcilePump([]*cluster.Cluster{n1.Cluster, n2.Cluster})
+	err := n1.Cluster.Reshard()
+	stopPump()
+	if err != nil {
+		t.Fatalf("multi-node Reshard (delegated, n1): %v", err)
 	}
-	// Let the post-RESUME redistribution reconcile settle.
+	// Let the post-finalize redistribution reconcile settle.
 	time.Sleep(900 * time.Millisecond)
 
 	// Sanity: the existing members are now at gen 1, count 16.
@@ -92,9 +101,10 @@ func TestJoinAfterReshard_JoinerLearnsGenerationNoLoss(t *testing.T) {
 	readAcrossNodes(t, []*sharedNode{n1, n2}, "rec-00000", want["rec-00000"])
 
 	// --- ADD A NODE to the already-resharded cluster (THE FIX UNDER TEST). ---
-	// The joiner must learn {gen 1, count 16} from a seed before it mounts any
-	// unit, so it never routes / owns a key at gen 0. seedAddr is n1's bind.
-	n3 := startSharedNode(t, "jar3", n1.BindAddr, unitCount, backing)
+	// The joiner must learn {gen 1, count 16} (here: from the __cluster/init
+	// marker in the shared store) before it mounts any unit, so it never routes
+	// / owns a key at gen 0. seedAddr is n1's bind.
+	n3 := startR1StoreNode(t, "jar3", n1.BindAddr, unitCount, backing, store)
 	nodes := []*sharedNode{n1, n2, n3}
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("3-node convergence after join: %v", err)

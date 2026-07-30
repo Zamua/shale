@@ -14,12 +14,15 @@ package integration
 // readable, with its exact value, after the cluster reaches the new
 // generation (2N units). The single-node bisect mechanics (copy split by the
 // new hash bit, catch-up drain, atomic cut-over) are pinned white-box in
-// pkg/cluster; this file proves the wired-together SINGLE-NODE reshard (the
-// supported, concurrent-write-safe surface) and that a multi-node reshard is
-// refused until the cluster-wide generation barrier lands.
+// pkg/cluster; this file proves the wired-together SINGLE-NODE reshard and the
+// MULTI-NODE delegated (arbiter-driven) Reshard() surface: on a multi-node
+// cluster Reshard() retargets the shared CAS arbiter and the per-tick
+// reconcile driver converges every node online (parent-anchored at R=1), with
+// a typed refusal when no ConditionalStore is configured.
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"sync"
 	"sync/atomic"
@@ -29,11 +32,47 @@ import (
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/ring"
-	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// startR1StoreNode brings up one R=1 multi-backend node sharing `backing` AND
+// the given ConditionalStore - the shape a multi-node (arbiter-driven) reshard
+// requires. All nodes of one in-process cluster share ONE MemConditionalStore,
+// the test analogue of the shared MinIO/S3 conditional store.
+func startR1StoreNode(t *testing.T, id, seedAddr string, unitCount int, backing *sharedfactory.Backing, store storageunit.ConditionalStore) *sharedNode {
+	t.Helper()
+	return startReplicatedNodeCfg(t, id, seedAddr, unitCount, 1, backing, func(cfg *cluster.Config) {
+		cfg.ConditionalStore = store
+	})
+}
+
+// startReconcilePump drives every node's reconcile on a fast background cadence
+// (the accelerated stand-in for the production reconcileInterval tick), so a
+// delegated Reshard() call - which converges only as every node's reconcile
+// drives its share of the split - completes promptly in-process. Returns a stop
+// func the caller MUST invoke before tearing the nodes down.
+func startReconcilePump(cs []*cluster.Cluster) (stop func()) {
+	done := make(chan struct{})
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			for _, c := range cs {
+				c.TestingRunReconcile()
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+	}()
+	return func() { close(done); wg.Wait() }
+}
 
 // TestReshard_SingleNodeNoAckedWriteLost is the simplest reshard gate: a single
 // multi-backend node writes a spread of acked keys, doubles N -> 2N via
@@ -78,26 +117,29 @@ func TestReshard_SingleNodeNoAckedWriteLost(t *testing.T) {
 	}
 }
 
-// TestReshard_MultiNodeFreezeBarrier proves the v0.8 multi-node doubling via the
-// cluster-wide WRITE-FREEZE barrier. A 2-node multi-backend cluster (both nodes
-// gRPC-registered + sharing one backing) writes a spread of acked keys, then a
-// reshard called on one node (the COORDINATOR) drives FREEZE -> BISECT -> FLIP
-// -> RESUME across both nodes. After it returns, EVERY acked key must still be
-// readable with its exact value (NO ACKED WRITE LOST), the cluster must serve
-// new writes at the doubled generation, and a doubled-count key (one that maps
-// to a unit id >= N, only reachable after 2N) must round-trip - proving routing
-// advanced to the new generation cluster-wide.
-func TestReshard_MultiNodeFreezeBarrier(t *testing.T) {
+// TestReshard_MultiNodeArbiterDoubling proves the multi-node doubling via the
+// DELEGATED (arbiter-driven) Reshard(). A 2-node R=1 multi-backend cluster
+// (both nodes gRPC-registered, sharing one backing + one ConditionalStore)
+// writes a spread of acked keys, then Reshard() on one node retargets the
+// shared arbiter and the per-tick reconcile driver converges both nodes online
+// (parent-anchored placement, per-unit pause-held cut-over, durable markers).
+// After it returns, EVERY acked key must still be readable with its exact
+// value (NO ACKED WRITE LOST), the cluster must serve new writes at the
+// doubled generation, and a doubled-count key (one that maps to a unit id >=
+// N, only reachable after 2N) must round-trip - proving routing advanced to
+// the new generation cluster-wide.
+func TestReshard_MultiNodeArbiterDoubling(t *testing.T) {
 	const unitCount = 16
 	backing := sharedfactory.NewBacking()
-	n1 := startSharedNode(t, "fb-a", "", unitCount, backing)
-	n2 := startSharedNode(t, "fb-b", n1.BindAddr, unitCount, backing)
+	store := storageunit.NewMemConditionalStore()
+	n1 := startR1StoreNode(t, "fb-a", "", unitCount, backing, store)
+	n2 := startR1StoreNode(t, "fb-b", n1.BindAddr, unitCount, backing, store)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
 	}
 	// Let the join-driven reconcile settle so ownership is stable before the
-	// reshard snapshots the participant set.
+	// reshard begins.
 	time.Sleep(700 * time.Millisecond)
 
 	want := make(map[string][]byte)
@@ -111,13 +153,16 @@ func TestReshard_MultiNodeFreezeBarrier(t *testing.T) {
 		want[k] = v
 	}
 
-	// COORDINATOR-driven reshard on n1: it freezes both nodes, each bisects its
-	// owned units under the freeze (static copy), both flip to gen g+1, resume.
+	// Delegated reshard on n1: Retarget(2N) + converge. The pump stands in for
+	// the production reconcile cadence on both nodes; it keeps running through
+	// the assertions so the post-finalize redistribution keeps moving too.
+	stopPump := startReconcilePump(clusters)
+	defer stopPump()
 	if err := n1.Cluster.Reshard(); err != nil {
-		t.Fatalf("multi-node Reshard (coordinator n1): %v", err)
+		t.Fatalf("multi-node Reshard (delegated, n1): %v", err)
 	}
 
-	// Let the post-RESUME redistribution reconcile settle so every gen-(g+1)
+	// Let the post-finalize redistribution reconcile settle so every gen-(g+1)
 	// unit lands on its ring owner (some keys retry through the acquiring window
 	// until then, which getWithRetryUnavailable absorbs).
 	time.Sleep(700 * time.Millisecond)
@@ -171,14 +216,12 @@ func TestReshard_MultiNodeFreezeBarrier(t *testing.T) {
 	}
 }
 
-// TestReshard_MultiNodeFreezeRefusesWritesThenResumes pins the write-freeze
-// semantics directly: while a node is frozen (the FREEZE phase applied but
-// before RESUME), a Put returns the retryable codes.Unavailable error - it is
-// NEVER acked - and a READ still succeeds. After the node resumes, the write
-// succeeds on retry at the new generation. This is the per-node freeze contract
-// the barrier's NO-ACKED-WRITE-LOST invariant rests on, exercised through the
-// public surface by driving the phases via the cluster's exported phase entry.
-func TestReshard_MultiNodeFreezeRefusesWritesThenResumes(t *testing.T) {
+// TestReshard_MultiNodeRefusesWithoutConditionalStore pins the typed refusal:
+// a multi-node Reshard() without a Config.ConditionalStore cannot run (the
+// arbiter-driven reshard's agreement object lives there), so it must refuse
+// with cluster.ErrReshardNeedsConditionalStore - and the cluster must stay
+// fully serving at the old generation (the refusal is a clean no-op).
+func TestReshard_MultiNodeRefusesWithoutConditionalStore(t *testing.T) {
 	const unitCount = 8
 	backing := sharedfactory.NewBacking()
 	n1 := startSharedNode(t, "fz-a", "", unitCount, backing)
@@ -188,70 +231,45 @@ func TestReshard_MultiNodeFreezeRefusesWritesThenResumes(t *testing.T) {
 	}
 	time.Sleep(700 * time.Millisecond)
 
-	// Seed a key so the read-during-freeze assertion has data.
 	if err := putWithRetryUnavailable(t, n1.Cluster, "seed", "v0", 8*time.Second); err != nil {
 		t.Fatalf("seed Put: %v", err)
 	}
 
-	// Drive only the FREEZE phase on n1 (target gen 1). No coordinator loop, so
-	// the node stays frozen until we resume it - a deterministic window.
-	if err := n1.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FREEZE, 1); err != nil {
-		t.Fatalf("apply FREEZE on n1: %v", err)
-	}
-
-	// A WRITE that routes to n1's local unit must be refused with a retryable
-	// codes.Unavailable, NEVER acked. Find a key n1 owns so we exercise the
-	// local write path's freeze gate (a forwarded write would be refused too,
-	// but we want the local gate here).
-	frozenKey := localKeyFor(t, n1, unitCount)
-	err := n1.Cluster.Put([]byte(frozenKey), []byte("should-not-ack"))
+	err := n1.Cluster.Reshard()
 	if err == nil {
-		t.Fatal("Put on a frozen node succeeded; want a retryable refusal (write must NOT be acked during freeze)")
+		t.Fatal("multi-node Reshard without a ConditionalStore succeeded; want the typed refusal")
 	}
-	if st, _ := status.FromError(err); st.Code() != codes.Unavailable {
-		t.Fatalf("frozen Put error code = %v, want codes.Unavailable (retryable)", st.Code())
-	}
-
-	// READS continue while frozen: the seeded key is still served.
-	if got, err := n1.Cluster.Get([]byte("seed")); err != nil || !bytes.Equal(got, []byte("v0")) {
-		t.Fatalf("read while frozen: got=%q err=%v, want v0 (reads must continue under freeze)", got, err)
+	if !errors.Is(err, cluster.ErrReshardNeedsConditionalStore) {
+		t.Fatalf("multi-node Reshard refusal = %v, want errors.Is(_, cluster.ErrReshardNeedsConditionalStore)", err)
 	}
 
-	// Begin is also frozen (the CAS commit write path is frozen).
-	if _, err := n1.Cluster.Begin(0); err == nil {
-		t.Fatal("Begin on a frozen node succeeded; want a retryable refusal")
+	// The refusal is a clean no-op: still gen 0, still serving reads + writes.
+	if gen, count := n1.Cluster.GenStateSnapshot(); gen != 0 || count != unitCount {
+		t.Fatalf("after refusal: gen=%d count=%d, want gen 0 count %d", gen, count, unitCount)
 	}
-
-	// ABORT clears the freeze (no flip happened; the node stays at gen 0).
-	if err := n1.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_ABORT, 1); err != nil {
-		t.Fatalf("apply ABORT on n1: %v", err)
+	if got, err := getWithRetryUnavailable(t, n2.Cluster, "seed", 8*time.Second); err != nil || !bytes.Equal(got, []byte("v0")) {
+		t.Fatalf("read after refusal: got=%q err=%v", got, err)
 	}
-
-	// After the abort the write succeeds (still gen 0, the cluster un-froze).
-	if err := putWithRetryUnavailable(t, n1.Cluster, frozenKey, "now-ok", 8*time.Second); err != nil {
-		t.Fatalf("Put after abort/resume: %v", err)
-	}
-	got, err := getWithRetryUnavailable(t, n2.Cluster, frozenKey, 8*time.Second)
-	if err != nil || !bytes.Equal(got, []byte("now-ok")) {
-		t.Fatalf("read after abort via n2: got=%q err=%v", got, err)
+	if err := putWithRetryUnavailable(t, n1.Cluster, "post-refusal", "ok", 8*time.Second); err != nil {
+		t.Fatalf("write after refusal: %v", err)
 	}
 }
 
 // putWithRetryReshard is the reshard-aware write retry. It retries the two
-// transient signals a write can hit during a coordinated multi-node reshard:
+// transient signals a write can hit during a multi-node reshard:
 //
-//   - codes.Unavailable: the write-freeze refusal (frozen for the barrier) and
-//     the Phase 3 acquiring-window (owner-but-unmounted during redistribution).
+//   - codes.Unavailable: the per-unit cut-over pause / acquiring-window
+//     refusals (owner-but-unmounted, a fenced mount mid-redistribution).
 //   - codes.FailedPrecondition: the forwarding loop-guard, which fires during
-//     the brief FLIP window when the originating node and the destination
-//     momentarily disagree about the generation (one flipped, one not), so the
-//     forwarded write lands on a node whose ring view no longer owns the key. A
-//     real SDK refreshes its ring view and retries; the cluster re-keys onto
-//     the new generation and the retry routes correctly.
+//     the staggered finalize window when the originating node and the
+//     destination momentarily disagree about the generation (one finalized,
+//     one still in flight), so the forwarded write lands on a node whose ring
+//     view no longer owns the key. A real SDK refreshes its ring view and
+//     retries; the cluster re-keys onto the new generation and the retry
+//     routes correctly.
 //
 // Neither refusal acks the write (Put returned an error), so retrying upholds
-// NO-ACKED-WRITE-LOST: only a write that returns nil is counted acked. This is
-// the faithful client-retry behavior the freeze barrier's invariant rests on.
+// NO-ACKED-WRITE-LOST: only a write that returns nil is counted acked.
 func putWithRetryReshard(t *testing.T, c *cluster.Cluster, key, val string, timeout time.Duration) error {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
@@ -399,19 +417,21 @@ func TestReshard_ConcurrentWritesNoAckedWriteLost(t *testing.T) {
 }
 
 // TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost is the strongest
-// multi-node oracle: writers hammer the FULL cluster surface (gRPC-registered,
-// routed across both nodes) with ACKED writes WHILE a coordinator-driven
-// freeze-barrier reshard runs. Writes attempted DURING the freeze get the
-// retryable codes.Unavailable and are retried (never counted acked until Put
-// returns nil); the rest land at gen g or gen g+1. After the reshard, EVERY
-// acked write must be readable with its exact value through both nodes. This
-// proves the cluster-wide freeze removes the cross-node concurrent-write hazard
-// that made the single-node bisect unsafe on a multi-node cluster.
+// multi-node oracle in this file: writers hammer the FULL cluster surface
+// (gRPC-registered, routed across both nodes) with ACKED writes WHILE a
+// delegated (arbiter-driven) reshard runs. Writes attempted during a per-unit
+// cut-over or the staggered finalize window get the retryable refusals and are
+// retried (never counted acked until Put returns nil); the rest land at gen g
+// or gen g+1. After the reshard, EVERY acked write must be readable with its
+// exact value through both nodes. This proves parent-anchored placement + the
+// per-unit pause-held cut-over remove the cross-node concurrent-write hazard
+// that made the plain single-node bisect unsafe on a multi-node cluster.
 func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	const unitCount = 8
 	backing := sharedfactory.NewBacking()
-	n1 := startSharedNode(t, "mc-a", "", unitCount, backing)
-	n2 := startSharedNode(t, "mc-b", n1.BindAddr, unitCount, backing)
+	store := storageunit.NewMemConditionalStore()
+	n1 := startR1StoreNode(t, "mc-a", "", unitCount, backing, store)
+	n2 := startR1StoreNode(t, "mc-b", n1.BindAddr, unitCount, backing, store)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
@@ -469,11 +489,15 @@ func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	}
 
 	// BARRIER: hold the reshard until every writer has provably landed an acked
-	// write through its entry node, so the coordinator-driven freeze below
-	// genuinely races live writes on both first-hops.
+	// write through its entry node, so the delegated reshard below genuinely
+	// races live writes on both first-hops.
 	awaitFirstAckBarrier(t, ready, 30*time.Second, &stop, &wg)
 
-	// Coordinator-driven reshard on n1 while writers hammer both nodes.
+	// Delegated reshard on n1 while writers hammer both nodes. The pump stands
+	// in for the production reconcile cadence and keeps running through the
+	// assertions so the redistribution keeps moving.
+	stopPump := startReconcilePump(clusters)
+	defer stopPump()
 	if err := n1.Cluster.Reshard(); err != nil {
 		stop.Store(true)
 		wg.Wait()
@@ -482,7 +506,7 @@ func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	stop.Store(true)
 	wg.Wait()
 
-	// Let the post-RESUME redistribution settle so every gen-(g+1) unit is on
+	// Let the post-finalize redistribution settle so every gen-(g+1) unit is on
 	// its ring owner before the final read sweep.
 	time.Sleep(700 * time.Millisecond)
 
