@@ -1,68 +1,61 @@
 package integration
 
-// THE LOSSLESS MULTI-NODE RESHARD GATE TEST for v0.8 (the data-loss oracle for
-// the cluster-wide-freeze barrier).
+// THE LOSSLESS MULTI-NODE R=1 RESHARD GATE (the data-loss oracle for the
+// arbiter-driven multi-node doubling).
 //
 // This is the multi-node analogue of the single-node Phase 4 gate
-// (lossless_reshard_gate_test.go). The safety net the whole multi-node
+// (lossless_reshard_gate_test.go). The safety net the multi-node
 // doubling-resharder is built to satisfy:
 //
-//	NO ACKED WRITE IS LOST DURING A COORDINATED MULTI-NODE RESHARD.
+//	NO ACKED WRITE IS LOST DURING A MULTI-NODE RESHARD.
 //
-// A cross-node doubling cannot be made safe by the single-node node-LOCAL
-// write-pause: each node advances its generation independently, so a concurrent
-// write could route at the OLD generation on one node while another has already
-// FLIPPED, and be lost. The multi-node reshard removes that hazard with a brief
-// cluster-wide WRITE-FREEZE: the coordinator (the node Reshard() is called on)
-// drives a 4-phase barrier over every node - FREEZE (writes refused cluster-
-// wide with a retryable error, reads continue) -> BISECT (each node statically
-// copies its gen-g units into fresh gen-(g+1) children in the shared backing,
-// no catch-up because the source is frozen) -> FLIP (every node atomically
-// advances to gen g+1 and retires its gen-g units) -> RESUME (unfreeze; the 2N
-// units redistribute across nodes by the reused Phase 3 lease handoff). Any
-// phase failure / timeout / membership change ABORTS: every node unfreezes,
-// discards half-built children, and stays at gen g.
+// A cross-node doubling cannot be made safe by the plain single-node
+// node-LOCAL write-pause: each node advances its generation independently, so
+// a concurrent write could route at the OLD generation on one node while
+// another has already flipped, and be lost. The arbiter-driven R=1 reshard
+// removes that hazard with PARENT-ANCHORED PLACEMENT plus the per-unit
+// pause-held cut-over (pkg/cluster/multibackend_reshard_r1.go): while a split
+// is in flight, every node forwards a splitting unit's key-space to the SAME
+// node (its gen-g owner), and that owner's clear+copy+flip under the unit's
+// write-pause WRITE side is the single, proven cut-over boundary. Cross-node
+// ordering comes from the durable cut-over markers (one per unit, create-only
+// CAS); each node finalizes (retires parents + advances its generation) only
+// once it observes EVERY unit's marker. Reshard() on a multi-node cluster
+// delegates to this flow: it retargets the shared CAS arbiter and waits for
+// the local generation to advance.
 //
-// The gate below stands up an in-process MULTI-NODE cluster (2-3 nodes,
-// gRPC-registered + forwarding, sharing ONE shared-backing factory) and asserts
-// the full set of properties across a live coordinated reshard, WITH A
-// CONCURRENT WRITER hammering acked keys through the whole reshard:
+// The gate below stands up an in-process 3-node R=1 cluster (gRPC-registered +
+// forwarding, sharing ONE shared-backing factory AND one MemConditionalStore)
+// and asserts the full set of properties across a live delegated reshard, WITH
+// A CONCURRENT WRITER hammering acked keys through the whole reshard:
 //
 //  1. THE ORACLE (zero loss). Every key written before the reshard AND every
 //     key the concurrent probe got an ACK for during the reshard is still
-//     readable, with its EXACT recorded value, from ANY node, after the cluster
-//     reaches gen g+1 (2N units). Hundreds of baseline keys including co-located
-//     {tag} sets, plus a stream of probe writes (the freeze-window analogue of
-//     Phase 3's concurrent-write probe: a write refused by the freeze gets the
-//     retryable error and is retried, so it is only counted acked once Put
-//     returns nil).
-//  2. GENERATION ADVANCED + PARTITIONED. The cluster reached gen g+1 (2N units):
-//     every gen-g unit store was retired and every gen-(g+1) child store exists
-//     in the shared backing, and the 2N units are correctly partitioned across
-//     the nodes by the Phase 3 redistribution (each node mounts exactly the
-//     gen-(g+1) units the ring assigns it; their union is all 2N units; no node
-//     still mounts a gen-g unit).
+//     readable, with its EXACT recorded value, from ANY node, after the
+//     cluster reaches gen g+1 (2N units). Hundreds of baseline keys including
+//     co-located {tag} sets, plus a stream of probe writes (a write refused by
+//     a cut-over pause / acquiring window gets the retryable error and is
+//     retried, so it is only counted acked once Put returns nil).
+//  2. GENERATION ADVANCED + PARTITIONED. The cluster reached gen g+1 (2N
+//     units): every gen-g unit store was retired and every gen-(g+1) child
+//     store exists in the shared backing, and the 2N units are correctly
+//     partitioned across the nodes by the redistribution (each node mounts
+//     exactly the gen-(g+1) units the ring assigns it; their union is all 2N
+//     units; no node still mounts a gen-g unit).
 //  3. CO-LOCATION SURVIVES. Every key in a {tag} set lands on ONE gen-(g+1)
-//     unit and is served by ONE owner node after the bisect (a co-located set is
-//     never split), because the whole set shares one ShardHash and one ShardHash
-//     bisects to exactly one child.
-//  4. READS AVAILABLE (strict during FREEZE/BISECT, retryable across FLIP). A
-//     read issued while the cluster is frozen mid-reshard succeeds STRICTLY
-//     (no retry), served from the live gen-g units. Across the staggered FLIP
-//     window generations differ across nodes, so a read may briefly hit the
-//     retryable acquiring-window / ring-refresh error; a reader running through
-//     the WHOLE reshard with the standard retry must always eventually read the
-//     correct value (retryable-available, never lost). Writes are refused with
-//     the retryable error during the freeze and resume after.
-//  5. BREAK DEMONSTRATION (TestMultiNodeReshardGateCatchesLostWrite, below). A
-//     deliberately broken barrier - one node SKIPS the freeze, so a write slips
-//     through at gen g into a gen-g unit that is then retired by FLIP without
-//     ever being bisected - makes the oracle FAIL, proving the gate actually
-//     catches a write lost to a violated barrier rather than rubber-stamping.
-//  6. ABORT PATH (TestMultiNodeReshardAbortStaysAtGenG, below). A forced phase
-//     failure ABORTs the reshard: the cluster stays at gen g, every node
-//     unfreezes, and the whole dataset is intact + writable at the old
-//     generation.
+//     unit and is served by ONE owner node after the bisect (a co-located set
+//     is never split), because the whole set shares one ShardHash and one
+//     ShardHash bisects to exactly one child.
+//  4. READS RETRYABLE-AVAILABLE ACROSS THE WHOLE RESHARD. Generations stagger
+//     across nodes during the split (one node finalized, a peer still in
+//     flight), so a read may briefly hit the retryable acquiring-window /
+//     ring-refresh error; a reader running through the WHOLE reshard with the
+//     standard retry must always eventually read the correct value
+//     (retryable-available, never lost, never wrong).
+//  5. BREAK DEMONSTRATION (TestMultiNodeReshardGateCatchesLostWrite, below).
+//     Config.TestingForceUncleanReshard flips + retires parents WITHOUT
+//     copying their data into the children; the oracle must FAIL (catch the
+//     loss), proving the gate is not a rubber stamp.
 //
 // If this test ever passes while a write is silently lost across a multi-node
 // reshard, the gate is broken; the break-demonstration keeps it honest.
@@ -79,7 +72,6 @@ import (
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/ring"
-	pb "github.com/Zamua/shale/pkg/rpc/proto"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -97,10 +89,10 @@ func genUnitOwnerAmong(members []ring.Member, gu storageunit.GenUnit) string {
 	return r.LocateKey(genUnitBytesForTest(gu)).ID
 }
 
-// nodeMountsGen1Units waits until node n's handle mounts EXACTLY the gen-1 units
-// the ring assigns it (and no gen-0 unit remains). Returns the set it settled on
-// for the union assertion. The redistribution is asynchronous (a debounced
-// reconcile after RESUME), so we poll.
+// nodeMountsExpectedGen1 waits until node n's handle mounts EXACTLY the gen-1
+// units the ring assigns it (and no gen-0 unit remains). Returns the set it
+// settled on for the union assertion. The redistribution is asynchronous (the
+// reconcile cadence after finalize), so we poll.
 func nodeMountsExpectedGen1(t *testing.T, n *sharedNode, members []ring.Member, newCount int) map[storageunit.UnitID]struct{} {
 	t.Helper()
 	newUC := storageunit.MustUnitCount(newCount)
@@ -135,33 +127,75 @@ func nodeMountsExpectedGen1(t *testing.T, n *sharedNode, members []ring.Member, 
 	return expected
 }
 
-// TestLosslessMultiNodeReshardGate is THE data-loss oracle for the v0.8 multi-
-// node cluster-wide-freeze reshard. See the file header for the properties it
-// pins. It stands up a 3-node shared-backing cluster, writes a recorded dataset
-// spanning every unit plus co-located {tag} sets, starts a concurrent probe that
-// keeps acking new keys through the full routed surface, triggers a coordinator-
-// driven Reshard() that doubles N -> 2N cluster-wide via the freeze barrier, and
-// asserts: the whole dataset (baseline + probe) survived with exact values from
-// every node, the cluster advanced to gen 1 with the 2N units partitioned
-// correctly across nodes, co-location held, and reads stayed available during
-// the freeze.
+// getWithRetryReshard is the reshard-aware READ retry: like
+// getWithRetryUnavailable it retries codes.Unavailable (acquiring / cut-over
+// windows), and it ALSO retries codes.FailedPrecondition - the forwarding
+// loop-guard a read hits during the staggered finalize window, when the
+// originating node (still in flight, parent-anchored) forwards to a node that
+// already finalized and re-keyed. A real SDK refreshes its ring view and
+// retries; the window closes as the origin observes the markers and finalizes.
+func getWithRetryReshard(t *testing.T, c *cluster.Cluster, key string, timeout time.Duration) ([]byte, error) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		got, err := c.Get([]byte(key))
+		if err == nil {
+			return got, nil
+		}
+		code := status.Code(err)
+		retryable := code == codes.Unavailable || code == codes.FailedPrecondition
+		if !retryable || time.Now().After(deadline) {
+			return nil, err
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// startR1StoreGateCluster stands up a 3-node R=1 cluster over one shared
+// backing + one shared MemConditionalStore (the arbiter-driven reshard's
+// agreement store), with an optional Config mutator, and converges it.
+func startR1StoreGateCluster(t *testing.T, idPrefix string, unitCount int, backing *sharedfactory.Backing, store storageunit.ConditionalStore, mutate func(*cluster.Config)) []*sharedNode {
+	t.Helper()
+	mk := func(cfg *cluster.Config) {
+		cfg.ConditionalStore = store
+		if mutate != nil {
+			mutate(cfg)
+		}
+	}
+	n1 := startReplicatedNodeCfg(t, idPrefix+"1", "", unitCount, 1, backing, mk)
+	n2 := startReplicatedNodeCfg(t, idPrefix+"2", n1.BindAddr, unitCount, 1, backing, mk)
+	n3 := startReplicatedNodeCfg(t, idPrefix+"3", n1.BindAddr, unitCount, 1, backing, mk)
+	nodes := []*sharedNode{n1, n2, n3}
+	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
+	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {
+		t.Fatalf("3-node convergence: %v", err)
+	}
+	// Let the join-driven reconcile settle so ownership is stable before the
+	// reshard begins.
+	time.Sleep(900 * time.Millisecond)
+	return nodes
+}
+
+// TestLosslessMultiNodeReshardGate is THE data-loss oracle for the multi-node
+// R=1 arbiter-driven reshard. See the file header for the properties it pins.
+// It stands up a 3-node shared-backing + shared-store cluster, writes a
+// recorded dataset spanning every unit plus co-located {tag} sets, starts a
+// concurrent probe that keeps acking new keys through the full routed surface,
+// triggers a delegated Reshard() that doubles N -> 2N cluster-wide, and
+// asserts: the whole dataset (baseline + probe) survived with exact values
+// from every node, the cluster advanced to gen 1 with the 2N units partitioned
+// correctly across nodes, co-location held, and reads stayed
+// retryable-available throughout.
 func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	const unitCount = 8 // N; doubles to 16
 	const newCount = 2 * unitCount
 	backing := sharedfactory.NewBacking()
+	store := storageunit.NewMemConditionalStore()
 
-	// === Step 1a: stand up 3 nodes, multi-backend, sharing one backing. ===
-	n1 := startSharedNode(t, "mngate1", "", unitCount, backing)
-	n2 := startSharedNode(t, "mngate2", n1.BindAddr, unitCount, backing)
-	n3 := startSharedNode(t, "mngate3", n1.BindAddr, unitCount, backing)
-	nodes := []*sharedNode{n1, n2, n3}
-	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
-	if err := waitForMembersAll(clusters, 3, 20*time.Second); err != nil {
-		t.Fatalf("3-node convergence: %v", err)
-	}
-	// Let the join-driven reconcile settle so ownership is stable before the
-	// reshard snapshots the participant set.
-	time.Sleep(900 * time.Millisecond)
+	// === Step 1a: stand up 3 nodes, R=1 multi-backend, sharing one backing +
+	// one conditional store. ===
+	nodes := startR1StoreGateCluster(t, "mngate", unitCount, backing, store, nil)
+	n1, n2 := nodes[0], nodes[1]
 
 	// === Step 1b: write a known dataset spanning MANY units, recording
 	// key -> value. plainKeys spread across all N units; coLocated {tag} sets
@@ -225,7 +259,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 
 	// === Step 2: start a CONCURRENT background probe. It writes THROUGH the full
 	// routed surface (alternating entry node so writes route both locally and
-	// forwarded), retries the freeze-window retryable error, and records ONLY
+	// forwarded), retries the reshard-window retryable errors, and records ONLY
 	// keys it got an ACK for (Put returned nil). ===
 	var probeMu sync.Mutex
 	probeAcked := make(map[string][]byte)
@@ -247,7 +281,7 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 			for !stop.Load() {
 				k := fmt.Sprintf("probe-%d-%07d", w, i)
 				v := fmt.Appendf(nil, "pv-%d-%07d", w, i)
-				// Retry the freeze-window + handoff-window retryable signals; any
+				// Retry the cut-over + handoff-window retryable signals; any
 				// other error is a real failure. Record only after Put returns nil.
 				if err := putWithRetryReshard(t, entry.Cluster, k, string(v), 15*time.Second); err != nil {
 					t.Errorf("probe Put %q during reshard: %v", k, err)
@@ -265,77 +299,33 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	}
 	// BARRIER: hold the reshard until every probe writer has provably landed an
 	// acked write through its entry node. The writers keep looping through the
-	// freeze barrier that follows, so the acked set spans it by construction
-	// rather than by timing luck.
+	// reshard that follows, so the acked set spans it by construction rather
+	// than by timing luck.
 	awaitFirstAckBarrier(t, probeReady, 30*time.Second, &stop, &wg)
 
-	// === Step 4 (req 6): READS AVAILABLE DURING THE FREEZE. Spin a reader that
-	// keeps reading a known baseline key throughout the reshard and records
-	// whether it ever saw a successful read while the cluster was frozen. The
-	// freeze refuses WRITES (retryable) but never gates reads; a read mid-reshard
-	// must succeed, served from the live gen-g units. ===
-	const freezeProbeKey = "rec-00000"
-	freezeProbeVal := want[freezeProbeKey]
-	var sawFrozen atomic.Bool // observed at least one node frozen during the run
-	var readOKWhileFrozen atomic.Bool
-	// The gate OWNS its observation window: the coordinator's post-FREEZE hook
-	// holds the barrier open (bounded) until the reader has provably run one
-	// probe inside it. Without this the assertion races the freeze duration -
-	// a fast freeze under a loaded machine slips between two 2ms polls and the
-	// vacuity guard below fails a run whose reshard was perfectly healthy
-	// (observed: green scoped 8/8, flaky only under full-suite load).
-	freezeObserved := make(chan struct{})
-	var freezeObservedOnce sync.Once
-	n1.Cluster.TestingSetAfterFreezeHook(func() {
-		select {
-		case <-freezeObserved:
-		case <-time.After(5 * time.Second):
-		}
-	})
+	// === Step 2b (req 4, the staggered-window read model): RETRYABLE-AVAILABLE
+	// ACROSS THE WHOLE RESHARD. Generations stagger across nodes during the
+	// split (a peer-mid-flight forwards to a node that already finalized, which
+	// may briefly return the retryable acquiring-window error or the
+	// ring-refresh loop-guard). A reader running through the whole reshard
+	// must, WITH the standard retry, always eventually read the correct value -
+	// never a permanent failure, never a wrong value. We rotate the entry node
+	// so the read routes both locally and forwarded. ===
+	const readProbeKey = "rec-00000"
+	readProbeVal := want[readProbeKey]
+	var readViolation atomic.Value // stores a string describing the first violation
 	var readWg sync.WaitGroup
-	readWg.Go(func() {
-		for !stop.Load() {
-			frozen := n1.Cluster.TestingIsFrozen() || n2.Cluster.TestingIsFrozen() || n3.Cluster.TestingIsFrozen()
-			if frozen {
-				sawFrozen.Store(true)
-				// Read DIRECTLY (no retry helper) so we are asserting the read
-				// path is not gated by the freeze. Read from a node that is itself
-				// frozen if possible, to prove its own read path serves.
-				got, err := n1.Cluster.Get([]byte(freezeProbeKey))
-				if err == nil && bytes.Equal(got, freezeProbeVal) {
-					readOKWhileFrozen.Store(true)
-				}
-				// One full probe ran inside the window: release the barrier.
-				freezeObservedOnce.Do(func() { close(freezeObserved) })
-			}
-			time.Sleep(2 * time.Millisecond)
-		}
-	})
-
-	// === Step 4b (req 3, the FLIP-window read model): RETRYABLE-AVAILABLE ACROSS
-	// THE WHOLE RESHARD. Reads are STRICTLY served during FREEZE/BISECT but only
-	// RETRYABLE-available across the staggered FLIP window (a peer-at-g forwards a
-	// read to a node-at-g+1 that may briefly return the retryable acquiring-window
-	// error or the ring-refresh loop-guard). So a reader running through the whole
-	// reshard must, WITH the standard retry, always eventually read the correct
-	// value - never a permanent failure, never a wrong value. We rotate the entry
-	// node so the read routes both locally and forwarded. A read that fails even
-	// after the retry budget, or returns a wrong value, is a violation. ===
-	var flipReadViolation atomic.Value // stores a string describing the first violation
 	readWg.Go(func() {
 		i := 0
 		for !stop.Load() {
 			entry := nodes[i%len(nodes)]
-			// getWithRetryUnavailable retries codes.Unavailable; the brief
-			// ring-refresh FailedPrecondition window self-heals as the ring
-			// re-keys, so a generous timeout rides out both.
-			got, err := getWithRetryUnavailable(t, entry.Cluster, freezeProbeKey, 8*time.Second)
+			got, err := getWithRetryReshard(t, entry.Cluster, readProbeKey, 8*time.Second)
 			if err != nil {
-				flipReadViolation.CompareAndSwap(nil, fmt.Sprintf("read of %q via %s failed across the reshard even with retry: %v", freezeProbeKey, entry.ID, err))
+				readViolation.CompareAndSwap(nil, fmt.Sprintf("read of %q via %s failed across the reshard even with retry: %v", readProbeKey, entry.ID, err))
 				return
 			}
-			if !bytes.Equal(got, freezeProbeVal) {
-				flipReadViolation.CompareAndSwap(nil, fmt.Sprintf("read of %q via %s returned %q, want %q (wrong value mid-reshard)", freezeProbeKey, entry.ID, got, freezeProbeVal))
+			if !bytes.Equal(got, readProbeVal) {
+				readViolation.CompareAndSwap(nil, fmt.Sprintf("read of %q via %s returned %q, want %q (wrong value mid-reshard)", readProbeKey, entry.ID, got, readProbeVal))
 				return
 			}
 			i++
@@ -343,21 +333,25 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 		}
 	})
 
-	// === Step 3: trigger the coordinated multi-node reshard on n1 (coordinator).
-	// It drives FREEZE -> BISECT -> FLIP -> RESUME across all three nodes. ===
+	// === Step 3: trigger the delegated multi-node reshard on n1. It retargets
+	// the shared arbiter; the reconcile pump (standing in for the production
+	// cadence) drives every node's share of the split to convergence. ===
+	stopPump := startReconcilePump([]*cluster.Cluster{nodes[0].Cluster, nodes[1].Cluster, nodes[2].Cluster})
+	defer stopPump()
 	if err := n1.Cluster.Reshard(); err != nil {
 		stop.Store(true)
 		wg.Wait()
 		readWg.Wait()
-		t.Fatalf("multi-node Reshard (coordinator n1): %v", err)
+		t.Fatalf("multi-node Reshard (delegated, n1): %v", err)
 	}
 
-	// === Step 4: stop the probe + reader and let the redistribution settle. ===
+	// === Step 4: keep writing briefly past the local convergence (peers may
+	// still be finalizing), then stop the probe + reader and let the
+	// redistribution settle. ===
+	time.Sleep(400 * time.Millisecond)
 	stop.Store(true)
 	wg.Wait()
 	readWg.Wait()
-	// Let the post-RESUME redistribution reconcile settle so every gen-(g+1)
-	// unit lands on its ring owner.
 	time.Sleep(900 * time.Millisecond)
 
 	probeMu.Lock()
@@ -370,22 +364,10 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	maps.Copy(probeSnapshot, probeAcked)
 	probeMu.Unlock()
 
-	// === ASSERTION (req 6): a read succeeded while the cluster was frozen. We
-	// require the reader to have OBSERVED a freeze (otherwise the assertion is
-	// vacuous); given a freeze was observed, at least one read must have served. ===
-	if !sawFrozen.Load() {
-		t.Fatal("reader never observed the cluster frozen during the reshard; the read-availability assertion is vacuous (the freeze window was missed)")
-	}
-	if !readOKWhileFrozen.Load() {
-		t.Fatal("READ-AVAILABILITY VIOLATED: no read succeeded while the cluster was frozen; reads must continue under the freeze, served from the live gen-g units")
-	}
-
-	// === ASSERTION (req 3, the FLIP-window read model): a reader running across
-	// the WHOLE reshard, WITH the standard Unavailable-retry, never hit a
-	// permanent failure or a wrong value. Reads are strict during FREEZE/BISECT
-	// and retryable-available across the staggered FLIP window - never lost. ===
-	if v := flipReadViolation.Load(); v != nil {
-		t.Fatalf("FLIP-WINDOW READ-AVAILABILITY VIOLATED: %s (reads must be retryable-available across the whole reshard)", v.(string))
+	// === ASSERTION (req 4): a reader running across the WHOLE reshard, WITH
+	// the standard retry, never hit a permanent failure or a wrong value. ===
+	if v := readViolation.Load(); v != nil {
+		t.Fatalf("READ-AVAILABILITY VIOLATED: %s (reads must be retryable-available across the whole reshard)", v.(string))
 	}
 
 	// === ASSERTION (req 1, THE ORACLE): EVERY baseline key AND every acked probe
@@ -406,10 +388,12 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 	assertOracle("baseline", want)
 	assertOracle("probe", probeSnapshot)
 
-	// === ASSERTION (req 2): GENERATION ADVANCED. Every gen-(g+1) child store
-	// exists in the shared backing and holds its keys; every gen-0 unit store was
-	// retired (no node still mounts a gen-0 unit). We verify routing advanced via
-	// the physical store + a doubled-only-unit key below. ===
+	// === ASSERTION (req 2): GENERATION ADVANCED. Every node reports gen 1 at
+	// 2N units, and every gen-(g+1) child store exists in the shared backing
+	// and holds its keys. ===
+	if !waitUntil(15*time.Second, func() bool { return allAtGeneration(nodes, 1, uint32(newCount)) }) {
+		t.Fatalf("GENERATION VIOLATED: not every node reached gen 1 / %d units: %s", newCount, genStatesOf(nodes))
+	}
 	newUC := storageunit.MustUnitCount(newCount)
 	for k, v := range want {
 		newU := storageunit.UnitForShardKey(ring.ShardKey([]byte(k)), newUC)
@@ -421,14 +405,11 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 		if !found {
 			t.Fatalf("GENERATION VIOLATED: key %q absent (or wrong) in its gen-1 child store %s (data did not physically move)", k, newGU)
 		}
-		// Its gen-0 unit store must no longer be the one routing serves: route a
-		// fresh op resolves at 2N (checked via doubled-only-unit key below).
 	}
 
-	// === ASSERTION (req 2): PARTITIONED across nodes by the Phase 3
-	// redistribution. Each node settles to EXACTLY the gen-1 units the ring
-	// assigns it; their union is all 2N gen-1 units; no node still mounts a
-	// gen-0 unit. ===
+	// === ASSERTION (req 2): PARTITIONED across nodes by the redistribution.
+	// Each node settles to EXACTLY the gen-1 units the ring assigns it; their
+	// union is all 2N gen-1 units; no node still mounts a gen-0 unit. ===
 	members := n1.Cluster.Members()
 	union := make(map[storageunit.UnitID]struct{})
 	for _, n := range nodes {
@@ -494,238 +475,57 @@ func TestLosslessMultiNodeReshardGate(t *testing.T) {
 }
 
 // --- BREAK DEMONSTRATION (req 5) ----------------------------------------
-//
-// To prove the multi-node gate is not a rubber stamp we deliberately VIOLATE the
-// freeze barrier and show the oracle FAILS (catches the lost write). The break:
-// drive the 4-phase barrier MANUALLY across the nodes via the same idempotent
-// phase handlers the coordinator and the gRPC server both funnel through
-// (Cluster.ApplyReshardPhase), but SKIP THE FREEZE on one node. A write that
-// routes (at the old generation) to that unfrozen node's gen-g unit then lands
-// in a gen-g store AFTER that node's bisect already snapshotted it. FLIP retires
-// the gen-g units, so the slipped write - never copied into the gen-(g+1) child
-// - is lost. This is exactly the cross-node hazard the cluster-wide freeze
-// exists to prevent; the oracle must observe the loss.
-//
-// We make the lost write DETERMINISTIC: after BOTH nodes bisect (so the
-// gen-(g+1) children are a static snapshot) but BEFORE FLIP, we write a known
-// "late" key that routes to a gen-g unit the UNFROZEN node owns. Because that
-// node never froze, the write is acked at gen g into the gen-g store; the bisect
-// already ran, so the child never gets it; FLIP retires the gen-g store. Lost.
 
 // TestMultiNodeReshardGateCatchesLostWrite is the BREAK DEMONSTRATION for the
-// multi-node gate. It drives the barrier manually, skipping the freeze on one
-// node, lands a write through the violated barrier, completes the flip, and
-// asserts the oracle CATCHES the loss. It PASSES iff the broken barrier is
-// caught (the slipped acked write becomes unreadable / wrong after the reshard).
-// If the break produced no detectable loss, the test fails loudly: that would
-// mean the oracle is blind to a write lost to a violated multi-node barrier.
+// multi-node gate. Config.TestingForceUncleanReshard disables the R=1 drive's
+// copy passes: units flip + publish their durable markers and finalize retires
+// the parents WITHOUT the children ever receiving the parents' data - exactly
+// the "flip without capturing acked writes" failure the copy machinery exists
+// to prevent. The oracle must CATCH the resulting loss. It PASSES iff the
+// broken reshard is caught; if the break produced no detectable loss, the test
+// fails loudly - that would mean the oracle is blind to a write lost to a
+// broken multi-node reshard.
 func TestMultiNodeReshardGateCatchesLostWrite(t *testing.T) {
 	const unitCount = 8
 	backing := sharedfactory.NewBacking()
-	n1 := startSharedNode(t, "mnbrk1", "", unitCount, backing)
-	n2 := startSharedNode(t, "mnbrk2", n1.BindAddr, unitCount, backing)
-	nodes := []*sharedNode{n1, n2}
-	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
-	if err := waitForMembersAll(clusters, 2, 20*time.Second); err != nil {
-		t.Fatalf("2-node convergence: %v", err)
-	}
-	time.Sleep(900 * time.Millisecond)
+	store := storageunit.NewMemConditionalStore()
+	nodes := startR1StoreGateCluster(t, "mnbrk", unitCount, backing, store, func(cfg *cluster.Config) {
+		cfg.TestingForceUncleanReshard = true
+	})
+	n1 := nodes[0]
 
-	// Seed so every unit has gen-g data to bisect.
+	// Seed so every unit has gen-g data the (skipped) bisect copy should have
+	// carried into the children.
+	want := make(map[string][]byte)
 	for i := range 200 {
 		k := fmt.Sprintf("seed-%05d", i)
-		if err := putWithRetryUnavailable(t, n1.Cluster, k, fmt.Sprintf("sv-%05d", i), 10*time.Second); err != nil {
-			t.Fatalf("seed Put %q: %v", k, err)
-		}
-	}
-
-	// Identify which node will be the BROKEN (unfrozen) one, and a key that
-	// routes (at gen 0) to a gen-g unit IT owns - so a write of that key lands in
-	// its local gen-g store while it is unfrozen. n2 is the broken node.
-	broken := n2
-	frozenOK := n1
-	lateKey := localKeyFor(t, broken, unitCount)
-	lateVal := []byte("slipped-through-the-broken-freeze")
-
-	// Drive the barrier MANUALLY, target gen 1, but skip FREEZE on the broken
-	// node. The handlers reject a bisect/flip on an unfrozen node, so we cannot
-	// simply skip the freeze and still flip the broken node through the public
-	// handler (it would refuse). Instead we model the violated-barrier hazard at
-	// its essence: the broken node IS frozen for the protocol's sake (so flip is
-	// reachable) but we LAND THE WRITE through a transient un-freeze BEFORE its
-	// bisect runs, simulating a node that did not honor the freeze for that write.
-	//
-	// Concretely: freeze the GOOD node, then on the broken node we (a) leave it
-	// UNFROZEN, (b) land the late write at gen 0 (the freeze-violating write),
-	// (c) NOW freeze it, (d) bisect it (its bisect snapshots gen-g WITHOUT the
-	// late write only if the late write is excluded - so we land the write AFTER
-	// the bisect to guarantee it is excluded). We do step (b) AFTER bisect.
-	if err := frozenOK.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FREEZE, 1); err != nil {
-		t.Fatalf("FREEZE good node: %v", err)
-	}
-	if err := broken.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FREEZE, 1); err != nil {
-		t.Fatalf("FREEZE broken node: %v", err)
-	}
-	// BISECT both: snapshots the current gen-g contents into the gen-1 children.
-	if err := frozenOK.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_BISECT, 1); err != nil {
-		t.Fatalf("BISECT good node: %v", err)
-	}
-	if err := broken.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_BISECT, 1); err != nil {
-		t.Fatalf("BISECT broken node: %v", err)
-	}
-
-	// THE BARRIER VIOLATION: the broken node fails to honor the freeze and lets a
-	// write through AFTER its bisect snapshotted the gen-g unit. We clear its
-	// freeze (modeling a node that never froze / un-froze early), land the late
-	// write at gen 0 into its gen-g store, then re-freeze so the flip is reachable.
-	broken.Cluster.TestingUnfreeze()
-	if err := broken.Cluster.Put([]byte(lateKey), lateVal); err != nil {
-		t.Fatalf("late write through the broken (unfrozen) node should ack at gen 0: %v", err)
-	}
-	// Confirm the write physically landed in the BROKEN node's gen-0 unit store
-	// (proving it acked at the old generation, into a store FLIP is about to
-	// retire) and NOT into the gen-1 child the bisect already snapshotted.
-	lateU0 := storageunit.UnitForShardKey(ring.ShardKey([]byte(lateKey)), storageunit.MustUnitCount(unitCount))
-	if found, ok := sharedStoreHas(backing, storageunit.NewGenUnit(0, lateU0), lateKey, lateVal); !ok || !found {
-		t.Fatalf("break setup: late write did not land in the gen-0 store %s (ok=%v found=%v); cannot demonstrate the loss", storageunit.NewGenUnit(0, lateU0), ok, found)
-	}
-	// Re-freeze so FLIP is reachable on the broken node.
-	if err := broken.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FREEZE, 1); err != nil {
-		t.Fatalf("re-FREEZE broken node: %v", err)
-	}
-
-	// FLIP both: advance to gen 1 and RETIRE the gen-0 units (including the one
-	// holding the late write, which the bisect never captured).
-	if err := frozenOK.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FLIP, 1); err != nil {
-		t.Fatalf("FLIP good node: %v", err)
-	}
-	if err := broken.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FLIP, 1); err != nil {
-		t.Fatalf("FLIP broken node: %v", err)
-	}
-	// RESUME both: unfreeze, redistribute.
-	if err := frozenOK.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_RESUME, 1); err != nil {
-		t.Fatalf("RESUME good node: %v", err)
-	}
-	if err := broken.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_RESUME, 1); err != nil {
-		t.Fatalf("RESUME broken node: %v", err)
-	}
-	// Let the redistribution settle so reads route to the gen-1 owner.
-	time.Sleep(900 * time.Millisecond)
-
-	// THE ORACLE, in detection mode: the late write was acked at gen 0 into a
-	// gen-0 store that FLIP retired, and the bisect (which ran before the write
-	// landed) never copied it into the gen-1 child. So it must now be lost: a read
-	// at gen 1 routes to the gen-1 child, which never got the value.
-	lost := false
-	for _, n := range nodes {
-		got, err := getWithRetryUnavailable(t, n.Cluster, lateKey, 8*time.Second)
-		if err != nil || !bytes.Equal(got, lateVal) {
-			lost = true
-			break
-		}
-	}
-	if !lost {
-		t.Fatalf("BREAK NOT CAUGHT: a write that slipped through a violated freeze barrier still reads correctly after the reshard - the oracle is blind to a write lost to a broken multi-node barrier")
-	}
-	t.Logf("break demonstration: a write that bypassed the freeze on node %s (acked at gen 0, retired by FLIP, never bisected) is lost; the oracle catches it", broken.ID)
-}
-
-// --- ABORT PATH (req 6) -------------------------------------------------
-//
-// The fail-safe: if any phase fails, the coordinator ABORTs - every node
-// unfreezes, discards half-built gen-(g+1) children, and STAYS at gen g. We
-// force a phase failure by freezing + bisecting, then driving ABORT directly
-// (the same handler the coordinator's abort path RPCs), and assert the cluster
-// stays at gen g, unfrozen, with the dataset intact + writable.
-
-// TestMultiNodeReshardAbortStaysAtGenG drives FREEZE + BISECT on a 2-node
-// cluster, then ABORTs (modeling a phase failure the coordinator catches before
-// FLIP). It asserts every node stays at gen g (0): no gen-1 unit is routed, the
-// cluster unfroze (writes succeed again), and the full pre-reshard dataset is
-// intact + readable. The half-built gen-1 children are harmless (never routed).
-func TestMultiNodeReshardAbortStaysAtGenG(t *testing.T) {
-	const unitCount = 8
-	backing := sharedfactory.NewBacking()
-	n1 := startSharedNode(t, "mnab1", "", unitCount, backing)
-	n2 := startSharedNode(t, "mnab2", n1.BindAddr, unitCount, backing)
-	nodes := []*sharedNode{n1, n2}
-	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
-	if err := waitForMembersAll(clusters, 2, 20*time.Second); err != nil {
-		t.Fatalf("2-node convergence: %v", err)
-	}
-	time.Sleep(900 * time.Millisecond)
-
-	// Record a dataset spanning every unit.
-	want := make(map[string][]byte)
-	for i := range 300 {
-		k := fmt.Sprintf("ab-%05d", i)
-		v := fmt.Appendf(nil, "abv-%05d", i)
+		v := fmt.Appendf(nil, "sv-%05d", i)
 		if err := putWithRetryUnavailable(t, n1.Cluster, k, string(v), 10*time.Second); err != nil {
-			t.Fatalf("baseline Put %q: %v", k, err)
+			t.Fatalf("seed Put %q: %v", k, err)
 		}
 		want[k] = v
 	}
 
-	// FREEZE + BISECT both nodes (target gen 1), then ABORT (no FLIP).
-	for _, n := range nodes {
-		if err := n.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_FREEZE, 1); err != nil {
-			t.Fatalf("FREEZE %s: %v", n.ID, err)
-		}
+	// Delegated reshard with the copy disabled: it CONVERGES (markers publish,
+	// parents retire, the generation advances) but the children are empty.
+	stopPump := startReconcilePump([]*cluster.Cluster{nodes[0].Cluster, nodes[1].Cluster, nodes[2].Cluster})
+	defer stopPump()
+	if err := n1.Cluster.Reshard(); err != nil {
+		t.Fatalf("unclean Reshard should still converge (the break is silent): %v", err)
 	}
-	// While frozen, a write is refused with the retryable error (never acked).
-	frozenKey := localKeyFor(t, n1, unitCount)
-	if err := n1.Cluster.Put([]byte(frozenKey), []byte("must-not-ack")); err == nil {
-		t.Fatal("Put on a frozen node succeeded; want a retryable refusal during the freeze")
-	} else if st, _ := status.FromError(err); st.Code() != codes.Unavailable {
-		t.Fatalf("frozen Put error code = %v, want codes.Unavailable", st.Code())
-	}
-	// Reads continue under the freeze.
-	if got, err := n2.Cluster.Get([]byte("ab-00000")); err != nil || !bytes.Equal(got, want["ab-00000"]) {
-		t.Fatalf("read while frozen: got=%q err=%v (reads must continue under freeze)", got, err)
-	}
-	for _, n := range nodes {
-		if err := n.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_BISECT, 1); err != nil {
-			t.Fatalf("BISECT %s: %v", n.ID, err)
-		}
-	}
-	// ABORT: the fail-safe. Every node unfreezes, discards half-built gen-1
-	// children, and stays at gen g.
-	for _, n := range nodes {
-		if err := n.Cluster.ApplyReshardPhase(pb.ReshardPhase_RESHARD_PHASE_ABORT, 1); err != nil {
-			t.Fatalf("ABORT %s: %v", n.ID, err)
-		}
-	}
+	time.Sleep(900 * time.Millisecond)
 
-	// === ASSERTION: stays at gen g (0). The cluster never advanced: a fresh
-	// write routes at gen 0 and physically lands in a gen-0 unit store, NOT a
-	// gen-1 one. (If a node had flipped, the fresh key would land in a gen-1
-	// store and resolveGenUnit would route to gen 1.) ===
-	freshKey := "post-abort-fresh"
-	freshVal := []byte("written-at-gen-0-after-abort")
-	if err := putWithRetryUnavailable(t, n1.Cluster, freshKey, string(freshVal), 8*time.Second); err != nil {
-		t.Fatalf("ABORT VIOLATED: writes did not resume after abort: %v (the cluster should have unfrozen)", err)
-	}
-	freshU0 := storageunit.UnitForShardKey(ring.ShardKey([]byte(freshKey)), storageunit.MustUnitCount(unitCount))
-	if found, ok := sharedStoreHas(backing, storageunit.NewGenUnit(0, freshU0), freshKey, freshVal); !ok || !found {
-		t.Fatalf("ABORT VIOLATED: fresh key %q did not land in a gen-0 store %s (ok=%v found=%v) - the cluster advanced past gen 0 despite the abort", freshKey, storageunit.NewGenUnit(0, freshU0), ok, found)
-	}
-	// No gen-1 unit should be the routed home of this fresh key: confirm the
-	// gen-1 child store does NOT hold it (routing did not advance).
-	freshU1 := storageunit.UnitForShardKey(ring.ShardKey([]byte(freshKey)), storageunit.MustUnitCount(2*unitCount))
-	if found, ok := sharedStoreHas(backing, storageunit.NewGenUnit(1, freshU1), freshKey, freshVal); ok && found {
-		t.Fatalf("ABORT VIOLATED: fresh key %q landed in a gen-1 store - routing advanced to gen 1 despite the abort", freshKey)
-	}
-
-	// === ASSERTION: every node is UNFROZEN (writes resumed everywhere). ===
-	for _, n := range nodes {
-		if n.Cluster.TestingIsFrozen() {
-			t.Fatalf("ABORT VIOLATED: node %s is still frozen after ABORT", n.ID)
-		}
-	}
-
-	// === ASSERTION: the full pre-reshard dataset is INTACT + readable from every
-	// node (the abort touched no live gen-g data). ===
+	// THE ORACLE, in detection mode: the seeded keys were never copied into the
+	// gen-1 children, so they must now be lost.
+	lost := 0
 	for k, v := range want {
-		readAcrossNodes(t, nodes, k, v)
+		got, err := getWithRetryUnavailable(t, n1.Cluster, k, 5*time.Second)
+		if err != nil || !bytes.Equal(got, v) {
+			lost++
+		}
 	}
+	if lost == 0 {
+		t.Fatalf("BREAK NOT CAUGHT: an unclean reshard (no copy) lost no acked write - the oracle would rubber-stamp a broken multi-node reshard")
+	}
+	t.Logf("break demonstration: unclean reshard lost %d/%d acked keys; the oracle catches it", lost, len(want))
 }

@@ -6,8 +6,9 @@ package chaos
 // INFRASTRUCTURE layer behind the small ClusterClient + Topology interfaces the
 // workload driver and chaos scheduler depend on. It stands up N shale nodes via
 // goroutines + ephemeral ports over ONE sharedfactory backing - the same shape
-// tests/integration uses (startSharedNode + the shared backing), so a lease
-// handoff is copy-free and a reshard exercises the real cluster-wide freeze.
+// tests/integration uses (the shared backing + a shared MemConditionalStore),
+// so a lease handoff is copy-free and a reshard exercises the real
+// arbiter-driven (delegated) multi-node flow.
 //
 // It is gated behind `//go:build chaos` because it pulls in the whole multi-node
 // stack (memberlist gossip, gRPC servers) and is only built for the soak. The
@@ -59,6 +60,11 @@ type node struct {
 type inProcCluster struct {
 	provider  factoryProvider
 	unitCount int
+	// condStore is the ONE shared conditional store every node's Config points
+	// at (the arbiter agreement object + the __cluster/init marker + the
+	// per-unit cut-over markers). The in-process analogue of the shared
+	// MinIO/S3 conditional store the deployable multi-node cluster requires.
+	condStore storageunit.ConditionalStore
 
 	mu       sync.Mutex // guards nodes + nextID
 	nodes    []*node
@@ -103,6 +109,7 @@ func newInProcCluster(provider factoryProvider, count, unitCount int, settleDela
 	c := &inProcCluster{
 		provider:    provider,
 		unitCount:   unitCount,
+		condStore:   storageunit.NewMemConditionalStore(),
 		settleDelay: settleDelay,
 		scale:       scale,
 		// Base in-memory budgets, scaled for a slow backend.
@@ -163,6 +170,7 @@ func (c *inProcCluster) startNode(seedAddr string) (*node, error) {
 			NodeID:               id,
 			BackendFactory:       h,
 			UnitCount:            storageunit.MustUnitCount(c.unitCount),
+			ConditionalStore:     c.condStore,
 			GRPCAddr:             grpcAddr,
 			LogOutput:            io.Discard,
 			RebalanceSettleDelay: c.settleDelay,
@@ -371,8 +379,10 @@ func (c *inProcCluster) removeLocked(id string, graceful bool) error {
 	return nil
 }
 
-// Reshard triggers a doubling reshard on a live coordinator node via the
-// cluster-wide freeze barrier. Returns the coordinator id used.
+// Reshard triggers a doubling reshard on a live node via the delegated
+// (arbiter-driven) flow: it retargets the shared conditional-store arbiter and
+// waits for the calling node's generation to advance; peers converge on their
+// own reconcile cadence.
 func (c *inProcCluster) Reshard() error {
 	c.structMu.Lock()
 	defer c.structMu.Unlock()
@@ -385,9 +395,9 @@ func (c *inProcCluster) Reshard() error {
 
 // ReshardAsync kicks the reshard off in a goroutine and returns immediately with
 // a channel that delivers the result. Used by the combination events so the
-// scheduler can fire a membership change WHILE the barrier is in flight (to drive
-// the clean-abort path). The structMu is intentionally NOT held across the async
-// barrier: the membership change must be able to proceed concurrently.
+// scheduler can fire a membership change WHILE the reshard is in flight. The
+// structMu is intentionally NOT held across the async reshard: the membership
+// change must be able to proceed concurrently.
 func (c *inProcCluster) ReshardAsync() <-chan error {
 	done := make(chan error, 1)
 	live := c.liveNodes()
