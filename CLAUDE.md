@@ -74,6 +74,9 @@ cmd/                   the command-line tools; its OWN Go module
                        against a running node (defaults to 127.0.0.1:7947)
   shale-bench/         comparative benchmark harness (memory / pebble / slate)
 internal/              private helpers + test fixtures
+  decide/              coordination decisions as pure functions (no *Cluster,
+                       no lock, no clock, no I/O), so each decision's state
+                       space is a table rather than a hand-built fixture
 tests/
   unit/                per-package tests
   integration/         multi-node in-process cluster, full path
