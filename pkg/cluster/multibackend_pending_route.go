@@ -35,6 +35,7 @@
 package cluster
 
 import (
+	"github.com/Zamua/shale/internal/decide"
 	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -110,7 +111,7 @@ func (c *Cluster) transitionSets() (joining, draining map[storageunit.NodeID]str
 // boot would compute current empty -> stableR 0 -> requiredWriteAcks(All,0)=0 ->
 // a write acking with ZERO durable applies (a lost acked write). The leave path
 // never needs the floor (a draining node stays a stable MOUNTED current owner, so
-// stableR == R by construction).
+// stableR == R by construction). The floor itself is decide.CurrentReplicaSet.
 func (c *Cluster) currentUnitReplicas(gu storageunit.GenUnit, joining map[storageunit.NodeID]struct{}) []coord.Node {
 	if len(joining) == 0 {
 		return c.unitReplicas(gu)
@@ -123,21 +124,9 @@ func (c *Cluster) currentUnitReplicas(gu storageunit.GenUnit, joining map[storag
 	// mounted. Only the hypothetical placement reconstructs the set the
 	// non-joining members actually hold.
 	excl := c.locate(gu, c.replicationFactor(), coord.Placement{Exclude: joining})
-	if len(excl) < c.replicationFactor() || len(excl) < len(full) {
-		// QUORUM FLOOR. Excluding joiners is safe only while >= R non-joining
-		// holders remain. If dropping them would leave current SHORT (the
-		// MASS-BOOT case: 2+ of a unit's replicas are freshly booted at once),
-		// fall back to the FULL set. That reverts the unit to the
-		// pre-Joining-bit behavior: unavailable-but-SAFE (a routed op to a
-		// warming replica returns the mid-acquire transient, so the write
-		// WEDGES) with stableR = len(current) >= R, so requiredWriteAcks never
-		// drops below the normal bar and a write can NEVER ack below R durable
-		// copies. Without the floor a mass boot would compute current empty ->
-		// stableR 0 -> requiredWriteAcks(All,0)=0 -> a write acking with ZERO
-		// durable applies (a lost acked write). The leave path never needs the
-		// floor (a draining node stays a stable MOUNTED current owner, so
-		// stableR == R by construction). An empty result - every member
-		// excluded, or no coordinator at all - lands here too.
+	// An empty exclusion - every member joining, or no coordinator at all -
+	// floors like any other shortfall.
+	if decide.CurrentReplicaSet(len(full), len(excl), c.replicationFactor()) == decide.CurrentFullRing {
 		return full
 	}
 	return excl

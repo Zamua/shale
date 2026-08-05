@@ -35,6 +35,7 @@ import (
 	"errors"
 	"time"
 
+	"github.com/Zamua/shale/internal/decide"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -60,67 +61,32 @@ func (c *Cluster) scheduleReconcile() {
 // (mountReplicaUnits): a node that booted missing owned positions has KNOWN,
 // non-churn work whose delay directly extends a write-quorum gap, so it arms
 // the pass at zero. Everything else debounces as before.
+//
+// The arming RULES - what a debounced arm may do to a pending immediate one,
+// and which arm owns the pending obligation - live in decide.SettleArm. This is
+// the shell: snapshot the state under settleMu, ask, perform.
+//
+// Stop is the only way to learn whether the pending timer is still live, and it
+// consumes a live one, so the probe runs BEFORE the decision and every arm
+// installs a replacement timer.
 func (c *Cluster) scheduleReconcileIn(d time.Duration) {
 	if c.closed.Load() {
 		return
 	}
 	c.settleMu.Lock()
 	defer c.settleMu.Unlock()
-	if c.settleTimer != nil {
-		if c.settleImmediate && d > 0 && c.settleTimer.Stop() {
-			// We just STOPPED a LIVE immediate-arm timer (the boot-defer
-			// prompt, or the stale-mount evict): a consumer-visible
-			// unavailability window is open RIGHT NOW and that arm exists to
-			// close it. A debounced re-arm must NOT postpone it -
-			// last-writer-wins here is how the prompt got silently pushed out
-			// a full settle delay when a coalesced view hint landed just
-			// after boot (the port delivers boot-time hints after Open
-			// returns), turning "arming the reconcile immediately" into a
-			// multi-second write-refusal window that outlived consumer retry
-			// budgets. The debounced obligation is subsumed: the immediate
-			// pass IS the same single reconcile, sooner. Restore the timer
-			// the Stop probe consumed; the original arm's pending obligation
-			// carries over to it.
-			c.settleTimer = time.AfterFunc(0, c.runScheduledReconcile)
-			return
-		}
-		// Stop returned false above (or the pending arm was debounced): a
-		// FIRED immediate timer whose callback has not yet cleared the field
-		// must NOT refuse this arm - its pass may have snapshotted state from
-		// BEFORE the change that prompted it, so the obligation is genuinely
-		// new. Fall through to the normal replacement.
-		// Re-arm: a still-live (or already-firing) timer already owns a
-		// pending obligation; the replacement inherits it. Do NOT
-		// double-count. Mirrors scheduleEvaluate.
-		//
-		// THE OBLIGATION ACCOUNTING TURNS ON WHETHER THE OLD TIMER FIRED
-		// (found as settlePending=-1 wedging every later idle-wait; CI R2
-		// boots, 3-in-12 under load). A LIVE timer we stop here never runs
-		// its callback, so the replacement INHERITS its obligation - no
-		// increment. A timer that already FIRED has a callback in flight
-		// that owns - and will release - that same obligation; if the
-		// replacement rode it without incrementing, the callback's release
-		// plus the replacement's own release double-decremented the single
-		// increment, the counter went NEGATIVE, and WaitForRebalanceIdle
-		// (checking ==0) never saw idle again. Boot is exactly this
-		// interleaving: the boot-defer prompt arms immediate, its zero-delay
-		// timer fires, and the join view hint re-arms before the callback
-		// takes settleMu.
-		//
-		// A zero-delay re-arm deliberately WINS over a pending debounced one:
-		// the obligation is the same single pass, sooner. Debounced-over-
-		// debounced also replaces, preserving the debounce's extend-on-burst
-		// semantics (the pass runs one settle delay after the LAST change).
-		if !c.settleTimer.Stop() {
-			c.settlePending.Add(1)
-		}
-	} else {
-		// Fresh arm: this reconcile is pending until the timer callback
-		// below releases it, so WaitForRebalanceIdle blocks through it.
+	cur := decide.SettleState{Armed: c.settleTimer != nil, Immediate: c.settleImmediate}
+	if cur.Armed {
+		cur.Fired = !c.settleTimer.Stop()
+	}
+	dec := decide.SettleArm(cur, d)
+	if dec.NewObligation {
+		// The reconcile is pending until this arm's callback releases it, so
+		// WaitForRebalanceIdle blocks through it.
 		c.settlePending.Add(1)
 	}
-	c.settleImmediate = d == 0
-	c.settleTimer = time.AfterFunc(d, c.runScheduledReconcile)
+	c.settleImmediate = dec.Immediate
+	c.settleTimer = time.AfterFunc(dec.Delay, c.runScheduledReconcile)
 }
 
 // runScheduledReconcile is the settle-timer callback for multi-backend
