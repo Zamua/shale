@@ -77,9 +77,9 @@ type mountTable struct {
 	// openEpochs records the EXACT epoch THIS node opened each mounted position
 	// at, captured from the factory's RETURN VALUE (not a re-read of the shared,
 	// climbing durable epoch). It is the STABLE drain-release gate AND the epoch
-	// the serving marker carries. Recorded by mountServing before the mount entry
-	// is visible; cleared on release. sync.Map: read without mu (see openEpochOf's
-	// callers), so it needs no ordering against the mount map.
+	// the serving marker carries. Recorded by the serving transition under the
+	// hold that installs the mount; cleared on release. sync.Map: read without mu
+	// (see openEpochOf's callers), so it needs no ordering against the mount map.
 	openEpochs sync.Map // storageunit.ReplicaUnit -> storageunit.Epoch
 	// acquireErr records, per position, why a DESIRED position is not mounted:
 	// the most recent open failure during an acquire, or the non-error
@@ -421,7 +421,10 @@ func (t *mountTable) clearOrphanedDrain(ru storageunit.ReplicaUnit) bool {
 	return true
 }
 
-// mountOutcome is the outcome of mountServing.
+// mountOutcome is the outcome of mountServing. The mount* values install
+// nothing, resolve nothing and publish nothing (the caller still holds the
+// backend it opened); the mounted* values all leave the same steady state:
+// mounted, no phase entry, marker published.
 type mountOutcome int
 
 const (
@@ -429,6 +432,11 @@ const (
 	// marker was published, and the caller must release the freshly-opened
 	// backend.
 	mountSuperseded mountOutcome = iota
+	// mountBlockedByDrain: the position is in a LOSER phase, so this node holds
+	// it as a draining predecessor. Nothing was mounted, the phase is untouched,
+	// no marker was published, and the caller must release the freshly-opened
+	// backend.
+	mountBlockedByDrain
 	// mountedPhaseResolved: the mount is installed and the marker published, but
 	// this was not the clean Acquiring -> Ready -> Owned advance: there was no
 	// gainer phase to advance (boot, clean-cut acquire), a concurrent reconcile
@@ -438,14 +446,21 @@ const (
 	mountedReady
 )
 
+// mounted reports whether the transition installed the mount, which is also
+// exactly when it published the marker and recorded the open epoch.
+func (o mountOutcome) mounted() bool {
+	return o == mountedPhaseResolved || o == mountedReady
+}
+
 // mountServing is THE TRANSITION TO LOCALLY SERVING and the ONE place a serving
 // mount is published. It records this node's exact open epoch, installs the
 // mount entry and resolves any in-flight gainer phase to Owned under ONE lock
 // hold (so a routed op never sees the mount present without the phase resolved,
 // and vice versa), then publishes the durable serving marker once the lock is
-// dropped. Every mounted outcome leaves the same steady state (mounted, no
-// phase entry, marker published); the outcome only tells the caller which log
-// line and cleanup to run.
+// dropped. Every mounted* outcome leaves the same steady state (mounted, no
+// phase entry, marker published) and differs only in which log line the caller
+// runs; a mount* outcome installed nothing and obliges the caller to release
+// the backend it opened.
 //
 // THE PUBLISH IS PART OF THE TRANSITION, not a step the caller remembers. The
 // marker is the only signal a draining predecessor releases on, and while it
@@ -464,35 +479,43 @@ const (
 // site names the mount path for the publish-failure log: the paths fail for
 // different reasons.
 func (t *mountTable) mountServing(ru storageunit.ReplicaUnit, b backend.Backend, opened storageunit.Epoch, site string) mountOutcome {
-	// Before the mount entry is visible, so a beginDrain that sees the mount
-	// also sees the epoch.
-	t.recordOpenEpoch(ru, opened)
 	out := t.installServing(ru, b, opened)
-	if out == mountSuperseded {
-		t.forgetOpenEpoch(ru) // nothing mounted: leave no epoch behind.
-		return out
+	if !out.mounted() {
+		return out // nothing installed: no epoch recorded, nothing to announce.
 	}
 	t.publishServing(ru, opened, site) // I/O: strictly after the unlock.
 	return out
 }
 
-// installServing is mountServing's critical section: the mount entry and the
-// phase resolution move together under ONE hold.
+// installServing is mountServing's critical section: the open-epoch record, the
+// mount entry and the phase resolution move together under ONE hold, so a
+// beginDrain that sees the mount also sees the epoch.
+//
+// It DEFENDS the drain protocol rather than assuming its callers do. A loser
+// (Draining) phase means this node is the predecessor at this position and a
+// successor's marker is what ends the drain; resolving the phase here and
+// publishing a marker would end it with no successor serving - the production
+// wedge inverted, and invisible locally because the mount would serve normally.
+// The current callers cannot present one (evictIfSame refuses to evict a
+// loser-phase mount and the overlap acquire skips loser phases), but that is a
+// property of THEM, so the refusal lives here where a new caller meets it.
 func (t *mountTable) installServing(ru storageunit.ReplicaUnit, b backend.Backend, opened storageunit.Epoch) mountOutcome {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.isClosed() {
 		return mountSuperseded
 	}
-	out := mountedReady
 	cur := t.phases[ru]
+	if cur.Phase.IsLoser() {
+		return mountBlockedByDrain
+	}
+	out := mountedReady
 	switch {
 	case cur.Phase != storageunit.PhaseAcquiring:
 		// No phase entry at all (a mount with no handoff in flight), or one a
 		// concurrent reconcile already flipped or dropped. The mount is still
 		// installed below (it is the authoritative durable owner) and any stale
-		// phase entry dropped. A LOSER phase cannot be here: armDrain requires a
-		// mount entry, and this transition is the one that installs it.
+		// phase entry dropped.
 		out = mountedPhaseResolved
 	default:
 		if _, err := storageunit.NextOnReady(cur, opened); err != nil {
@@ -501,6 +524,7 @@ func (t *mountTable) installServing(ru storageunit.ReplicaUnit, b backend.Backen
 			out = mountedPhaseResolved
 		}
 	}
+	t.recordOpenEpoch(ru, opened)
 	t.mountLocked(ru, b)
 	// Ready is transient: once the mount entry is present the node serves
 	// locally, so the steady state is Owned (no phase entry). Drop the entry
@@ -706,9 +730,9 @@ func (t *mountTable) openEpochOf(ru storageunit.ReplicaUnit) (storageunit.Epoch,
 	return e, ok
 }
 
-// recordOpenEpoch stores this node's exact open epoch for ru. Every open site
-// records it just BEFORE the mount, so a drain that sees the mount also sees the
-// epoch.
+// recordOpenEpoch stores this node's exact open epoch for ru. The serving
+// transition records it under the same lock hold that installs the mount, so a
+// drain that sees the mount also sees the epoch.
 func (t *mountTable) recordOpenEpoch(ru storageunit.ReplicaUnit, e storageunit.Epoch) {
 	t.openEpochs.Store(ru, e)
 }
