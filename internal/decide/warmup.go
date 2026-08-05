@@ -74,9 +74,10 @@ func (r BootReason) String() string {
 // to re-derive from a later reconcile tick. Leaving the bit up until that tick
 // is not merely stale: it is READ BY PEERS as this node not being established,
 // which downgrades a peer's own warm-up to the debounce path below and spends a
-// settle delay in the write-quorum gap the prompt exists to close. That is the
-// blind spot this gate shipped with, and it fails at a CONSUMER, one node away
-// from the node holding the stale bit.
+// settle delay in the write-quorum gap the prompt exists to close. The cost
+// lands one node away from the node holding the stale bit, which is why the bit
+// is decided HERE, against the outcome that determines it, rather than left to
+// a tick that re-derives it from something else.
 //
 // WHY PROMPT AT ALL (the staggered join): a node joining an established cluster
 // knows, at this instant, exactly which owned positions it is missing, and

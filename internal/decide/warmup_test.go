@@ -17,9 +17,9 @@ func TestBootWarmUp(t *testing.T) {
 			want: BootAction{Reason: BootWarm},
 		},
 		{
-			name: "BLIND SPOT: a joiner that deferred nothing is warm and drops the bit NOW",
-			// Held until the first reconcile tick, the bit makes every peer
-			// booting into this node read it as not established.
+			name: "a joiner that deferred nothing drops the bit NOW, not on the first reconcile tick",
+			// Held until that tick, the bit makes every peer booting into this
+			// node read it as not established.
 			in:   BootState{Peers: 2, SelfJoining: true},
 			want: BootAction{Reason: BootStaleJoining},
 		},
@@ -62,10 +62,10 @@ func TestBootWarmUp(t *testing.T) {
 	}
 }
 
-// TestBootWarmUp_JoiningTracksTheOutcome pins the blind spot as a property: the
-// advertised bit follows what the mount pass DID, never what this node intended
-// at membership-open. A node that deferred nothing lowers the bit whatever it
-// was carrying; a node that deferred anything raises it.
+// TestBootWarmUp_JoiningTracksTheOutcome pins the advertised bit to what the
+// mount pass DID, never to what this node intended at membership-open: a node
+// that deferred nothing lowers the bit whatever it was carrying, and a node
+// that deferred anything raises it.
 func TestBootWarmUp_JoiningTracksTheOutcome(t *testing.T) {
 	for _, deferred := range []int{0, 1, 7} {
 		for _, self := range []bool{false, true} {
@@ -98,9 +98,9 @@ func TestBootWarmUp_NeverPromptsWithoutAnEstablishedPeer(t *testing.T) {
 }
 
 // TestBootWarmUp_CleanBootMakesThisNodeAnEstablishedPeer composes the gate with
-// itself across two nodes, which is where the blind spot actually failed: the
-// bit node A publishes after its own clean boot is exactly what B's copy of the
-// gate counts a second later. A that kept the bit up costs B the prompt path.
+// itself across two nodes, which is where a stale bit costs anything: the bit
+// node A publishes after its own clean boot is exactly what B's copy of the
+// gate counts a second later. An A that kept the bit up costs B the prompt path.
 func TestBootWarmUp_CleanBootMakesThisNodeAnEstablishedPeer(t *testing.T) {
 	a := BootWarmUp(BootState{Deferred: 0, SelfJoining: true})
 	joiningPeers := 0
