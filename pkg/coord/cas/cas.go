@@ -96,6 +96,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Zamua/shale/internal/decide"
 	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/coord/internal/placement"
 	"github.com/Zamua/shale/pkg/ring"
@@ -262,15 +263,6 @@ type snapshot struct {
 	ring *ring.Ring
 }
 
-// leaseTrack is the observer-side liveness record for one peer: the last
-// (incarnation, leaseGen) this node observed and how many consecutive polls
-// the pair has sat unchanged.
-type leaseTrack struct {
-	inc   string
-	gen   uint64
-	stale int
-}
-
 // Coordinator is the CAS/lease implementation of coord.Coordinator.
 type Coordinator struct {
 	cfg Config
@@ -311,9 +303,10 @@ type Coordinator struct {
 	displaced atomic.Bool
 
 	// pollMu serializes observation passes (the background loop vs the
-	// Testing seam) and guards the observer state below.
+	// Testing seam) and guards the observer state below: the per-member lease
+	// record decide.ExpireSilent folds each pass into its successor.
 	pollMu  sync.Mutex
-	tracker map[storageunit.NodeID]*leaseTrack
+	tracker map[string]decide.LeaseObservation
 
 	// reduced memoizes the last hypothetical-placement ring (see Locate),
 	// keyed by the exclusion set and the snapshot epoch it was built from.
@@ -401,7 +394,7 @@ func New(cfg Config) *Coordinator {
 		log:     log.New(out, "", log.LstdFlags),
 		changed: make(chan struct{}, 1),
 		closeCh: make(chan struct{}),
-		tracker: make(map[storageunit.NodeID]*leaseTrack),
+		tracker: make(map[string]decide.LeaseObservation),
 	}
 	c.snap.Store(&snapshot{})
 	return c
@@ -831,49 +824,32 @@ func (c *Coordinator) observe(d *document, ver string) {
 	c.pollMu.Lock()
 	defer c.pollMu.Unlock()
 
-	// Judge liveness observer-side. SELF IS EXEMPT: a node always believes
-	// itself alive (its renewal advances its own counter, and a node that
-	// cannot write the store cannot poll it either), which also keeps the
-	// port's "View always contains Self once started" shape.
+	// Judge liveness observer-side, in decide.ExpireSilent: the rules (self
+	// exempt, a baseline pass for a member new to the view, an incarnation or
+	// counter change resetting the count, K consecutive unchanged passes
+	// expiring) are a fold over scalars and live there with their reasoning.
+	// This pass carries the fold's output into the document's shape.
+	rows := make([]decide.LeaseRow, 0, len(d.Members))
+	for _, row := range d.Members {
+		rows = append(rows, decide.LeaseRow{ID: row.ID, Inc: row.Inc, Gen: row.LeaseGen})
+	}
+	next, expiredIDs := decide.ExpireSilent(c.tracker, rows, c.cfg.ExpiryPolls, string(c.self.ID))
+	c.tracker = next
+
+	expired := make(map[string]struct{}, len(expiredIDs))
+	for _, id := range expiredIDs {
+		expired[id] = struct{}{}
+	}
 	live := make([]docRow, 0, len(d.Members)+1)
 	selfSeen := false
-	var expired []storageunit.NodeID
-	seen := make(map[storageunit.NodeID]struct{}, len(d.Members))
 	for _, row := range d.Members {
-		id := storageunit.NodeID(row.ID)
-		seen[id] = struct{}{}
-		if id == c.self.ID {
+		if _, gone := expired[row.ID]; gone {
+			continue
+		}
+		if storageunit.NodeID(row.ID) == c.self.ID {
 			selfSeen = true
-			live = append(live, row)
-			continue
-		}
-		tr, ok := c.tracker[id]
-		if !ok {
-			c.tracker[id] = &leaseTrack{inc: row.Inc, gen: row.LeaseGen}
-			live = append(live, row)
-			continue
-		}
-		// A changed leaseGen is a renewal; a changed incarnation is a fresh
-		// row (a rejoin after GC) whose counter must not be judged against
-		// the dead incarnation's. Either resets the count.
-		if tr.inc != row.Inc || tr.gen != row.LeaseGen {
-			tr.inc, tr.gen, tr.stale = row.Inc, row.LeaseGen, 0
-			live = append(live, row)
-			continue
-		}
-		tr.stale++
-		if tr.stale >= c.cfg.ExpiryPolls {
-			expired = append(expired, id)
-			continue
 		}
 		live = append(live, row)
-	}
-	// Rows gone from the document (graceful leave, a peer's GC) leave the
-	// tracker too, so a returning member starts a fresh count.
-	for id := range c.tracker {
-		if _, ok := seen[id]; !ok {
-			delete(c.tracker, id)
-		}
 	}
 
 	// SELF-EXEMPTION MUST SURVIVE A MISSING ROW. A peer that judged this
@@ -971,14 +947,10 @@ func nodesEqual(a, b []coord.Member) bool {
 // observation pass read. ONE attempt per pass: losing the race just means
 // another member's document is already correct (or will be re-judged next
 // poll) - GC is idempotent and racing GCs resolve by CAS.
-func (c *Coordinator) gcExpired(expired []storageunit.NodeID, d *document, ver string) {
-	drop := make(map[string]struct{}, len(expired))
-	for _, id := range expired {
-		drop[string(id)] = struct{}{}
-	}
+func (c *Coordinator) gcExpired(expired map[string]struct{}, d *document, ver string) {
 	next := &document{Members: make([]docRow, 0, len(d.Members))}
 	for _, row := range d.Members {
-		if _, ex := drop[row.ID]; !ex {
+		if _, ex := expired[row.ID]; !ex {
 			next.Members = append(next.Members, row)
 		}
 	}
