@@ -310,14 +310,24 @@ func (c *Cluster) mountReplicaUnits() error {
 	// re-derives warmth from the pending set on the reconcile cadence, while here
 	// warmth is a boot-completion FACT - zero positions were deferred, so there is
 	// nothing to re-derive.
+	//
+	// PUBLISH THE BIT, THEN SAMPLE THE VIEW. setSelfJoining republishes the role
+	// set through the coordinator, which on a CAS coordinator is an object-store
+	// read-modify-write; the poll loop can refresh the coordination snapshot
+	// during it. Sampling afterwards is therefore never staler and can be
+	// strictly fresher, and the founder-with-deferred-positions shape turns on
+	// exactly that: if this node's only peer clears its own Joining bit inside
+	// the round trip, a sample taken first still counts it as warming and
+	// DEBOUNCES, spending a full settle delay inside the deferred-position
+	// write-quorum gap the prompt exists to close.
+	st := decide.BootState{
+		Deferred:    int(deferred.Load()),
+		SelfJoining: c.selfJoining.Load(),
+	}
+	c.setSelfJoining(st.Joining())
 	peers, joining := c.peerJoiningCounts()
-	act := decide.BootWarmUp(decide.BootState{
-		Deferred:     int(deferred.Load()),
-		Peers:        peers,
-		JoiningPeers: joining,
-		SelfJoining:  c.selfJoining.Load(),
-	})
-	c.setSelfJoining(act.Joining)
+	st.Peers, st.JoiningPeers = peers, joining
+	act := decide.BootWarmUp(st)
 	switch {
 	case act.Reason == decide.BootStaleJoining:
 		c.logf("shale: boot-defer warm-up: WARM (%s)", act.Reason)

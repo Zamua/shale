@@ -81,6 +81,26 @@ func TestBootWarmUp_JoiningTracksTheOutcome(t *testing.T) {
 	}
 }
 
+// TestBootWarmUp_JoiningMatchesTheViewFreeAnswer pins the two ways to ask for
+// the bit to the same answer over every view shape. The shell publishes
+// BootState.Joining() BEFORE it samples Peers/JoiningPeers, and hands the same
+// state to BootWarmUp after; a divergence would advertise one bit and reason
+// about another.
+func TestBootWarmUp_JoiningMatchesTheViewFreeAnswer(t *testing.T) {
+	for _, deferred := range []int{0, 1, 7} {
+		for _, self := range []bool{false, true} {
+			for peers := 0; peers <= 3; peers++ {
+				for joining := 0; joining <= peers; joining++ {
+					in := BootState{Deferred: deferred, Peers: peers, JoiningPeers: joining, SelfJoining: self}
+					if got, want := BootWarmUp(in).Joining, in.Joining(); got != want {
+						t.Fatalf("BootWarmUp(%+v).Joining = %v, BootState.Joining() = %v", in, got, want)
+					}
+				}
+			}
+		}
+	}
+}
+
 // TestBootWarmUp_NeverPromptsWithoutAnEstablishedPeer pins the mass-boot guard
 // as a property over every view shape: prompting on a view that shows only
 // joining peers is acting on a partial topology, which lost acked writes.

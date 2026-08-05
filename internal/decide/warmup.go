@@ -18,6 +18,13 @@ type BootState struct {
 	SelfJoining bool
 }
 
+// Joining is the bit a boot that ended in this state advertises. It reads only
+// the mount pass, never the view, which is what lets the shell PUBLISH the bit
+// before it SAMPLES Peers/JoiningPeers: publishing is a coordination round trip
+// during which the view can move, and a sample taken after it is never staler.
+// BootWarmUp returns exactly this value, so the two orders cannot disagree.
+func (s BootState) Joining() bool { return s.Deferred > 0 }
+
 // BootAction is what boot does with that state.
 type BootAction struct {
 	// Joining is the bit to advertise now the mount pass is DONE. It is not
@@ -101,14 +108,17 @@ func (r BootReason) String() string {
 // long ago cleared it. A peer that has not gossiped at all is not visible,
 // which also (correctly) reads as not established.
 func BootWarmUp(s BootState) BootAction {
-	if s.Deferred == 0 {
-		if s.SelfJoining {
-			return BootAction{Reason: BootStaleJoining}
-		}
-		return BootAction{Reason: BootWarm}
+	act := BootAction{Joining: s.Joining()}
+	switch {
+	case s.Deferred == 0 && s.SelfJoining:
+		act.Reason = BootStaleJoining
+	case s.Deferred == 0:
+		act.Reason = BootWarm
+	case s.Peers > s.JoiningPeers:
+		act.Prompt = true
+		act.Reason = BootEstablishedPeer
+	default:
+		act.Reason = BootFleetJoining
 	}
-	if s.Peers > s.JoiningPeers {
-		return BootAction{Joining: true, Prompt: true, Reason: BootEstablishedPeer}
-	}
-	return BootAction{Joining: true, Reason: BootFleetJoining}
+	return act
 }
