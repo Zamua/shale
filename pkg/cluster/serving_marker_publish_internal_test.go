@@ -108,6 +108,55 @@ func TestMountServing_SupersededPublishesNothing(t *testing.T) {
 	}
 }
 
+// TestMountServing_RefusesAPositionDrainingHere pins the transition's own
+// defence of the drain protocol. A drain ends on a SUCCESSOR's marker, so
+// resolving the loser phase here and publishing would end it with nothing
+// serving in this node's place - and silently, since the resulting mount serves
+// normally. The refusal must leave the phase, the mount entry and the recorded
+// open epoch (the drain gate) exactly as it found them.
+func TestMountServing_RefusesAPositionDrainingHere(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")
+	target := ru(0, 0, 0)
+
+	var seen []capturedPublish
+	c.mounts.publish = func(p storageunit.ReplicaUnit, epoch storageunit.Epoch, site string) {
+		seen = append(seen, capturedPublish{p, epoch, site})
+	}
+
+	// This node as the DRAINING PREDECESSOR: mounted, open epoch recorded,
+	// PhaseDraining armed at that epoch.
+	predB, predEpoch, err := c.factory.OpenUnit(storageunit.ReplicaMount(target), acquireBaseEpoch)
+	if err != nil {
+		t.Fatalf("predecessor open: %v", err)
+	}
+	c.mounts.mountUndecorated(target, predB)
+	c.mounts.recordOpenEpoch(target, predEpoch)
+	c.beginDrain(target)
+	if st := c.handoffPhaseOf(target); st.Phase != storageunit.PhaseDraining {
+		t.Fatalf("fixture phase = %v, want Draining", st.Phase)
+	}
+
+	out := c.mounts.mountServing(target, memory.New(), predEpoch+5, "unit-test")
+
+	if out != mountBlockedByDrain {
+		t.Fatalf("mountServing over a position draining here = %v, want mountBlockedByDrain", out)
+	}
+	if st := c.handoffPhaseOf(target); st.Phase != storageunit.PhaseDraining {
+		t.Fatalf("phase after the refused mount = %v, want Draining preserved: dropping it converts the "+
+			"drain to Owned with no successor having taken the position", st.Phase)
+	}
+	if len(seen) != 0 {
+		t.Fatalf("the refused mount published %+v: that marker releases the drain onto no one", seen)
+	}
+	if got, _ := c.mounts.backendFor(target); got != predB {
+		t.Fatalf("the refused mount replaced the draining mount entry")
+	}
+	if got, ok := c.mounts.openEpochOf(target); !ok || got != predEpoch {
+		t.Fatalf("recorded open epoch = (%d, %v), want the predecessor's %d: it is the drain gate", got, ok, predEpoch)
+	}
+}
+
 // TestBootMount_PublishesServingMarker pins the boot path through the
 // PRODUCTION mount (not a re-implementation of its steps). Where pods are
 // REPLACED rather than restarted in place, boot is the ordinary way a position

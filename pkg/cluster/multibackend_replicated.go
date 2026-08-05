@@ -272,10 +272,10 @@ func (c *Cluster) mountReplicaUnits() error {
 			// no other path that could ever satisfy its poll. openedEpoch (the
 			// factory return, max(intended, durable+1)) is strictly above any
 			// predecessor's open epoch, which is what the strict > gate needs.
-			if c.mounts.mountServing(ru, b, openedEpoch, "boot") == mountSuperseded {
-				// Close raced the boot mount; release rather than leaking the
-				// freshly-opened backend past shutdown.
-				_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
+			if !c.mountServingOrRelease(ru, b, openedEpoch, "boot") {
+				// A boot racing Close: the position is opened and released, and
+				// the recorded reason is the only account of why this node came
+				// up holding fewer mounts than it desires.
 				return nil
 			}
 			mounted.Add(1)
@@ -506,6 +506,40 @@ func (c *Cluster) unitApplyErrMaps(ru storageunit.ReplicaUnit, b backend.Backend
 		}
 }
 
+// mountServingOrRelease drives the serving transition for a freshly-opened
+// backend and reports whether the position is mounted here now. It is the ONE
+// place the transition's non-mounting outcomes are handled, because both of
+// them end with a position that opened cleanly and then did not mount - a state
+// with no local symptom at all unless someone records it. Left unrecorded, Open
+// simply returns with fewer mounts than desired and /debug/shale/state has
+// nothing to say about the gap.
+//
+// Every non-mounting outcome also releases the backend, which the transition
+// did not take: leaving it open leaks a live handle on a position this node is
+// not serving.
+func (c *Cluster) mountServingOrRelease(ru storageunit.ReplicaUnit, b backend.Backend, opened storageunit.Epoch, site string) bool {
+	out := c.mounts.mountServing(ru, b, opened, site)
+	if out.mounted() {
+		return true
+	}
+	switch out {
+	case mountBlockedByDrain:
+		// The drain ends on a SUCCESSOR's marker; mounting here would end it
+		// with nothing serving in this node's place. Loud, because no current
+		// caller can reach it: reaching it means a mount path was wired into the
+		// overlap regime without the loser-phase skip that regime assumes.
+		c.mounts.recordAcquireErr(ru, fmt.Sprintf("%s: REFUSED - this node holds %s in a draining phase; "+
+			"mounting it here would end that drain with no successor serving it", site, ru))
+		c.logf("shale: %s mount REFUSED for %s: the position is draining on this node; "+
+			"the release gate owns it, this open is discarded", site, ru)
+	default:
+		c.mounts.recordAcquireErr(ru, fmt.Sprintf("%s: superseded - Close ran during the open, "+
+			"so the position was opened and released rather than mounted", site))
+	}
+	_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
+	return false
+}
+
 // publishServingMarker is the mount table's serving-marker publisher: the table
 // calls it (with its lock released) whenever a position becomes locally
 // serving, which is what makes the publish a property of mounting rather than a
@@ -588,12 +622,9 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	c.mounts.clearAcquireErr(ru)
 	// openedEpoch is THIS node's EXACT open epoch (the factory return value, NOT
 	// a re-read of the climbing durable): the drain gate and the marker epoch.
-	if c.mounts.mountServing(ru, b, openedEpoch, "acquire") == mountSuperseded {
-		// Close raced us between the open and the mount; release rather than
-		// leaking the freshly-opened backend past shutdown.
-		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
-		return
-	}
+	// A declined transition records why and releases the open; the next reconcile
+	// retries.
+	c.mountServingOrRelease(ru, b, openedEpoch, "acquire")
 }
 
 // releaseReplicaUnit unmounts the ReplicaUnit ru via the factory. The mount

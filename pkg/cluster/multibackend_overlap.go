@@ -914,9 +914,11 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	// marker epoch + recorded as this node's drain gate. NOT a re-read of the
 	// climbing durable.
 	flipStart := time.Now()
-	if c.mounts.mountServing(ru, b, openedEpoch, "overlap") == mountSuperseded {
-		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
-		return nil // Close superseded this attempt; nothing to retry.
+	if !c.mountServingOrRelease(ru, b, openedEpoch, "overlap") {
+		// Superseded by Close, or refused because the position is draining here.
+		// Neither is retryable by re-opening: the redrive loop ends and the
+		// periodic reconcile re-derives what this node should hold.
+		return nil
 	}
 	c.logf("shale: mounted %s at epoch %d: open %s, flip+serving-mark %s",
 		ru, openedEpoch, flipStart.Sub(openStart).Round(time.Millisecond), time.Since(flipStart).Round(time.Millisecond))
