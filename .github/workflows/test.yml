@@ -37,6 +37,55 @@ jobs:
             echo "::group::GOWORK=off go build $m"; (cd "$m" && GOWORK=off go build ./...); echo "::endgroup::"
           done
 
+  # FORWARD-PAIRING gate: each published backend against the NEWEST core tag.
+  #
+  # The per-module GOWORK=off build above proves each module against the core
+  # it PINS. That is not the combination a consumer runs. Go's minimal version
+  # selection takes the MAX, so a consumer of a core-only release gets the old
+  # backend meeting a core it was never built against - a pairing that is
+  # created fresh by every release which "does not need a backend bump", and
+  # which nothing else here can see (a check on the pin as written is
+  # forward-blind by construction).
+  #
+  # This builds AND tests it, because the other GOWORK=off step is build-only:
+  # no module was otherwise exercised against real pins at all.
+  forward-pairing:
+    name: forward pairing (backends vs newest core)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          check-latest: true
+          cache: true
+      - name: build + test each backend against the newest core tag
+        env:
+          GOWORK: 'off'
+          GOFLAGS: '-mod=mod'
+        run: |
+          set -euo pipefail
+          CORE=$(git tag --list 'v[0-9]*' --sort=-v:refname | head -1)
+          if [ -z "$CORE" ]; then
+            echo "no core tag found - refusing to report a pass"; exit 1
+          fi
+          echo "newest core tag: $CORE"
+          for m in backends/pebble backends/slate; do
+            echo "::group::$m against core $CORE"
+            (
+              cd "$m"
+              PINNED=$(go list -m -f '{{.Version}}' github.com/Zamua/shale)
+              echo "$m pins core $PINNED; consumer resolves $CORE"
+              go get "github.com/Zamua/shale@$CORE"
+              go build ./...
+              go test ./... -count=1
+            )
+            echo "::endgroup::"
+          done
+          echo "forward pairing clean against $CORE"
+
   # BLOCKING race-detector gate, fanned out across runners. The race detector
   # is the primary defense against the concurrency bugs a gossip-membership +
   # multi-node-handoff store is prone to, so it gates merges.
