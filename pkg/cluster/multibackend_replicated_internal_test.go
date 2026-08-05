@@ -18,6 +18,8 @@ import (
 
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
+	"github.com/Zamua/shale/pkg/coord"
+	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -445,5 +447,91 @@ func TestMountReplicaUnits_SupersededMountRecordsWhyItIsUnmounted(t *testing.T) 
 		if !strings.Contains(msg, "superseded") {
 			t.Fatalf("boot recorded %q for %s, want a reason naming the superseding close", msg, ru)
 		}
+	}
+}
+
+// roleHookCoord runs a hook when this node PUBLISHES its role set, so a test
+// can move the coordination view inside that round trip. On a CAS coordinator
+// the publish is an object-store read-modify-write and the poll loop refreshes
+// the snapshot underneath it; the hook stands in for that.
+type roleHookCoord struct {
+	coord.Coordinator
+	onSetRole func()
+}
+
+func (c *roleHookCoord) SetRole(r coord.Role) error {
+	err := c.Coordinator.SetRole(r)
+	if c.onSetRole != nil {
+		c.onSetRole()
+	}
+	return err
+}
+
+// syncLog is an io.Writer safe to read while the reconcile the boot warm-up
+// arms is still logging.
+type syncLog struct {
+	mu  sync.Mutex
+	buf strings.Builder
+}
+
+func (l *syncLog) Write(p []byte) (int, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.Write(p)
+}
+
+func (l *syncLog) String() string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.buf.String()
+}
+
+// TestBootWarmUp_PublishesTheJoiningBitBeforeSamplingTheView pins the boot
+// warm-up's READ ORDER against the founder-with-deferred-positions shape, the
+// only one where it is observable: the node founds membership carrying no
+// Joining bit, defers to a marker from the generation before it, and its sole
+// peer clears its own bit during the publish. Sampling the view BEFORE
+// publishing counts that peer as still warming and debounces, spending a full
+// settle delay inside the deferred-position write-quorum gap the prompt exists
+// to close.
+func TestBootWarmUp_PublishesTheJoiningBitBeforeSamplingTheView(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2")
+	logs := &syncLog{}
+	c.cfg.LogOutput = logs
+
+	// The peer advertises Joining until this node publishes its own bit, at
+	// which point it is established.
+	peerFacts := func(roles coord.Role) coord.Member {
+		return coord.Member{Node: coord.Node{ID: "n2", Addr: "n2:0"}, Roles: roles}
+	}
+	inner := c.coord.(*gossip.Coordinator)
+	inner.TestingSetFacts(peerFacts(coord.RoleJoining))
+	c.coord = &roleHookCoord{
+		Coordinator: inner,
+		onSetRole:   func() { inner.TestingSetFacts(peerFacts(0)) },
+	}
+
+	// Defer a position so the warm-up runs at all: the peer is serving it.
+	desired := c.desiredReplicaUnits()
+	if len(desired) == 0 {
+		t.Fatalf("n1 desires no position; the test proves nothing")
+	}
+	peer := backing.Handle()
+	_, peerEpoch, err := peer.OpenReplicaUnit(desired[0], storageunit.Epoch(1))
+	if err != nil {
+		t.Fatalf("peer open: %v", err)
+	}
+	if err := peer.WriteServingMarker(storageunit.ReplicaMount(desired[0]), peerEpoch); err != nil {
+		t.Fatalf("peer write serving marker: %v", err)
+	}
+
+	if err := c.mountReplicaUnits(); err != nil {
+		t.Fatalf("mountReplicaUnits: %v", err)
+	}
+
+	if got := logs.String(); !strings.Contains(got, "PROMPT") {
+		t.Fatalf("boot warm-up did not prompt into a peer that became established during the "+
+			"role publish; the view was sampled before the publish. log:\n%s", got)
 	}
 }
