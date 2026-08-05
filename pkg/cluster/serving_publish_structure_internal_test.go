@@ -231,12 +231,17 @@ func usesOf(funcs map[string]*ast.FuncDecl, sel string) []string {
 	return out
 }
 
-// isMountTableReceiver reports whether expr addresses the mount table: the
-// table's own receiver (t.mounts as a map, i.e. bare "mounts") or a Cluster's
-// "c.mounts" field.
+// isMountTableReceiver reports whether expr addresses the mount table: a
+// holder's "mounts" field (c.mounts.helper, t.mounts[ru]) or the table's own
+// receiver (t.helper, from inside mounttable.go).
 func isMountTableReceiver(expr ast.Expr) bool {
-	sel, ok := expr.(*ast.SelectorExpr)
-	return ok && sel.Sel.Name == "mounts"
+	switch x := expr.(type) {
+	case *ast.SelectorExpr:
+		return x.Sel.Name == "mounts"
+	case *ast.Ident:
+		return x.Name == "t"
+	}
+	return false
 }
 
 // isCallOf reports whether expr is a call to the named function.
