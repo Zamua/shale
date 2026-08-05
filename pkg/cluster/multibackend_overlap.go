@@ -401,20 +401,13 @@ func (c *Cluster) logAcquireQueueSummary() {
 // the leaver's drainCheck never sees a successor marker and its graceful drain
 // runs to the timeout (the staging scale-down availability gap). The mount being
 // present means the open already succeeded + the durable copy is recovered, so it
-// is safe to advance to Owned (drop the phase) and write the serving marker at
-// the position's durable open epoch (strictly above the leaver's, which releases
-// its drain). Caller holds reconcileMu. A no-op unless genuinely stuck.
+// is safe to advance to Owned (drop the phase), which publishes the serving
+// marker at THIS node's exact open epoch (strictly above the leaver's, which
+// releases its drain). Caller holds reconcileMu. A no-op unless genuinely stuck.
 func (c *Cluster) finishStuckFlipIfNeeded(ru storageunit.ReplicaUnit) {
-	if !c.mounts.finishStuckGainer(ru) {
-		// A flip goroutine is running, the position is not mounted, or it is
-		// already Owned / in a loser phase: nothing to finish.
-		return
-	}
-
-	// Write the serving marker OUTSIDE the lock (shared-storage I/O), at THIS
-	// node's EXACT open epoch (the recorded factory return) - exactly what the
-	// in-goroutine flip would have written, NOT a re-read of the climbing durable.
-	c.writeServingMarker(ru, c.ownOpenEpoch(ru), "overlap-rearm")
+	// A no-op if a flip goroutine is running, the position is not mounted, or it
+	// is already Owned / in a loser phase.
+	c.mounts.finishStuckGainer(ru)
 }
 
 // ownOpenEpoch returns the EXACT epoch this node opened ru at (recorded from
@@ -912,34 +905,21 @@ func (c *Cluster) acquireReplicaUnitOverlapBlocking(ru storageunit.ReplicaUnit) 
 	}
 	c.mounts.clearAcquireErr(ru)
 
-	// openedEpoch is THIS node's EXACT open epoch (factory return), used as the
-	// serving-marker epoch + recorded as this node's drain gate. NOT a re-read of
-	// the climbing durable. Record it before the mount flip so a beginDrain that
-	// sees the mount also sees the epoch.
-	c.mounts.recordOpenEpoch(ru, openedEpoch)
-
 	// THE MOUNT FLIP: insert the mount entry + resolve the phase to Owned under
-	// ONE table hold so a routed op never sees the mount present without the
-	// phase resolved (and vice versa).
-	switch c.mounts.completeAcquireFlip(ru, b, openedEpoch) {
-	case flipSuperseded:
-		c.mounts.forgetOpenEpoch(ru) // no mount installed; don't leak the recorded epoch.
+	// ONE table hold (so a routed op never sees the mount present without the
+	// phase resolved, and vice versa), then publish the durable serving marker
+	// the old owner's drainCheck polls. No RPC is sent.
+	//
+	// openedEpoch is THIS node's EXACT open epoch (factory return), used as the
+	// marker epoch + recorded as this node's drain gate. NOT a re-read of the
+	// climbing durable.
+	flipStart := time.Now()
+	if c.mounts.mountServing(ru, b, openedEpoch, "overlap") == mountSuperseded {
 		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 		return nil // Close superseded this attempt; nothing to retry.
-	case flipMountedResolved:
-		// The phase entry was already resolved elsewhere (or the FSM edge was
-		// illegal). The mount is installed either way; still publish the marker.
-		c.writeServingMarker(ru, openedEpoch, "overlap-flip")
-		return nil
 	}
-
-	// Write the serving marker EXACTLY ONCE, AFTER the mount flip (outside the
-	// lock: it is shared-storage I/O). This is the durable, poll-observable release
-	// signal the old owner's drainCheck polls. No RPC is sent.
-	markStart := time.Now()
-	c.writeServingMarker(ru, openedEpoch, "overlap-mount")
-	c.logf("shale: mounted %s at epoch %d: open %s, serving-mark %s",
-		ru, openedEpoch, markStart.Sub(openStart).Round(time.Millisecond), time.Since(markStart).Round(time.Millisecond))
+	c.logf("shale: mounted %s at epoch %d: open %s, flip+serving-mark %s",
+		ru, openedEpoch, flipStart.Sub(openStart).Round(time.Millisecond), time.Since(flipStart).Round(time.Millisecond))
 	return nil
 }
 

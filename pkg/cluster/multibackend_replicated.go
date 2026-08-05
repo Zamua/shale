@@ -265,27 +265,18 @@ func (c *Cluster) mountReplicaUnits() error {
 				return nil
 			}
 			c.mounts.clearAcquireErr(ru)
-			c.mounts.recordOpenEpoch(ru, openedEpoch) // this node's exact open epoch (drain gate)
-			c.mounts.mount(ru, b)
-			// Write the serving marker HERE TOO, not only on the reconcile-time
-			// acquire path. A predecessor draining this position polls for a marker
-			// STRICTLY ABOVE its own open epoch (drainCheck); if the successor
-			// establishes the position at BOOT and writes nothing, that poll can
-			// never be satisfied and the predecessor stays Draining forever - still
-			// mounted, still walked by every cross-shard scan, refusing all of them.
-			//
-			// This is not a corner case. In a deployment whose pods are replaced
-			// rather than restarted in place (a Deployment, a rolling surge), boot IS
-			// the ordinary way a position is established, so the acquire path may
-			// never run and NO marker is ever written. Observed in production: every
-			// marker in the bucket named a pod from a retired topology and none had
-			// been written for 41 days, while open epochs climbed into the hundreds.
-			//
-			// The epoch MUST be the factory's returned openedEpoch, never a re-read
-			// of the durable: opened = max(intended, durable+1) is monotonic per
-			// position, so this value is strictly above any predecessor's, which is
-			// exactly what the strict > gate needs.
-			c.writeServingMarker(ru, openedEpoch, "boot")
+			// The serving transition publishes the marker: in a deployment whose
+			// pods are REPLACED rather than restarted in place, boot is the ordinary
+			// way a position is established, so a predecessor draining it may have
+			// no other path that could ever satisfy its poll. openedEpoch (the
+			// factory return, max(intended, durable+1)) is strictly above any
+			// predecessor's open epoch, which is what the strict > gate needs.
+			if c.mounts.mountServing(ru, b, openedEpoch, "boot") == mountSuperseded {
+				// Close raced the boot mount; release rather than leaking the
+				// freshly-opened backend past shutdown.
+				_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
+				return nil
+			}
 			mounted.Add(1)
 			return nil
 		})
@@ -530,30 +521,6 @@ func (c *Cluster) applyEnvelopeIfNewerToUnit(key, incomingEnvBytes []byte) error
 // a stale non-draining one. A non-fence error passes through unchanged (stays a
 // hard failure). The in-memory test double fences at Begin (already recoded by
 // the Begin path); only real slatedb / the fence-at-commit double reach here.
-// writeServingMarker publishes the durable release signal a draining
-// predecessor polls, and REPORTS a failure instead of swallowing it.
-//
-// Every call site used to be `_ = c.factory.WriteServingMarker(...)`. That made
-// the marker path unable to say it was not working: a write that never lands
-// leaves a predecessor Draining forever, and the only symptom is a cross-shard
-// scan refusing somewhere else entirely, hours later, on a different node. The
-// failure is silent, remote in time, and remote in place - the worst combination
-// to debug, and it went unnoticed in production for 41 days.
-//
-// The error is logged rather than returned because there is nothing useful for
-// the caller to do with it: the mount has already succeeded and is serving, and
-// failing the mount over an unwritten marker would trade a stuck DRAIN for a
-// missing REPLICA, which is strictly worse. What matters is that it stops being
-// invisible. `site` names which path failed, since they have different causes.
-func (c *Cluster) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, site string) {
-	if err := c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), epoch); err != nil {
-		c.logf("shale: SERVING MARKER WRITE FAILED for %s at epoch %d (%s): %v "+
-			"(a predecessor draining this position polls for this marker and will "+
-			"stay Draining until it appears; its mount keeps refusing cross-shard scans)",
-			ru, epoch, site, err)
-	}
-}
-
 func (c *Cluster) fenceToTransient(ru storageunit.ReplicaUnit, b backend.Backend, op string, err error) error {
 	if errors.Is(err, backend.ErrFenced) {
 		c.evictStaleMount(ru, b)
@@ -582,6 +549,43 @@ func (c *Cluster) unitApplyErrMaps(ru storageunit.ReplicaUnit, b backend.Backend
 		}
 }
 
+// publishServingMarker is the mount table's serving-marker publisher: the table
+// calls it (with its lock released) whenever a position becomes locally
+// serving, which is what makes the publish a property of mounting rather than a
+// step each mount path repeats.
+//
+// epoch 0 means the table held no recorded open epoch for the position, which a
+// replica-layout mount always records before mounting; resolve it instead of
+// publishing 0, because a 0-epoch marker is a marker that EXISTS but can never
+// satisfy any drain gate, and its mere existence flips the "no marker was ever
+// written" branch of the abandoned-release hold.
+func (c *Cluster) publishServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, site string) {
+	if epoch == 0 {
+		epoch = c.ownOpenEpoch(ru)
+	}
+	c.writeServingMarker(ru, epoch, site)
+}
+
+// writeServingMarker publishes the durable release signal a draining
+// predecessor polls, and REPORTS a failure instead of swallowing it. A write
+// that never lands leaves that predecessor Draining forever, and the only
+// symptom is a cross-shard scan refusing somewhere else entirely, on a
+// different node: silent, remote in time and remote in place.
+//
+// The error is logged rather than returned because there is nothing useful for
+// the caller to do with it: the mount has already succeeded and is serving, and
+// failing the mount over an unwritten marker would trade a stuck DRAIN for a
+// missing REPLICA, which is strictly worse. `site` names which path failed,
+// since they have different causes.
+func (c *Cluster) writeServingMarker(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, site string) {
+	if err := c.factory.WriteServingMarker(storageunit.ReplicaMount(ru), epoch); err != nil {
+		c.logf("shale: SERVING MARKER WRITE FAILED for %s at epoch %d (%s): %v "+
+			"(a predecessor draining this position polls for this marker and will "+
+			"stay Draining until it appears; its mount keeps refusing cross-shard scans)",
+			ru, epoch, site, err)
+	}
+}
+
 // acquireReplicaUnit mounts replica position ru.Replica of unit ru.Unit via
 // the per-replica factory, opening at a strictly higher epoch than this node's
 // current durable lease for that replica position (the fence). On error the
@@ -596,20 +600,14 @@ func (c *Cluster) unitApplyErrMaps(ru storageunit.ReplicaUnit, b backend.Backend
 // under reconcileMu made a boot-defer warm-up take N x open latency (the
 // boot-gap residual).
 //
-// It writes the durable SERVING MARKER after mounting, EXACTLY as the overlap
-// acquire does. Since v0.14.2 the reconcile routes every real successor mount
-// through the background bounded acquire, so in production this clean-cut path
-// no longer lands positions moving off a leaving node - the break-demo is its
-// one remaining caller shape. The marker write stays anyway, for the same
-// reason it was added: any path that CAN mount a position a leaver is draining
-// must publish the release signal, or the leaver waits out its full grace
-// timeout against a marker that is not coming. Keeping the write here makes
-// that property a property of MOUNTING rather than of one caller's routing,
-// which is exactly how the original omission (boot mounted, published nothing,
-// wedged production for 41 days) became possible. The clean-cut gainer opens at durable+1
-// (strictly above the leaver's open epoch), so the marker it writes here releases
-// the draining leaver. The marker is monotonic + idempotent, so writing it on a
-// pure new mount (no draining leaver) is a harmless no-op observer-wise.
+// The mount goes through mountServing, so it publishes the durable SERVING
+// MARKER like every other serving mount: any path that CAN mount a position a
+// leaver is draining must publish the release signal, or the leaver waits out
+// its full grace timeout against a marker that is not coming. The clean-cut
+// gainer opens at durable+1 (strictly above the leaver's open epoch), so the
+// marker released there releases the draining leaver; the marker is monotonic +
+// idempotent, so publishing on a pure new mount (no draining leaver) is a
+// harmless no-op observer-wise.
 func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 	epoch := acquireBaseEpoch
 	b, openedEpoch, err := c.factory.OpenUnit(storageunit.ReplicaMount(ru), epoch)
@@ -631,23 +629,14 @@ func (c *Cluster) acquireReplicaUnit(ru storageunit.ReplicaUnit) {
 		}
 	}
 	c.mounts.clearAcquireErr(ru)
-	// Record THIS node's exact open epoch (from the factory return) BEFORE the
-	// mount, so a beginDrain that sees the mount also sees the epoch.
-	c.mounts.recordOpenEpoch(ru, openedEpoch)
-	if !c.mounts.mountUnlessClosed(ru, b) {
+	// openedEpoch is THIS node's EXACT open epoch (the factory return value, NOT
+	// a re-read of the climbing durable): the drain gate and the marker epoch.
+	if c.mounts.mountServing(ru, b, openedEpoch, "acquire") == mountSuperseded {
 		// Close raced us between the open and the mount; release rather than
 		// leaking the freshly-opened backend past shutdown.
-		c.mounts.forgetOpenEpoch(ru)
 		_ = c.factory.CloseUnit(storageunit.ReplicaMount(ru))
 		return
 	}
-
-	// Write the durable serving marker AFTER the mount (outside the lock: shared
-	// storage I/O), at THIS node's EXACT open epoch (the factory return value, NOT
-	// a re-read of the climbing durable). This is the poll-observable release
-	// signal a DRAINING predecessor reads (drainCheck); without it a clean-cut
-	// successor of a leaving node never releases that node's drain.
-	c.writeServingMarker(ru, openedEpoch, "acquire")
 }
 
 // releaseReplicaUnit unmounts the ReplicaUnit ru via the factory. The mount

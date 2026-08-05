@@ -22,7 +22,7 @@ import (
 // LOCK DISCIPLINE. mu is private and is never exported, so no caller can hold
 // it across arbitrary cluster code. Every multi-step read-modify-write that the
 // old call sites performed inside ONE shared-mutex hold is a single method here (see
-// armDrain, completeAcquireFlip, releaseDrained, evictIfSame, finishStuckGainer,
+// armDrain, mountServing, releaseDrained, evictIfSame, finishStuckGainer,
 // clearOrphanedDrain, takeAll), so those critical sections keep
 // their atomicity without exposing the lock.
 //
@@ -31,10 +31,15 @@ import (
 // constructor. Everything else called under mu is either a map/slice operation
 // or a pure function of the storageunit domain package (NextOnDrain,
 // NextOnReady, NextOnRelease, replica0, sortReplicaUnits) - none of which can
-// reach back into the table. Slow work (factory opens/closes, serving-marker
-// I/O, flushes) stays OUTSIDE: the methods hand the caller what it needs
-// (usually the backend handle that was just removed) and the caller does the
-// I/O after the method returns.
+// reach back into the table. Slow work (factory opens/closes, flushes) stays
+// OUTSIDE: the methods hand the caller what it needs (usually the backend
+// handle that was just removed) and the caller does the I/O after the method
+// returns.
+//
+// The ONE piece of I/O the table performs itself is the serving-marker publish
+// (see publish and mountServing), and it runs strictly AFTER mu is released. It
+// is here rather than at the call sites for the same reason wrap is: it must be
+// a property of BECOMING SERVING, not a step each mount path remembers.
 //
 // The sync.Map-backed members (openEpochs, acquireErr, permits) keep their
 // pre-existing lock-free discipline: they are read both inside and outside mu
@@ -72,8 +77,8 @@ type mountTable struct {
 	// openEpochs records the EXACT epoch THIS node opened each mounted position
 	// at, captured from the factory's RETURN VALUE (not a re-read of the shared,
 	// climbing durable epoch). It is the STABLE drain-release gate AND the epoch
-	// the serving marker carries. Recorded just before the mount at every open
-	// site; cleared on release. sync.Map: read without mu (see openEpochOf's
+	// the serving marker carries. Recorded by mountServing before the mount entry
+	// is visible; cleared on release. sync.Map: read without mu (see openEpochOf's
 	// callers), so it needs no ordering against the mount map.
 	openEpochs sync.Map // storageunit.ReplicaUnit -> storageunit.Epoch
 	// acquireErr records, per position, why a DESIRED position is not mounted:
@@ -95,6 +100,18 @@ type mountTable struct {
 	// re-enter. Holding it here rather than at the call sites keeps the
 	// decorator a property of "being mounted": no mount site can omit it.
 	wrap func(storageunit.ReplicaUnit, backend.Backend) backend.Backend
+	// publish writes the durable SERVING MARKER for a position that just became
+	// locally serving, at the epoch this node opened it at. It is the ONLY
+	// release signal a draining predecessor accepts, so a mount path that omits
+	// it leaves that predecessor Draining forever while its own mount serves
+	// normally - a failure with no local symptom. Holding it here rather than at
+	// the call sites makes publishing a property of the serving transition: see
+	// mountServing.
+	//
+	// It is shared-storage I/O, so it is invoked ONLY with mu RELEASED (see
+	// publishServing). nil in a bare white-box fixture, which then publishes
+	// nothing.
+	publish func(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, site string)
 	// closed points at the Cluster's closed flag. Read under mu by
 	// mountUnlessClosed / startAcquire so the "is the cluster shutting down"
 	// check pairs atomically with the mutation, exactly as the old call sites
@@ -113,7 +130,18 @@ func (t *mountTable) init(c *Cluster) {
 	t.phases = make(map[storageunit.ReplicaUnit]storageunit.HandoffState)
 	t.inFlight = make(map[storageunit.ReplicaUnit]struct{})
 	t.wrap = c.newFencedSelfHealing
+	t.publish = c.publishServingMarker
 	t.closed = &c.closed
+}
+
+// publishServing runs the serving-marker publish for ru. Callers MUST have
+// released mu: the publish is shared-storage I/O and no table lock may cover
+// I/O.
+func (t *mountTable) publishServing(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, site string) {
+	if t.publish == nil {
+		return
+	}
+	t.publish(ru, epoch, site)
 }
 
 // isClosed reports the cluster's shutdown flag. Callers hold mu.
@@ -340,9 +368,25 @@ func (t *mountTable) reclaimDrain(ru storageunit.ReplicaUnit) {
 
 // finishStuckGainer completes a half-done flip: a MOUNTED position in a GAINER
 // phase with NO acquire goroutine in flight never dropped its phase, so it never
-// reads as serving. Dropping the phase converges it to Owned. Reports whether it
-// did, so the caller writes the serving marker outside the lock.
+// reads as serving. Dropping the phase converges it to Owned, and the position
+// becomes locally serving HERE, so this transition publishes the serving marker
+// exactly as mountServing does - nothing else will publish for a position whose
+// mount already happened. Reports whether it finished a stuck flip.
+//
+// The published epoch is the one recorded for the mount (this node's exact open
+// epoch). A mount with no recorded epoch publishes 0, which the publisher
+// resolves rather than writing: see Cluster.publishServingMarker.
 func (t *mountTable) finishStuckGainer(ru storageunit.ReplicaUnit) bool {
+	if !t.dropStuckGainerPhase(ru) {
+		return false
+	}
+	epoch, _ := t.openEpochOf(ru)
+	t.publishServing(ru, epoch, "overlap-rearm") // I/O: strictly after the unlock.
+	return true
+}
+
+// dropStuckGainerPhase is finishStuckGainer's critical section.
+func (t *mountTable) dropStuckGainerPhase(ru storageunit.ReplicaUnit) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if _, running := t.inFlight[ru]; running {
@@ -377,46 +421,84 @@ func (t *mountTable) clearOrphanedDrain(ru storageunit.ReplicaUnit) bool {
 	return true
 }
 
-// flipResult is the outcome of completeAcquireFlip.
-type flipResult int
+// mountOutcome is the outcome of mountServing.
+type mountOutcome int
 
 const (
-	// flipSuperseded: Close ran before the flip; nothing was mounted and the
-	// caller must release the freshly-opened backend.
-	flipSuperseded flipResult = iota
-	// flipMountedResolved: the mount is installed, but the phase entry was
-	// already resolved elsewhere (or the FSM edge was illegal), so this was not
-	// the clean Acquiring -> Ready -> Owned advance.
-	flipMountedResolved
-	// flipMountedReady: the clean Acquiring -> Ready -> Owned advance.
-	flipMountedReady
+	// mountSuperseded: Close ran before the transition; nothing was mounted, no
+	// marker was published, and the caller must release the freshly-opened
+	// backend.
+	mountSuperseded mountOutcome = iota
+	// mountedPhaseResolved: the mount is installed and the marker published, but
+	// this was not the clean Acquiring -> Ready -> Owned advance: there was no
+	// gainer phase to advance (boot, clean-cut acquire), a concurrent reconcile
+	// already resolved it, or the FSM edge was illegal.
+	mountedPhaseResolved
+	// mountedReady: the clean Acquiring -> Ready -> Owned advance.
+	mountedReady
 )
 
-// completeAcquireFlip is THE MOUNT FLIP: it installs the mount entry and
-// resolves the handoff phase to Owned under ONE lock hold, so a routed op never
-// sees the mount present without the phase resolved (and vice versa). Every
-// mounted outcome leaves the same steady state (mounted, no phase entry); the
-// result only tells the caller which log line and cleanup to run OUTSIDE the
-// lock.
-func (t *mountTable) completeAcquireFlip(ru storageunit.ReplicaUnit, b backend.Backend, opened storageunit.Epoch) flipResult {
+// mountServing is THE TRANSITION TO LOCALLY SERVING and the ONE place a serving
+// mount is published. It records this node's exact open epoch, installs the
+// mount entry and resolves any in-flight gainer phase to Owned under ONE lock
+// hold (so a routed op never sees the mount present without the phase resolved,
+// and vice versa), then publishes the durable serving marker once the lock is
+// dropped. Every mounted outcome leaves the same steady state (mounted, no
+// phase entry, marker published); the outcome only tells the caller which log
+// line and cleanup to run.
+//
+// THE PUBLISH IS PART OF THE TRANSITION, not a step the caller remembers. The
+// marker is the only signal a draining predecessor releases on, and while it
+// was a separate write each mount path repeated, every path was a fresh chance
+// to omit it - and a path that omits it mounts and serves normally, so the
+// omission has no local symptom at all: it surfaces as a predecessor elsewhere
+// that stays Draining forever and refuses cross-shard scans. Doing it here
+// means a new mount path inherits the publish instead of having to know about
+// it.
+//
+// opened MUST be the factory's RETURNED open epoch (max(intended, durable+1)),
+// never a re-read of the shared durable epoch, which any node's later open
+// bumps. It is both this node's stable drain gate and the epoch the marker
+// carries, and a predecessor releases only STRICTLY ABOVE its own open epoch.
+//
+// site names the mount path for the publish-failure log: the paths fail for
+// different reasons.
+func (t *mountTable) mountServing(ru storageunit.ReplicaUnit, b backend.Backend, opened storageunit.Epoch, site string) mountOutcome {
+	// Before the mount entry is visible, so a beginDrain that sees the mount
+	// also sees the epoch.
+	t.recordOpenEpoch(ru, opened)
+	out := t.installServing(ru, b, opened)
+	if out == mountSuperseded {
+		t.forgetOpenEpoch(ru) // nothing mounted: leave no epoch behind.
+		return out
+	}
+	t.publishServing(ru, opened, site) // I/O: strictly after the unlock.
+	return out
+}
+
+// installServing is mountServing's critical section: the mount entry and the
+// phase resolution move together under ONE hold.
+func (t *mountTable) installServing(ru storageunit.ReplicaUnit, b backend.Backend, opened storageunit.Epoch) mountOutcome {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	if t.isClosed() {
-		return flipSuperseded
+		return mountSuperseded
 	}
-	res := flipMountedReady
+	out := mountedReady
 	cur := t.phases[ru]
 	switch {
 	case cur.Phase != storageunit.PhaseAcquiring:
-		// The phase entry is gone or not Acquiring (a concurrent reconcile
-		// already flipped or dropped it). The mount is still installed below (it
-		// is the authoritative durable owner) and any stale phase entry dropped.
-		res = flipMountedResolved
+		// No phase entry at all (a mount with no handoff in flight), or one a
+		// concurrent reconcile already flipped or dropped. The mount is still
+		// installed below (it is the authoritative durable owner) and any stale
+		// phase entry dropped. A LOSER phase cannot be here: armDrain requires a
+		// mount entry, and this transition is the one that installs it.
+		out = mountedPhaseResolved
 	default:
 		if _, err := storageunit.NextOnReady(cur, opened); err != nil {
 			// Illegal edge should not happen (cur is Acquiring); mount and drop
 			// the phase to converge to Owned regardless.
-			res = flipMountedResolved
+			out = mountedPhaseResolved
 		}
 	}
 	t.mountLocked(ru, b)
@@ -425,7 +507,7 @@ func (t *mountTable) completeAcquireFlip(ru storageunit.ReplicaUnit, b backend.B
 	// rather than parking in Ready - Owned = mounted + no phase, per the FSM's
 	// steady-state poles.
 	delete(t.phases, ru)
-	return res
+	return out
 }
 
 // releaseDrained is the drain release: it re-checks the Draining phase and
@@ -504,7 +586,10 @@ func (t *mountTable) mountLocked(ru storageunit.ReplicaUnit, b backend.Backend) 
 	t.mounts[ru] = t.decorate(ru, b)
 }
 
-// mount installs ru -> b, decorated.
+// mount installs ru -> b, decorated. It publishes NO serving marker and records
+// no open epoch, so it is for SOLE-layout (R=1) mounts, which have neither: a
+// position that becomes locally serving under the replica layout goes through
+// mountServing.
 func (t *mountTable) mount(ru storageunit.ReplicaUnit, b backend.Backend) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -522,6 +607,8 @@ func (t *mountTable) mount(ru storageunit.ReplicaUnit, b backend.Backend) {
 // reshardMu), so this is not a bug fix. It is here so the all-or-nothing
 // property is a property of the type rather than a standing bet that no future
 // reader will care - which is the same reason the mutex is private.
+//
+// Sole-layout (R=1) only, like mount: no serving marker, no open epoch.
 func (t *mountTable) mountPair(ruA storageunit.ReplicaUnit, bA backend.Backend, ruB storageunit.ReplicaUnit, bB backend.Backend) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -534,6 +621,9 @@ func (t *mountTable) mountPair(ruA storageunit.ReplicaUnit, bA backend.Backend, 
 // insert: Close sets the flag BEFORE draining the table, so observing false
 // here proves the drain has not started and this mount will be closed by it.
 // Mounting after the drain would leak the backend past shutdown.
+//
+// Like mount, it publishes no serving marker and records no open epoch:
+// SOLE-layout (R=1) mounts only.
 func (t *mountTable) mountUnlessClosed(ru storageunit.ReplicaUnit, b backend.Backend) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -548,8 +638,8 @@ func (t *mountTable) mountUnlessClosed(ru storageunit.ReplicaUnit, b backend.Bac
 // without clearing the acquire record. It is the white-box test seam that
 // mirrors a raw mount-map assignment: tests that inject a fenced/failing handle
 // and then assert the exact handle is evicted need the value they stored to be
-// the value the table holds. Production mount sites use mount /
-// mountUnlessClosed / completeAcquireFlip.
+// the value the table holds. Production mount sites use mountServing (replica
+// layout) or mount / mountUnlessClosed / mountPair (sole layout).
 func (t *mountTable) mountUndecorated(ru storageunit.ReplicaUnit, b backend.Backend) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
