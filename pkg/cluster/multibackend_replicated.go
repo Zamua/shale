@@ -43,6 +43,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Zamua/shale/internal/decide"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -302,75 +303,34 @@ func (c *Cluster) mountReplicaUnits() error {
 	// graceful leave. The reconcile clears the bit once every owned position is
 	// mounted (maintainJoiningState). A cold start defers nothing, so the bit is
 	// never set and first-cluster convergence is unchanged.
-	if deferred.Load() == 0 {
-		// FULLY WARMED BY CONSTRUCTION: every position this node owns is
-		// mounted, so clear the Joining bit NOW rather than a reconcile tick
-		// later. startJoining raises the bit at membership-open (before any
-		// mount) so peers exclude a warming node from CURRENT; leaving it up
-		// after a clean boot is stale state, and it is not harmless: a peer
-		// booting into this node during that window reads it as "not
-		// established" and downgrades its own warm-up to the slow debounce
-		// path (hasEstablishedPeer below). Observed downstream: node A booted
-		// cleanly, node B arrived one second later, saw A still advertising
-		// Joining, and spent a full settle delay in a write-quorum gap that
-		// the prompt path exists to close.
-		//
-		// Deliberately NOT routed through maintainJoiningState: that helper
-		// re-derives warmth from the pending set on the reconcile cadence,
-		// while here warmth is a boot-completion FACT - zero positions were
-		// deferred, so there is nothing to re-derive.
-		c.setSelfJoining(false)
-	}
-	if deferred.Load() > 0 {
-		c.setSelfJoining(true)
-		// ACQUIRE THE DEFERRED POSITIONS NOW - but ONLY when there is an
-		// ESTABLISHED cluster to warm into. Both halves of that sentence are
-		// load-bearing and each is backed by a failure:
-		//
-		// WHY NOW (the staggered join): a node joining an established cluster
-		// knows, at this instant, exactly which owned positions it is missing,
-		// and until they are warmed the cluster may not be able to assemble a
-		// write quorum for their units (the displaced peer holds ONE copy; this
-		// node's copy does not exist yet). The settle debounce exists to absorb
-		// membership churn, and a lone join into a converged ring is not churn -
-		// every debounce tick extends a KNOWN quorum gap for no batching
-		// benefit. Observed downstream: a 2-node bootstrap deferred 3 of 4
-		// positions, the acquire arrived a full production settle delay later,
-		// and a write in the gap exhausted its entire retry budget. The write
-		// retry is sized to ride an OPEN; not an open plus an idle debounce.
-		//
-		// WHY ONLY THEN (the mass boot): when EVERY node is booting at once,
-		// this node's ring is a partial view and its deferred set was computed
-		// against that partial view. Reconciling immediately means acting on
-		// the wrong topology - acquiring positions this node will not own once
-		// the ring converges, at epochs that fence sibling booting nodes' live
-		// mounts mid-boot. The debounce IS load-bearing there: it is what gives
-		// gossip time to converge before anyone acts. Skipping it in the mass
-		// case deterministically LOST ACKED WRITES in the mass-boot safety
-		// gate (8 of 8 runs) before this guard existed.
-		//
-		// The discriminator is the gossiped Joining bit, and its timing makes
-		// it exact rather than heuristic: every multi-node R>1 node advertises
-		// Joining from the moment its MEMBERSHIP opens (startJoining, before
-		// it mounts anything), and clears it only once fully warmed. So in a
-		// mass boot every visible peer says Joining and the gate falls back to
-		// the debounce; in a staggered join the established peers long ago
-		// cleared it and the gate fires. A peer that has not yet gossiped at
-		// all is simply not visible, which also (correctly) reads as
-		// not-established.
-		//
+	//
+	// The bit and the warm-up timing are ONE decision over four scalars, taken in
+	// decide.BootWarmUp (which carries the reasoning for each outcome). The clear
+	// is deliberately NOT routed through maintainJoiningState: that helper
+	// re-derives warmth from the pending set on the reconcile cadence, while here
+	// warmth is a boot-completion FACT - zero positions were deferred, so there is
+	// nothing to re-derive.
+	peers, joining := c.peerJoiningCounts()
+	act := decide.BootWarmUp(decide.BootState{
+		Deferred:     int(deferred.Load()),
+		Peers:        peers,
+		JoiningPeers: joining,
+		SelfJoining:  c.selfJoining.Load(),
+	})
+	c.setSelfJoining(act.Joining)
+	switch {
+	case act.Reason == decide.BootStaleJoining:
+		c.logf("shale: boot-defer warm-up: WARM (%s)", act.Reason)
+	case act.Prompt:
 		// Routed through the settle machinery with a zero delay rather than
-		// called inline: Open must not block on acquires, and the
-		// settlePending accounting keeps WaitForRebalanceIdle honest.
-		peers, joining := c.peerJoiningCounts()
-		if peers > joining {
-			c.logf("shale: boot-defer warm-up: PROMPT (peers=%d joining=%d - an established peer exists; "+
-				"arming the reconcile immediately to close the deferred-position quorum gap)", peers, joining)
-			c.scheduleReconcileIn(0)
-		} else {
-			c.logf("shale: boot-defer warm-up: DEBOUNCED (peers=%d joining=%d - no established peer visible; "+
-				"a fleet-wide boot must wait for ring convergence, the settle cadence handles it)", peers, joining)
-		}
+		// called inline: Open must not block on acquires, and the settlePending
+		// accounting keeps WaitForRebalanceIdle honest.
+		c.logf("shale: boot-defer warm-up: PROMPT (peers=%d joining=%d - %s; "+
+			"arming the reconcile immediately to close the deferred-position quorum gap)", peers, joining, act.Reason)
+		c.scheduleReconcileIn(0)
+	case act.Joining:
+		c.logf("shale: boot-defer warm-up: DEBOUNCED (peers=%d joining=%d - %s, "+
+			"the settle cadence handles it)", peers, joining, act.Reason)
 	}
 	return nil
 }
@@ -433,14 +393,11 @@ func (c *Cluster) promptAcquireFreshPositions() {
 }
 
 // peerJoiningCounts reports how many OTHER nodes the coordination view
-// contains and how many of those advertise Joining. peers > joining means at
-// least one established peer exists - the safety condition for acting on this
-// node's boot state immediately: an established peer proves there is a
-// converged topology to warm into, rather than a fleet-wide boot still
-// negotiating one. Returned as counts rather than a bool so the caller can LOG
-// what the decision saw; the one lesson this incident repeated at every layer
-// is that a guard which cannot report its own reasoning costs a night of
-// diagnosis when it fires unexpectedly.
+// contains and how many of those advertise Joining - the two scalars
+// decide.BootWarmUp reads an established peer out of. Returned as counts rather
+// than a bool so the caller can LOG what the decision saw: a guard that cannot
+// report its own reasoning costs a night of diagnosis when it fires
+// unexpectedly.
 func (c *Cluster) peerJoiningCounts() (peers, joining int) {
 	if c.coord == nil {
 		return 0, 0
