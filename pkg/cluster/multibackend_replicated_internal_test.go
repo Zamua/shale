@@ -12,10 +12,12 @@ import (
 	"io"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/internal/sharedfactory"
+	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -390,6 +392,58 @@ func TestMountReplicaUnits_DoesNotFenceServingPeer(t *testing.T) {
 	for _, ru := range desired[1:] {
 		if _, ok := c.mounts.backendFor(ru); !ok {
 			t.Fatalf("un-marked position %s should mount normally at boot", ru)
+		}
+	}
+}
+
+// closeRacingFactory flips the cluster's closed flag as each open RETURNS, so
+// every boot mount reaches the serving transition with the table already
+// closing: the Open/Close overlap (a cancelled startup, a supervisor tearing
+// the node down mid-boot), made deterministic.
+type closeRacingFactory struct {
+	storageunit.BackendFactory
+	closed *atomic.Bool
+}
+
+func (f *closeRacingFactory) OpenUnit(m storageunit.MountRef, e storageunit.Epoch) (backend.Backend, storageunit.Epoch, error) {
+	b, opened, err := f.BackendFactory.OpenUnit(m, e)
+	if err == nil {
+		f.closed.Store(true)
+	}
+	return b, opened, err
+}
+
+// TestMountReplicaUnits_SupersededMountRecordsWhyItIsUnmounted pins the BOOT
+// caller's handling of a superseded serving transition. The position is opened
+// and released rather than mounted, and mountReplicaUnits still returns nil, so
+// Open succeeds holding fewer positions than it desires. The recorded acquire
+// reason is the only account of that gap - /debug/shale/state has nothing else
+// to read, and the mount count alone does not say which positions are missing
+// or why.
+func TestMountReplicaUnits_SupersededMountRecordsWhyItIsUnmounted(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1")
+	desired := c.desiredReplicaUnits()
+	if len(desired) == 0 {
+		t.Fatalf("n1 desires no position; the test proves nothing")
+	}
+	c.factory = &closeRacingFactory{BackendFactory: c.factory, closed: &c.closed}
+
+	if err := c.mountReplicaUnits(); err != nil {
+		t.Fatalf("mountReplicaUnits: %v", err)
+	}
+
+	if n := c.mounts.mountedCount(); n != 0 {
+		t.Fatalf("a boot that lost the race with Close mounted %d positions, want 0", n)
+	}
+	for _, ru := range desired {
+		msg, ok := c.mounts.acquireErrOf(ru)
+		if !ok {
+			t.Fatalf("boot opened %s, did not mount it, and recorded nothing: the missing mount is "+
+				"unexplainable in /debug/shale/state", ru)
+		}
+		if !strings.Contains(msg, "superseded") {
+			t.Fatalf("boot recorded %q for %s, want a reason naming the superseding close", msg, ru)
 		}
 	}
 }
