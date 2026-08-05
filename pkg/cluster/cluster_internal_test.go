@@ -343,22 +343,14 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 }
 
 // TestScheduleReconcileIn_DebouncedRearmMustNotPostponeImmediate pins the
-// settle-timer arming state machine in the direction the doc comment always
-// promised but the code did not enforce: once an IMMEDIATE (zero-delay) pass
-// is pending - the boot-defer prompt, the stale-mount evict - a later
-// DEBOUNCED re-arm must not postpone it. Last-writer-wins here silently pushed
-// the boot-defer prompt out a full production settle delay whenever a
-// coalesced view hint landed just after boot (the coordination port delivers
-// boot-time hints after Open returns), which turned "arming the reconcile
-// immediately" into a multi-second write-refusal window that outlived the
-// consumer's documented retry budget. Caught by
-// TestFreshBoot_StaggeredJoin_NoWriteGap failing ~1-in-2 under the port.
+// arming machine THROUGH THE REAL TIMER: a debounced re-arm over a pending
+// IMMEDIATE arm must leave the pass immediate, observed as the pending
+// obligation draining promptly rather than waiting out the hour-long debounce.
+// The decision itself is enumerated in internal/decide; what this adds is that
+// the decision reaches a live timer whose callback actually runs the pass.
 //
-// The pending-immediate state is INJECTED (a live fake timer + the flag), so
-// the guard's decision is deterministic: the debounced re-arm must leave the
-// pass immediate - observed behaviorally as the pending obligation draining
-// promptly instead of waiting out the hour-long debounce it was (pre-fix)
-// re-armed with.
+// The pending-immediate state is INJECTED (a live stand-in timer + the flag) so
+// the arm is deterministic.
 func TestScheduleReconcileIn_DebouncedRearmMustNotPostponeImmediate(t *testing.T) {
 	saved := reconcileInterval
 	reconcileInterval = time.Hour
@@ -417,22 +409,20 @@ func TestScheduleReconcileIn_DebouncedRearmMustNotPostponeImmediate(t *testing.T
 	}
 }
 
-// TestScheduleReconcileIn_FiredTimerRearmOwnsFreshObligation pins the
-// obligation accounting across the fired-timer re-arm race (found live as
-// settlePending=-1 wedging every subsequent WaitForRebalanceIdle: CI R2
-// boots, 3-in-12 under 6-core load). A timer that already FIRED has a
-// callback in flight that owns - and will release - the pending obligation it
-// was armed with; a replacement arm landing in that window must therefore
-// count as a FRESH obligation. Riding the old one double-releases a single
-// increment and the counter goes negative.
+// TestScheduleReconcileIn_FiredTimerRearmOwnsFreshObligation pins the SHELL's
+// half of the fired-timer rule: that a timer which already fired is reported to
+// the arming core as FIRED (the Stop probe returning false is the only signal
+// there is), and that the core's fresh-obligation answer becomes a real
+// settlePending increment. The rule's decision table is in internal/decide;
+// mis-wiring the probe polarity or the increment here still double-releases one
+// obligation, drives the counter negative and wedges every later idle-wait.
 func TestScheduleReconcileIn_FiredTimerRearmOwnsFreshObligation(t *testing.T) {
 	c := &Cluster{}
 	c.cfg.RebalanceSettleDelay = time.Hour
 
 	// A FIRED timer whose callback has not yet cleared the field: the timer
-	// object has run (empty func - we play the callback's bookkeeping
-	// ourselves below), the field still references it, one obligation
-	// outstanding.
+	// object has run (empty func - the callback's bookkeeping is played out
+	// below), the field still references it, one obligation outstanding.
 	fired := time.AfterFunc(0, func() {})
 	time.Sleep(20 * time.Millisecond) // let it fire; Stop() now returns false
 	c.settleMu.Lock()
@@ -449,7 +439,7 @@ func TestScheduleReconcileIn_FiredTimerRearmOwnsFreshObligation(t *testing.T) {
 	}
 
 	// The in-flight callback releases the ORIGINAL obligation; the
-	// replacement timer's callback will release its own. Nothing can reach
+	// replacement timer's callback would release its own. Nothing can reach
 	// -1 from here.
 	c.settlePending.Add(-1)
 	c.settleMu.Lock()
