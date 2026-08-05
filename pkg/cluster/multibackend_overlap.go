@@ -362,12 +362,12 @@ func (c *Cluster) heldForMissingSuccessorMarker(ru storageunit.ReplicaUnit) bool
 		return true // cannot prove a successor serves: hold, re-check next pass.
 	}
 	if !ok {
-		// NO marker has EVER been written for this position: its current
-		// holder mounted at boot (boot mounts do not mark), so there is no
-		// pending acquire whose marker would release this hold - holding
-		// would wedge forever against a signal that is not coming. The
-		// flap-interleaving class the rule defends always involves a marked
-		// acquire, so requiring an existing marker keeps the defense.
+		// NO marker has EVER been written for this position, so no live owner
+		// has ever served it: there is no serving mount whose marker would
+		// release this hold - holding would wedge forever against a signal that
+		// is not coming. The flap-interleaving class the rule defends always
+		// involves a marked serving mount, so requiring an existing marker
+		// keeps the defense.
 		return false
 	}
 	return epoch <= own
