@@ -110,6 +110,20 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
+			// THE BUDGET EXPIRED WITH THE HAND-OFF INCOMPLETE. Departing anyway
+			// is deliberate (a leave must not hang on a stuck successor), and
+			// the cost is real: each position below is unserved from teardown
+			// until its successor finishes mounting, so a routed read or write
+			// for it finds NO holder in the union and gets the retryable
+			// acquiring refusal. Name them - the window is indistinguishable
+			// from a routing bug downstream unless the node that opened it says
+			// so on the way out.
+			if waiting := c.positionsAwaitingSuccessor(); len(waiting) > 0 {
+				c.logf("shale: LEAVING WITH %d POSITION(S) NOT HANDED OFF after the %s drain budget: %v - "+
+					"each is unserved until its successor mounts; routed ops for them refuse with the "+
+					"retryable acquiring error until then",
+					len(waiting), c.cfg.GracefulLeaveDrainTimeout, waiting)
+			}
 			return ctx.Err()
 		case <-t.C:
 		}
@@ -133,9 +147,19 @@ func (c *Cluster) DrainForLeave(ctx context.Context) error {
 // gate. With no positions mounted, the gate is true (the leaver has handed off
 // everything).
 func (c *Cluster) allOwnedPositionsHandedOff() bool {
+	return len(c.positionsAwaitingSuccessor()) == 0
+}
+
+// positionsAwaitingSuccessor returns the mounted positions with NO successor
+// provably serving above this node's own open epoch. It is the gate's evidence
+// half: a leave that ends on its budget rather than on hand-off leaves exactly
+// these positions unserved from teardown until a successor mounts, and that
+// window is invisible unless the leaver names them on the way out.
+func (c *Cluster) positionsAwaitingSuccessor() []storageunit.ReplicaUnit {
 	if !c.replicaLayout() {
-		return true
+		return nil
 	}
+	var waiting []storageunit.ReplicaUnit
 	for _, ru := range c.mounts.mountedList() {
 		// Gate on THIS node's OWN open epoch (the recorded factory return), NOT the
 		// live durable: the durable climbs as the successor opens, which would push
@@ -147,10 +171,10 @@ func (c *Cluster) allOwnedPositionsHandedOff() bool {
 		if err != nil || !ok || markerEpoch <= open {
 			// No successor serving this position above the leaver's epoch yet: still
 			// handing off (or a transient marker-read error - retry next poll).
-			return false
+			waiting = append(waiting, ru)
 		}
 	}
-	return true
+	return waiting
 }
 
 // ownedPositionCount returns how many ReplicaUnit positions this node still has
