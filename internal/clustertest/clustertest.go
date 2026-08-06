@@ -23,13 +23,13 @@ package clustertest
 
 import (
 	"fmt"
-	"net"
 	"slices"
 	"strconv"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/testport"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/coord/gossip"
 	"google.golang.org/grpc/codes"
@@ -48,24 +48,13 @@ import (
 // use" out of memberlist.Create. Callers that bind the result for a
 // Cluster should go through OpenClusterRetryBind, which re-rolls a
 // fresh port and retries on exactly that conflict.
+// FreePort returns a port free on both TCP and UDP. The implementation lives
+// in internal/testport so the three test packages that need it cannot drift:
+// this was the only correct copy, and the other two had silently kept the
+// TCP-only version that fails under a whole-repo run.
 func FreePort(t *testing.T) int {
 	t.Helper()
-	for range 16 {
-		l, err := net.Listen("tcp", "127.0.0.1:0")
-		if err != nil {
-			continue
-		}
-		port := l.Addr().(*net.TCPAddr).Port
-		udp, err := net.ListenPacket("udp", fmt.Sprintf("127.0.0.1:%d", port))
-		_ = l.Close()
-		if err != nil {
-			continue
-		}
-		_ = udp.Close()
-		return port
-	}
-	t.Fatalf("FreePort: exhausted 16 attempts to find a port free on both TCP+UDP")
-	return 0
+	return testport.Free(t)
 }
 
 // HostPort renders a loopback bind address for port.
