@@ -505,15 +505,14 @@ func TestLeaveReadTransparent_GetScanEveryNode(t *testing.T) {
 	// whether or not the hand-off converged, so it is the ceiling on the window
 	// this gate probes in, and a message that quoted a stale copy of it would send
 	// the next reader after the wrong knob.
-	// Generous BY CONSTRUCTION, not by headroom. The window this gate probes in
-	// must be closed by the fixture's own release below, never by a product
-	// timer racing the runner: at 20s against a ~1.2s probe phase the margin
-	// looked ample and still lost on a loaded CI runner, because "enough time"
-	// is a bet on scheduling rather than a property. The successors are pinned
-	// mid-mount for drainMountDelay, so hand-off CANNOT complete and this budget
-	// is the only other way the drain ends - set it past any plausible probe
-	// phase and the guard below still fails loudly if it is ever reached.
-	const drainBudget = 4 * time.Minute
+	// NOT a knob to widen. Raising it past the 90s this test waits for Close
+	// below breaks the gate's own consistency: the leave legitimately sits in
+	// DrainForLeave for the whole budget while the post-loop wait gives up at
+	// 90s, and the guard there correctly reports a leave "stuck somewhere other
+	// than the hand-off wait" that is simply slower than the fixture's patience.
+	// The window this gate probes in is bounded by BOTH this budget and that
+	// wait, so they move together or not at all.
+	const drainBudget = 20 * time.Second
 	mutate := func(cfg *cluster.Config) {
 		cfg.GracefulLeaveDrainTimeout = drainBudget
 		cfg.OpenConcurrency = 8
