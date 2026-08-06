@@ -31,6 +31,12 @@
 // mounting + writing serving markers), the ordered-removal drainCheck, and the
 // DrainForLeave drive live in the controller files; this file just answers
 // "which replicas does an op for this key touch, and what is the ack bar."
+//
+// AND IT IS THE SHELL, NOT THE DECISION. Everything above turns on the three
+// placements alone - the full one, the joiner-excluded one, the drainer-excluded
+// one - so it is decide.Route, exercised as values over every topology rather
+// than sampled through a live cluster. What is left here is coordinator work:
+// asking for those placements, and translating IDs back into nodes.
 
 package cluster
 
@@ -132,6 +138,57 @@ func (c *Cluster) currentUnitReplicas(gu storageunit.GenUnit, joining map[storag
 	return excl
 }
 
+// unitPlacements is one unit's three candidate placements as coordinator nodes,
+// alongside the bare-ID projection decide.Route is stated in. The two views are
+// built together so the "an empty exclusion is the full placement" rule has one
+// site rather than one per view.
+type unitPlacements struct {
+	full            []coord.Node
+	joinerExcluded  []coord.Node
+	drainerExcluded []coord.Node
+	ids             decide.Placements
+}
+
+// placementsForUnit asks the coordinator where gu sits over every member, and
+// where it would sit if the joining / draining members were NOT members.
+//
+// The exclusions are separate LOCATE calls, not the full placement filtered:
+// bounded-load consistent hashing is not removal-invariant, so a filtered list
+// is a placement nobody ever mounted while a re-located one is the set those
+// members genuinely hold. An empty exclusion set skips the call - there is
+// nothing to exclude, so the answer is the full placement.
+func (c *Cluster) placementsForUnit(gu storageunit.GenUnit, joining, draining map[storageunit.NodeID]struct{}) unitPlacements {
+	p := unitPlacements{full: c.unitReplicas(gu)}
+	p.joinerExcluded, p.drainerExcluded = p.full, p.full
+	p.ids.Full = nodeIDs(p.full)
+	p.ids.JoinerExcluded, p.ids.DrainerExcluded = p.ids.Full, p.ids.Full
+	if len(joining) > 0 {
+		p.joinerExcluded = c.locate(gu, c.replicationFactor(), coord.Placement{Exclude: joining})
+		p.ids.JoinerExcluded = nodeIDs(p.joinerExcluded)
+	}
+	if len(draining) > 0 {
+		p.drainerExcluded = c.locate(gu, c.replicationFactor(), coord.Placement{Exclude: draining})
+		p.ids.DrainerExcluded = nodeIDs(p.drainerExcluded)
+	}
+	return p
+}
+
+// current resolves the decision's CURRENT choice back to coordinator nodes.
+func (p unitPlacements) current(rt decide.Routing) []coord.Node {
+	if rt.Current == decide.CurrentFullRing {
+		return p.full
+	}
+	return p.joinerExcluded
+}
+
+// pending resolves the decision's PENDING choice back to coordinator nodes.
+func (p unitPlacements) pending(rt decide.Routing) []coord.Node {
+	if rt.Pending == decide.PendingFullRing {
+		return p.full
+	}
+	return p.drainerExcluded
+}
+
 // routedReplicasForKey resolves a key to the replica set an op fans out to,
 // AND reports the STABLE replica count the ack bar is held at. It is the
 // pending-ranges core consulted by every replicated fan-out (put / get / delete
@@ -143,34 +200,19 @@ func (c *Cluster) currentUnitReplicas(gu storageunit.GenUnit, joining map[storag
 //     over (requiredWriteAcks(WriteConsistency, stableR)), so a transition does
 //     NOT raise the bar even though len(routed) > stableR.
 //
-// current is the ring located over ALL members (draining included); pending is
-// the placement over a ring genuinely rebuilt without the draining members.
-// They are equal in steady state, so the common path returns current with no
-// union work.
+// This is the SHELL: it asks the coordinator for the three placements, hands
+// them to decide.Route, and translates the answer back into coordinator nodes.
+// The decision itself - which placement is current, which is pending, whether
+// the unit is in transition, the union and its order - is decide.Route.
 func (c *Cluster) routedReplicasForKey(key []byte) (routed []coord.Node, stableR int) {
 	gu := c.genUnitForKey(key)
 	joining, draining := c.transitionSets()
-
-	// UNIFIED SPLIT: current = ring EXCLUDING joining (floored); pending = ring
-	// EXCLUDING draining. In steady state both equal the full ring.
-	current := c.currentUnitReplicas(gu, joining)
-	stableR = len(current)
-
-	if len(joining) == 0 && len(draining) == 0 {
-		// Steady state: no transition, routed == stable set.
-		return current, stableR
+	p := c.placementsForUnit(gu, joining, draining)
+	rt := decide.Route(p.ids, c.replicationFactor())
+	if !rt.InTransition {
+		return p.current(rt), rt.StableR
 	}
-
-	pending := c.pendingUnitReplicas(gu, draining)
-	if sameMemberSet(current, pending) {
-		// A joining/draining member exists somewhere in the cluster, but this
-		// key's current and pending sets coincide (the member is not in this
-		// unit's set, or the quorum floor reverted current to the full ring):
-		// the position is not in transition. Route the stable set.
-		return current, stableR
-	}
-
-	return unionMembers(current, pending), stableR
+	return membersByID(rt.Routed, p.current(rt), p.pending(rt)), rt.StableR
 }
 
 // pendingUnitReplicas resolves the PENDING replica set for an explicit GenUnit:
@@ -201,10 +243,9 @@ func (c *Cluster) pendingUnitReplicas(gu storageunit.GenUnit, draining map[stora
 		return c.unitReplicas(gu)
 	}
 	pend := c.locate(gu, c.replicationFactor(), coord.Placement{Exclude: draining})
-	if len(pend) == 0 {
-		// Every member is draining (or there is no coordinator): there is no
-		// post-leave placement to predict; fall back to the full set - the safe
-		// wedge.
+	// Every member draining (or no coordinator) leaves nothing to predict; the
+	// fallback to the full set is decide.PendingReplicaSet.
+	if decide.PendingReplicaSet(len(pend)) == decide.PendingFullRing {
 		return c.unitReplicas(gu)
 	}
 	return pend
@@ -231,11 +272,13 @@ type routedReplica struct {
 func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, stableR int) {
 	gu := c.genUnitForKey(key)
 	joining, draining := c.transitionSets()
-
-	// UNIFIED SPLIT: current = ring EXCLUDING joining (floored); pending = ring
-	// EXCLUDING draining. In steady state both equal the full ring.
-	current := c.currentUnitReplicas(gu, joining)
-	stableR = len(current)
+	p := c.placementsForUnit(gu, joining, draining)
+	// Same decision as routedReplicasForKey, so the two fan-out resolvers cannot
+	// disagree about which set is current or whether the unit is in transition.
+	// Only the DEDUP differs: this one keys on (member, position) pairs.
+	rt := decide.Route(p.ids, c.replicationFactor())
+	stableR = rt.StableR
+	current := p.current(rt)
 
 	withUnit := func(members []coord.Node) []routedReplica {
 		out := make([]routedReplica, len(members))
@@ -245,13 +288,10 @@ func (c *Cluster) routedReplicasWithUnit(key []byte) (routed []routedReplica, st
 		return out
 	}
 
-	if len(joining) == 0 && len(draining) == 0 {
+	if !rt.InTransition {
 		return withUnit(current), stableR
 	}
-	pending := c.pendingUnitReplicas(gu, draining)
-	if sameMemberSet(current, pending) {
-		return withUnit(current), stableR
-	}
+	pending := p.pending(rt)
 
 	// Union over (member, POSITION) PAIRS - current-first, then every pending
 	// pair not already present. A leave OR a join shuffles replica indices: a
@@ -337,18 +377,40 @@ func containsMember(ms []coord.Node, id storageunit.NodeID) bool {
 	return false
 }
 
-// unionMembers returns the de-duplicated union of two replica slices,
-// CURRENT-first so the still-mounted current owners (which can satisfy the ack
-// bar instantly) lead the fan-out and a pending owner mid-mount trails. Order is
-// otherwise stable (current order, then any pending members not already in
-// current).
-func unionMembers(current, pending []coord.Node) []coord.Node {
-	out := make([]coord.Node, 0, len(current)+len(pending))
-	out = append(out, current...)
-	for _, m := range pending {
-		if !containsMember(out, m.ID) {
+// nodeIDs projects a placement onto the bare IDs the pure routing decision is
+// stated in.
+func nodeIDs(ms []coord.Node) []string {
+	out := make([]string, len(ms))
+	for i, m := range ms {
+		out[i] = string(m.ID)
+	}
+	return out
+}
+
+// membersByID resolves a decision's routed ID set back to coordinator nodes.
+// The decision works in bare IDs so it can stay free of the coordinator's node
+// type; the addresses live only here. Every routed ID comes from the current or
+// the pending placement by construction (the routed set is their union), so a
+// and b together cover the whole answer.
+func membersByID(ids []string, a, b []coord.Node) []coord.Node {
+	out := make([]coord.Node, 0, len(ids))
+	for _, id := range ids {
+		if m, ok := findMember(a, id); ok {
+			out = append(out, m)
+			continue
+		}
+		if m, ok := findMember(b, id); ok {
 			out = append(out, m)
 		}
 	}
 	return out
+}
+
+func findMember(ms []coord.Node, id string) (coord.Node, bool) {
+	for _, m := range ms {
+		if string(m.ID) == id {
+			return m, true
+		}
+	}
+	return coord.Node{}, false
 }
