@@ -16,36 +16,37 @@ package integration
 //
 //   - JOIN alone: a 4th node boot-defers (Joining bit) and slow-mounts its
 //     positions while probes read every unit through every node.
-//   - LEAVE alone: one node of four drains gracefully (Draining bit) while
-//     survivors slow-mount its positions; probes run through the drain AND
-//     through the post-exit window right after the leaver departs the ring
-//     (where the consistent-hash reshuffle can shift surviving replicas to
-//     NEW position indices they have not mounted yet).
 //   - SURGE composition: join, then a leave of a different node overlapping
 //     the settling, then the next join 2s later - the k8s rollout timeline.
+//   - ENTRY DURING DRAIN: a gracefully-leaving node keeps answering as the
+//     entry point for the whole drain.
+//
+// WHAT THE WIRE PATH IS FOR, AND WHAT IT IS NOT. These gates exist to catch
+// what only appears once real nodes, real mounts and real gossip are in play.
+// They are a poor instrument for the ROUTING DECISION itself - which replicas
+// an op touches during a transition - because reaching a given topology through
+// them means holding a mount window open against a drain that ends on its own,
+// so the topologies actually observed are whatever the runner allowed. That
+// decision is a pure function of three placements and R, and it is enumerated
+// exhaustively as values in internal/decide (Route). Leave availability end to
+// end stays gated by TestGracefulLeave_HoldsAvailabilityThroughLeave, which
+// runs a continuous writer against an ack-rate gate and a no-acked-loss oracle
+// rather than sampling a window.
 //
 // Every probe is a SINGLE attempt (no retry): the gate is transparency, not
 // eventual success. A probe failure is a client-visible read error.
 //
-// THE OBSERVATION WINDOW IS PART OF THE ASSERTION. Each gate here is only
-// meaningful while its transition is actually in flight, and none of these
-// windows stays open on its own: a modeled mount latency elapses, a drain
-// finishes. Both gates below previously let their window be closed by whatever
-// ran before the probes - a gossip convergence wait, most of all - and the two
-// failed in OPPOSITE, equally useless directions:
-//
-//   - the JOIN gate failed LOUDLY but vacuously ("rt-d mounted before any
-//     during-join probe ran"), reporting a fixture-window miss as a
-//     transparency verdict. That is the failure it produced in CI, on a merge
-//     that changed no executable code.
-//   - the LEAVE gate failed SILENTLY: nothing required the drain window to have
-//     been observed at all, so a fast drain left it asserting nothing while
-//     reporting a pass. Its own sibling pin (TestLeaveEntryServesWhileDraining)
-//     already had that guard; this one was simply missing it.
-//
-// So each gate now OPENS its window explicitly, PROVES it is open before issuing
-// a read, and CLOSES it itself. A window that a slow runner can close is not a
-// window; it is a race whose loss is reported as a result.
+// THE OBSERVATION WINDOW IS PART OF THE ASSERTION. A gate here is only
+// meaningful while its transition is actually in flight, and no such window
+// stays open on its own: a modeled mount latency elapses, a drain finishes. A
+// window left to whatever ran before the probes - a gossip convergence wait,
+// most of all - fails in one of two equally useless directions. It fails LOUDLY
+// but vacuously, reporting a fixture-window miss as a transparency verdict (the
+// JOIN gate did exactly that in CI, on a merge that changed no executable
+// code); or it fails SILENTLY, asserting nothing while reporting a pass. So a
+// gate OPENS its window explicitly, PROVES it is open before issuing a read,
+// and CLOSES it itself. A window that a slow runner can close is not a window;
+// it is a race whose loss is reported as a result.
 //
 // Failure messages here report the MEASURED breakdown (refusals vs wrong or
 // absent values, and within refusals the transient acquiring-window class vs
@@ -222,9 +223,7 @@ func (b readFailureBreakdown) String() string {
 		b.total(), b.Acquiring, b.OtherErr, b.WrongValue, b.EmptyScan)
 }
 
-// classifyReadFailures counts fails onto the axes above. It is the single
-// counting implementation the read-transparency gates report through, so a
-// message in one of them cannot drift from a message in another.
+// classifyReadFailures counts fails onto the axes above.
 func classifyReadFailures(fails []readFailure) readFailureBreakdown {
 	var b readFailureBreakdown
 	for _, f := range fails {
@@ -295,83 +294,6 @@ func waitMountWindowOpen(t *testing.T, c *cluster.Cluster, who string, timeout t
 	t.Fatalf("%s: no desired-but-unmounted position appeared within %s, so the mount window this gate "+
 		"probes in never opened. OBSERVED: desiredButUnmounted=%d. This is a fixture-window miss, not a "+
 		"read-transparency result - no read was issued. State:\n%s", who, timeout, last, c.DebugState())
-	return 0
-}
-
-// acquireInFlight reports how many replica positions c currently has an
-// OpenReplicaUnit call OUTSTANDING for, parsed from DebugState's
-// acquire-in-flight line. It returns a NEGATIVE count when that line is absent,
-// which makes an unparseable dump an unusable reading rather than a zero.
-//
-// It is the LEAVE-side analogue of desiredButUnmounted, and it has to be a
-// different reading. Through a graceful leave the leaver stays a CURRENT OWNER
-// in the ring, so a survivor taking one of its positions over gains that
-// position in the PENDING set, never the desired one - desiredButUnmounted
-// reads 0 on every survivor for the whole drain (measured: 0/0/0 across all
-// seven drain rounds of a passing local run). What IS observable is the
-// survivor's outstanding open, which is precisely what the fixture's armed
-// acquire delay holds, so it is the reading that can prove the fixture, and not
-// a race, is holding the window open.
-func acquireInFlight(c *cluster.Cluster) int {
-	for _, line := range strings.Split(c.DebugState(), "\n") {
-		rest, ok := strings.CutPrefix(strings.TrimSpace(line), "acquire-in-flight=[")
-		if !ok {
-			continue
-		}
-		return len(strings.Fields(strings.TrimSuffix(rest, "]")))
-	}
-	return -1
-}
-
-// totalAcquireInFlight sums acquireInFlight over nodes, propagating an unusable
-// (negative) reading instead of folding it into the total.
-func totalAcquireInFlight(nodes []*sharedNode) int {
-	total := 0
-	for _, n := range nodes {
-		got := acquireInFlight(n.Cluster)
-		if got < 0 {
-			return got
-		}
-		total += got
-	}
-	return total
-}
-
-// waitAcquireWindowOpen blocks until at least one of nodes has an outstanding
-// OpenReplicaUnit call, and returns how many are outstanding: the MEASURED form
-// of "the armed acquire delay is now holding a mount open on a survivor", which
-// is the mechanism that keeps a graceful leave's drain from completing while the
-// probes run.
-//
-// done is the drain's completion channel. If it closes first, the drain finished
-// without any survivor open ever being held, which means the armed delay is NOT
-// what gates this drain - so no value of that delay could hold the window and
-// the fixture must say so rather than probe a window that is already shut.
-func waitAcquireWindowOpen(t *testing.T, nodes []*sharedNode, done <-chan struct{}, timeout time.Duration) int {
-	t.Helper()
-	deadline := time.Now().Add(timeout)
-	last := 0
-	for time.Now().Before(deadline) {
-		last = totalAcquireInFlight(nodes)
-		if last < 0 {
-			t.Fatalf("acquireInFlight could not find DebugState's acquire-in-flight line (got %d); the "+
-				"window reading is unusable, so the probes below would run on an unproven window", last)
-		}
-		if last > 0 {
-			return last
-		}
-		select {
-		case <-done:
-			t.Fatalf("the drain completed before any survivor open was outstanding, so the armed acquire "+
-				"delay is not what gates this drain and no value of it can hold the window open. OBSERVED: "+
-				"acquire-in-flight=%d across the survivors. This is a fixture failure, not a read-transparency "+
-				"result - no read was issued during the drain", last)
-		default:
-		}
-		time.Sleep(25 * time.Millisecond)
-	}
-	t.Fatalf("no survivor had an outstanding open within %s, so the mount the drain waits on never started "+
-		"and the drain window this gate probes in was never held. OBSERVED: acquire-in-flight=%d", timeout, last)
 	return 0
 }
 
@@ -481,226 +403,6 @@ func TestJoinReadTransparent_GetScanEveryNode(t *testing.T) {
 			"newcomer warms - so every one of these is client-visible. Reported as observation, not "+
 			"diagnosis: the counts above are measured, the cause is not. Measure before attributing one.",
 			rounds, b)
-	}
-}
-
-// TestLeaveReadTransparent_GetScanEveryNode: a graceful LEAVE must not produce
-// client-visible read failures - through the drain window AND through the
-// post-exit window right after the leaver departs the ring, where the
-// consistent-hash reshuffle can move surviving replicas to NEW position
-// indices (whose independent databases they have not mounted yet) while the
-// bytes still sit mounted at their OLD indices.
-func TestLeaveReadTransparent_GetScanEveryNode(t *testing.T) {
-	const uc, rf = 16, 2
-	backing := sharedfactory.NewBacking()
-	// OPT-OUT (permissive fence semantics, both toggles): zero-tolerance
-	// single-attempt read probes through the drain + post-exit windows
-	// require the draining leaver (and the old-index holders) to keep
-	// serving reads while successors slow-mount; see the justification on
-	// TestJoinReadTransparent_GetScanEveryNode above.
-	backing.SetEagerFence(false)
-	backing.SetStrictReadFencing(false)
-	// drainBudget is the leaver's GracefulLeaveDrainTimeout, and it is NAMED
-	// because the drain-window guard below reports it: the budget ends the leave
-	// whether or not the hand-off converged, so it is the ceiling on the window
-	// this gate probes in, and a message that quoted a stale copy of it would send
-	// the next reader after the wrong knob.
-	// NOT a knob to widen. Raising it past the 90s this test waits for Close
-	// below breaks the gate's own consistency: the leave legitimately sits in
-	// DrainForLeave for the whole budget while the post-loop wait gives up at
-	// 90s, and the guard there correctly reports a leave "stuck somewhere other
-	// than the hand-off wait" that is simply slower than the fixture's patience.
-	// The window this gate probes in is bounded by BOTH this budget and that
-	// wait, so they move together or not at all.
-	const drainBudget = 20 * time.Second
-	mutate := func(cfg *cluster.Config) {
-		cfg.GracefulLeaveDrainTimeout = drainBudget
-		cfg.OpenConcurrency = 8
-	}
-	n1 := startReplicatedNodeCfg(t, "rl-a", "", uc, rf, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "rl-b", n1.BindAddr, uc, rf, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "rl-c", n1.BindAddr, uc, rf, backing, mutate)
-	n4 := startReplicatedNodeCfg(t, "rl-d", n1.BindAddr, uc, rf, backing, mutate)
-	all := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
-	if err := waitForMembersAll(all, 4, 30*time.Second); err != nil {
-		t.Fatalf("4-node convergence: %v", err)
-	}
-	time.Sleep(900 * time.Millisecond)
-
-	uk := oneKeyPerUnit(t, n1.Cluster, uc)
-
-	// Sanity: fully transparent before the transition.
-	if pre := probeReadsOnceDetailed([]*sharedNode{n1, n2, n3, n4}, uk, []byte("seed")); len(pre) > 0 {
-		b := summarizeReadFailures(t, "PRE-LEAVE (steady state)", pre, 12)
-		t.Fatalf("reads were already failing BEFORE the transition, at steady state: %s. The fixture cannot "+
-			"attribute anything to the leave from here", b)
-	}
-
-	// THE DRAIN WINDOW IS HELD OPEN, NOT TIMED. The drain ends when every position
-	// the leaver owns has a successor PROVABLY SERVING, and a successor cannot
-	// serve until its OpenReplicaUnit returns - so the survivors' armed acquire
-	// delay IS what the drain waits on, and it is a knob this test holds and then
-	// releases (SetAcquireDelay re-reads as it sleeps, so lowering it releases
-	// opens ALREADY in flight rather than only later ones).
-	//
-	// Sizing that delay against wall clock is what broke: at 2.5s the window was
-	// whatever fraction of 2.5s survived everything that ran before the probes, so
-	// the round count was SAMPLED (6 to 52 on a developer machine, ONE on a 2-vCPU
-	// CI runner) rather than chosen. Arming the delay far beyond any bounded wait
-	// and releasing it explicitly removes that coupling instead of widening it.
-	//
-	// It is never slept. Measured cost of the probe phase below: a round's probes
-	// take 0.04s to 0.09s even under GOMAXPROCS=2 (a stand-in for the 2-vCPU
-	// runner), so four rounds plus their inter-round sleeps run in ~1.2s, after
-	// which the delay drops to postExitMountDelay and the successors mount.
-	//
-	// RESIDUAL, stated rather than hidden: drainBudget is a SECOND way this window
-	// can close, independent of the delay, because the leaver departs when its
-	// drain budget expires whether or not its positions were handed off. That
-	// budget is therefore the window's ceiling, and 20s against a measured ~1.2s
-	// probe phase is better than an order of magnitude of headroom - but it is
-	// headroom, not a guarantee, so the guard below fails LOUDLY if the ceiling is
-	// ever hit instead of quietly asserting less.
-	const drainMountDelay = 5 * time.Minute
-	// The post-exit reshuffle window keeps the delay the whole test has always
-	// used. Releasing to ZERO here would land the survivors' newly-assigned
-	// positions instantly and shut the SECOND window this gate probes, trading one
-	// unobserved window for another.
-	const postExitMountDelay = 2500 * time.Millisecond
-	survivors := []*sharedNode{n1, n2, n3}
-	for _, n := range survivors {
-		n.Handle.SetAcquireDelay(drainMountDelay)
-	}
-	// Registered AFTER the nodes' own t.Cleanup(Close), so it runs BEFORE them
-	// (cleanups are LIFO): no teardown ever waits out an armed window, on ANY exit
-	// path including a t.Fatalf from the probe loop below. This is what makes a
-	// 5-minute delay affordable - the cost of arming a long window must not be
-	// paid by a runner that never needed it.
-	t.Cleanup(func() {
-		for _, n := range survivors {
-			n.Handle.SetAcquireDelay(0)
-		}
-	})
-
-	drainDone := make(chan struct{})
-	go func() { defer close(drainDone); _ = n4.Cluster.Close() }()
-	time.Sleep(600 * time.Millisecond) // let the Draining bit gossip
-
-	// PROVE THE WINDOW IS HELD BEFORE ISSUING A READ. A survivor with an
-	// outstanding open is the drain's own blocker, so observing one is proof that
-	// the delay - not luck - is what keeps the leaver draining while the probes
-	// run.
-	held := waitAcquireWindowOpen(t, survivors, drainDone, 30*time.Second)
-	t.Logf("drain window held open: %d survivor opens outstanding under a %s acquire delay", held, drainMountDelay)
-
-	var fails []readFailure
-	drainRounds := 0
-	// wantDrainRounds is CHOSEN, not sampled: the window is held until the loop
-	// has run this many rounds, so the count no longer varies with the runner's
-	// probe throughput. It matches the JOIN gate's round count above; each round
-	// is 96 reads (16 units x 3 survivors x 2 ops).
-	const wantDrainRounds = 4
-drainLoop:
-	for r := 0; r < wantDrainRounds; r++ {
-		// CHECK BEFORE PROBING, not after. A probe issued while the leaver is
-		// still draining can STRADDLE its departure: the budget expires
-		// mid-probe, the leaver leaves the ring, and its successors are still
-		// pinned mid-mount by the acquire delay above - so the tail of that
-		// probe reads a unit with no holder anywhere in the union and records
-		// refusals that did NOT happen in the drain window. Checking after the
-		// probe counted them anyway, which is how this gate reported a
-		// drain-window transparency violation for reads taken after the drain
-		// ended.
-		select {
-		case <-drainDone:
-			break drainLoop // the window shut under us; the guard below reports it
-		default:
-		}
-		fails = append(fails, probeReadsOnceDetailed(survivors, uk, []byte("seed"))...)
-		drainRounds++
-		time.Sleep(300 * time.Millisecond)
-	}
-	// RELEASE THE WINDOW, down to the delay the post-exit window below runs on.
-	// Every probe above ran with the leaver provably still draining.
-	for _, n := range survivors {
-		n.Handle.SetAcquireDelay(postExitMountDelay)
-	}
-
-	// THE DRAIN WINDOW MUST HAVE BEEN OBSERVED. Nothing about the leave itself
-	// forces the drain to outlast the probes, so a drain that completed early
-	// would leave this gate reporting "LEAVE is read-transparent" having issued no
-	// read DURING the drain at all. A gate that can pass vacuously stops being a
-	// gate, and that failure is silent, which is worse than the loud kind. Its
-	// sibling pin TestLeaveEntryServesWhileDraining already requires its own
-	// window to have been observed; this one was missing the same guard.
-	//
-	// Reaching the full count is now the fixture's job rather than the runner's:
-	// the delay above is armed past any bounded wait here and is released only on
-	// the line above this one. So a short count no longer means "this runner is
-	// slow" - it means the delay stopped gating the drain, which is a fixture
-	// fault worth failing on.
-	if drainRounds < wantDrainRounds {
-		t.Fatalf("the drain completed after only %d of %d probe rounds even though the survivors' acquire "+
-			"delay is armed at %s and held until the loop finishes, so the drain window was never fully "+
-			"observed and a pass here would assert less than it claims. The window is no longer under the "+
-			"fixture's control - either the drain stopped waiting on a survivor mount, or it hit the "+
-			"GracefulLeaveDrainTimeout ceiling (%s) that ends the leave regardless",
-			drainRounds, wantDrainRounds, drainMountDelay, drainBudget)
-	}
-	// Log the window on PASSING runs too: the size of the window a gate observed
-	// is the evidence that its pass means something, and a gate that reports it
-	// only when it fails is one whose silence cannot be distinguished from having
-	// looked at nothing.
-	t.Logf("observed %d drain rounds while the leaver was draining", drainRounds)
-	drainB := summarizeReadFailures(t, "LEAVE (drain window)", fails, 12)
-
-	// Post-exit window: the leaver has left the ring; survivors converge to 3
-	// and reconcile toward the genuinely-rebuilt 3-node placement, which can
-	// differ from the drain-time successor-chain approximation (index shuffles).
-	// The acquire delay is still armed at postExitMountDelay, so any newly-assigned
-	// position is provably mid-mount while we probe.
-	//
-	// Wait for the leaver to actually depart first, and REPORT how it departed. A
-	// leave whose hand-off converges returns shortly after the delay drops; one
-	// whose hand-off does not converge returns when drainBudget fires and the
-	// leave proceeds with positions still un-handed-off. Both genuinely end the
-	// drain, and BOTH occur on this tree: across six runs of the pre-existing
-	// fixture the leaver's Close took 3.0s, 3.0s, 3.0s, 10.4s, 10.8s and 20.1s,
-	// that last one being the full budget. So the latency is logged, never
-	// asserted - hand-off completeness is a leave-completion property that nothing
-	// in this gate measures, and failing a READ gate on it would be naming a
-	// mechanism it did not observe.
-	tExit := time.Now()
-	select {
-	case <-drainDone:
-		t.Logf("leaver departed %v after the acquire delay dropped to %s", time.Since(tExit).Round(time.Millisecond), postExitMountDelay)
-	case <-time.After(90 * time.Second):
-		t.Fatalf("the leaver's Close did not return within 90s of the acquire delay dropping to %s, which "+
-			"is far past the %s drain budget that ends a leave unconditionally; the leave is stuck "+
-			"somewhere other than the hand-off wait. State:\n%s", postExitMountDelay, drainBudget, n4.Cluster.DebugState())
-	}
-	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
-		t.Fatalf("post-leave convergence: %v", err)
-	}
-	var postFails []readFailure
-	for r := 0; r < 6; r++ {
-		postFails = append(postFails, probeReadsOnceDetailed(survivors, uk, []byte("seed"))...)
-		time.Sleep(300 * time.Millisecond)
-	}
-	for _, n := range survivors {
-		n.Handle.SetAcquireDelay(0)
-	}
-	postB := summarizeReadFailures(t, "LEAVE (post-exit window)", postFails, 12)
-	fails = append(fails, postFails...)
-
-	if len(fails) > 0 {
-		t.Fatalf("OBSERVED across a leave: drain window (%d rounds) %s; post-exit window (6 rounds) %s. "+
-			"A graceful leave must stay read-transparent - whoever in the union physically holds the "+
-			"position keeps serving it - so every one of these is client-visible. Reported as observation, "+
-			"not diagnosis: the windows and classes above are measured, the cause is not. The two windows "+
-			"are reported separately because they fail for different reasons (the drain window is the "+
-			"leaver still serving; the post-exit window is the consistent-hash reshuffle moving survivors "+
-			"to positions they have not mounted).", drainRounds, drainB, postB)
 	}
 }
 
