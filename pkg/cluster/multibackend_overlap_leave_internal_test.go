@@ -10,7 +10,10 @@ package cluster
 // covered by the integration tests.
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -150,5 +153,66 @@ func TestLeave_ownedPositionCount(t *testing.T) {
 	c.mounts.mountUndecorated(target, b)
 	if c.ownedPositionCount() != 1 {
 		t.Fatalf("after one mount ownedPositionCount = %d, want 1", c.ownedPositionCount())
+	}
+}
+
+// TestLeave_BudgetExpiry_NamesTheUnservedPositions pins the evidence half of
+// the graceful-leave trade. A leave whose budget expires departs anyway, which
+// is deliberate (it must not hang on a stuck successor) and leaves exactly
+// those positions unserved from teardown until a successor mounts: a routed op
+// for one finds NO holder in the union and gets the retryable acquiring
+// refusal. That window is indistinguishable from a routing bug downstream
+// unless the departing node names it, so the leaver must log which positions it
+// abandoned and how many.
+func TestLeave_BudgetExpiry_NamesTheUnservedPositions(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	var log bytes.Buffer
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
+	c.cfg.LogOutput = &log
+	c.cfg.GracefulLeaveDrainTimeout = 200 * time.Millisecond
+
+	owned := seedOwnedPositions(t, c, backing)
+	markDraining(c)
+	// No serving markers: every successor is stuck, so the budget is what ends
+	// the drain and every owned position is left unserved.
+
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	if err := c.DrainForLeave(ctx); err == nil {
+		t.Fatal("DrainForLeave must time out when no successor becomes Ready")
+	}
+
+	got := log.String()
+	if !strings.Contains(got, "NOT HANDED OFF") {
+		t.Fatalf("a leave that abandoned %d position(s) said nothing about it; log:\n%s", len(owned), got)
+	}
+	if !strings.Contains(got, fmt.Sprintf("%d POSITION(S)", len(owned))) {
+		t.Fatalf("the count of abandoned positions is missing or wrong (want %d); log:\n%s", len(owned), got)
+	}
+	for _, ru := range owned {
+		if !strings.Contains(got, ru.String()) {
+			t.Fatalf("abandoned position %v is not named in the log; log:\n%s", ru, got)
+		}
+	}
+}
+
+// TestLeave_PositionsAwaitingSuccessor_EmptyWhenAllHandedOff pins the other
+// direction: a clean hand-off names nothing, so the loud line above cannot fire
+// on a leave that did what it promised.
+func TestLeave_PositionsAwaitingSuccessor_EmptyWhenAllHandedOff(t *testing.T) {
+	backing := sharedfactory.NewBacking()
+	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3", "n4")
+
+	owned := seedOwnedPositions(t, c, backing)
+	markDraining(c)
+	h := backing.Handle()
+	for _, ru := range owned {
+		// A successor serving strictly above this node's open epoch.
+		if err := h.WriteServingMarker(storageunit.ReplicaMount(ru), c.ownOpenEpoch(ru)+1); err != nil {
+			t.Fatalf("plant marker for %v: %v", ru, err)
+		}
+	}
+	if waiting := c.positionsAwaitingSuccessor(); len(waiting) != 0 {
+		t.Fatalf("every position has a serving successor, but %d still reported as awaiting: %v", len(waiting), waiting)
 	}
 }

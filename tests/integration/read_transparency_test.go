@@ -505,7 +505,15 @@ func TestLeaveReadTransparent_GetScanEveryNode(t *testing.T) {
 	// whether or not the hand-off converged, so it is the ceiling on the window
 	// this gate probes in, and a message that quoted a stale copy of it would send
 	// the next reader after the wrong knob.
-	const drainBudget = 20 * time.Second
+	// Generous BY CONSTRUCTION, not by headroom. The window this gate probes in
+	// must be closed by the fixture's own release below, never by a product
+	// timer racing the runner: at 20s against a ~1.2s probe phase the margin
+	// looked ample and still lost on a loaded CI runner, because "enough time"
+	// is a bet on scheduling rather than a property. The successors are pinned
+	// mid-mount for drainMountDelay, so hand-off CANNOT complete and this budget
+	// is the only other way the drain ends - set it past any plausible probe
+	// phase and the guard below still fails loudly if it is ever reached.
+	const drainBudget = 4 * time.Minute
 	mutate := func(cfg *cluster.Config) {
 		cfg.GracefulLeaveDrainTimeout = drainBudget
 		cfg.OpenConcurrency = 8
@@ -595,13 +603,22 @@ func TestLeaveReadTransparent_GetScanEveryNode(t *testing.T) {
 	const wantDrainRounds = 4
 drainLoop:
 	for r := 0; r < wantDrainRounds; r++ {
-		fails = append(fails, probeReadsOnceDetailed(survivors, uk, []byte("seed"))...)
-		drainRounds++
+		// CHECK BEFORE PROBING, not after. A probe issued while the leaver is
+		// still draining can STRADDLE its departure: the budget expires
+		// mid-probe, the leaver leaves the ring, and its successors are still
+		// pinned mid-mount by the acquire delay above - so the tail of that
+		// probe reads a unit with no holder anywhere in the union and records
+		// refusals that did NOT happen in the drain window. Checking after the
+		// probe counted them anyway, which is how this gate reported a
+		// drain-window transparency violation for reads taken after the drain
+		// ended.
 		select {
 		case <-drainDone:
 			break drainLoop // the window shut under us; the guard below reports it
 		default:
 		}
+		fails = append(fails, probeReadsOnceDetailed(survivors, uk, []byte("seed"))...)
+		drainRounds++
 		time.Sleep(300 * time.Millisecond)
 	}
 	// RELEASE THE WINDOW, down to the delay the post-exit window below runs on.
