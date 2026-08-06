@@ -4,25 +4,23 @@ import (
 	"bytes"
 	"errors"
 	"io"
-	"net"
 	"strconv"
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/testport"
 	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
+// freePort returns a port free on both TCP and UDP: memberlist binds both
+// halves on the same number, so a TCP-only probe (what this used to be)
+// certifies half of it and hands back a number that can fail to bind under the
+// port pressure of a whole-repo test run. See internal/testport.
 func freePort(t testing.TB) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freePort: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
+	return testport.Free(t)
 }
 
 // openSolo starts a single-node gossip coordinator (no seeds), parking the ring

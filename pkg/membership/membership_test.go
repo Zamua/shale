@@ -3,29 +3,20 @@ package membership
 import (
 	"fmt"
 	"io"
-	"net"
 	"strconv"
 	"testing"
 	"time"
+
+	"github.com/Zamua/shale/internal/testport"
 )
 
-// ephemeralPort returns a free TCP port. memberlist binds both TCP +
-// UDP on the same port; on a loopback the TCP probe is a good-enough
-// proxy for availability. There is an inherent race between us closing
-// the listener + memberlist re-binding; in practice it is fine for
-// localhost tests, and the alternative (asking memberlist to pick) is
-// not exposed by its API.
+// ephemeralPort returns a port free on both TCP and UDP. memberlist binds both
+// halves on the same number, and the kernel allocates them independently, so a
+// TCP-only probe certifies half of what the caller is about to do. See
+// internal/testport for why that matters only under load.
 func ephemeralPort(t *testing.T) int {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("ephemeralPort: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	if err := l.Close(); err != nil {
-		t.Fatalf("ephemeralPort close: %v", err)
-	}
-	return port
+	return testport.Free(t)
 }
 
 func bindAddr(port int) string {
