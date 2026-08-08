@@ -342,7 +342,7 @@ func waitNoUndesiredMounts(t *testing.T, nodes []*sharedNode, timeout time.Durat
 		clean := true
 		for _, n := range nodes {
 			n.Cluster.TestingRunReconcile()
-			if strings.Contains(n.Cluster.DebugState(), "desired=false pending=false mounted=true") {
+			if strings.Contains(n.Cluster.DebugState(), "desired=false pendingOwner=false mounted=true") {
 				clean = false
 			}
 		}
