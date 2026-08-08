@@ -16,6 +16,13 @@ import (
 // no-op, not an error (see Store.Delete).
 var ErrNotFound = errors.New("blob: object not found")
 
+// ErrBound is returned by UnstageBlob when the ref's pointer exists: the blob
+// is committed metadata's referenced bytes, and deleting them would be
+// committed-data loss surfaced only at read time. Callers branch with
+// errors.Is; the recovery path treats it as "this ref was bound after all,
+// drop it from the unstage list".
+var ErrBound = errors.New("blob: ref is bound; unstage refused")
+
 // SizeUnknown is the size sentinel a caller passes to PutStream when the length
 // of the reader is not known up front. The adapter then streams the bytes via a
 // multipart upload that does not need the total size in advance. Prefer passing

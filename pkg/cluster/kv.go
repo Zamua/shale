@@ -250,6 +250,42 @@ func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, si
 	}, nil
 }
 
+// UnstageBlob deletes the object ref names: the presence-acting complement to
+// the absence-acting orphan sweep (design section 13). The caller is a recovery
+// path that recorded its staged refs on a durable intent before binding and now
+// reclaims an exact list - no enumeration, no referenced-set scan, and no
+// transition gate (the sweep's quiescence refusals do not apply here).
+//
+// BOUND-REF GUARD, fail closed: a pointer found at brefKey(ref) means committed
+// metadata references these bytes, and deleting them would be committed-data
+// loss surfaced only at read time - refuse with blob.ErrBound. The guard is one
+// routed Get, not a scan (brefKey is a pure function of the ref, section 12),
+// and a pointer there can only describe THIS blob (BlobIDs are unique-minted at
+// stage time). A guard read that fails with anything other than not-found also
+// refuses: cannot verify, do not destroy.
+//
+// The guard is check-then-delete; a BindBlob committing between the two would
+// bind bytes about to vanish, and no lock inside shale closes that window (the
+// pointer and the object live in different stores). The exclusion is the
+// CALLER'S BY CONSTRUCTION: only the party that staged a ref holds it, so only
+// the process that could call UnstageBlob can bind it. Callers MUST NOT bind
+// and unstage the same ref concurrently.
+//
+// Store.Delete is idempotent (a missing object is a no-op), so re-running a
+// partially-unstaged list converges. After UnbindBlob the pointer is gone and
+// the original ref unstages successfully: unbind-then-unstage is the scan-free
+// deletion path for a caller that kept the ref (design section 13.4).
+func (b *BlobKV) UnstageBlob(ctx context.Context, ref BlobRef) error {
+	_, err := b.c.Get(brefKey(ref))
+	switch {
+	case err == nil:
+		return fmt.Errorf("shale: unstage %s/%s: %w", ref.Unit, ref.BlobID, blob.ErrBound)
+	case !errors.Is(err, backend.ErrNotFound):
+		return fmt.Errorf("shale: unstage %s/%s: bound-ref guard read: %w", ref.Unit, ref.BlobID, err)
+	}
+	return b.blobs.Delete(ctx, blob.FinalKey(ref.Unit, ref.BlobID))
+}
+
 // GetBlob resolves the bref for (routeKey, blobid), decodes the pointer, and
 // streams the bytes out (design section 11.4). The pointer read is a normal
 // routed Cluster.Get (small value, to the unit owner); the byte stream is a
