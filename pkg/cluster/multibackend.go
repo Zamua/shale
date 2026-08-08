@@ -500,14 +500,11 @@ func (c *Cluster) mountedUnits() []mountedUnit {
 // answer.
 //
 // WHY THAT IS DATA-LOSS-ADJACENT, not an availability nit. Aggregate's callers
-// build SETS and then act on what is ABSENT from them. shale's own blob GC does
-// exactly this (referencedObjKeys -> the orphan sweep): an object is deleted
-// when its key is absent from the referenced set. A silently-partial scan is
+// build SETS and then act on what is ABSENT from them (a garbage collector
+// deletes what nothing in its referenced set names). A silently-partial scan is
 // therefore not a smaller answer, it is a WRONG one that deletes live data, and
-// re-running afterwards cannot undo it. Fail-closed is the only safe direction,
-// which is why referencedObjKeys already aborts its whole scan on a single
-// undecodable pointer; an unmounted unit is the same hazard reached through a
-// different door.
+// re-running afterwards cannot undo it. Fail-closed is the only safe
+// direction; an unmounted unit is that hazard reached through a quiet door.
 //
 // The predicate is MountReadiness's PendingUnits (desired positions minus
 // mounted ones) - the same diff the readiness probe and the /debug/shale/state

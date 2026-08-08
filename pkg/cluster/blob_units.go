@@ -1,22 +1,11 @@
 package cluster
 
-// blob_units.go adds the unit-resolution accessors the blob byte plane needs
-// (design section 11.5 / 11.7). The blob object key is UNIT-keyed
+// blob_units.go adds the unit-resolution accessor the blob byte plane needs
+// (design section 11.5). The blob object key is UNIT-keyed
 // (blob/<unit>/<blobid>), so StageBlob must derive the routed unit token for a
-// route key, and the orphan sweep must enumerate the units this node has
-// MOUNTED. RoutedUnitToken is a pure function of the cluster's
-// generation-aware routing state (genUnitForKey); MountedUnits reads the live
-// mount map. This file only renders them as the stable string tokens the
-// object key uses and exposes them on *Cluster.
-//
-// The sweep enumerates MOUNTED units (not desired ownership) so its
-// object-listing loop and its referenced-pointer scan read the SAME ownership
-// view (the pointers a mounted unit's local scan can see). A desired-but-
-// unmounted unit (cold boot / mid rebalance-acquire) is skipped this pass: a
-// missed sweep is a storage leak, never data loss. The reshard-era reclamation
-// of objects sitting under an OLD-generation parent token prefix (after a
-// doubling re-keys a unit) is a documented leak-only follow-up and is NOT
-// shipped here; the old reshard-ancestor union machinery is removed.
+// route key. RoutedUnitToken is a pure function of the cluster's
+// generation-aware routing state (genUnitForKey), rendered as the stable
+// string token the object key uses.
 //
 // The unit TOKEN is rendered "<gen>-<unitID>" in DECIMAL (e.g. "0-13"), NOT the
 // GenUnit.String() form "g<gen>/u<id>": the token is a path segment in the
@@ -24,7 +13,7 @@ package cluster
 // contains a '-' so it can never collide with the legacy sentinel "legacy"
 // (design section 11.11 item 4). In LEGACY (non-multi) mode there are no units;
 // the single node owns the whole keyspace, so the token is the fixed sentinel
-// "legacy" and the sweep enumerates the one prefix blob/legacy/.
+// "legacy".
 
 import (
 	"strconv"
@@ -40,9 +29,9 @@ const legacyUnitToken = "legacy"
 
 // unitToken renders a GenUnit as the stable "<gen>-<unitID>" decimal string the
 // blob object key uses. It is the canonical rendering for the blob plane; every
-// place that derives or enumerates a unit token MUST go through here so the
-// object key (StageBlob), the pointer key (BindBlob via BlobRef.Unit), and the
-// sweep prefix (SweepOrphans) agree by construction.
+// place that derives a unit token MUST go through here so the object key
+// (StageBlob), the pointer key (BindBlob via BlobRef.Unit), and the delete key
+// (UnstageBlob via BlobRef.Unit) agree by construction.
 func unitToken(gu storageunit.GenUnit) string {
 	return strconv.FormatUint(uint64(gu.Gen), 10) + "-" + strconv.FormatUint(uint64(gu.ID), 10)
 }

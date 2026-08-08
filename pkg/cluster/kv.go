@@ -28,7 +28,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"time"
 
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/blob"
@@ -109,7 +108,7 @@ func (t *Tx) Delete(key []byte) error { return t.tx.Delete(key) }
 // BlobKV is the blob-capable cluster surface: a SUPERSET of *KV (it embeds *KV,
 // inheriting Get / Put / Delete / Close and the metadata Transact) that
 // SHADOWS Transact to yield the richer *BlobTx and adds the streaming blob ops
-// (StageBlob / GetBlob / SweepOrphans, landing in the implementation phase).
+// (StageBlob / GetBlob / UnstageBlob).
 // Because it embeds *KV, any consumer that needs only metadata accepts a
 // *BlobKV too.
 //
@@ -120,15 +119,7 @@ func (t *Tx) Delete(key []byte) error { return t.tx.Delete(key) }
 type BlobKV struct {
 	*KV
 	blobs blob.Store
-	// testingSweepMidPass, when set (Testing* convention), runs between the
-	// referenced scan and the topology guard inside SweepOrphans, so a test can
-	// mutate the mount view at the exact torn-pass instant. Nil in production.
-	testingSweepMidPass func()
 }
-
-// TestingSetSweepMidPassHook installs the SweepOrphans mid-pass hook (see the
-// field). Test-only, following the Testing* white-box convention.
-func (b *BlobKV) TestingSetSweepMidPassHook(f func()) { b.testingSweepMidPass = f }
 
 // NewBlobKV wraps a blob-configured cluster. cfg.BlobStore MUST be non-nil:
 // NewBlobKV returns an error otherwise, since the whole point of *BlobKV is the
@@ -200,7 +191,8 @@ func (bt *BlobTx) BindBlob(ref BlobRef) error {
 
 // UnbindBlob removes a bound blob's pointer in the SAME transaction that removes
 // the app's metadata (atomic delete, design section 11.3). The now-unreferenced
-// bytes are reclaimed by the same-shard orphan sweep. It is a convenience over
+// bytes are reclaimed by UnstageBlob (a caller that kept the ref deletes them
+// scan-free, design section 13.4) or leak. It is a convenience over
 // tx.Delete(brefKey(ref)); both work because deleting the pointer key is an
 // ordinary KV delete. The deleted (token-free, section 12) key is the SAME one
 // GetBlob and a later reshard reconstruct, so the tombstone is reshard-
@@ -218,9 +210,12 @@ func (bt *BlobTx) UnbindBlob(ref BlobRef) error {
 // the small pointer (committed later by BindBlob) routes through the cluster.
 //
 // After StageBlob returns the bytes are durable at blob/<unit>/<blobid> but
-// UNREFERENCED: no bref points at them, so they are invisible to every reader (a
-// reader reaches bytes only via a committed pointer). A crash here leaves a
-// unit-local orphan the age-gated sweep reclaims (SweepOrphans).
+// UNREFERENCED: no bref points at them, so they are invisible to every reader
+// (a reader reaches bytes only via a committed pointer). Reclamation is the
+// CALLER'S: record the returned ref durably and UnstageBlob it if the binding
+// never commits (design section 13). A crash after the upload but before the
+// ref is recorded anywhere leaves bytes nothing can name - an accepted,
+// bounded storage leak (wasted space, never wrong data; design section 11.7).
 //
 // routeKey is the app key whose shard the blob co-locates with (its slug / id);
 // StageBlob derives the unit + the route shard from it purely (no network).
@@ -251,11 +246,10 @@ func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, si
 	}, nil
 }
 
-// UnstageBlob deletes the object ref names: the presence-acting complement to
-// the absence-acting orphan sweep (design section 13). The caller is a recovery
-// path that recorded its staged refs on a durable intent before binding and now
-// reclaims an exact list - no enumeration, no referenced-set scan, and no
-// transition gate (the sweep's quiescence refusals do not apply here).
+// UnstageBlob deletes the object ref names (design section 13): the blob
+// plane's ONLY reclamation path. The caller is a recovery path that recorded
+// its staged refs on a durable intent before binding and now reclaims an exact
+// list - acting on recorded presence, with no enumeration and no scan.
 //
 // BOUND-REF GUARD, fail closed: a pointer found at brefKey(ref) means committed
 // metadata references these bytes, and deleting them would be committed-data
@@ -263,7 +257,7 @@ func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, si
 // routed read, not a scan (brefKey is a pure function of the ref, section 12),
 // and as long as BlobIDs are unique-minted at stage time a pointer there can
 // only describe THIS blob (a future content-keyed dedup id would add a
-// false-refuse mode: leak-side, sweep-backstopped). A guard read that fails
+// false-refuse mode: leak-side only). A guard read that fails
 // with anything other than not-found also refuses: cannot verify, do not
 // destroy.
 //
@@ -373,176 +367,6 @@ func (b *BlobKV) GetBlob(ctx context.Context, routeKey []byte, blobid string) (i
 	return b.blobs.GetStream(ctx, ptr.ObjKey)
 }
 
-// SweepOrphans reclaims unreferenced blob objects under the units this node has
-// MOUNTED (design section 11.7). It enumerates ONLY mounted units (MountedUnits,
-// NOT desired ownership) so the object-listing loop and the referenced-pointer
-// scan (referencedObjKeys, a scan of this node's MOUNTED brefs) read the SAME
-// ownership view: a unit that is DESIRED but not yet MOUNTED (cold boot / mid
-// rebalance-acquire) is never swept, so its bound-but-not-locally-visible blobs
-// are never mis-classified as unreferenced and deleted (the P0 fix). The cost is
-// that a desired-but-unmounted unit is skipped this pass - a missed sweep is a
-// storage leak, never data loss, since GetBlob still resolves via the stored
-// pointer's ObjKey. Reshard-era objects sitting under an OLD-generation token
-// prefix (after a doubling re-keys a unit) are likewise a documented leak-only
-// follow-up, NOT reclaimed here. It is a single callable pass; the scheduling
-// loop / cadence is operator wiring the cmd binary owns (deferred to phase 3).
-//
-// Mechanics, per mounted unit (blob/<unit>/):
-//
-//   - Build the set of OBJECT KEYS this node's local pointers reference, by
-//     scanning the local bref/ keys and decoding each pointer's ObjKey. This is
-//     shard-LOCAL (the node holds only the brefs for units it owns), exact, and
-//     fail-closed; it does NOT require reconstructing a point bref key from an
-//     object key (which is impossible: the object key blob/<unit>/<blobid>
-//     carries no route shard, but the bref key embeds the route shard in its
-//     hash tag - see design section 11.5). Using the pointer's own ObjKey as
-//     ground truth also survives a reshard token change (the pointer holds the
-//     verbatim ObjKey, design section 11.8).
-//   - List blob/<unit>/. An object whose key is NOT in the referenced set is a
-//     candidate orphan.
-//   - AGE-GATE: reclaim a candidate only if its object-store ModTime is older
-//     than now.Add(-grace), so a just-staged-not-yet-bound blob (recent
-//     ModTime) is never swept (design section 10.2 / 11.7). A genuine
-//     crash-orphan ages out past grace and is reclaimed.
-//
-// FAIL-CLOSED: any List or local-scan error aborts the pass with the error and
-// reclaims NOTHING further (it keeps the bytes - a missed sweep is a storage
-// leak, never data loss, since GetBlob still resolves via the stored pointer).
-// Delete is idempotent (a double sweep or a race with a manual delete is
-// harmless).
-//
-// THE SINGLE-SNAPSHOT TOPOLOGY GUARD (docs/design/blob-values.md 11.7): the
-// mounted-unit set is captured ONCE, BEFORE the referenced scan, the sweep
-// enumerates ONLY that snapshot, and the pass ABORTS fail-closed if the
-// mounted set changed by the end of the scan or a membership transition
-// (Joining/Draining) is in flight. Without the guard the referenced set and
-// the object enumeration are two reads of a MOVING mount view: a unit
-// ACQUIRED between them (a reconcile acquire during a rollout, a fence-evict
-// re-acquire, a boot mount completing) is enumerated for objects with NONE of
-// its brefs in the referenced set, so every bound blob under it older than
-// the grace is deleted - committed-data loss (a bound blob whose pointer and
-// metadata stay intact while the bytes vanish). A skipped pass is a leak
-// retried next tick; a torn pass is data loss.
-func (b *BlobKV) SweepOrphans(ctx context.Context, now time.Time, grace time.Duration) error {
-	// Refuse to sweep mid-transition: the mount view is expected to move while
-	// members join/drain, and the guard below would only catch the mutation
-	// after the (wasted) scan.
-	if joining, draining := b.c.transitionSets(); len(joining) > 0 || len(draining) > 0 {
-		return fmt.Errorf("shale: orphan sweep skipped: membership transition in flight (%d joining, %d draining); retry next pass", len(joining), len(draining))
-	}
-	// Snapshot the mount view FIRST; the referenced scan and the object
-	// enumeration below must both read exactly this view.
-	unitsBefore := b.c.MountedUnits()
-
-	// The referenced-object set is computed ONCE per pass from the node's local
-	// pointers; it covers every unit this node has MOUNTED (the local scan sees
-	// only the brefs for mounted units). Fail-closed: a scan error keeps every
-	// object.
-	referenced, err := b.referencedObjKeys()
-	if err != nil {
-		return err
-	}
-	if b.testingSweepMidPass != nil {
-		b.testingSweepMidPass()
-	}
-	// FAIL-CLOSED TOPOLOGY GUARD: the referenced set is only sound for the
-	// mount view it was scanned under. Any acquire/release since the snapshot
-	// means an enumerated unit's brefs may be missing from the set - abort and
-	// let the next tick retry on a calm view.
-	if !sameUnitTokenSet(unitsBefore, b.c.MountedUnits()) {
-		return fmt.Errorf("shale: orphan sweep aborted: mounted units changed during the referenced scan; retry next pass")
-	}
-	cutoff := now.Add(-grace)
-	for _, unit := range unitsBefore {
-		prefix := blob.FinalPrefixForUnit(unit)
-		for obj, lerr := range b.blobs.List(ctx, prefix) {
-			if lerr != nil {
-				return lerr // fail-closed: keep the bytes
-			}
-			if _, ok := referenced[obj.Key]; ok {
-				continue // a live pointer references it -> keep
-			}
-			// Unreferenced. Only reclaim once the object is older than the grace,
-			// so an in-flight stage (recent) is never swept.
-			if !obj.ModTime.Before(cutoff) {
-				continue
-			}
-			if derr := b.blobs.Delete(ctx, obj.Key); derr != nil {
-				return derr // fail-closed: stop on the first delete error
-			}
-		}
-	}
-	return nil
-}
-
-// sameUnitTokenSet reports whether two mounted-unit token slices contain the
-// same set (order-independent; the slices are small).
-func sameUnitTokenSet(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	set := make(map[string]struct{}, len(a))
-	for _, t := range a {
-		set[t] = struct{}{}
-	}
-	for _, t := range b {
-		if _, ok := set[t]; !ok {
-			return false
-		}
-	}
-	return true
-}
-
-// referencedObjKeys returns the set of blob object keys this node's LOCAL
-// pointers reference: it scans the local bref/ keyspace and decodes each
-// pointer's ObjKey. The node holds only the brefs for the units it owns, so the
-// scan is shard-local (bounded by this node's pointer count), NOT a global
-// cross-shard scan. It is the exact, fail-closed input to the orphan sweep: an
-// object is orphan-eligible only if its key is absent from this set (design
-// section 11.7).
-//
-// A pointer that fails to decode cannot have its ObjKey read, so we cannot tell
-// which object it protects; rather than risk deleting an object a
-// malformed-but-present pointer references, a decode error fails the whole scan
-// closed (the sweep keeps every object).
-func (b *BlobKV) referencedObjKeys() (map[string]struct{}, error) {
-	it, err := b.c.LocalScanPrefix([]byte(brefPrefix))
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = it.Close() }()
-	referenced := make(map[string]struct{})
-	for {
-		k, v, err := it.Next()
-		if err != nil {
-			return nil, err
-		}
-		if k == nil {
-			break
-		}
-		// LocalScanPrefix hands back the RAW stored value. At R>1 that is the
-		// LWW Envelope (Stamp + payload); at R=1 it is the bare payload. Decode
-		// strips the envelope and passes a raw value through unchanged (its v0.3
-		// compat path), so this is correct at every replication factor. WITHOUT
-		// this strip the sweep fed the envelope's binary header into
-		// DecodePointer and fail-closed on the FIRST enveloped bref - so the
-		// blob GC never ran at R>1.
-		env, derr := Decode(v)
-		if derr != nil {
-			return nil, derr // a present-but-corrupt envelope header: fail closed
-		}
-		if len(env.Payload) == 0 {
-			continue // a delete tombstone (the bref was unbound) references nothing
-		}
-		ptr, derr := blob.DecodePointer(env.Payload)
-		if derr != nil {
-			return nil, derr // fail-closed: an undecodable pointer aborts the scan
-		}
-		referenced[ptr.ObjKey] = struct{}{}
-	}
-	return referenced, nil
-}
-
 // BlobRef is the opaque token StageBlob returns and Bind / Unbind / Unstage /
 // Get consume. It carries everything brefKey + the persisted blob.Pointer
 // need, so the app never sees object keys or the pointer record (design
@@ -555,8 +379,7 @@ func (b *BlobKV) referencedObjKeys() (map[string]struct{}, error) {
 type BlobRef struct {
 	// Unit is the routed storage-unit token (<gen>-<unitID>, e.g. "0-13", or
 	// the "legacy" sentinel). It is the object-key prefix the bytes live under
-	// (blob/<unit>/<blobid>) and the finite per-owner prefix the orphan sweep
-	// enumerates.
+	// (blob/<unit>/<blobid>).
 	Unit string
 	// RouteShard is ShardKeyFn(routeKey) captured at stage time. It drives the
 	// bref key's hash tag so the pointer co-routes with the app's metadata under

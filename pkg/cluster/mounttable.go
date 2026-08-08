@@ -626,7 +626,7 @@ func (t *mountTable) mount(ru storageunit.ReplicaUnit, b backend.Backend) {
 // that is only half-covered. Two successive mount calls would publish that
 // intermediate state.
 //
-// No CURRENT reader is harmed by the torn view (the blob sweep re-checks its
+// No CURRENT reader is harmed by the torn view (a mount-view consumer re-checks its
 // unit-token set and fails closed, and the R=1 reconcile is excluded by
 // reshardMu), so this is not a bug fix. It is here so the all-or-nothing
 // property is a property of the type rather than a standing bet that no future

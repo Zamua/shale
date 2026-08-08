@@ -142,7 +142,7 @@ type Config struct {
 	// docs/design/blob-values.md). nil leaves the cluster metadata-only; the
 	// plain *KV surface is all that is reachable. When set, NewBlobKV wraps the
 	// cluster in the blob-capable *BlobKV surface (StageBlob / GetBlob /
-	// BindBlob / SweepOrphans). The concrete object-store adapter
+	// BindBlob / UnstageBlob). The concrete object-store adapter
 	// (blobstore.MinioBlobStore) is wired at the cmd binary, exactly as the
 	// slate Backend + ConditionalStore are; tests pass an in-memory blob.Store.
 	//

@@ -20,9 +20,8 @@ package integration
 // The second door is the dangerous one, and these tests exist mostly for it.
 //
 // WHY THIS IS DATA-LOSS-ADJACENT RATHER THAN AN ERGONOMICS COMPLAINT. Fan-out
-// consumers build SETS and then act on what is ABSENT from them: shale's own
-// blob GC does exactly this (referencedObjKeys feeds the orphan sweep, which
-// deletes an object whose key is absent from the referenced set). For such a
+// consumers build SETS and then act on what is ABSENT from them (a garbage
+// collector deletes what nothing in its referenced set names). For such a
 // consumer a silently-partial scan is not a smaller answer, it is a WRONG one
 // that deletes live data, and re-running afterwards cannot undo it. So the bar
 // here is HIGHER than "the refusal is matchable": a partial result must never

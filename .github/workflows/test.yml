@@ -78,9 +78,18 @@ jobs:
               cd "$m"
               PINNED=$(go list -m -f '{{.Version}}' github.com/Zamua/shale)
               echo "$m pins core $PINNED; consumer resolves $CORE"
-              go get "github.com/Zamua/shale@$CORE"
-              go build ./...
-              go test ./... -count=1
+              # A pin AHEAD of the newest tag means a breaking core transition
+              # is in flight (the backend already tracks an unreleased core, by
+              # pseudo-version). Downgrading it to the older tag would fabricate
+              # a pairing the repo has explicitly moved past; the real pairing
+              # becomes testable when the next core tag exists.
+              if [ "$(printf '%s\n%s\n' "$CORE" "$PINNED" | sort -V | tail -1)" != "$CORE" ]; then
+                echo "SKIP: $m pin $PINNED is ahead of newest tag $CORE (unreleased core in flight)"
+              else
+                go get "github.com/Zamua/shale@$CORE"
+                go build ./...
+                go test ./... -count=1
+              fi
             )
             echo "::endgroup::"
           done

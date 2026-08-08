@@ -4,8 +4,6 @@ import (
 	"context"
 	"errors"
 	"io"
-	"iter"
-	"time"
 )
 
 // ErrNotFound is returned by Store reads (GetStream) when the requested
@@ -74,32 +72,4 @@ type Store interface {
 	// bytes. The future within-record dedup (phase 3) skips staging when the
 	// content-keyed blob already exists.
 	Has(ctx context.Context, objkey string) (bool, error)
-
-	// List yields every object under prefix, each as an ObjectInfo (Key + Size
-	// + ModTime), for the same-shard orphan-bytes sweep (phase 2). The sweep
-	// age-gates a pointer-less object on its ModTime (the object store's
-	// LastModified), so List MUST carry it; the object store's listing already
-	// returns Key/Size/LastModified together, so no per-object HEAD is needed
-	// (design section 11.6). It is an iter.Seq2 so the caller can stop early and
-	// so a listing error surfaces per-item rather than buffering the whole
-	// listing; once a non-nil error is yielded the sequence ends.
-	List(ctx context.Context, prefix string) iter.Seq2[ObjectInfo, error]
-}
-
-// ObjectInfo is the per-object metadata List yields: enough for the orphan
-// sweep to identify an object (Key), report its footprint (Size), and age-gate
-// it (ModTime). It is the object store's own listing record mapped onto the
-// fields the sweep needs - no extra round-trip beyond the listing itself.
-type ObjectInfo struct {
-	// Key is the object key in the same key space the other Store methods use
-	// (the adapter strips any internal KeyPrefix), so a key from List feeds
-	// straight back into Has / Delete.
-	Key string
-	// Size is the stored object byte length.
-	Size int64
-	// ModTime is the object store's LastModified timestamp - the durable,
-	// per-object, restart-surviving signal the sweep age-gates on (a
-	// pointer-less object younger than the grace may be an in-flight stage and
-	// is kept; older is a genuine orphan). Design sections 10.2 + 11.6.
-	ModTime time.Time
 }

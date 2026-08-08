@@ -35,8 +35,8 @@ func (f fenceScanBackend) ScanPrefix(_ []byte) (backend.Iterator, error) {
 // SUPERSEDED (a higher-epoch owner opens the same db), and in production slatedb
 // a read/scan through that stale handle fails with the writer-epoch fence
 // (`detected newer DB client`). Without the fix the scan path returns that RAW
-// fence, failing the WHOLE aggregate - and because a SCAN-ONLY workload (the blob
-// migrate dry-run, the blob-GC sweeper) never issues the write that would
+// fence, failing the WHOLE aggregate - and because a SCAN-ONLY workload (e.g. a blob
+// migrate dry-run) never issues the write that would
 // otherwise evict the stale mount via the write path, the fence re-surfaces on
 // every retry FOREVER (the observed prod symptom).
 //

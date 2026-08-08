@@ -10,14 +10,13 @@
 // This package is ONLY the low-level byte PORT plus its pure domain types:
 //
 //   - Store: the streaming object-byte PORT (PutStream / GetStream / Delete /
-//     Has / List). Pure interface, no object-store types. Reads map a missing
+//     Has). Pure interface, no object-store types. Reads map a missing
 //     object to ErrNotFound; Delete is idempotent (deleting a missing object is a
 //     no-op). PutStream and GetStream are strictly streaming and never buffer a
 //     whole blob in memory.
 //   - Domain types (pure, no I/O): Pointer (the small versioned record phase 2
-//     persists as a slatedb value, with Encode/DecodePointer), the ObjectInfo
-//     listing record, and the object-key layout helpers (FinalKey,
-//     FinalPrefixForUnit, NewBlobID).
+//     persists as a slatedb value, with Encode/DecodePointer) and the
+//     object-key layout helpers (FinalKey, NewBlobID).
 //
 // The single object-store ADAPTER that implements Store (a MinIO/S3 client
 // reusing the slate ConditionalStore's minio-go pattern) does NOT live here: it
@@ -34,10 +33,10 @@
 // away, and the binding transaction only commits the small Pointer. Bytes
 // sitting at the final key before the pointer commits are unreachable to any
 // reader (a reader reaches them only via committed metadata -> pointer), so a
-// crash before the bind leaves a UNIT-LOCAL orphan that the age-gated
-// same-shard sweep reclaims via List over FinalPrefixForUnit. Keying by the
-// unit (a bounded per-node set) rather than the raw shard key (unbounded) is
-// what makes the sweep a finite per-owned-unit prefix scan (section 11.5).
+// crash before the bind leaves a UNIT-LOCAL orphan. Reclamation is the
+// caller's, by exact ref (UnstageBlob over a durably recorded intent); bytes
+// whose ref was never recorded anywhere are an accepted bounded leak
+// (section 11.7).
 //
 // # Explicitly DEFERRED to phase 2 (the cluster capability split)
 //
@@ -46,9 +45,6 @@
 //   - StageBlob + BindBlob: streaming bytes to the final shard-keyed key and
 //     co-committing the Pointer with the app's metadata in one per-shard
 //     transaction (the reader-atomic create).
-//   - The same-shard orphan-bytes sweep that reclaims unreferenced final objects
-//     (after a delete) and pre-bind orphans (after a crash before bind), driven
-//     by Store.List over the per-shard prefix.
 //
 // # Explicitly DEFERRED to phase 3
 //

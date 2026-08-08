@@ -18,8 +18,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"iter"
-	"strings"
 
 	"github.com/minio/minio-go/v7"
 	"github.com/minio/minio-go/v7/pkg/credentials"
@@ -108,8 +106,8 @@ func (s *MinioBlobStore) GetStream(ctx context.Context, objkey string) (io.ReadC
 }
 
 // Delete removes objkey. It is idempotent: RemoveObject against a missing object
-// returns no error from S3/MinIO, so a delete of an already-reclaimed object is
-// a no-op (the orphan sweep relies on this).
+// returns no error from S3/MinIO, so re-running a partially-unstaged recovery
+// list is a no-op for the already-deleted entries (UnstageBlob relies on this).
 func (s *MinioBlobStore) Delete(ctx context.Context, objkey string) error {
 	if err := s.client.RemoveObject(ctx, s.bucket, s.keyFor(objkey), minio.RemoveObjectOptions{}); err != nil {
 		return fmt.Errorf("blobstore: Delete %s: %w", objkey, err)
@@ -128,36 +126,6 @@ func (s *MinioBlobStore) Has(ctx context.Context, objkey string) (bool, error) {
 		return false, fmt.Errorf("blobstore: Has %s: %w", objkey, err)
 	}
 	return true, nil
-}
-
-// List yields every object under prefix as a blob.ObjectInfo (Key + Size +
-// ModTime, with this store's KeyPrefix stripped off the Key so callers see the
-// same key space they pass to the other methods). It is the input to the
-// same-shard orphan-bytes sweep, whose age-gate needs the per-object
-// LastModified - minio's ListObjects already returns Key, Size, and
-// LastModified in the listing record, so mapping all three adds no round-trip
-// (a separate Stat per object would be one HEAD each; section 11.6).
-func (s *MinioBlobStore) List(ctx context.Context, prefix string) iter.Seq2[blob.ObjectInfo, error] {
-	return func(yield func(blob.ObjectInfo, error) bool) {
-		opts := minio.ListObjectsOptions{Prefix: s.keyFor(prefix), Recursive: true}
-		for obj := range s.client.ListObjects(ctx, s.bucket, opts) {
-			if obj.Err != nil {
-				yield(blob.ObjectInfo{}, fmt.Errorf("blobstore: List %s: %w", prefix, obj.Err))
-				return
-			}
-			// TrimPrefix fails safe: every listed key starts with s.prefix
-			// (ListObjects was given keyFor(prefix)), and if one ever did not it
-			// is returned unchanged rather than blindly length-sliced.
-			info := blob.ObjectInfo{
-				Key:     strings.TrimPrefix(obj.Key, s.prefix),
-				Size:    obj.Size,
-				ModTime: obj.LastModified,
-			}
-			if !yield(info, nil) {
-				return
-			}
-		}
-	}
 }
 
 // isNotFound maps the object store's NoSuchKey/NoSuchBucket response onto a
