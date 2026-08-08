@@ -23,6 +23,7 @@ package cluster
 // capability split lives entirely here.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -250,6 +251,85 @@ func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, si
 	}, nil
 }
 
+// UnstageBlob deletes the object ref names: the presence-acting complement to
+// the absence-acting orphan sweep (design section 13). The caller is a recovery
+// path that recorded its staged refs on a durable intent before binding and now
+// reclaims an exact list - no enumeration, no referenced-set scan, and no
+// transition gate (the sweep's quiescence refusals do not apply here).
+//
+// BOUND-REF GUARD, fail closed: a pointer found at brefKey(ref) means committed
+// metadata references these bytes, and deleting them would be committed-data
+// loss surfaced only at read time - refuse with blob.ErrBound. The guard is one
+// routed read, not a scan (brefKey is a pure function of the ref, section 12),
+// and as long as BlobIDs are unique-minted at stage time a pointer there can
+// only describe THIS blob (a future content-keyed dedup id would add a
+// false-refuse mode: leak-side, sweep-backstopped). A guard read that fails
+// with anything other than not-found also refuses: cannot verify, do not
+// destroy.
+//
+// The guard read does NOT inherit cfg.ReadConsistency: at R>1 it runs at
+// ReadQuorum minimum and requires absence to be witnessed by a full read
+// quorum (guardGet). Under ReadNearest a single lagging replica's miss would
+// read as "unbound" while the write quorum holds the pointer - acceptable
+// staleness for a read, committed-data loss for a delete.
+//
+// The guard is check-then-delete; a BindBlob committing between the two would
+// bind bytes about to vanish, and no lock inside shale closes that window (the
+// pointer and the object live in different stores). Callers that persist refs
+// for crash recovery MUST fence the original writer before unstaging: an
+// ownership record (epoch / lease) CO-SHARDED with the bref - the intent
+// itself may shard elsewhere - checked in the same Transact as BindBlob, so
+// that once recovery has bumped the epoch, a resumed writer's bind aborts
+// instead of racing the delete (design section 13.3).
+//
+// A ref whose Unit, RouteShard, or BlobID is missing is rejected with
+// blob.ErrInvalidRef before any read: persisted refs re-enter here after a
+// round-trip through the caller's serialization, and a ref that lost
+// RouteShard would guard-read a DIFFERENT key than BindBlob wrote - a false
+// "unbound" that deletes committed bytes. Every field must round-trip
+// byte-exact (design section 13.6).
+//
+// Store.Delete is idempotent (a missing object is a no-op), so re-running a
+// partially-unstaged list converges. After UnbindBlob the pointer is gone and
+// the original ref unstages successfully: unbind-then-unstage is the scan-free
+// deletion path for a caller that kept the ref (design section 13.4).
+func (b *BlobKV) UnstageBlob(ctx context.Context, ref BlobRef) error {
+	if err := validateUnstageRef(ref); err != nil {
+		return err
+	}
+	_, err := b.c.guardGet(brefKey(ref))
+	switch {
+	case err == nil:
+		return fmt.Errorf("shale: unstage %s/%s: %w", ref.Unit, ref.BlobID, blob.ErrBound)
+	case !errors.Is(err, backend.ErrNotFound):
+		return fmt.Errorf("shale: unstage %s/%s: bound-ref guard read: %w", ref.Unit, ref.BlobID, err)
+	}
+	if err := b.blobs.Delete(ctx, blob.FinalKey(ref.Unit, ref.BlobID)); err != nil {
+		return fmt.Errorf("shale: unstage %s/%s: %w", ref.Unit, ref.BlobID, err)
+	}
+	return nil
+}
+
+// validateUnstageRef rejects a ref any of whose key-forming fields is missing
+// or malformed. Deletion keys are DERIVED from the ref, so a field lost in the
+// caller's persistence round-trip silently retargets both the guard read and
+// the object delete; failing loudly here is the only place that can catch it.
+func validateUnstageRef(ref BlobRef) error {
+	switch {
+	case ref.Unit == "":
+		return fmt.Errorf("shale: unstage: empty Unit: %w", blob.ErrInvalidRef)
+	case ref.BlobID == "":
+		return fmt.Errorf("shale: unstage: empty BlobID: %w", blob.ErrInvalidRef)
+	case len(ref.RouteShard) == 0:
+		return fmt.Errorf("shale: unstage: empty RouteShard: %w", blob.ErrInvalidRef)
+	case bytes.IndexByte(ref.RouteShard, '}') >= 0:
+		// The documented brefKey contract: an embedded '}' truncates the hash
+		// tag and mis-routes the pointer key.
+		return fmt.Errorf("shale: unstage: RouteShard contains '}': %w", blob.ErrInvalidRef)
+	}
+	return nil
+}
+
 // GetBlob resolves the bref for (routeKey, blobid), decodes the pointer, and
 // streams the bytes out (design section 11.4). The pointer read is a normal
 // routed Cluster.Get (small value, to the unit owner); the byte stream is a
@@ -463,12 +543,15 @@ func (b *BlobKV) referencedObjKeys() (map[string]struct{}, error) {
 	return referenced, nil
 }
 
-// BlobRef is the opaque token StageBlob returns and Bind / Unbind / Get consume.
-// It carries everything brefKey + the persisted blob.Pointer need, so the app
-// never sees object keys or the pointer record (design section 11.6). It is NOT
-// persisted - the persisted reference is the blob.Pointer the bref holds; the
-// BlobRef is a transient handle that threads a staged blob from StageBlob into
-// the binding transaction.
+// BlobRef is the opaque token StageBlob returns and Bind / Unbind / Unstage /
+// Get consume. It carries everything brefKey + the persisted blob.Pointer
+// need, so the app never sees object keys or the pointer record (design
+// section 11.6). shale never persists it - the committed reference is the
+// blob.Pointer the bref holds - but a caller MAY persist refs to drive
+// crash-recovery unstaging (design section 13.6); every field must then
+// round-trip byte-exact, since UnstageBlob derives both of its keys from the
+// ref (a lossy round-trip is rejected by blob.ErrInvalidRef where detectable,
+// but a CORRUPTED-not-missing RouteShard is not detectable).
 type BlobRef struct {
 	// Unit is the routed storage-unit token (<gen>-<unitID>, e.g. "0-13", or
 	// the "legacy" sentinel). It is the object-key prefix the bytes live under

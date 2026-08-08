@@ -16,6 +16,20 @@ import (
 // no-op, not an error (see Store.Delete).
 var ErrNotFound = errors.New("blob: object not found")
 
+// ErrBound is returned when unstaging is refused because the ref's pointer
+// exists: the bytes are referenced by committed metadata, and deleting them
+// would be committed-data loss surfaced only at read time. Callers branch with
+// errors.Is; a recovery path treats it as "this ref was bound after all, drop
+// it from the unstage list" - a skip, not a failure.
+var ErrBound = errors.New("blob: ref is bound; unstage refused")
+
+// ErrInvalidRef is returned when unstaging is refused because a key-forming
+// ref field (unit, route shard, blob id) is missing or malformed. Distinct
+// from both ErrBound (skip) and transient errors (retry): it means the
+// caller's persisted ref did not round-trip faithfully, and retrying the same
+// ref cannot succeed.
+var ErrInvalidRef = errors.New("blob: invalid ref; unstage refused")
+
 // SizeUnknown is the size sentinel a caller passes to PutStream when the length
 // of the reader is not known up front. The adapter then streams the bytes via a
 // multipart upload that does not need the total size in advance. Prefer passing
