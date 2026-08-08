@@ -715,8 +715,10 @@ func FinalPrefixForUnit(unit string) string    { return FinalPrefix + unit + "/"
 ```go
 // pkg/cluster - BlobRef is the opaque token StageBlob returns and Bind/Unbind/
 // Get consume. It carries everything brefKey + the pointer need, so the app
-// never sees objkeys or the pointer record. It is NOT persisted; the persisted
-// reference is the blob.Pointer the bref holds.
+// never sees objkeys or the pointer record. shale never persists it; the
+// persisted reference is the blob.Pointer the bref holds. (A caller MAY
+// persist refs to drive crash-recovery unstaging - see 13.6 for the
+// round-trip contract that creates.)
 type BlobRef struct {
     Unit        string // the routed unit token <gen>-<unitID> (or "legacy")
     RouteShard  []byte // ShardKeyFn(routeKey) at stage time - drives brefKey co-routing
@@ -1135,33 +1137,74 @@ func (b *BlobKV) UnstageBlob(ctx context.Context, ref BlobRef) error
 
 Semantics, in order:
 
-1. **Bound-ref guard (fail closed).** Read `brefKey(ref)` through the cluster.
-   If a pointer EXISTS, the blob is bound: committed metadata references these
-   bytes, and deleting them is committed-data loss discovered at read time.
-   Refuse with the typed sentinel `blob.ErrBound`. If the read fails with
-   anything other than not-found, return that error WITHOUT deleting (cannot
-   verify -> do not destroy).
+0. **Ref validation (fail loudly).** A ref whose Unit, BlobID, or RouteShard is
+   missing - or whose RouteShard carries a `}` (the brefKey hash-tag contract) -
+   is rejected with `blob.ErrInvalidRef` before any read. Persisted refs
+   re-enter here after a round-trip through the caller's serialization; a ref
+   that silently lost RouteShard would guard-read a DIFFERENT key than BindBlob
+   wrote, turning a bound ref into a false "unbound". Deletion keys are derived
+   from the ref, so this is the only place a lossy round-trip can be caught.
+1. **Bound-ref guard (fail closed, quorum-floored).** Read `brefKey(ref)`
+   through the cluster. If a pointer EXISTS, the blob is bound: committed
+   metadata references these bytes, and deleting them is committed-data loss
+   discovered at read time. Refuse with the typed sentinel `blob.ErrBound`. If
+   the read fails with anything other than not-found, return that error WITHOUT
+   deleting (cannot verify -> do not destroy).
+
+   The guard read does NOT inherit `cfg.ReadConsistency`. At R>1 it runs at
+   ReadQuorum minimum (ReadAll stays ReadAll) AND requires absence to be
+   witnessed by a full read quorum of not-found legs (`guardGet`). Two distinct
+   holes force this beyond a naive `Get`:
+   - Under ReadNearest (the library default) the first answering leg wins; a
+     replica lagging behind a WriteQuorum-acked bind answers not-found and the
+     holders' values are dropped - a false "unbound" in steady state.
+   - The gather loop concludes not-found from WHATEVER legs answered; with
+     holders unreachable, a single miss would carry a quorum read too. The
+     guard's sweep therefore refuses sub-quorum absence (errSubQuorumAbsence,
+     surfaced as a retryable guard-read error, never as not-found).
+   Both are acceptable staleness for an ordinary read (the next read heals);
+   for a delete they are data loss, hence the dedicated read path. Single-copy
+   modes (R=1, legacy, forwarded) already answer authoritatively-or-refuse
+   (acquiring windows, fence guards), so plain Get is sound there.
 2. **Delete the object.** `Store.Delete(ctx, blob.FinalKey(ref.Unit,
    ref.BlobID))` - the same key StageBlob wrote (ref.Unit is the stage-time
    token, carried verbatim, so this is reshard-transparent the same way GetBlob's
    ptr.ObjKey is). Store.Delete is idempotent (missing object is a no-op), so a
    recovery that re-runs a partially-unstaged list converges.
 
-The guard is a single cluster Get, not a scan: brefKey is a pure function of
-ref.RouteShard + ref.BlobID (section 12), and a pointer found there can only
-describe THIS blob (BlobIDs are unique-minted at stage time), so the guard has
-no false-positive mode.
+The guard is a single routed read, not a scan: brefKey is a pure function of
+ref.RouteShard + ref.BlobID (section 12). As long as BlobIDs are unique-minted
+at stage time, a pointer found there can only describe THIS blob; a future
+content-keyed dedup id (11.6 leaves the door open) would add a FALSE-REFUSE
+mode - two stagings of identical content sharing a bref key - which is
+leak-side and sweep-backstopped, never loss-side.
 
-### 13.3 The race window, stated honestly
+### 13.3 The race window, and what the caller must actually build
 
 The guard is check-then-delete: a BindBlob committing between the pointer read
 and the object delete would bind bytes that are about to vanish. No lock closes
 this inside shale (the pointer commit and the object delete live in different
-stores). The exclusion is the CALLER'S BY CONSTRUCTION: a BlobRef exists only in
-the hands of the party that staged it, so the only process that can bind a ref
-is the one that could call unstage on it. Callers MUST NOT bind and unstage the
-same ref concurrently; the doc comment states this rather than implying the
-guard is airtight against a race only the caller can create.
+stores).
+
+The exclusion is the caller's, and for the crash-recovery caller this section
+exists for, it is NOT automatic. Recovery is BY DESIGN a different process
+reading refs a (presumed-)crashed writer persisted - and the presumed-dead
+writer may be alive (partition, GC pause, wedged-then-resumed pod) and still
+able to bind while recovery unstages the same ref. "Do not bind and unstage
+the same ref concurrently" therefore requires a FENCE, not good intentions:
+
+- The intent record carries an ownership epoch (or lease).
+- BindBlob runs inside a transaction that CO-COMMITS a check of that
+  ownership: read the intent record in the same Transact, abort if recovery
+  has taken it over. shale's single-shard transaction gives this atomicity
+  today; no new machinery is needed, but the caller must route the intent
+  record to the same shard as the bref (same route key) for the co-commit.
+- Recovery bumps the intent's epoch FIRST (taking ownership), then unstages.
+  A resumed writer's subsequent bind aborts on the ownership check instead of
+  racing the delete.
+
+A caller without such a fence has a real, if narrow, loss window; the API doc
+states the requirement rather than implying the guard closes it.
 
 ### 13.4 Interaction with the sweep and UnbindBlob
 
@@ -1175,5 +1218,34 @@ guard is airtight against a race only the caller can create.
 
 ### 13.5 Errors
 
-`blob.ErrBound` (new sentinel, beside `blob.ErrNotFound`): the ref has a live
-pointer; unstage refused. Callers branch on it with `errors.Is`.
+Three caller-visible outcomes, three distinct shapes, all beside
+`blob.ErrNotFound` in pkg/blob:
+
+- `blob.ErrBound`: the ref has a live pointer; unstage refused. Recovery
+  treats it as a SKIP (the blob got bound after all; drop it from the list).
+- `blob.ErrInvalidRef`: a key-forming field is missing or malformed; retrying
+  the same ref cannot succeed. A caller bug or a lossy persistence
+  round-trip - surface it, do not retry.
+- anything else (wrapped): the guard read or the delete failed transiently;
+  RETRY the ref later. Includes the sub-quorum-absence refusal.
+
+The refusal never crosses the wire: UnstageBlob is client-side composition (a
+routed pointer read + a direct object-store delete on the calling node), so
+`errors.Is` identity needs no wire decode. The one property that does cross -
+the pointer read's not-found identity through peer forwarding - is the same
+pre-existing property GetBlob's blob.ErrNotFound mapping already load-bears.
+
+### 13.6 The ref persistence contract
+
+Sections 11.6 / the BlobRef doc say shale never persists a BlobRef - still
+true. But this feature's caller DOES: the durable intent records refs so
+recovery can unstage them. That makes the ref's fields a de-facto persistence
+contract:
+
+- Unit, RouteShard, BlobID MUST round-trip byte-exact; UnstageBlob derives
+  both the guard key and the object key from them. Size / ContentHash are not
+  consumed by unstage.
+- A MISSING field is caught by validation (ErrInvalidRef). A CORRUPTED-but-
+  present RouteShard is NOT detectable - the guard would read a wrong key and
+  conclude "unbound". Callers serializing refs by hand (rather than encoding
+  the struct whole) own that risk.

@@ -852,17 +852,70 @@ func (c *Cluster) getReplicatedUnit(key []byte) ([]byte, error) {
 	})
 }
 
-// getReplicatedUnitOnce is ONE union read sweep (the pre-retry getReplicatedUnit
-// body): resolve the routed union, fan out position-addressed reads, gather per
-// ReadConsistency, LWW-select, read-repair. It returns the acquiring-tagged
-// error ONLY for the all-legs-transient outcome, which is the retry wrapper's
-// re-poll signal.
+// getReplicatedUnitOnce is the config-default sweep: one union read at
+// cfg.ReadConsistency with the ordinary (non-guarded) absence semantics.
 func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte, error) {
+	return c.getReplicatedUnitOnceOpts(deadline, key, replicatedReadOpts{rc: c.cfg.ReadConsistency})
+}
+
+// replicatedReadOpts parameterizes one union read sweep away from the
+// config-wide defaults. The zero value plus an explicit rc reproduces the
+// ordinary read path.
+type replicatedReadOpts struct {
+	rc ReadConsistency
+	// quorumAbsence requires a no-value conclusion to be witnessed by n
+	// not-found legs (n = the rc's replica count) before it becomes
+	// backend.ErrNotFound. The ordinary read path reports not-found from
+	// whatever legs answered - acceptable for a read (the caller sees a miss it
+	// can retry) but NOT for a caller that DESTROYS data on a miss: a
+	// sub-quorum miss (lagging replica answered, holders unreachable) must
+	// surface as an unverifiable error instead.
+	quorumAbsence bool
+}
+
+// errSubQuorumAbsence marks a guarded read that could not prove absence at
+// quorum: fewer than n legs answered not-found and none held a value. It is
+// deliberately NOT backend.ErrNotFound; guarded callers fail closed on it.
+var errSubQuorumAbsence = errors.New("shale: absence not provable at read quorum (insufficient replicas answered); retry")
+
+// guardGet is the DESTRUCTIVE-CALLER read: like Get, but a not-found conclusion
+// is only ever returned when it is provable - at least a read quorum of
+// replicas positively answered not-found. Ordinary reads inherit
+// cfg.ReadConsistency where a lagging replica's miss is a transient staleness
+// the next read heals; a caller that deletes bytes on a miss (UnstageBlob's
+// bound-ref guard) cannot tolerate that leg failing open, so this path floors
+// the consistency at ReadQuorum (ReadAll stays ReadAll) and refuses sub-quorum
+// absence with errSubQuorumAbsence. Single-copy modes (R=1, legacy) already
+// answer authoritatively-or-refuse (acquiring windows, fence guards, forwarded
+// reads all surface errors, never a fabricated miss), so plain Get is sound
+// there.
+func (c *Cluster) guardGet(key []byte) ([]byte, error) {
+	if !c.multiReplicated() {
+		return c.Get(key)
+	}
+	if c.notReady() {
+		return nil, backend.ErrClosed
+	}
+	rc := c.cfg.ReadConsistency
+	if rc != ReadAll {
+		rc = ReadQuorum
+	}
+	return retryReadThroughHandoff(c, func(deadline time.Time) ([]byte, error) {
+		return c.getReplicatedUnitOnceOpts(deadline, key, replicatedReadOpts{rc: rc, quorumAbsence: true})
+	})
+}
+
+// getReplicatedUnitOnceOpts is ONE union read sweep (the pre-retry
+// getReplicatedUnit body): resolve the routed union, fan out position-addressed
+// reads, gather per opts.rc, LWW-select, read-repair. It returns the
+// acquiring-tagged error ONLY for the all-legs-transient outcome, which is the
+// retry wrapper's re-poll signal.
+func (c *Cluster) getReplicatedUnitOnceOpts(deadline time.Time, key []byte, opts replicatedReadOpts) ([]byte, error) {
 	routed, stableR := c.routedReplicasWithUnit(key)
 	if len(routed) == 0 {
 		return nil, status.Error(codes.Unavailable, "shale: no replicas available for key")
 	}
-	rc := c.cfg.ReadConsistency
+	rc := opts.rc
 	// N is the stable read quorum, NOT widened by a transient union member; clamp
 	// to the routed size so a single-replica routed set is still answerable.
 	n := min(requiredReadReplicas(rc, stableR), len(routed))
@@ -947,6 +1000,9 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 			// unwraps the marker, so callers only ever see the dial error).
 			return nil, &unreachableOnlyError{inner: firstUnreachable}
 		}
+		if opts.quorumAbsence {
+			return nil, errSubQuorumAbsence
+		}
 		return nil, backend.ErrNotFound
 	}
 
@@ -967,6 +1023,14 @@ func (c *Cluster) getReplicatedUnitOnce(deadline time.Time, key []byte) ([]byte,
 	}
 
 	if !winner.hadValue {
+		// A no-value winner means every gathered leg answered not-found. Under
+		// quorumAbsence that conclusion must be witnessed by n legs: a
+		// sub-quorum miss (the only answering replica may be the one lagging
+		// behind an acked write, with the holders unreachable) is not proof of
+		// absence.
+		if opts.quorumAbsence && usable < n {
+			return nil, errSubQuorumAbsence
+		}
 		return nil, backend.ErrNotFound
 	}
 	if len(winner.env.Payload) == 0 {

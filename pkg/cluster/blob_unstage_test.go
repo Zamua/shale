@@ -110,6 +110,93 @@ func TestUnstageBlob_IdempotentOnMissingObject(t *testing.T) {
 	}
 }
 
+// A ref that lost a key-forming field in the caller's persistence round-trip
+// must be rejected before any read or delete: the derived keys would target
+// the wrong entries (an empty RouteShard guard-reads a different key than
+// BindBlob wrote, turning a bound ref into a false "unbound").
+func TestUnstageBlob_RejectsInvalidRef(t *testing.T) {
+	store := blobmem.New()
+	bkv := newStreamingBlobKV(t, store)
+	ref := stageOne(t, bkv, store, []byte("slug-invalid"))
+
+	mangle := map[string]cluster.BlobRef{
+		"empty Unit":          {Unit: "", RouteShard: ref.RouteShard, BlobID: ref.BlobID},
+		"empty BlobID":        {Unit: ref.Unit, RouteShard: ref.RouteShard, BlobID: ""},
+		"empty RouteShard":    {Unit: ref.Unit, RouteShard: nil, BlobID: ref.BlobID},
+		"brace in RouteShard": {Unit: ref.Unit, RouteShard: []byte("a}b"), BlobID: ref.BlobID},
+	}
+	for name, bad := range mangle {
+		err := bkv.UnstageBlob(context.Background(), bad)
+		if !errors.Is(err, blob.ErrInvalidRef) {
+			t.Fatalf("%s: err = %v, want blob.ErrInvalidRef", name, err)
+		}
+	}
+	has, err := store.Has(context.Background(), blob.FinalKey(ref.Unit, ref.BlobID))
+	if err != nil {
+		t.Fatalf("Has: %v", err)
+	}
+	if !has {
+		t.Fatalf("staged object deleted by a rejected ref")
+	}
+}
+
+// The "cannot verify, do not destroy" leg: when the guard read errors (closed
+// cluster stands in for any unavailable read), the bytes must survive and the
+// error must not read as the bound-skip signal.
+func TestUnstageBlob_FailsClosedWhenGuardReadErrors(t *testing.T) {
+	store := blobmem.New()
+	bkv := newStreamingBlobKV(t, store)
+	ref := stageOne(t, bkv, store, []byte("slug-closed"))
+
+	if err := bkv.Close(); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	err := bkv.UnstageBlob(context.Background(), ref)
+	if err == nil {
+		t.Fatalf("UnstageBlob succeeded with the guard read unavailable")
+	}
+	if errors.Is(err, blob.ErrBound) {
+		t.Fatalf("guard-read failure surfaced as ErrBound (a skip); it must be retryable: %v", err)
+	}
+	has, herr := store.Has(context.Background(), blob.FinalKey(ref.Unit, ref.BlobID))
+	if herr != nil {
+		t.Fatalf("Has: %v", herr)
+	}
+	if !has {
+		t.Fatalf("bytes deleted despite an unverifiable guard read")
+	}
+}
+
+// BlobID disambiguates both the bref key and the object key: unstaging the
+// unbound of two same-route-key blobs deletes only its own object.
+func TestUnstageBlob_DeletesOnlyItsOwnObject(t *testing.T) {
+	store := blobmem.New()
+	bkv := newStreamingBlobKV(t, store)
+	routeKey := []byte("slug-shared")
+	bound := stageOne(t, bkv, store, routeKey)
+	orphan := stageOne(t, bkv, store, routeKey)
+
+	if err := bkv.Transact(routeKey, func(tx *cluster.BlobTx) error { return tx.BindBlob(bound) }); err != nil {
+		t.Fatalf("Transact(bind): %v", err)
+	}
+	if err := bkv.UnstageBlob(context.Background(), orphan); err != nil {
+		t.Fatalf("UnstageBlob(orphan): %v", err)
+	}
+	hasOrphan, _ := store.Has(context.Background(), blob.FinalKey(orphan.Unit, orphan.BlobID))
+	if hasOrphan {
+		t.Fatalf("orphan object survived")
+	}
+	hasBound, _ := store.Has(context.Background(), blob.FinalKey(bound.Unit, bound.BlobID))
+	if !hasBound {
+		t.Fatalf("bound object was deleted alongside the orphan")
+	}
+	rc, _, err := bkv.GetBlob(context.Background(), routeKey, bound.BlobID)
+	if err != nil {
+		t.Fatalf("GetBlob(bound) after unstaging the orphan: %v", err)
+	}
+	_ = rc.Close()
+}
+
 func TestUnstageBlob_SucceedsAfterUnbind(t *testing.T) {
 	store := blobmem.New()
 	bkv := newStreamingBlobKV(t, store)
