@@ -11,8 +11,14 @@ import (
 // DebugState returns a human-readable dump of this node's per-position handoff
 // state, for LIVE diagnosis on the SHALE_DEBUG_ADDR /debug/shale/state endpoint.
 // For every ReplicaUnit this node desires (current owner), pending-owns, has
-// mounted, or holds a handoff phase for, it reports desired / pending / mounted
-// + the current handoff phase.
+// mounted, or holds a handoff phase for, it reports desired / pendingOwner /
+// mounted + the current handoff phase.
+//
+// pendingOwner means "owned under the PENDING view" (the ring excluding
+// draining members - the slots this node will hold once drains complete); in
+// steady state it equals desired, so every steady position prints
+// pendingOwner=true. It is UNRELATED to MountReadiness.PendingUnits (/readyz),
+// which counts desired-but-unmounted positions.
 //
 // THERE ARE TWO WEDGE SIGNATURES, and they are mirror images. Both are a
 // position stuck in a loser phase (Draining) whose drainCheck waits on a
@@ -107,7 +113,7 @@ func (c *Cluster) DebugState() string {
 		if v, ok := c.mounts.acquireErrOf(ru); ok {
 			acqErr = fmt.Sprintf(" lastAcquireErr=%q", v)
 		}
-		fmt.Fprintf(&b, "  %s desired=%v pending=%v mounted=%v phase=%s%s%s\n",
+		fmt.Fprintf(&b, "  %s desired=%v pendingOwner=%v mounted=%v phase=%s%s%s\n",
 			ru, desired[ru], pending[ru], mounted[ru], ph, acqErr, flag)
 	}
 	fmt.Fprintf(&b, "summary: %d positions, %d desired-but-unmounted\n", len(list), wedged)

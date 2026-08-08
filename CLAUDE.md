@@ -133,7 +133,7 @@ The shaled run-loop exposes an OPTIONAL debug HTTP server, OFF unless the
 `SHALE_DEBUG_ADDR` env var is set (so production is unaffected). When set (e.g.
 `:6060` on a node under investigation) it serves `net/http/pprof` plus
 `/debug/shale/state` - a per-node dump of every `ReplicaUnit`'s
-desired/pending/mounted/handoff-phase (flagging the desired-but-unmounted
+desired/pendingOwner/mounted/handoff-phase (flagging the desired-but-unmounted
 auto-recovery wedge) and the last swallowed acquire error. Reach it with a
 port-forward; no shell needed in the distroless image.
 
