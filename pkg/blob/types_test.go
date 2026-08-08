@@ -117,30 +117,6 @@ func TestFinalKey(t *testing.T) {
 	}
 }
 
-func TestFinalPrefixForUnit(t *testing.T) {
-	got := FinalPrefixForUnit("0-13")
-	want := "blob/0-13/"
-	if got != want {
-		t.Fatalf("FinalPrefixForUnit = %q, want %q", got, want)
-	}
-	// The prefix must enumerate exactly the unit's blobs: every FinalKey for
-	// that unit must start with the prefix.
-	fk := FinalKey("0-13", "abc")
-	if !strings.HasPrefix(fk, got) {
-		t.Fatalf("FinalKey %q is not under FinalPrefixForUnit %q", fk, got)
-	}
-	// And a DIFFERENT unit's key must NOT be under it. The trailing slash is
-	// what guards against the prefix collision between unit "0-1" and "0-13"
-	// (without it, "blob/0-1" would be a prefix of "blob/0-13/...").
-	other := FinalKey("0-1", "abc")
-	if strings.HasPrefix(other, got) {
-		t.Fatalf("FinalKey %q for a different unit must not match prefix %q (trailing slash guards against prefix collision)", other, got)
-	}
-	if !strings.HasPrefix(other, FinalPrefixForUnit("0-1")) {
-		t.Fatalf("FinalKey %q must be under its own unit prefix %q", other, FinalPrefixForUnit("0-1"))
-	}
-}
-
 func TestNewBlobID(t *testing.T) {
 	id1, err := NewBlobID()
 	if err != nil {

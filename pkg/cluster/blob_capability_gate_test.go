@@ -3,7 +3,7 @@ package cluster_test
 // Compile-time capability gate (design section 4 / 11.1, guarantee 5).
 //
 // The blob capability is meant to be visible IN THE TYPE: a metadata-only *KV
-// has NO StageBlob / GetBlob / SweepOrphans, and its Transact yields a plain
+// has NO StageBlob / GetBlob / UnstageBlob, and its Transact yields a plain
 // *Tx that has NO BindBlob / UnbindBlob. Reaching a blob op without having
 // configured a blob store is therefore a COMPILE error, not a runtime nil
 // dereference. There is no runtime assertion that can pin "this does not
@@ -94,9 +94,9 @@ func TestCapabilityGate_PositiveSurface(t *testing.T) {
 //	//     kv.GetBlob(context.Background(), []byte("rk"), "id")
 //	// build error: kv.GetBlob undefined (type *cluster.KV has no field or method GetBlob)
 //
-//	// (C) *KV has no SweepOrphans:
-//	//     kv.SweepOrphans(context.Background(), time.Now(), time.Hour)
-//	// build error: kv.SweepOrphans undefined (type *cluster.KV has no field or method SweepOrphans)
+//	// (C) *KV has no UnstageBlob:
+//	//     kv.UnstageBlob(context.Background(), cluster.BlobRef{})
+//	// build error: kv.UnstageBlob undefined (type *cluster.KV has no field or method UnstageBlob)
 //
 //	// (D) *KV.Transact yields a plain *Tx, which has NO BindBlob:
 //	//     kv.Transact([]byte("pin"), func(tx *cluster.Tx) error { return tx.BindBlob(cluster.BlobRef{}) })

@@ -104,14 +104,6 @@ func FinalKey(unit, blobid string) string {
 	return FinalPrefix + unit + "/" + blobid
 }
 
-// FinalPrefixForUnit builds the List prefix that enumerates every blob object
-// owned by unit - the input to the same-shard orphan sweep (phase 2). The
-// trailing '/' bounds the prefix to exactly that unit (so "0-1" does not also
-// match "0-13").
-func FinalPrefixForUnit(unit string) string {
-	return FinalPrefix + unit + "/"
-}
-
 // NewBlobID returns a fresh, random, URL-safe blob id (128 bits of crypto/rand
 // hex). shale uses crypto/rand elsewhere for random payloads; this keeps id
 // generation dependency-free. The app may instead key a blob by its content sha

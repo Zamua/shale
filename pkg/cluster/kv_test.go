@@ -4,7 +4,7 @@ package cluster_test
 // *KV / *BlobKV / *Tx / *BlobTx wrappers, the constructor gating, the
 // embed-and-shadow Transact dispatch, the BlobRef shape, and the brefKey
 // co-routing rule. These are FOUNDATION tests: they pin the type surface and the
-// pure key rule. The blob op BODIES (StageBlob / GetBlob / SweepOrphans and the
+// pure key rule. The blob op BODIES (StageBlob / GetBlob / UnstageBlob and the
 // BindBlob / UnbindBlob persistence) land in the implementation phase; here
 // BindBlob / UnbindBlob are stubs, so these tests do NOT exercise a bind commit.
 

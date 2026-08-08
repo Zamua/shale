@@ -756,7 +756,7 @@ listed object in the sweep, turning an O(objects) listing into O(objects)
 network HEADs. List-carries-modtime is strictly cheaper and is the canonical
 sweep input.
 
-### 11.7 SweepOrphans (age-gated, unit-local, owner-only)
+### 11.7 SweepOrphans (age-gated, unit-local, owner-only) - REMOVED, see 14
 
 ```go
 func (b *BlobKV) SweepOrphans(ctx context.Context, now time.Time, grace time.Duration) error {
@@ -1210,15 +1210,14 @@ the same ref concurrently" therefore requires a FENCE, not good intentions:
 A caller without such a fence has a real, if narrow, loss window; the API doc
 states the requirement rather than implying the guard closes it.
 
-### 13.4 Interaction with the sweep and UnbindBlob
+### 13.4 Interaction with UnbindBlob
 
 - After `UnbindBlob` (pointer deleted), the bytes are again staged-but-
   unreferenced; `UnstageBlob` on the original ref succeeds and reclaims them
-  immediately, without waiting for a sweep pass. Unbind-then-unstage is the
-  scan-free deletion path for a caller that kept the ref.
-- The sweep remains the backstop for refs NOBODY recorded (crash before the
-  intent write). The two mechanisms are disjoint by construction: unstage acts
-  on a recorded presence, the sweep on a computed absence.
+  immediately. Unbind-then-unstage is the deletion path for a caller that kept
+  the ref.
+- Refs NOBODY recorded (crash before the intent write) are an accepted bounded
+  leak; see 14.
 
 ### 13.5 Errors
 
@@ -1253,3 +1252,46 @@ contract:
   present RouteShard is NOT detectable - the guard would read a wrong key and
   conclude "unbound". Callers serializing refs by hand (rather than encoding
   the struct whole) own that risk.
+
+## 14. SweepOrphans removed (UnstageBlob is the only reclamation path)
+
+### 14.1 The decision
+
+`SweepOrphans` is deleted from the API - not deprecated, deleted, along with
+its whole support surface: `Store.List` + `ObjectInfo` + the ModTime listing
+extension (the Store port is now PutStream / GetStream / Delete / Has),
+`FinalPrefixForUnit`, `Cluster.MountedUnits`, the blobmem clock/mod-time test
+seams, and the MinIO adapter's List.
+
+### 14.2 Why
+
+Dual-write recovery is the APPLICATION's problem, solved with the
+application's chosen pattern (a saga over a durable intent, in the reference
+consumer). What the datastore owes the app is a reclamation path for what the
+app can NAME - and that is `UnstageBlob` (section 13). The sweep failed the
+basic operator question "when do you call it": per-write is absurd, and
+periodic makes an embedded library demand a background job PLUS a quiescent
+cluster to even run (its transition refusals meant real deployments rarely had
+a window). An API whose correct invocation pattern does not exist does not
+belong on the product surface.
+
+### 14.3 What its removal costs, stated precisely
+
+The one job a saga cannot do: reclaim bytes whose ref was NEVER recorded
+anywhere (the process died after the upload durably completed but before the
+returned ref reached the intent). Object keys are deliberately hidden behind
+the opaque BlobRef, so no application step can name those bytes. With the
+sweep gone they are an ACCEPTED, BOUNDED LEAK: wasted storage, never wrong
+data, accumulating at the rate of crashes inside a sub-second window. An
+operator who ever cares can reclaim them offline against the object store
+directly (list `blob/<unit>/` prefixes, keep everything a bref pointer names,
+delete old unreferenced leftovers) - janitorial tooling outside shale, not a
+datastore feature.
+
+### 14.4 Supersedes
+
+Sections 10.2 (age-gate), 11.7 (the sweep design), the `Store.List` /
+`ObjectInfo` port members in 11.6 and section 4, and every "the sweep
+reclaims..." claim in earlier sections' narrative. Section 13's contrast
+framing ("presence-acting complement to the absence-acting sweep") reduces to:
+UnstageBlob is the blob plane's only reclamation path.
