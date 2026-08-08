@@ -1193,13 +1193,17 @@ writer may be alive (partition, GC pause, wedged-then-resumed pod) and still
 able to bind while recovery unstages the same ref. "Do not bind and unstage
 the same ref concurrently" therefore requires a FENCE, not good intentions:
 
-- The intent record carries an ownership epoch (or lease).
+- An OWNERSHIP RECORD carries an ownership epoch (or lease). It must be
+  CO-SHARDED with the bref (same route key), because shale's transaction is
+  single-shard; the durable intent itself may shard elsewhere (a consumer
+  that shards intents by owner identity for node-local boot scans keeps that
+  layout and adds a small per-route-key ownership record instead - the epoch
+  lives where the bind can see it, the intent keeps its home).
 - BindBlob runs inside a transaction that CO-COMMITS a check of that
-  ownership: read the intent record in the same Transact, abort if recovery
-  has taken it over. shale's single-shard transaction gives this atomicity
-  today; no new machinery is needed, but the caller must route the intent
-  record to the same shard as the bref (same route key) for the co-commit.
-- Recovery bumps the intent's epoch FIRST (taking ownership), then unstages.
+  ownership record: read it in the same Transact, abort if recovery has taken
+  it over. shale's single-shard transaction gives this atomicity today; no
+  new machinery is needed.
+- Recovery bumps the ownership epoch FIRST (taking ownership), then unstages.
   A resumed writer's subsequent bind aborts on the ownership check instead of
   racing the delete.
 

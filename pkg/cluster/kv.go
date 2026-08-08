@@ -276,11 +276,11 @@ func (b *BlobKV) StageBlob(ctx context.Context, routeKey []byte, r io.Reader, si
 // The guard is check-then-delete; a BindBlob committing between the two would
 // bind bytes about to vanish, and no lock inside shale closes that window (the
 // pointer and the object live in different stores). Callers that persist refs
-// for crash recovery MUST fence the original writer before unstaging: perform
-// BindBlob inside a transaction that co-commits a check of the intent record's
-// ownership (epoch / lease), so that once recovery has taken the intent over, a
-// resumed writer's bind aborts instead of racing the delete (design section
-// 13.3).
+// for crash recovery MUST fence the original writer before unstaging: an
+// ownership record (epoch / lease) CO-SHARDED with the bref - the intent
+// itself may shard elsewhere - checked in the same Transact as BindBlob, so
+// that once recovery has bumped the epoch, a resumed writer's bind aborts
+// instead of racing the delete (design section 13.3).
 //
 // A ref whose Unit, RouteShard, or BlobID is missing is rejected with
 // blob.ErrInvalidRef before any read: persisted refs re-enter here after a
