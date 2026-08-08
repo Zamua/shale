@@ -1252,6 +1252,15 @@ contract:
   present RouteShard is NOT detectable - the guard would read a wrong key and
   conclude "unbound". Callers serializing refs by hand (rather than encoding
   the struct whole) own that risk.
+- WHEN the record is written matters as much as what it carries: the STAGING
+  flow must write it (before or atomically with each StageBlob), never the
+  commit path. A record opened only by the commit machinery cannot name the
+  bytes of the likeliest abandonment - a process that died mid-staging, before
+  any commit step ran - and that failure is silent: the orphaned bytes simply
+  survive every recovery pass. A staging record and a commit intent settle
+  DIFFERENT questions (staged bytes outlive the half-written-metadata
+  question), so a consumer whose intent opens at commit time needs a separate
+  stage-time record rather than an earlier intent.
 
 ## 14. SweepOrphans removed (UnstageBlob is the only reclamation path)
 
