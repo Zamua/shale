@@ -4,7 +4,7 @@
 // streaming behaviour: that PutStream/GetStream round-trip bytes identically for
 // both small and large (~20MB) blobs, that the large round-trip is genuinely
 // STREAMING (driven from a generating reader, hashed through a discard sink, with
-// no full-blob []byte ever materialized), that Delete is idempotent, Has and List
+// no full-blob []byte ever materialized), that Delete is idempotent, Has
 // behave, and a missing object surfaces the blob.ErrNotFound sentinel.
 //
 // This is the slate-module object-store adapter for the core module's pure-Go
