@@ -1110,3 +1110,70 @@ This section supersedes the bref KEY SHAPE in 11.5 / 11.9 (`bref/{<routeShard>}/
 half of the reshard interaction 11.8 / 11.11 flagged. The OBJECT key shape
 (`blob/<unit-token>/<blobid>`, 11.5) and the sweep's mounted-unit enumeration
 (11.7 / 11.12) are UNCHANGED.
+
+## 13. UnstageBlob (exact-ref reclamation, no scan, no quiescence)
+
+### 13.1 Motivation
+
+The orphan sweep (11.7) is age-gated, scan-based, and refuses to run whenever
+membership is in transition or the mount view moves mid-pass. Those refusals are
+correct for a mechanism that acts on ABSENCE (delete what nothing references),
+but they make the sweep a poor fit for the one caller that KNOWS which staged
+bytes it abandoned: a crash-recovery path that recorded its staged refs on a
+durable intent before binding. Such a caller holds an exact list; making it wait
+for cluster quiescence to reclaim bytes it can name is backwards.
+
+`UnstageBlob` is the presence-acting complement: delete the object ONE ref
+names. No enumeration, no referenced-set scan, no transition gate.
+
+### 13.2 API
+
+```go
+// on BlobKV, beside StageBlob
+func (b *BlobKV) UnstageBlob(ctx context.Context, ref BlobRef) error
+```
+
+Semantics, in order:
+
+1. **Bound-ref guard (fail closed).** Read `brefKey(ref)` through the cluster.
+   If a pointer EXISTS, the blob is bound: committed metadata references these
+   bytes, and deleting them is committed-data loss discovered at read time.
+   Refuse with the typed sentinel `blob.ErrBound`. If the read fails with
+   anything other than not-found, return that error WITHOUT deleting (cannot
+   verify -> do not destroy).
+2. **Delete the object.** `Store.Delete(ctx, blob.FinalKey(ref.Unit,
+   ref.BlobID))` - the same key StageBlob wrote (ref.Unit is the stage-time
+   token, carried verbatim, so this is reshard-transparent the same way GetBlob's
+   ptr.ObjKey is). Store.Delete is idempotent (missing object is a no-op), so a
+   recovery that re-runs a partially-unstaged list converges.
+
+The guard is a single cluster Get, not a scan: brefKey is a pure function of
+ref.RouteShard + ref.BlobID (section 12), and a pointer found there can only
+describe THIS blob (BlobIDs are unique-minted at stage time), so the guard has
+no false-positive mode.
+
+### 13.3 The race window, stated honestly
+
+The guard is check-then-delete: a BindBlob committing between the pointer read
+and the object delete would bind bytes that are about to vanish. No lock closes
+this inside shale (the pointer commit and the object delete live in different
+stores). The exclusion is the CALLER'S BY CONSTRUCTION: a BlobRef exists only in
+the hands of the party that staged it, so the only process that can bind a ref
+is the one that could call unstage on it. Callers MUST NOT bind and unstage the
+same ref concurrently; the doc comment states this rather than implying the
+guard is airtight against a race only the caller can create.
+
+### 13.4 Interaction with the sweep and UnbindBlob
+
+- After `UnbindBlob` (pointer deleted), the bytes are again staged-but-
+  unreferenced; `UnstageBlob` on the original ref succeeds and reclaims them
+  immediately, without waiting for a sweep pass. Unbind-then-unstage is the
+  scan-free deletion path for a caller that kept the ref.
+- The sweep remains the backstop for refs NOBODY recorded (crash before the
+  intent write). The two mechanisms are disjoint by construction: unstage acts
+  on a recorded presence, the sweep on a computed absence.
+
+### 13.5 Errors
+
+`blob.ErrBound` (new sentinel, beside `blob.ErrNotFound`): the ref has a live
+pointer; unstage refused. Callers branch on it with `errors.Is`.
