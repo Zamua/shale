@@ -37,14 +37,13 @@ func plantEnvelope(t *testing.T, b backend.Backend, key string, payload []byte, 
 }
 
 // purgeFixture builds an R=2 write-all cluster with one mounted position and
-// returns it with that position's backend.
-func purgeFixture(t *testing.T, grace time.Duration) (*Cluster, storageunit.ReplicaUnit, backend.Backend) {
+// returns it with that position's backend. Config grace stays zero so the
+// mount-time hook spawns no background pass; tests drive the purge functions
+// with an explicit grace.
+func purgeFixture(t *testing.T) (*Cluster, storageunit.ReplicaUnit, backend.Backend) {
 	t.Helper()
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2")
-	// grace deliberately NOT set on cfg: the mount-time hook must not spawn
-	// background passes that race the test's plants; the tests drive
-	// runTombstonePurge / purgeOneTombstone with grace explicitly.
 	c.cfg.WriteConsistency = WriteQuorum // R=2: quorum == all.
 	if err := c.mountReplicaUnits(); err != nil {
 		t.Fatalf("mountReplicaUnits: %v", err)
@@ -63,7 +62,7 @@ func purgeFixture(t *testing.T, grace time.Duration) (*Cluster, storageunit.Repl
 
 func TestTombstonePurge_ExpiredPurgedYoungAndLiveSurvive(t *testing.T) {
 	const grace = time.Hour
-	c, ru, b := purgeFixture(t, grace)
+	c, ru, b := purgeFixture(t)
 
 	plantEnvelope(t, b, "dead-old", nil, 2*time.Hour)                  // expired tombstone: purge.
 	plantEnvelope(t, b, "dead-young", nil, time.Minute)                // young tombstone: keep.
@@ -88,7 +87,7 @@ func TestTombstonePurge_ExpiredPurgedYoungAndLiveSurvive(t *testing.T) {
 // be kept. Pinned deterministically by mutating between the two phases.
 func TestTombstonePurge_RewrittenKeyIsKeptByTheReCheck(t *testing.T) {
 	const grace = time.Hour
-	c, ru, b := purgeFixture(t, grace)
+	c, ru, b := purgeFixture(t)
 
 	plantEnvelope(t, b, "contested", nil, 2*time.Hour)
 	keys, _, err := collectExpiredTombstones(b, grace, uint64(time.Now().UnixNano()), nil)
@@ -146,7 +145,7 @@ func TestTombstonePurge_RefusesBelowWriteAll(t *testing.T) {
 // both while the transaction is open.
 func TestTombstonePurge_GuardWindowHoldsTheWriterLocks(t *testing.T) {
 	const grace = time.Hour
-	c, ru, b := purgeFixture(t, grace)
+	c, ru, b := purgeFixture(t)
 	plantEnvelope(t, b, "probed", nil, 2*time.Hour)
 
 	var applyFree, casFree bool
