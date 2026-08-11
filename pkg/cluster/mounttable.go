@@ -112,6 +112,13 @@ type mountTable struct {
 	// publishServing). nil in a bare white-box fixture, which then publishes
 	// nothing.
 	publish func(ru storageunit.ReplicaUnit, epoch storageunit.Epoch, site string)
+	// purge starts the mount-time tombstone purge for a position that just
+	// became serving (docs/SPEC.md "Tombstone purge"). Held here for the same
+	// reason as publish: purging is a property of the serving transition, so
+	// every mount path inherits it and none can forget it. It only SPAWNS the
+	// background pass (eligibility-gated inside), but is still invoked with mu
+	// RELEASED, beside publish. nil in a bare white-box fixture.
+	purge func(ru storageunit.ReplicaUnit)
 	// closed points at the Cluster's closed flag. Read under mu by
 	// mountUnlessClosed / startAcquire so the "is the cluster shutting down"
 	// check pairs atomically with the mutation, exactly as the old call sites
@@ -119,9 +126,9 @@ type mountTable struct {
 	closed *atomic.Bool
 }
 
-// init makes the table ready to hold mounts for c. It takes the two narrow
-// dependencies the table needs from the cluster (the mount decorator and the
-// closed flag) as data, NOT as a general cluster handle, so the set of things a
+// init makes the table ready to hold mounts for c. It takes the narrow
+// dependencies the table needs from the cluster (the mount decorator, the
+// serving-marker publish, the purge starter and the closed flag) as data, NOT as a general cluster handle, so the set of things a
 // table method can reach is auditable at this one line.
 func (t *mountTable) init(c *Cluster) {
 	t.mu.Lock()
@@ -131,6 +138,7 @@ func (t *mountTable) init(c *Cluster) {
 	t.inFlight = make(map[storageunit.ReplicaUnit]struct{})
 	t.wrap = c.newFencedSelfHealing
 	t.publish = c.publishServingMarker
+	t.purge = c.startTombstonePurge
 	t.closed = &c.closed
 }
 
@@ -382,6 +390,9 @@ func (t *mountTable) finishStuckGainer(ru storageunit.ReplicaUnit) bool {
 	}
 	epoch, _ := t.openEpochOf(ru)
 	t.publishServing(ru, epoch, "overlap-rearm") // I/O: strictly after the unlock.
+	if t.purge != nil {
+		t.purge(ru) // becoming serving purges, on THIS path exactly as on mountServing.
+	}
 	return true
 }
 
@@ -484,6 +495,9 @@ func (t *mountTable) mountServing(ru storageunit.ReplicaUnit, b backend.Backend,
 		return out // nothing installed: no epoch recorded, nothing to announce.
 	}
 	t.publishServing(ru, opened, site) // I/O: strictly after the unlock.
+	if t.purge != nil {
+		t.purge(ru) // spawn-only; eligibility-gated inside.
+	}
 	return out
 }
 

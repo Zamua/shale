@@ -250,6 +250,24 @@ type Config struct {
 	// per-value semantics.
 	ReadConsistency ReadConsistency
 
+	// TombstoneGracePeriod enables the mount-time tombstone purge: when a
+	// replica position completes its mount, expired delete-tombstones (RF>1
+	// delete envelopes older than this window) are purged from that
+	// position's local backend so the engine's compaction can drop them
+	// physically (docs/SPEC.md "Tombstone purge"). Zero (the default)
+	// disables purging entirely.
+	//
+	// The window must dominate maximum cross-node clock skew plus the write
+	// durability window - think hours, not seconds. Purging requires the
+	// write ack bar to cover ALL replicas (at R=2, WriteQuorum already
+	// does); an enabled-but-ineligible configuration refuses loudly at
+	// mount instead of purging. Under RELAXED backend durability a crash can
+	// still lose an acked tombstone from one replica and leave a divergence
+	// the purge can resurrect (docs/SPEC.md "Tombstone purge", the accepted
+	// paths); operators who cannot accept that pair purging with
+	// awaited-durable writes on the backend.
+	TombstoneGracePeriod time.Duration
+
 	// WriteTimeout bounds the wall-clock budget for a Put / Delete
 	// fanout. Each replica dispatch inherits this deadline through
 	// context.WithTimeout, so a blackholed peer (hung gRPC, half-open
@@ -631,6 +649,15 @@ type Cluster struct {
 	// per key. The R=1 path never takes this lock (raw values, no
 	// envelopes, no LWW).
 	applyMu sync.Mutex
+
+	// purgeSem serializes tombstone-purge passes node-wide (one full local
+	// scan at a time; boot may mount many positions at once). Lazily created
+	// via purgeSemOnce so bare white-box fixtures need no wiring.
+	purgeSem     chan struct{}
+	purgeSemOnce sync.Once
+	// purgeRefusalOnce bounds the enabled-but-ineligible refusal log to once
+	// per process (the verdict is config-wide, identical for every position).
+	purgeRefusalOnce sync.Once
 
 	// stamps is this node's monotone envelope-stamp source, initialized
 	// (zero-value ready) at Open. Every stamp the node ORIGINATES

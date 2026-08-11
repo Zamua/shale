@@ -2332,6 +2332,116 @@ Every adapter runs the harness and keeps its adapter-specific suite on top
 (gossip: ring-drop heal, reconcile idempotence, bootstrap discovery; cas:
 lease expiry, document GC, bootstrap races).
 
+## Tombstone purge (RF>1)
+
+At R>1 a delete is a replicated LWW ENVELOPE with an empty payload - a shale
+tombstone - written as ordinary KV into the storage backend. The backend
+cannot distinguish it from live data (the empty payload is shale's semantics,
+not the engine's), so nothing ever removes it: a churned range accumulates
+every delete it has ever seen, and every prefix scan of that range re-reads
+the full history forever. The purge is the mechanism that makes deletes
+eventually free.
+
+### Where it lives: a mount-lifecycle step
+
+Purging is a first-class step of the replica-mount lifecycle, hung off the
+SAME single seam that publishes the serving marker (`mountServing`): when a
+position completes its mount and begins serving, the owner starts one
+background purge pass over that position's local backend. One call site, every
+mount path inherits it, and a future mount path cannot forget it - the same
+unforgettability argument as the marker publish.
+
+There is deliberately NO periodic driver: no daemon, no ticker, no operator
+cadence to choose. A pass runs when a position (re)mounts, so a deploy roll
+purges the fleet. The consequence is stated plainly: restart is the de facto
+purge trigger, exactly as restart is the de facto WAL-flush trigger for
+low-traffic units. A position that never remounts never purges; accepting that
+is what keeps the mechanism free of the invocation-pattern problem that killed
+the orphan sweep.
+
+### The policy: a named grace window
+
+`Config.TombstoneGracePeriod` (duration; zero = purge disabled, the default).
+A tombstone is purge-eligible when its envelope stamp is older than the grace.
+The grace must dominate the sum of maximum cross-node clock skew and the
+write-durability window; operators should think in hours, not seconds.
+
+### The precondition: refuse below WriteConsistency == R
+
+The grace window proves an ACKED delete reached every replica only when the
+write ack bar is ALL replicas (`requiredWriteAcks(wc, R) == R`; at R=2,
+WriteQuorum is 2 = all, so the common R=2 deployment qualifies). Below that
+bar (e.g. R=3 / WriteQuorum=2) a lagging replica may hold the pre-delete value
+as live KV with NO mechanism that bounds when it applies the delete
+(read-repair fires only on Quorum/All reads of that key), so no finite grace
+is safe and a purged tombstone would let the old value resurrect. The
+eligibility decision is a pure function (`internal/decide`), and an ineligible
+configuration REFUSES the purge loudly at mount rather than assuming.
+
+Two resurrection paths are ACCEPTED and stated rather than hidden:
+
+- An UNACKED delete (a failed W=R write that still landed on some replica)
+  can be purged into resurrection; the delete never happened officially - the
+  same call Cassandra's gc_grace makes.
+- Under RELAXED backend durability, an acked tombstone can be LOST from one
+  replica by a crash inside the write-durability window while an older,
+  long-flushed value survives beneath it. That divergence is normally healed
+  lazily by quorum-read repair - but it is unbounded in time, and if the
+  OTHER replica purges its tombstone first, the stale value wins the next
+  read and repair spreads it back. Operators who cannot accept this enable
+  purging only with awaited-durable writes on the backend (the backend's
+  write-durability knob), which closes the loss window the divergence needs.
+
+### The pass: CAS-guarded local native deletes
+
+The pass scans the position's LOCAL backend (no fan-out, no peer traffic),
+decodes each value with the ONE envelope codec (`Decode`), and collects keys
+whose envelope is an expired tombstone. Each candidate is then deleted through
+a per-key backend transaction: re-read the key, confirm it is still an
+expired tombstone, delete, commit - the whole window held under the SAME
+node-wide locks every local envelope writer takes (the apply-if-newer paths
+and the owner-local CAS commit). The locks are the atomicity: a backend
+transaction is not required to conflict-detect (the in-memory backend does
+not), so exclusion, not the commit, is what closes the guard-vs-subject race.
+A key found changed by the re-read is SKIPPED; on a backend that does detect
+conflicts, a racing commit surfaces as a pass abort - fail-closed either way. The delete is a NATIVE backend delete:
+it shadows the envelope history locally, and the engine's own compaction
+removes the native tombstone and everything below it by the standard last-run
+rule - the bytes physically leave the SSTs with no engine changes.
+
+Each delete is applied under the same per-unit write-pause read-lock local
+writes take, so a reshard cut-over quiesces the purge exactly as it quiesces
+writes. `ErrFenced` or `ErrClosed` aborts the pass: the position was
+superseded or the node is shutting down, and the successor's own mount purges
+instead. Passes run one at a time per node (a boot mounting many positions
+queues its passes rather than launching concurrent full scans). A pass that
+purged something logs one summary line; aborts log their own reason; an empty
+pass is silent.
+
+### Consistency while half-purged
+
+Replicas purge independently at their own mount times. Between them, a purged
+replica answers "absent" where an unpurged one answers "tombstone envelope";
+both decode to DELETED at the read layer, so Gets and scans read consistently
+through the entire window. This property is pinned by test.
+
+One consequence stated plainly: a Quorum/All read of a half-purged deleted
+key picks the surviving tombstone envelope as the LWW winner and read-repair
+RE-PLANTS it on the purged replica. That is churn, not corruption (the key
+still reads deleted everywhere); it means reclamation of quorum-read deleted
+keys converges only once EVERY replica has purged, i.e. after a full
+restart cycle.
+
+### Explicit non-goals
+
+- No engine-level compaction filter: slatedb has the API upstream
+  (`compaction_filters`), but the Go binding exposes no registration surface,
+  and the filter would need shale's envelope codec on the far side of the FFI.
+  If the binding ever grows the surface, the predicate can move there and this
+  pass becomes the fallback.
+- No purge at W < R (see the precondition), no anti-entropy pass, no
+  periodic scheduler.
+
 ## Roadmap
 
 - [ ] **v0.1** - single-node Cluster wrapping one Backend; memory backend impl; SlateDB backend impl; gRPC service (used by CLI + ready for v0.2 inter-node); `shaled` standalone binary; `shale` CLI with put/get/delete/scan/topology/stats/ping. API lockup.
