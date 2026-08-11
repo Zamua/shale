@@ -250,6 +250,20 @@ type Config struct {
 	// per-value semantics.
 	ReadConsistency ReadConsistency
 
+	// TombstoneGracePeriod enables the mount-time tombstone purge: when a
+	// replica position completes its mount, expired delete-tombstones (RF>1
+	// delete envelopes older than this window) are purged from that
+	// position's local backend so the engine's compaction can drop them
+	// physically (docs/SPEC.md "Tombstone purge"). Zero (the default)
+	// disables purging entirely.
+	//
+	// The window must dominate maximum cross-node clock skew plus the write
+	// durability window - think hours, not seconds. Purging requires the
+	// write ack bar to cover ALL replicas (at R=2, WriteQuorum already
+	// does); an enabled-but-ineligible configuration refuses loudly at
+	// mount instead of purging.
+	TombstoneGracePeriod time.Duration
+
 	// WriteTimeout bounds the wall-clock budget for a Put / Delete
 	// fanout. Each replica dispatch inherits this deadline through
 	// context.WithTimeout, so a blackholed peer (hung gRPC, half-open
