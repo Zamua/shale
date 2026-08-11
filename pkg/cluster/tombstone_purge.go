@@ -34,8 +34,10 @@ func (c *Cluster) startTombstonePurge(ru storageunit.ReplicaUnit) {
 	v := decide.TombstonePurge(grace, c.cfg.ReplicationFactor,
 		requiredWriteAcks(c.cfg.WriteConsistency, c.cfg.ReplicationFactor))
 	if !v.Eligible {
-		if grace > 0 {
-			c.logf("shale: tombstone purge REFUSED for %s: %s", ru, v.Reason)
+		if grace != 0 { // an operator ASKED for purging (even with a bad value): refuse loudly, once.
+			c.purgeRefusalOnce.Do(func() {
+				c.logf("shale: tombstone purge REFUSED (all positions): %s", v.Reason)
+			})
 		}
 		return
 	}
@@ -63,16 +65,29 @@ func (c *Cluster) TestingRunTombstonePurge() {
 	}
 }
 
+// errPurgeStopped marks a pass interrupted by shutdown mid-scan.
+var errPurgeStopped = errors.New("stopped by shutdown")
+
 // runTombstonePurge is one purge pass over ru's local backend: collect the
 // keys whose value is an expired tombstone envelope, then delete each through
 // a per-key transaction that re-checks the key first. Fail-closed throughout:
 // anything unreadable, undecodable, unexpired, or changed-underneath is KEPT.
 func (c *Cluster) runTombstonePurge(ru storageunit.ReplicaUnit, grace time.Duration) {
+	// One pass at a time per node: a boot mounting N positions must not launch
+	// N concurrent full scans of the store at the moment the node starts
+	// serving. Passes queue on the semaphore; shutdown drains the queue.
+	c.purgeSemOnce.Do(func() { c.purgeSem = make(chan struct{}, 1) })
+	select {
+	case c.purgeSem <- struct{}{}:
+		defer func() { <-c.purgeSem }()
+	case <-c.closeCh:
+		return
+	}
 	b, ok := c.mounts.backendFor(ru)
 	if !ok {
 		return // released before the pass started; the next mount purges.
 	}
-	candidates, scanned, err := collectExpiredTombstones(b, grace, uint64(time.Now().UnixNano()))
+	candidates, scanned, err := collectExpiredTombstones(b, grace, uint64(time.Now().UnixNano()), c.closed.Load)
 	if err != nil {
 		c.logf("shale: tombstone purge for %s aborted during scan (kept everything): %v", ru, err)
 		return
@@ -110,13 +125,16 @@ func (c *Cluster) runTombstonePurge(ru storageunit.ReplicaUnit, grace time.Durat
 // than grace. Values that fail to decode are kept without failing the pass:
 // the pass deletes only what it AFFIRMATIVELY recognizes as an expired
 // tombstone, and an undecodable value is not that.
-func collectExpiredTombstones(b backend.Backend, grace time.Duration, nowNanos uint64) (keys [][]byte, scanned int, err error) {
+func collectExpiredTombstones(b backend.Backend, grace time.Duration, nowNanos uint64, stop func() bool) (keys [][]byte, scanned int, err error) {
 	it, err := b.ScanPrefix(nil)
 	if err != nil {
 		return nil, 0, err
 	}
 	defer func() { _ = it.Close() }()
 	for {
+		if stop != nil && stop() {
+			return nil, scanned, errPurgeStopped
+		}
 		k, v, err := it.Next()
 		if err != nil {
 			return nil, scanned, err
@@ -137,16 +155,29 @@ func collectExpiredTombstones(b backend.Backend, grace time.Duration, nowNanos u
 }
 
 // purgeOneTombstone deletes key from b iff it still holds an expired
-// tombstone, atomically: the re-read and the delete share one transaction, so
-// a write racing the pass surfaces as a commit conflict (backend.ErrCASConflict)
-// instead of being clobbered - the guard and its subject come from one read at
-// one instant. The delete is applied under the unit's write-pause read-lock,
-// the same lock local writes take, so a reshard cut-over quiesces the purge
-// exactly as it quiesces writes.
+// tombstone, atomically: the re-read and the delete share one transaction, AND
+// the whole window runs under applyMu + casCommitMu - the two node-wide locks
+// that jointly cover every local envelope writer (the replica-receiving
+// apply-if-newer paths and the owner-local CAS commit). The locks are the
+// atomicity: the memory backend's transaction commit performs NO write-write
+// conflict detection (see the applyMu field doc, which prescribes exactly this
+// convention), so without them a write landing between the re-read and the
+// commit would be silently clobbered. On a backend that DOES conflict-detect,
+// a racing commit surfaces as an error the caller treats as an abort -
+// fail-closed either way. The guard and its subject come from one read at one
+// instant, under the same exclusion every local writer honors.
+//
+// The delete also holds the unit's write-pause read-lock, the same lock local
+// writes take, so a reshard cut-over quiesces the purge exactly as it
+// quiesces writes.
 func (c *Cluster) purgeOneTombstone(ru storageunit.ReplicaUnit, b backend.Backend, key []byte, grace time.Duration) error {
 	pause := c.pauseLockFor(ru.Unit.ID)
 	pause.RLock()
 	defer pause.RUnlock()
+	c.applyMu.Lock()
+	defer c.applyMu.Unlock()
+	c.casCommitMu.Lock()
+	defer c.casCommitMu.Unlock()
 
 	tx, err := b.Begin(backend.SnapshotIsolation)
 	if err != nil {

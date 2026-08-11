@@ -390,6 +390,9 @@ func (t *mountTable) finishStuckGainer(ru storageunit.ReplicaUnit) bool {
 	}
 	epoch, _ := t.openEpochOf(ru)
 	t.publishServing(ru, epoch, "overlap-rearm") // I/O: strictly after the unlock.
+	if t.purge != nil {
+		t.purge(ru) // becoming serving purges, on THIS path exactly as on mountServing.
+	}
 	return true
 }
 

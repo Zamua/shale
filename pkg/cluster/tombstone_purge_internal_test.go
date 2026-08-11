@@ -42,7 +42,9 @@ func purgeFixture(t *testing.T, grace time.Duration) (*Cluster, storageunit.Repl
 	t.Helper()
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2")
-	c.cfg.TombstoneGracePeriod = grace
+	// grace deliberately NOT set on cfg: the mount-time hook must not spawn
+	// background passes that race the test's plants; the tests drive
+	// runTombstonePurge / purgeOneTombstone with grace explicitly.
 	c.cfg.WriteConsistency = WriteQuorum // R=2: quorum == all.
 	if err := c.mountReplicaUnits(); err != nil {
 		t.Fatalf("mountReplicaUnits: %v", err)
@@ -89,7 +91,7 @@ func TestTombstonePurge_RewrittenKeyIsKeptByTheReCheck(t *testing.T) {
 	c, ru, b := purgeFixture(t, grace)
 
 	plantEnvelope(t, b, "contested", nil, 2*time.Hour)
-	keys, _, err := collectExpiredTombstones(b, grace, uint64(time.Now().UnixNano()))
+	keys, _, err := collectExpiredTombstones(b, grace, uint64(time.Now().UnixNano()), nil)
 	if err != nil || len(keys) != 1 {
 		t.Fatalf("collect: keys=%d err=%v, want the one expired tombstone", len(keys), err)
 	}
@@ -136,6 +138,96 @@ func TestTombstonePurge_RefusesBelowWriteAll(t *testing.T) {
 		t.Fatalf("ineligible purge did not refuse loudly; log: %q", log.String())
 	}
 }
+
+// The purge's guarded-delete window must be covered by the SAME exclusion
+// every local envelope writer honors (applyMu + casCommitMu): the memory
+// backend's transaction commit performs no conflict detection, so the locks
+// ARE the atomicity. Probed from inside the window: TryLock must fail for
+// both while the transaction is open.
+func TestTombstonePurge_GuardWindowHoldsTheWriterLocks(t *testing.T) {
+	const grace = time.Hour
+	c, ru, b := purgeFixture(t, grace)
+	plantEnvelope(t, b, "probed", nil, 2*time.Hour)
+
+	var applyFree, casFree bool
+	probe := &probeBackend{Backend: b, onTxGet: func() {
+		if c.applyMu.TryLock() {
+			applyFree = true
+			c.applyMu.Unlock()
+		}
+		if c.casCommitMu.TryLock() {
+			casFree = true
+			c.casCommitMu.Unlock()
+		}
+	}}
+	if err := c.purgeOneTombstone(ru, probe, []byte("probed"), grace); err != nil {
+		t.Fatalf("purgeOneTombstone: %v", err)
+	}
+	if applyFree {
+		t.Fatal("applyMu was free inside the guarded-delete window; a racing apply could be clobbered")
+	}
+	if casFree {
+		t.Fatal("casCommitMu was free inside the guarded-delete window; a racing CAS commit could be clobbered")
+	}
+	if _, err := b.Get([]byte("probed")); err == nil {
+		t.Fatal("expired tombstone survived the probed purge")
+	}
+}
+
+// probeBackend delegates to a real backend but fires onTxGet inside every
+// transaction Get - i.e., inside purgeOneTombstone's guarded window.
+type probeBackend struct {
+	backend.Backend
+	onTxGet func()
+}
+
+func (p *probeBackend) Begin(level backend.IsolationLevel) (backend.Transaction, error) {
+	tx, err := p.Backend.Begin(level)
+	if err != nil {
+		return nil, err
+	}
+	return &probeTx{Transaction: tx, onGet: p.onTxGet}, nil
+}
+
+type probeTx struct {
+	backend.Transaction
+	onGet func()
+}
+
+func (p *probeTx) Get(key []byte) ([]byte, error) {
+	v, err := p.Transaction.Get(key)
+	p.onGet()
+	return v, err
+}
+
+// A scan error aborts the collect fail-closed: no keys are returned for a
+// partial read, so nothing downstream can delete on incomplete evidence.
+func TestCollectExpiredTombstones_ScanErrorKeepsEverything(t *testing.T) {
+	keys, _, err := collectExpiredTombstones(&scanErrBackend{}, time.Hour, uint64(time.Now().UnixNano()), nil)
+	if err == nil {
+		t.Fatal("collect swallowed the scan error")
+	}
+	if len(keys) != 0 {
+		t.Fatalf("collect returned %d keys from a failed scan; a partial result must not be actionable", len(keys))
+	}
+}
+
+type scanErrBackend struct{ backend.Backend }
+
+func (s *scanErrBackend) ScanPrefix(_ []byte) (backend.Iterator, error) {
+	return &erringIter{}, nil
+}
+
+type erringIter struct{ n int }
+
+func (e *erringIter) Next() ([]byte, []byte, error) {
+	if e.n == 0 { // one healthy expired tombstone, then the failure
+		e.n++
+		return []byte("k"), Encode(Envelope{Stamp: Stamp{TimestampNanos: 1}, Payload: nil}), nil
+	}
+	return nil, nil, errors.New("iterator torn mid-scan")
+}
+func (e *erringIter) Close() error { return nil }
 
 // mountServing invokes the purge hook once per serving mount, beside the
 // marker publish - the same seam, the same unforgettability argument.

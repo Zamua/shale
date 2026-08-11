@@ -2378,19 +2378,33 @@ is safe and a purged tombstone would let the old value resurrect. The
 eligibility decision is a pure function (`internal/decide`), and an ineligible
 configuration REFUSES the purge loudly at mount rather than assuming.
 
-An UNACKED delete (a failed W=R write that still landed on some replica) can
-be purged into resurrection; the delete never happened officially, so this is
-accepted - the same call Cassandra's gc_grace makes.
+Two resurrection paths are ACCEPTED and stated rather than hidden:
+
+- An UNACKED delete (a failed W=R write that still landed on some replica)
+  can be purged into resurrection; the delete never happened officially - the
+  same call Cassandra's gc_grace makes.
+- Under RELAXED backend durability, an acked tombstone can be LOST from one
+  replica by a crash inside the write-durability window while an older,
+  long-flushed value survives beneath it. That divergence is normally healed
+  lazily by quorum-read repair - but it is unbounded in time, and if the
+  OTHER replica purges its tombstone first, the stale value wins the next
+  read and repair spreads it back. Operators who cannot accept this enable
+  purging only with awaited-durable writes on the backend (the backend's
+  write-durability knob), which closes the loss window the divergence needs.
 
 ### The pass: CAS-guarded local native deletes
 
 The pass scans the position's LOCAL backend (no fan-out, no peer traffic),
 decodes each value with the ONE envelope codec (`Decode`), and collects keys
 whose envelope is an expired tombstone. Each candidate is then deleted through
-a per-key backend transaction: re-read the key, confirm it is STILL the same
-expired tombstone, delete, commit. A commit conflict means the key changed
-underneath (a re-create raced the pass) - the key is SKIPPED, closing the
-guard-vs-subject race by construction. The delete is a NATIVE backend delete:
+a per-key backend transaction: re-read the key, confirm it is still an
+expired tombstone, delete, commit - the whole window held under the SAME
+node-wide locks every local envelope writer takes (the apply-if-newer paths
+and the owner-local CAS commit). The locks are the atomicity: a backend
+transaction is not required to conflict-detect (the in-memory backend does
+not), so exclusion, not the commit, is what closes the guard-vs-subject race.
+A key found changed by the re-read is SKIPPED; on a backend that does detect
+conflicts, a racing commit surfaces as a pass abort - fail-closed either way. The delete is a NATIVE backend delete:
 it shadows the envelope history locally, and the engine's own compaction
 removes the native tombstone and everything below it by the standard last-run
 rule - the bytes physically leave the SSTs with no engine changes.
@@ -2399,7 +2413,10 @@ Each delete is applied under the same per-unit write-pause read-lock local
 writes take, so a reshard cut-over quiesces the purge exactly as it quiesces
 writes. `ErrFenced` or `ErrClosed` aborts the pass: the position was
 superseded or the node is shutting down, and the successor's own mount purges
-instead. The pass logs one summary line (scanned / purged / skipped / aborted).
+instead. Passes run one at a time per node (a boot mounting many positions
+queues its passes rather than launching concurrent full scans). A pass that
+purged something logs one summary line; aborts log their own reason; an empty
+pass is silent.
 
 ### Consistency while half-purged
 
@@ -2407,6 +2424,13 @@ Replicas purge independently at their own mount times. Between them, a purged
 replica answers "absent" where an unpurged one answers "tombstone envelope";
 both decode to DELETED at the read layer, so Gets and scans read consistently
 through the entire window. This property is pinned by test.
+
+One consequence stated plainly: a Quorum/All read of a half-purged deleted
+key picks the surviving tombstone envelope as the LWW winner and read-repair
+RE-PLANTS it on the purged replica. That is churn, not corruption (the key
+still reads deleted everywhere); it means reclamation of quorum-read deleted
+keys converges only once EVERY replica has purged, i.e. after a full
+restart cycle.
 
 ### Explicit non-goals
 
