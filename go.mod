@@ -16,7 +16,7 @@ require (
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260526163538-3dc84a4a5aaa
 	google.golang.org/grpc v1.81.1
 	google.golang.org/protobuf v1.36.11
-	slatedb.io/slatedb-go v0.13.1
+	slatedb.io/slatedb-go v0.14.1
 )
 
 require (
