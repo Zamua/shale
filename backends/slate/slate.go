@@ -408,7 +408,9 @@ func (s *Slate) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	if s.db == nil {
 		return nil, backend.ErrClosed
 	}
-	it, err := s.db.ScanPrefix(prefix)
+	// The zero KeyRange (no bounds) scans the whole prefix - the pre-v0.14
+	// single-argument behavior.
+	it, err := s.db.ScanPrefix(prefix, slatedb.KeyRange{})
 	if err != nil {
 		return nil, fenceTag("slate: scan prefix", err)
 	}
@@ -596,7 +598,7 @@ func (t *transaction) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	if t.done || t.tx == nil {
 		return nil, backend.ErrClosed
 	}
-	it, err := t.tx.ScanPrefix(prefix)
+	it, err := t.tx.ScanPrefix(prefix, slatedb.KeyRange{})
 	if err != nil {
 		return nil, fenceTag("slate: tx scan prefix", err)
 	}
