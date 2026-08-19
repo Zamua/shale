@@ -26,9 +26,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
@@ -43,11 +43,11 @@ import (
 // a shared backing. Several sharedNodes off one Backing model a cluster
 // whose units live in shared storage, so a lease handoff is copy-free.
 type sharedNode struct {
-	ID       string
-	Cluster  *cluster.Cluster
-	Handle   *sharedfactory.Handle
-	BindAddr string
-	GRPCAddr string
+	ID           string
+	Cluster      *cluster.Cluster
+	Handle       *sharedfactory.Handle
+	ClusterToken string
+	GRPCAddr     string
 
 	stop func()
 }
@@ -87,16 +87,8 @@ func startSharedNode(t *testing.T, id, seedAddr string, unitCount int, backing *
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 300 * time.Millisecond,
 	}
-	gcfg := gossip.Config{LogOutput: io.Discard}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
-
-	// openClusterRetryBind fills in the coordinator's bind address (re-rolling
-	// a fresh port and retrying if memberlist hits the release-rebind port
-	// race) and returns the address actually bound, which the node advertises
-	// as its seed.
-	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
+	store, token := coordStoreFor(t, seedAddr)
+	c := clustertest.OpenClusterCAS(t, cfg, store)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
@@ -105,11 +97,11 @@ func startSharedNode(t *testing.T, id, seedAddr string, unitCount int, backing *
 	}()
 
 	n := &sharedNode{
-		ID:       id,
-		Cluster:  c,
-		Handle:   h,
-		BindAddr: bindAddr,
-		GRPCAddr: grpcAddr,
+		ID:           id,
+		Cluster:      c,
+		Handle:       h,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -173,7 +165,7 @@ func TestLeaseHandoff_NoAckedWriteLost(t *testing.T) {
 
 	// Join the second node. Membership convergence + the reconcile (debounced
 	// by the 300ms settle delay) hand off roughly half the units to it.
-	n2 := startSharedNode(t, "lh2", n1.BindAddr, unitCount, backing)
+	n2 := startSharedNode(t, "lh2", n1.ClusterToken, unitCount, backing)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("ring convergence: %v", err)
@@ -257,8 +249,8 @@ func TestLeaseHandoff_NodeLeaveSurvivorReacquires(t *testing.T) {
 	const unitCount = 16
 	backing := sharedfactory.NewBacking()
 	n1 := startSharedNode(t, "lv1", "", unitCount, backing)
-	n2 := startSharedNode(t, "lv2", n1.BindAddr, unitCount, backing)
-	n3 := startSharedNode(t, "lv3", n1.BindAddr, unitCount, backing)
+	n2 := startSharedNode(t, "lv2", n1.ClusterToken, unitCount, backing)
+	n3 := startSharedNode(t, "lv3", n1.ClusterToken, unitCount, backing)
 	all := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(all, 3, 15*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)

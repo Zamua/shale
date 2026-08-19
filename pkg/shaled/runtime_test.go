@@ -30,8 +30,6 @@ func TestStdConfig_RequiresNodeID(t *testing.T) {
 func TestStdConfig_DefaultsAndEnv(t *testing.T) {
 	t.Setenv("SHALE_NODE_ID", "node-from-env")
 	t.Setenv("SHALE_GRPC_ADDR", "")
-	t.Setenv("SHALE_BIND_ADDR", "")
-	t.Setenv("SHALE_SEEDS", "")
 
 	fs := flag.NewFlagSet("test", flag.ContinueOnError)
 	std := BindStdFlags(fs)
@@ -47,12 +45,6 @@ func TestStdConfig_DefaultsAndEnv(t *testing.T) {
 	}
 	if std.GRPCAddr != ":7947" {
 		t.Fatalf("GRPCAddr default: want :7947, got %q", std.GRPCAddr)
-	}
-	if std.BindAddr != ":7946" {
-		t.Fatalf("BindAddr default: want :7946, got %q", std.BindAddr)
-	}
-	if len(std.Seeds) != 0 {
-		t.Fatalf("Seeds: want empty, got %v", std.Seeds)
 	}
 }
 
@@ -73,27 +65,6 @@ func TestStdConfig_FlagOverridesEnv(t *testing.T) {
 	}
 	if std.GRPCAddr != ":2222" {
 		t.Fatalf("grpc-addr: flag should win; got %q", std.GRPCAddr)
-	}
-}
-
-func TestStdConfig_SeedsParsing(t *testing.T) {
-	t.Setenv("SHALE_NODE_ID", "n1")
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	std := BindStdFlags(fs)
-	if err := fs.Parse([]string{"--seeds", " a:1 , , b:2 ,"}); err != nil {
-		t.Fatalf("parse: %v", err)
-	}
-	if err := std.Validate(); err != nil {
-		t.Fatalf("validate: %v", err)
-	}
-	want := []string{"a:1", "b:2"}
-	if len(std.Seeds) != len(want) {
-		t.Fatalf("seeds: want %v, got %v", want, std.Seeds)
-	}
-	for i := range want {
-		if std.Seeds[i] != want[i] {
-			t.Fatalf("seeds[%d]: want %q, got %q", i, want[i], std.Seeds[i])
-		}
 	}
 }
 
@@ -195,7 +166,7 @@ func TestRun_RejectsNeitherBackendNorFactory(t *testing.T) {
 
 // TestRun_MultiBackendSingleNode drives Run end to end in MULTI-BACKEND
 // mode with an in-process memory factory (no -tags slatedb, no MinIO):
-// single-node (BindAddr empty), an ephemeral gRPC listener, UnitCount
+// single-node (Coordinator nil), an ephemeral gRPC listener, UnitCount
 // threaded from Std. Run blocks until SIGTERM; a clean nil return proves
 // cluster.Open accepted the BackendFactory + UnitCount Run built into the
 // cluster.Config (a misthreaded UnitCount would make Open fail the
@@ -241,25 +212,6 @@ func TestRun_MultiBackendSingleNode(t *testing.T) {
 	}
 }
 
-func TestSplitSeeds(t *testing.T) {
-	cases := []struct {
-		in   string
-		want []string
-	}{
-		{"", nil},
-		{"  ", nil},
-		{"a:1", []string{"a:1"}},
-		{"a:1,b:2", []string{"a:1", "b:2"}},
-		{" a:1 , , b:2 ,", []string{"a:1", "b:2"}},
-	}
-	for _, tc := range cases {
-		got := SplitSeeds(tc.in)
-		if !equalSlices(got, tc.want) {
-			t.Errorf("SplitSeeds(%q): want %v, got %v", tc.in, tc.want, got)
-		}
-	}
-}
-
 func TestEnvOr(t *testing.T) {
 	t.Setenv("SHALED_TEST_KEY", "")
 	if got := EnvOr("SHALED_TEST_KEY", "fallback"); got != "fallback" {
@@ -268,114 +220,5 @@ func TestEnvOr(t *testing.T) {
 	t.Setenv("SHALED_TEST_KEY", "value")
 	if got := EnvOr("SHALED_TEST_KEY", "fallback"); got != "value" {
 		t.Errorf("want env value when set, got %q", got)
-	}
-}
-
-func equalSlices(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for i := range a {
-		if a[i] != b[i] {
-			return false
-		}
-	}
-	return true
-}
-
-// -- single-backend bind-address resolution ---------------------------
-//
-// A single Backend is single-node only. The shared flag constructor
-// defaults --bind-addr to ":7946" because shaled-slate needs that default
-// (its multi-backend mode is a real multi-node configuration), so a
-// single-backend binary has to tell a DEFAULTED bind address apart from an
-// explicit one. These pin all three outcomes.
-
-func parseStdFlags(t *testing.T, args ...string) *StdConfig {
-	t.Helper()
-	t.Setenv("SHALE_NODE_ID", "n1")
-	fs := flag.NewFlagSet("test", flag.ContinueOnError)
-	fs.SetOutput(io.Discard)
-	std := BindStdFlags(fs)
-	if err := fs.Parse(args); err != nil {
-		t.Fatalf("parse %v: %v", args, err)
-	}
-	if err := std.Validate(); err != nil {
-		t.Fatalf("validate %v: %v", args, err)
-	}
-	return std
-}
-
-func TestResolveSingleBackendBindAddr_DefaultedIsBlanked(t *testing.T) {
-	t.Setenv("SHALE_BIND_ADDR", "")
-	std := parseStdFlags(t)
-	if std.BindAddr == "" {
-		t.Fatal("precondition: the flag default should be non-empty")
-	}
-	got, err := resolveSingleBackendBindAddr(std)
-	if err != nil {
-		t.Fatalf("bare invocation should resolve, got %v", err)
-	}
-	if got != "" {
-		t.Fatalf("defaulted bind address should be blanked, got %q", got)
-	}
-}
-
-func TestResolveSingleBackendBindAddr_ExplicitFlagIsKept(t *testing.T) {
-	t.Setenv("SHALE_BIND_ADDR", "")
-	std := parseStdFlags(t, "--bind-addr", "127.0.0.1:9999")
-	got, err := resolveSingleBackendBindAddr(std)
-	if err != nil {
-		t.Fatalf("explicit bind address should resolve here (Open refuses it later), got %v", err)
-	}
-	// Kept, so cluster.Open can refuse it with the message naming the
-	// multi-backend requirement instead of silently downgrading.
-	if got != "127.0.0.1:9999" {
-		t.Fatalf("explicit bind address should be kept, got %q", got)
-	}
-}
-
-func TestResolveSingleBackendBindAddr_ExplicitEnvIsKept(t *testing.T) {
-	t.Setenv("SHALE_BIND_ADDR", "127.0.0.1:9998")
-	std := parseStdFlags(t)
-	got, err := resolveSingleBackendBindAddr(std)
-	if err != nil {
-		t.Fatalf("env-supplied bind address should resolve here, got %v", err)
-	}
-	if got != "127.0.0.1:9998" {
-		t.Fatalf("env-supplied bind address should be kept, got %q", got)
-	}
-}
-
-// The trap that blanking a defaulted bind address would otherwise open: an
-// operator who passes seeds but no bind address would get a node that
-// silently ignores them and joins nothing. Across a fleet that is N
-// independent divergent stores, so it is an error.
-func TestResolveSingleBackendBindAddr_SeedsWithoutBindAddrIsAnError(t *testing.T) {
-	t.Setenv("SHALE_BIND_ADDR", "")
-	std := parseStdFlags(t, "--seeds", "10.0.0.1:7946")
-	_, err := resolveSingleBackendBindAddr(std)
-	if err == nil {
-		t.Fatal("seeds without an explicit bind address should be refused")
-	}
-	if !strings.Contains(err.Error(), "--bind-addr") {
-		t.Fatalf("error should name --bind-addr, got %v", err)
-	}
-}
-
-// Run must surface that refusal, not just the helper.
-func TestRun_SingleBackendRejectsSeedsWithoutBindAddr(t *testing.T) {
-	t.Setenv("SHALE_BIND_ADDR", "")
-	std := parseStdFlags(t, "--seeds", "10.0.0.1:7946", "--grpc-addr", "127.0.0.1:0")
-	err := Run(RunConfig{
-		Std:     *std,
-		Logger:  log.New(io.Discard, "", 0),
-		Backend: memory.New(),
-	})
-	if err == nil {
-		t.Fatal("Run should refuse seeds without a bind address")
-	}
-	if !strings.Contains(err.Error(), "--bind-addr") {
-		t.Fatalf("error should name --bind-addr, got %v", err)
 	}
 }

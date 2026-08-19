@@ -1,16 +1,12 @@
 package integration
 
-// FULL-CLUSTER verification that the CURRENT code (#473 unique memberlist names)
-// recovers the exact reclaim-gate failure at the ring + write-recovery level: a
-// node marked DEAD at its old address, then a same-stable-id successor appearing
-// at a NEW address (with connectivity), must be re-integrated so the ring
-// re-converges and writes recover. The membership-layer pre/post proof lives in
-// pkg/membership/reclaim_supersession_repro_test.go; this is its cluster-level
-// counterpart (the "ring re-converges + writes recover" half of the gate).
+// FULL-CLUSTER verification of same-identity supersession: a node expired as
+// dead at its old address, then a same-stable-id successor appearing at a NEW
+// address (with connectivity), must be re-integrated so the ring re-converges
+// and writes recover.
 
 import (
 	"bytes"
-	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -35,10 +31,9 @@ func (s *logBuf) String() string {
 	return s.b.String()
 }
 
-// TestReclaimGate_FullClusterRejoinRecovers proves the current code integrates a
-// same-stable-id/new-address rejoin after the old instance was reaped DEAD, so
-// the ring re-converges and writes recover, with no conflicting-address
-// rejection. This is the cluster-level "with the fix it supersedes" assertion.
+// TestReclaimGate_FullClusterRejoinRecovers pins that a same-stable-id/
+// new-address rejoin after the old instance was expired as dead re-integrates:
+// the ring re-converges and writes recover.
 func TestReclaimGate_FullClusterRejoinRecovers(t *testing.T) {
 	const uc, rf = 16, 2
 	backing := sharedfactory.NewBacking()
@@ -46,13 +41,13 @@ func TestReclaimGate_FullClusterRejoinRecovers(t *testing.T) {
 	mk := func(id, seed string, buf *logBuf) *sharedNode {
 		return startReplicatedNodeCfg(t, id, seed, uc, rf, backing, func(cfg *cluster.Config) {
 			if buf != nil {
-				cfg.LogOutput = buf // cluster passes LogOutput to memberlist, capturing "Conflicting address"
+				cfg.LogOutput = buf // captured for failure diagnostics
 			}
 		})
 	}
 	n1 := mk("n1", "", b1)
-	n2 := mk("n2", n1.BindAddr, b2)
-	n3 := mk("n3", n1.BindAddr, nil)
+	n2 := mk("n2", n1.ClusterToken, b2)
+	n3 := mk("n3", n1.ClusterToken, nil)
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {
 		t.Fatalf("baseline convergence: %v", err)
@@ -78,7 +73,7 @@ func TestReclaimGate_FullClusterRejoinRecovers(t *testing.T) {
 	t.Logf("n3 reaped DEAD: n1 + n2 both see 2 members")
 
 	// REJOIN n3 with the SAME stable id, a NEW address, seeded to the live n1.
-	n3b := mk("n3", n1.BindAddr, nil)
+	n3b := mk("n3", n1.ClusterToken, nil)
 	cs = []*cluster.Cluster{n1.Cluster, n2.Cluster, n3b.Cluster}
 
 	// The ring must re-converge to 3 on EVERY node (the successor is superseded in,
@@ -88,14 +83,6 @@ func TestReclaimGate_FullClusterRejoinRecovers(t *testing.T) {
 			"n1 log tail:\n%s", err, tail(b1.String(), 1500))
 	}
 	t.Logf("ring re-converged to 3 after same-id/new-address rejoin")
-
-	// No conflicting-address rejection should have been logged (that is the pre-#473
-	// failure). Its presence would mean the gate bit.
-	for id, buf := range map[string]*logBuf{"n1": b1, "n2": b2} {
-		if strings.Contains(buf.String(), "Conflicting address") {
-			t.Errorf("unexpected reclaim-gate rejection on %s ('Conflicting address' logged) - #473 should prevent it", id)
-		}
-	}
 
 	// Writes must recover on every unit, and the seeded dataset must survive.
 	keys := unitKeys(uc)
@@ -129,8 +116,8 @@ func TestReclaimGate_FullClusterRejoinRecovers(t *testing.T) {
 	if lost > 0 {
 		t.Fatalf("durability: %d/%d seeded keys lost after rejoin", lost, len(want))
 	}
-	t.Logf("RECOVERED: ring re-converged, all %d units writable, %d seeded keys durable - #473 supersedes the "+
-		"same-id/new-address rejoin with no reclaim-gate rejection", uc, len(want))
+	t.Logf("RECOVERED: ring re-converged, all %d units writable, %d seeded keys durable after the "+
+		"same-id/new-address rejoin", uc, len(want))
 }
 
 // tail returns the last n bytes of s (a log tail for failure diagnostics).

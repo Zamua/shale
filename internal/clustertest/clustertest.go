@@ -3,19 +3,13 @@
 // Cluster instances over loopback (the cluster package's external tests
 // and the integration tree).
 //
-// Why a shared package: both trees need the same primitives - draw an
-// ephemeral port memberlist can actually bind, open a Cluster while
-// tolerating the release-then-rebind race, wait for the ring to
+// Why a shared package: both trees need the same primitives - build a
+// coordinator at the shared test cadence, wait for the ring to
 // converge, wait until a freshly-joined cluster is genuinely
 // write-ready, and classify the transient gRPC codes a warming cluster
-// emits. Kept as hand-copied pairs those definitions drift: the two
-// freePort implementations diverged, one probing TCP+UDP with a retry
-// loop (memberlist binds both protocols on the same port, so a TCP-only
-// probe can hand back a port already taken on UDP) and the other
-// probing TCP only, which meant a port-race fix made in one tree never
-// reached the other. Routing both trees through this package makes that
-// drift impossible, exactly as internal/goleakignore does for the
-// goleak ignore lists.
+// emits. Kept as hand-copied pairs those definitions drift; routing
+// both trees through this package makes that drift impossible, exactly
+// as internal/goleakignore does for the goleak ignore lists.
 //
 // The helpers depend only on the cluster package's PUBLIC surface, the
 // same surface the external tests use, so there is no import cycle.
@@ -23,35 +17,23 @@ package clustertest
 
 import (
 	"fmt"
-	"slices"
+	"io"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
 	"github.com/Zamua/shale/internal/testport"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
+	"github.com/Zamua/shale/pkg/coord/cas"
+	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
 
-// FreePort returns an OS-assigned ephemeral port that's free on both
-// TCP and UDP. memberlist binds both protocols on the same port, so a
-// TCP-only probe can hand back a port already taken on UDP, causing
-// flaky bind failures under load (especially on CI). Probe both, retry
-// on collision.
-//
-// Probing cannot RESERVE the port: there is a real race between
-// releasing the probe listeners and the caller binding the number for
-// real, and under a stress loop that surfaces as "address already in
-// use" out of memberlist.Create. Callers that bind the result for a
-// Cluster should go through OpenClusterRetryBind, which re-rolls a
-// fresh port and retries on exactly that conflict.
-// FreePort returns a port free on both TCP and UDP. The implementation lives
-// in internal/testport so the three test packages that need it cannot drift:
-// this was the only correct copy, and the other two had silently kept the
-// TCP-only version that fails under a whole-repo run.
+// FreePort returns an OS-assigned ephemeral port free on both TCP and UDP.
+// The implementation lives in internal/testport so the test packages that
+// need it cannot drift. Probing cannot RESERVE the port: a caller that binds
+// the result accepts the release-then-rebind race.
 func FreePort(t *testing.T) int {
 	t.Helper()
 	return testport.Free(t)
@@ -62,70 +44,41 @@ func HostPort(port int) string {
 	return "127.0.0.1:" + strconv.Itoa(port)
 }
 
-// IsBindConflict reports whether err is a memberlist.Create failure
-// caused by another listener already holding the bind port (the
-// release-then-rebind race FreePort cannot close on its own). memberlist
-// wraps the OS bind error as "failed to start TCP/UDP listener on ...:
-// bind: address already in use"; we match the stable substring rather
-// than reaching for syscall.EADDRINUSE so the check survives the wrap.
-func IsBindConflict(err error) bool {
-	return err != nil && strings.Contains(err.Error(), "address already in use")
+// Shared CAS-coordinator test cadence: the same ratios as the production
+// defaults (renewal 2s / poll 1s / 5 expiry polls), shrunk so a silent death
+// is detected in ExpiryPolls*poll = 250ms of observed silence against a
+// 100ms renewal - the same 2.5x margin.
+const (
+	CASTestRenewal     = 100 * time.Millisecond
+	CASTestPoll        = 50 * time.Millisecond
+	CASTestExpiryPolls = 5
+)
+
+// CASCoordinator returns an unstarted CAS coordinator over store at the
+// shared test cadence, with quiet logs. Every node of one in-process test
+// cluster passes the SAME store instance: the store IS the discovery
+// mechanism, so the first node to Open founds the cluster and every later
+// one joins by CAS-appending its row - no bind address, no seed list.
+func CASCoordinator(store storageunit.ConditionalStore) *cas.Coordinator {
+	return cas.New(cas.Config{
+		Store:           store,
+		RenewalInterval: CASTestRenewal,
+		PollInterval:    CASTestPoll,
+		ExpiryPolls:     CASTestExpiryPolls,
+		LogOutput:       io.Discard,
+	})
 }
 
-// OpenClusterRetryBind opens a Cluster, retrying on a memberlist bind
-// conflict with a FRESH port each time. A gossip coordinator is built per
-// attempt with gcfg plus a new FreePort allocation (including on the first, so
-// the caller does not have to seed a bind address), and the BindAddr actually
-// bound is returned so the node fixture advertises the right seed address.
-//
-// The bind now happens inside cluster.Open, when it starts the coordinator, so
-// the retry still wraps exactly one call. This
-// waits on a REAL condition (a successful bind), not a sleep: it loops
-// only while memberlist reports the port is taken, and fails loudly if
-// every attempt in the bounded budget conflicts (which would indicate a
-// genuine port-exhaustion problem, not the transient release-rebind
-// race). A non-bind error (bad config, join failure) returns
-// immediately - those are real test failures, not flakes to retry.
-//
-// forbiddenPorts, if supplied, are bind ports the node must NOT be given:
-// a drawn port that matches one is discarded and re-rolled. This exists for
-// tests that hard-kill a node and start a replacement that must be
-// UNREACHABLE from the survivors. Killing a node does not erase it from its
-// peers' memberlist tables, and memberlist keeps gossiping to a member it
-// has declared dead for GossipToTheDeadTime. So for that whole window the
-// dead node's address is still live bait: whatever binds it next is fused
-// into the cluster, regardless of that process's own seed configuration.
-// A replacement that happens to draw the corpse's port therefore silently
-// rejoins the cluster it was supposed to be isolated from. Excluding the
-// port closes that door by construction instead of relying on the OS's
-// ephemeral-port allocator not to reuse it (darwin's is sequential and
-// effectively never does, which is why this hides on a Mac and bites on a
-// Linux CI runner, whose allocator is randomized).
-func OpenClusterRetryBind(t *testing.T, cfg cluster.Config, gcfg gossip.Config, forbiddenPorts ...int) (*cluster.Cluster, string) {
+// OpenClusterCAS wires a CASCoordinator over store into cfg and opens the
+// Cluster, failing the test on any Open error.
+func OpenClusterCAS(t *testing.T, cfg cluster.Config, store storageunit.ConditionalStore) *cluster.Cluster {
 	t.Helper()
-	const maxAttempts = 8
-	var lastErr error
-	for range maxAttempts {
-		port := FreePort(t)
-		if slices.Contains(forbiddenPorts, port) {
-			// Drew a forbidden port (e.g. a just-killed node's address).
-			// Re-roll; FreePort hands out a fresh allocation each call.
-			continue
-		}
-		bindAddr := HostPort(port)
-		gcfg.BindAddr = bindAddr
-		cfg.Coordinator = gossip.New(gcfg)
-		c, err := cluster.Open(cfg)
-		if err == nil {
-			return c, bindAddr
-		}
-		if !IsBindConflict(err) {
-			t.Fatalf("OpenClusterRetryBind %s: cluster.Open: %v", cfg.NodeID, err)
-		}
-		lastErr = err
+	cfg.Coordinator = CASCoordinator(store)
+	c, err := cluster.Open(cfg)
+	if err != nil {
+		t.Fatalf("OpenClusterCAS %s: cluster.Open: %v", cfg.NodeID, err)
 	}
-	t.Fatalf("OpenClusterRetryBind %s: %d bind attempts all hit a port conflict: %v", cfg.NodeID, maxAttempts, lastErr)
-	return nil, ""
+	return c
 }
 
 // WaitForRingSize polls c.Members() until it has want entries or the
@@ -143,19 +96,19 @@ func WaitForRingSize(c *cluster.Cluster, want int, timeout time.Duration) error 
 }
 
 // converged reports whether BOTH member bases hold exactly want members: the
-// membership VIEW (gossip truth, where a join/leave lands first) and the
-// PLACEMENT basis (the ring routing is computed over, which trails the view
-// by an event-loop hop). Readiness must gate on both - the view alone is
-// satisfied before the ring has absorbed the change, so a test that proceeds
-// on it races the takeover its "converged" cluster has not started
-// (post-leave, WaitForRebalanceIdle reads vacuously idle in that window
-// because the un-evicted ring never scheduled a reconcile).
+// membership VIEW (where a join/leave lands first) and the PLACEMENT basis
+// (the ring routing is computed over; an adapter may let it trail the view).
+// Readiness must gate on both - the view alone is satisfied before the ring
+// has absorbed the change, so a test that proceeds on it races the takeover
+// its "converged" cluster has not started (post-leave, WaitForRebalanceIdle
+// reads vacuously idle in that window because the un-evicted ring never
+// scheduled a reconcile).
 func converged(c *cluster.Cluster, want int) bool {
 	return len(c.Members()) == want && len(c.PlacementMembers()) == want
 }
 
 // WaitForMembersAll polls every cluster in cs until they each report
-// want members. Convergence under SWIM gossip is not synchronous - a
+// want members. Convergence rides each node's own poll cadence - a
 // fresh join can reach the seed before reaching the other peers - so
 // any multi-node assertion must wait for every node to agree on the
 // ring before issuing routed ops.
@@ -207,17 +160,17 @@ func WaitForMembersAll(cs []*cluster.Cluster, want int, timeout time.Duration) e
 //     hashing, every member is the local-self leg for at least one)
 //     THROUGH EVERY node.
 //  2. STABILITY across time. The rebalance-idle wait can return idle,
-//     then a LATE-arriving SWIM gossip join notification (push/pull sync
-//     still converging under load) fires a fresh debounced reconcile that
-//     reopens a StateReceiving window MID-TEST - so a write partway
-//     through a test fails even though the first writes succeeded. A
-//     single passing probe does not prove the ring will stay stable. This
-//     gate therefore requires a full CLEAN SWEEP: every (node, key) probe
-//     must succeed within ONE uninterrupted pass. Any transient anywhere
-//     in a pass restarts the whole pass. Completing a clean sweep proves
-//     the ring held stable (no reopened receiving window, every server
-//     accepting) for the full duration of that pass - the deterministic
-//     stand-in for "the late gossip rounds have drained."
+//     then a LATE-arriving join observation (a poll landing under load)
+//     fires a fresh debounced reconcile that reopens a StateReceiving
+//     window MID-TEST - so a write partway through a test fails even
+//     though the first writes succeeded. A single passing probe does not
+//     prove the ring will stay stable. This gate therefore requires a
+//     full CLEAN SWEEP: every (node, key) probe must succeed within ONE
+//     uninterrupted pass. Any transient anywhere in a pass restarts the
+//     whole pass. Completing a clean sweep proves the ring held stable
+//     (no reopened receiving window, every server accepting) for the full
+//     duration of that pass - the deterministic stand-in for "the late
+//     membership observations have drained."
 //
 // It retries ONLY transient warmup errors (Unavailable: refused dial /
 // not enough acks yet; ResourceExhausted: a partition still mid-

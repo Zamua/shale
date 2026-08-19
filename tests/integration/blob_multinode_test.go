@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/pkg/blob"
 	"github.com/Zamua/shale/pkg/blob/blobmem"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -22,9 +22,9 @@ import (
 // through the production NewBlobKV constructor (cfg.BlobStore set) so the
 // integration test exercises the real wiring, not a test-only wrapper.
 type blobNode struct {
-	ID       string
-	Blob     *cluster.BlobKV
-	BindAddr string
+	ID           string
+	Blob         *cluster.BlobKV
+	ClusterToken string
 
 	stop func()
 }
@@ -41,7 +41,7 @@ func (n *blobNode) Close() {
 }
 
 // startBlobNode brings up one blob-capable node joined to seedAddr (empty = the
-// first node). It mirrors startTestNodeWithReplication's gRPC + memberlist
+// first node). It mirrors startTestNodeWithReplication's gRPC + coordinator
 // wiring, but builds the cluster via NewBlobKV with the SHARED object store so
 // every node reaches the same byte plane. The gRPC server is registered against
 // the underlying *Cluster so routed pointer ops forward between nodes.
@@ -66,31 +66,11 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 		RebalanceSettleDelay: 500 * time.Millisecond,
 		ReplicationFactor:    1,
 	}
-	gcfg := gossip.Config{LogOutput: io.Discard}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
-
-	// NewBlobKV opens the cluster internally; retry the bind on the
-	// release-rebind port race, mirroring openClusterRetryBind.
-	var bkv *cluster.BlobKV
-	var bindAddr string
-	const maxAttempts = 8
-	for range maxAttempts {
-		bindAddr = hostPort(freePort(t))
-		gcfg.BindAddr = bindAddr
-		cfg.Coordinator = gossip.New(gcfg)
-		b, oerr := cluster.NewBlobKV(cfg)
-		if oerr == nil {
-			bkv = b
-			break
-		}
-		if !isBindConflict(oerr) {
-			t.Fatalf("startBlobNode %s: NewBlobKV: %v", id, oerr)
-		}
-	}
-	if bkv == nil {
-		t.Fatalf("startBlobNode %s: all bind attempts hit a port conflict", id)
+	condStore, token := coordStoreFor(t, seedAddr)
+	cfg.Coordinator = clustertest.CASCoordinator(condStore)
+	bkv, err := cluster.NewBlobKV(cfg)
+	if err != nil {
+		t.Fatalf("startBlobNode %s: NewBlobKV: %v", id, err)
 	}
 
 	rpc.NewServer(bkv.Cluster()).Register(grpcSrv)
@@ -100,9 +80,9 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 	}()
 
 	n := &blobNode{
-		ID:       id,
-		Blob:     bkv,
-		BindAddr: bindAddr,
+		ID:           id,
+		Blob:         bkv,
+		ClusterToken: token,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -134,8 +114,8 @@ func TestBlobMultiNode_PointerRoutesBytesShared(t *testing.T) {
 	// it; a blob staged via one node is byte-reachable from any node.
 	store := blobmem.New()
 	n1 := startBlobNode(t, "bn1", "", store)
-	n2 := startBlobNode(t, "bn2", n1.BindAddr, store)
-	n3 := startBlobNode(t, "bn3", n1.BindAddr, store)
+	n2 := startBlobNode(t, "bn2", n1.ClusterToken, store)
+	n3 := startBlobNode(t, "bn3", n1.ClusterToken, store)
 
 	clusters := []*cluster.Cluster{n1.Blob.Cluster(), n2.Blob.Cluster(), n3.Blob.Cluster()}
 	waitForClusterReady(t, clusters, 15*time.Second)

@@ -31,8 +31,8 @@ func TestHandoffCycle_BoundedAcquires_ChainWithoutTicks(t *testing.T) {
 	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
 
 	n1 := startReplicatedNodeCfg(t, "hc-a", "", uc, rf, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "hc-b", n1.BindAddr, uc, rf, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "hc-c", n1.BindAddr, uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "hc-b", n1.ClusterToken, uc, rf, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "hc-c", n1.ClusterToken, uc, rf, backing, mutate)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestHandoffCycle_BoundedAcquires_ChainWithoutTicks(t *testing.T) {
 
 	const mountDelay = 1 * time.Second
 	// PRODUCTION DEFAULT bound: OpenConcurrency 1 (override the gate helper's 8).
-	n4 := startReplicatedNodeSlowAcquireCfg(t, "hc-d", n1.BindAddr, uc, rf, backing, mountDelay, 300*time.Millisecond,
+	n4 := startReplicatedNodeSlowAcquireCfg(t, "hc-d", n1.ClusterToken, uc, rf, backing, mountDelay, 300*time.Millisecond,
 		func(cfg *cluster.Config) { cfg.OpenConcurrency = 1 })
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)

@@ -248,7 +248,7 @@ func aggregatePair(t *testing.T, unitCount, n int, prefix string) (n1, n2 *share
 	shortPeerConnect := func(cfg *cluster.Config) { cfg.PeerConnectTimeout = 750 * time.Millisecond }
 	backing := sharedfactory.NewBacking()
 	n1 = startReplicatedNodeCfg(t, "agr1", "", unitCount, 1, backing, shortPeerConnect)
-	n2 = startReplicatedNodeCfg(t, "agr2", n1.BindAddr, unitCount, 1, backing, shortPeerConnect)
+	n2 = startReplicatedNodeCfg(t, "agr2", n1.ClusterToken, unitCount, 1, backing, shortPeerConnect)
 
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
@@ -420,9 +420,9 @@ func TestAcquiringReason_AggregatePeerDownDoesNotMatchErrAcquiring(t *testing.T)
 	)
 	n1, n2, _ := aggregatePair(t, unitCount, n, prefix)
 
-	// Kill ONLY the peer's gRPC listener; memberlist keeps running so the ring
-	// still fans out to it and the leg fails at a real dial, not a synthesized
-	// error.
+	// Kill ONLY the peer's gRPC listener; its coordinator keeps running so the
+	// ring still fans out to it and the leg fails at a real dial, not a
+	// synthesized error.
 	n2.stop()
 	n2.stop = nil
 

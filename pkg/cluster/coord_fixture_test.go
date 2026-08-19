@@ -7,8 +7,8 @@ package cluster
 // join, nothing to reconcile.
 
 import (
+	"github.com/Zamua/shale/internal/coordstatic"
 	"github.com/Zamua/shale/pkg/coord"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
@@ -23,8 +23,14 @@ func nodesFor(ids ...string) []coord.Node {
 }
 
 // staticCoord returns a transport-free coordinator for self over members.
-func staticCoord(self string, members []coord.Node) *gossip.Coordinator {
-	return gossip.NewStatic(coord.Node{ID: storageunit.NodeID(self), Addr: self + ":0"}, members)
+func staticCoord(self string, members []coord.Node) *coordstatic.Coordinator {
+	return coordstatic.New(coord.Node{ID: storageunit.NodeID(self), Addr: self + ":0"}, members)
+}
+
+// staticCoordOf exposes c's coordinator as the concrete static adapter, for
+// the tests that drive its test seams.
+func staticCoordOf(c *Cluster) *coordstatic.Coordinator {
+	return c.coord.(*coordstatic.Coordinator)
 }
 
 // setCoordMembers replaces c's coordination view with exactly members.
@@ -34,7 +40,7 @@ func setCoordMembers(c *Cluster, members ...coord.Node) {
 
 // coordMembers returns the placement basis of c's (static) coordinator.
 func coordMembers(c *Cluster) []coord.Node {
-	return c.coord.(*gossip.Coordinator).TestingRingMembers()
+	return staticCoordOf(c).TestingRingMembers()
 }
 
 // addCoordMember folds n into c's existing coordination view, replacing any
@@ -48,7 +54,7 @@ func addCoordMember(c *Cluster, n coord.Node) {
 		}
 	}
 	out = append(out, n)
-	c.coord.(*gossip.Coordinator).TestingSetMembers(out)
+	staticCoordOf(c).TestingSetMembers(out)
 }
 
 // removeCoordMembers drops ids from c's coordination view.
@@ -64,5 +70,5 @@ func removeCoordMembers(c *Cluster, ids ...string) {
 			out = append(out, m)
 		}
 	}
-	c.coord.(*gossip.Coordinator).TestingSetMembers(out)
+	staticCoordOf(c).TestingSetMembers(out)
 }

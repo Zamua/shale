@@ -14,8 +14,9 @@
 //     NIL, so every placement question answers "me". Non-nil means multi-node:
 //     Open STARTS the coordinator (handing it this node's identity, declared
 //     unit count and initial role set) and asks it who should hold each unit.
-//     HOW it answers - SWIM gossip plus a consistent hash ring today
-//     (pkg/coord/gossip), a lease/CAS table later - is invisible here.
+//     HOW it answers - a CAS membership document plus a consistent hash ring
+//     (pkg/coord/cas, the shipped adapter), or a fork's own mechanism
+//     against the port - is invisible here.
 //   - BACKEND MODE is set by Config.Backend vs Config.BackendFactory +
 //     Config.UnitCount, plus Config.ReplicationFactor. That is the three-mode
 //     matrix below.

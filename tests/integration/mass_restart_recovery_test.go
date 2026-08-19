@@ -50,8 +50,8 @@ func TestMassRestart_R2_AutoRecoversAndDurable(t *testing.T) {
 	// Phase 3: RESTART all nodes on the SAME backing, same IDs (persistent
 	// storage, fresh processes). The founder re-establishes; joiners re-seed.
 	r1 := startReplicatedNode(t, "r2a", "", unitCount, 2, backing)
-	r2 := startReplicatedNode(t, "r2b", r1.BindAddr, unitCount, 2, backing)
-	r3 := startReplicatedNode(t, "r2c", r1.BindAddr, unitCount, 2, backing)
+	r2 := startReplicatedNode(t, "r2b", r1.ClusterToken, unitCount, 2, backing)
+	r3 := startReplicatedNode(t, "r2c", r1.ClusterToken, unitCount, 2, backing)
 	restarted := []*sharedNode{r1, r2, r3}
 	cs := []*cluster.Cluster{r1.Cluster, r2.Cluster, r3.Cluster}
 	if err := waitForMembersAll(cs, 3, 30*time.Second); err != nil {

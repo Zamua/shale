@@ -62,7 +62,6 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
 	"github.com/Zamua/shale/pkg/coord"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -74,8 +73,6 @@ import (
 type StdConfig struct {
 	NodeID   string
 	GRPCAddr string
-	BindAddr string
-	Seeds    []string
 
 	// ReplicationFactor is the number of nodes that hold a copy of each
 	// key. Threaded into cluster.Config.ReplicationFactor in BOTH single-
@@ -93,27 +90,6 @@ type StdConfig struct {
 	// backend opens) and stores the resulting value here so Run never
 	// re-parses it. Default 1.
 	UnitCount storageunit.UnitCount
-
-	// seedsRaw holds the comma-separated form pre-split; tests that
-	// poke at the flag set directly can inspect it. Populated by
-	// BindStdFlags after Parse; Seeds is derived from it inside
-	// Validate.
-	seedsRaw string
-
-	// fs is the FlagSet BindStdFlags bound into, retained so Run can ask
-	// whether a flag was EXPLICITLY supplied rather than defaulted. Only
-	// --bind-addr needs this today: a single-backend binary must blank a
-	// DEFAULTED bind address (so a bare `shaled` is a working single node)
-	// while still honoring an explicit one (so the operator gets the clear
-	// Open error instead of a silent downgrade). Nil when a caller built
-	// StdConfig by hand rather than through BindStdFlags.
-	fs *flag.FlagSet
-
-	// bindAddrEnvSet records that SHALE_BIND_ADDR carried a non-empty value.
-	// That is an explicit operator choice too, and flag.Visit cannot see it
-	// (the env value arrives as the flag's DEFAULT). An empty value does not
-	// count: envOr falls back to the flag default for it.
-	bindAddrEnvSet bool
 
 	// GracefulLeaveDrainTimeout, when > 0, makes a multi-backend overlap node
 	// drain its owned units to successors on shutdown (broadcast leave, keep
@@ -152,26 +128,17 @@ type StdConfig struct {
 //
 //	--node-id            SHALE_NODE_ID             (required)
 //	--grpc-addr          SHALE_GRPC_ADDR           (default ":7947")
-//	--bind-addr          SHALE_BIND_ADDR           (default ":7946")
-//	--seeds              SHALE_SEEDS               (comma-separated; optional)
 //	--replication-factor SHALE_REPLICATION_FACTOR  (int; default 1)
 //	--unit-count         SHALE_UNIT_COUNT          (power-of-two int; default 1)
 //
-// Validation (required-ness, parsing of --seeds into a slice, the
-// --unit-count power-of-two check) happens in StdConfig.Validate, which
-// the caller runs after fs.Parse.
+// Validation (required-ness, the --unit-count power-of-two check) happens
+// in StdConfig.Validate, which the caller runs after fs.Parse.
 func BindStdFlags(fs *flag.FlagSet) *StdConfig {
-	// An EMPTY SHALE_BIND_ADDR is not an explicit choice: envOr falls back
-	// to the flag default for it, so the resulting BindAddr is the default.
-	std := &StdConfig{fs: fs, bindAddrEnvSet: os.Getenv("SHALE_BIND_ADDR") != ""}
+	std := &StdConfig{}
 	fs.StringVar(&std.NodeID, "node-id", envOr("SHALE_NODE_ID", ""),
 		"unique node identifier (required)")
 	fs.StringVar(&std.GRPCAddr, "grpc-addr", envOr("SHALE_GRPC_ADDR", ":7947"),
 		"address the gRPC service binds to (host:port; host may be empty)")
-	fs.StringVar(&std.BindAddr, "bind-addr", envOr("SHALE_BIND_ADDR", ":7946"),
-		"memberlist bind address")
-	fs.StringVar(&std.seedsRaw, "seeds", envOr("SHALE_SEEDS", ""),
-		"comma-separated peer addresses for cluster join")
 	fs.IntVar(&std.replicationFactorRaw, "replication-factor",
 		envOrInt("SHALE_REPLICATION_FACTOR", 1),
 		"number of nodes that hold a copy of each key (default 1)")
@@ -187,46 +154,24 @@ func BindStdFlags(fs *flag.FlagSet) *StdConfig {
 	return std
 }
 
-// BindAddrExplicit reports whether the operator actually asked for this bind
-// address, as opposed to inheriting the flag default. True when --bind-addr
-// was passed on the command line or SHALE_BIND_ADDR was set in the
-// environment.
-//
-// It exists because the flag's DEFAULT and an explicit value must be treated
-// differently by a single-backend binary. A defaulted bind address is an
-// artifact of a shared flag constructor (shaled-slate needs the default,
-// because its multi-backend mode is a legitimate multi-node configuration);
-// blanking it lets a bare `shaled` come up as the single node it now is. An
-// EXPLICIT bind address is a real request for a cluster, and must reach
-// cluster.Open so the operator gets the error naming the multi-backend
-// requirement rather than a silently non-clustered node.
-//
-// Returns true when the FlagSet is unknown (a hand-built StdConfig), which
-// fails toward honoring the value the caller set.
-func (s *StdConfig) BindAddrExplicit() bool {
-	if s.bindAddrEnvSet {
-		return true
-	}
-	if s.fs == nil {
-		return true
-	}
-	explicit := false
-	s.fs.Visit(func(f *flag.Flag) {
-		if f.Name == "bind-addr" {
-			explicit = true
-		}
-	})
-	return explicit
-}
-
 // Validate enforces required fields and finalizes derived values
-// (parsing --seeds into a slice, validating --unit-count as a power of
-// two, recording --replication-factor). Call after fs.Parse.
+// (validating --unit-count as a power of two, recording
+// --replication-factor). Call after fs.Parse.
 func (s *StdConfig) Validate() error {
 	if strings.TrimSpace(s.NodeID) == "" {
 		return errors.New("--node-id is required (or set SHALE_NODE_ID)")
 	}
-	s.Seeds = SplitSeeds(s.seedsRaw)
+	// RETIRED KNOBS. These configured the removed SWIM adapter's mesh. An
+	// operator whose manifests still set them is describing a cluster shape
+	// that no longer exists, and silently ignoring them is how a node comes
+	// up believing it is alone; the flags are gone, so only the env survives
+	// to be rejected here.
+	for _, k := range []string{"SHALE_BIND_ADDR", "SHALE_SEEDS"} {
+		if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
+			return fmt.Errorf("%s is set (%q) but the gossip adapter it configured was removed; "+
+				"membership now comes from the coordinator this binary constructs, so drop the variable", k, v)
+		}
+	}
 	s.ReplicationFactor = s.replicationFactorRaw
 	uc, err := storageunit.NewUnitCount(s.unitCountRaw)
 	if err != nil {
@@ -304,6 +249,15 @@ type RunConfig struct {
 	// decentralized reshard arbiter. nil keeps the legacy seed-RPC bootstrap.
 	ConditionalStore storageunit.ConditionalStore
 
+	// Coordinator is the coordination-port adapter (pkg/coord) this node
+	// participates in the cluster through. The binary constructs it (e.g. a
+	// cas.Coordinator over the shared conditional store) and Run threads it
+	// into cluster.Config; the cluster owns its Start/Close lifecycle. nil
+	// means SINGLE-NODE. Requires BackendFactory (cluster.Open rejects a
+	// single Backend with a Coordinator: a single Backend cannot take part
+	// in a unit lease handoff).
+	Coordinator coord.Coordinator
+
 	// Logger is where startup + shutdown lines are written. Required.
 	Logger *log.Logger
 }
@@ -323,17 +277,6 @@ func Run(cfg RunConfig) error {
 	hasFactory, err := validateBackendXOR(cfg)
 	if err != nil {
 		return err
-	}
-	if !hasFactory {
-		// Single-backend binaries are single-node. Drop a DEFAULTED bind
-		// address so a bare invocation works, keep an explicit one so Open
-		// can refuse it loudly, and reject seeds-without-bind-addr outright.
-		bindAddr, err := resolveSingleBackendBindAddr(&cfg.Std)
-		if err != nil {
-			_ = closeBackendQuiet(cfg.CloseBackend)
-			return err
-		}
-		cfg.Std.BindAddr = bindAddr
 	}
 	logger := cfg.Logger
 
@@ -407,8 +350,7 @@ func Run(cfg RunConfig) error {
 
 	logger.Printf("shaled: node=%s grpc=%s backend=%s",
 		cfg.Std.NodeID, lis.Addr().String(), cfg.BackendLabel)
-	if cfg.Std.BindAddr != "" {
-		logger.Printf("shaled: bind-addr=%s seeds=%v", cfg.Std.BindAddr, cfg.Std.Seeds)
+	if cfg.Coordinator != nil {
 		logger.Printf("shaled: joined cluster, members=%d", len(c.Members()))
 	}
 
@@ -485,51 +427,14 @@ func validateBackendXOR(cfg RunConfig) (hasFactory bool, err error) {
 	return hasFactory, nil
 }
 
-// resolveSingleBackendBindAddr decides what bind address a SINGLE-BACKEND
-// binary should actually run with, and refuses the one configuration that
-// would otherwise fail silently.
-//
-// A single Backend is single-node only: it cannot open a storage unit, so it
-// cannot fence a prior writer, so it cannot take part in a lease handoff.
-// cluster.Open rejects Backend + BindAddr for exactly that reason. But the
-// shared flag constructor defaults --bind-addr to ":7946" (shaled-slate needs
-// that default, since its multi-backend mode IS a real multi-node
-// configuration), so a bare `shaled` would inherit a bind address it never
-// asked for and fail to start.
-//
-// Three cases, and only the middle one is a judgement call:
-//
-//   - seeds set, no explicit bind address: ERROR. Blanking here would come up
-//     as an isolated single node that silently ignored the seeds. Across a
-//     fleet that is N independent divergent stores, which is the same
-//     silent-failure class the Open rejection exists to close.
-//   - bind address DEFAULTED: blank it. The operator did not ask for a
-//     cluster; give them the working single node a bare invocation should be.
-//   - bind address EXPLICIT: keep it, and let cluster.Open refuse with the
-//     message naming the multi-backend requirement. An operator who typed
-//     --bind-addr wants a cluster and deserves to hear why they cannot have
-//     one with this backend, rather than getting a quiet downgrade.
-func resolveSingleBackendBindAddr(std *StdConfig) (string, error) {
-	if std.BindAddrExplicit() {
-		return std.BindAddr, nil
-	}
-	if len(std.Seeds) > 0 {
-		return "", errors.New("shaled: --seeds requires --bind-addr; a single Backend is single-node only, " +
-			"so seeds without a bind address would silently start an isolated node that joins nothing " +
-			"(multi-node requires BackendFactory + --unit-count)")
-	}
-	return "", nil
-}
-
 // clusterConfig maps a RunConfig (plus the resolved gRPC broadcast address)
 // onto ONE cluster.Config. It is pure (no I/O) so it is the testable seam for
 // "Run threads ReplicationFactor + UnitCount + the right backend mode into the
 // cluster.Config it builds":
 //
-//   - common (both modes): NodeID, the resolved GRPCAddr, the Coordinator (a
-//     gossip adapter carrying BindAddr + Seeds, or nil for single-node), and
-//     ReplicationFactor (the fix: single-backend Run previously omitted R,
-//     pinning the legacy path to the cluster default).
+//   - common (both modes): NodeID, the resolved GRPCAddr, the Coordinator
+//     (the binary-constructed coordination adapter, or nil for single-node),
+//     and ReplicationFactor.
 //   - single-backend (Backend set): Backend only; UnitCount stays zero
 //     (cluster.validateBackendMode requires it zero in legacy mode).
 //   - multi-backend (BackendFactory set): BackendFactory + UnitCount; Backend
@@ -542,7 +447,7 @@ func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 	clusterCfg := cluster.Config{
 		NodeID:                    cfg.Std.NodeID,
 		GRPCAddr:                  grpcAddr,
-		Coordinator:               coordinatorFor(cfg.Std),
+		Coordinator:               cfg.Coordinator,
 		ReplicationFactor:         cfg.Std.ReplicationFactor,
 		GracefulLeaveDrainTimeout: cfg.Std.GracefulLeaveDrainTimeout,
 		WriteTimeout:              cfg.Std.WriteTimeout, // 0 -> cluster default (5s)
@@ -577,24 +482,6 @@ func clusterConfig(cfg RunConfig, grpcAddr string) cluster.Config {
 	return clusterCfg
 }
 
-// coordinatorFor builds this node's coordination adapter from the operator
-// flags, or returns nil for single-node (no bind address = nobody to
-// coordinate with, which is exactly what a nil Coordinator means to
-// cluster.Open).
-//
-// The gossip knobs stop here: BindAddr, Seeds and the memberlist log sink are
-// the ADAPTER's config, not the cluster's. Swapping in a lease/CAS coordinator
-// later is a change to this one function.
-func coordinatorFor(std StdConfig) coord.Coordinator {
-	if std.BindAddr == "" {
-		return nil
-	}
-	return gossip.New(gossip.Config{
-		BindAddr: std.BindAddr,
-		Seeds:    std.Seeds,
-	})
-}
-
 // buildCluster validates the Backend-vs-BackendFactory XOR and opens a Cluster
 // from the RunConfig, using grpcAddr as the broadcast gRPC address. It is the
 // cluster-construction core extracted out of Run so the wiring (R + UnitCount +
@@ -610,23 +497,6 @@ func buildCluster(cfg RunConfig, grpcAddr string) (*cluster.Cluster, error) {
 		return nil, err
 	}
 	return cluster.Open(clusterConfig(cfg, grpcAddr))
-}
-
-// SplitSeeds turns "a:7946,b:7946" into ["a:7946", "b:7946"], trimming
-// whitespace and dropping empty entries. Exported so per-backend tests
-// can share the same parsing as the runtime.
-func SplitSeeds(raw string) []string {
-	if strings.TrimSpace(raw) == "" {
-		return nil
-	}
-	parts := strings.Split(raw, ",")
-	out := make([]string, 0, len(parts))
-	for _, p := range parts {
-		if s := strings.TrimSpace(p); s != "" {
-			out = append(out, s)
-		}
-	}
-	return out
 }
 
 // EnvOr returns the env-var value if set + non-empty, else fallback.

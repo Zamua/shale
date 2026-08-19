@@ -82,7 +82,7 @@ type ShaleNodeClient interface {
 	LocalScan(ctx context.Context, in *LocalScanRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[LocalScanResponse], error)
 	// Topology describes the current cluster membership + ring layout.
 	// In v0.1 single-node mode, single_node=true + nodes contains exactly
-	// this one node. In v0.2+ it reports the full memberlist view.
+	// this one node. In v0.2+ it reports the full membership view.
 	Topology(ctx context.Context, in *TopologyRequest, opts ...grpc.CallOption) (*TopologyResponse, error)
 	// Stats returns per-node counters: how many keys this node holds,
 	// request counts since process start, and the node's mount-readiness
@@ -301,7 +301,7 @@ type ShaleNodeServer interface {
 	LocalScan(*LocalScanRequest, grpc.ServerStreamingServer[LocalScanResponse]) error
 	// Topology describes the current cluster membership + ring layout.
 	// In v0.1 single-node mode, single_node=true + nodes contains exactly
-	// this one node. In v0.2+ it reports the full memberlist view.
+	// this one node. In v0.2+ it reports the full membership view.
 	Topology(context.Context, *TopologyRequest) (*TopologyResponse, error)
 	// Stats returns per-node counters: how many keys this node holds,
 	// request counts since process start, and the node's mount-readiness

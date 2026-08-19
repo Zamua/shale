@@ -18,7 +18,7 @@ shale is the third option: thin Go library, BYO backend, scales by adding proces
 
 - Consistent-hash sharding across N embedded nodes: single-key ops route in one hop, cross-shard ops fan out explicitly.
 - Replication factor R with tunable read/write consistency (Nearest / Quorum / All), LWW conflict resolution, and read-repair.
-- Online resharding with no acked-write loss: decentralized split/merge, zero-copy unit handoff over shared object storage, driven declaratively by a gossiped target count.
+- Online resharding with no acked-write loss: decentralized split/merge, zero-copy unit handoff over shared object storage, driven declaratively by a target unit count every node advertises through the coordinator.
 - Value-separation: large values stream to a blob plane out-of-band, transactionally bound to the metadata write.
 - Homogeneous bootstrap: every node runs the same image and try-joins-else-forms via an object-storage CAS marker, so there is no dedicated seed.
 - Pluggable backends, each its own Go module: SlateDB-on-object-storage (default), Pebble (local LSM), in-memory.
@@ -36,7 +36,7 @@ shale is the third option: thin Go library, BYO backend, scales by adding proces
 - [x] v0.6: production-shape defaults - relaxed durability (`AwaitDurable=false`) paired with replication; replica-aware lossless rebalance at R>1.
 - [x] v0.7: online multi-node resharding via a cluster-wide freeze barrier; zero-copy SlateDB unit handoff over shared object storage; chaos/soak-validated losslessness.
 - [x] v0.8: value-separation (streaming blob values); decentralized online split/merge resharding; homogeneous bootstrap; degraded-boot + self-healing fenced-mount recovery.
-- [x] v0.9: declarative resharding from the gossiped unit count; membership/ring hardening under dense churn.
+- [x] v0.9: declarative resharding from the advertised unit count; membership/ring hardening under dense churn.
 
 ## Development
 

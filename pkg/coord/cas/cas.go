@@ -97,8 +97,8 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/decide"
+	"github.com/Zamua/shale/internal/placement"
 	"github.com/Zamua/shale/pkg/coord"
-	"github.com/Zamua/shale/pkg/coord/internal/placement"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -405,8 +405,9 @@ func New(cfg Config) *Coordinator {
 // exists to model a placement basis diverged from the view, and this
 // adapter's single-snapshot design makes that divergence structurally
 // absent - offering the seam would let tests manufacture exactly the state
-// the design rules out. Cluster tests fall back gracefully (the seam is
-// consumed via a checked type assertion).
+// the design rules out. A test that needs a diverged basis therefore runs
+// on internal/coordstatic instead; asking this adapter for the seam PANICS
+// (cluster.TestingSetRingMembers) rather than silently doing nothing.
 var (
 	_ coord.Coordinator    = (*Coordinator)(nil)
 	_ coord.HardShutdowner = (*Coordinator)(nil)

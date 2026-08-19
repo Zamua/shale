@@ -10,8 +10,7 @@ import (
 // TestTCPOnlyProbeHandsOutAPortItCannotFullyBind demonstrates the defect
 // deterministically rather than waiting for it under load: hold the UDP half
 // of a port, and a TCP-only probe will still certify that number as free. A
-// caller that binds both halves (memberlist) then fails on a port a helper
-// promised it.
+// caller that binds both halves then fails on a port a helper promised it.
 //
 // The demonstration is direct rather than statistical because the flake it
 // causes is not: it surfaces only under the port churn of a concurrent
@@ -50,8 +49,7 @@ func TestTCPOnlyProbeHandsOutAPortItCannotFullyBind(t *testing.T) {
 }
 
 // TestFreeIsBindableOnBothHalves pins the guarantee the callers rely on: the
-// number comes back bindable on TCP and UDP together, which is what
-// memberlist does with it.
+// number comes back bindable on TCP and UDP together.
 func TestFreeIsBindableOnBothHalves(t *testing.T) {
 	for i := 0; i < 200; i++ {
 		port := testport.Free(t)

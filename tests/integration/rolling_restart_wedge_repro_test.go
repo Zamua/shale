@@ -86,7 +86,7 @@ func (f *liveFleet) bootstrap(ids ...string) {
 	f.live[ids[0]] = founder
 	f.mu.Unlock()
 	for _, id := range ids[1:] {
-		n := startReplicatedNode(f.t, id, founder.BindAddr, f.unitCount, f.rf, f.backing)
+		n := startReplicatedNode(f.t, id, founder.ClusterToken, f.unitCount, f.rf, f.backing)
 		f.mu.Lock()
 		f.live[id] = n
 		f.mu.Unlock()
@@ -104,7 +104,7 @@ func (f *liveFleet) seedsForLocked(except string) string {
 			continue
 		}
 		if n := f.live[id]; n != nil && n.Cluster != nil {
-			return n.BindAddr
+			return n.ClusterToken
 		}
 	}
 	return ""

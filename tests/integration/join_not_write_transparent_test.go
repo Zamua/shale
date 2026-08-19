@@ -39,9 +39,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -94,18 +94,15 @@ func startReplicatedNodeSlowAcquireCfg(t *testing.T, id, seedAddr string, unitCo
 		// TestOverlapAcquire_BoundedByOpenConcurrency in pkg/cluster.
 		OpenConcurrency: 8,
 	}
-	gcfg := gossip.Config{}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
 	if mutate != nil {
 		mutate(&cfg)
 	}
-	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
+	store, token := coordStoreFor(t, seedAddr)
+	c := clustertest.OpenClusterCAS(t, cfg, store)
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() { defer close(serveDone); _ = grpcSrv.Serve(lis) }()
 	n := &sharedNode{
-		ID: id, Cluster: c, Handle: h, BindAddr: bindAddr, GRPCAddr: grpcAddr,
+		ID: id, Cluster: c, Handle: h, ClusterToken: token, GRPCAddr: grpcAddr,
 		stop: func() { grpcSrv.GracefulStop(); <-serveDone },
 	}
 	t.Cleanup(n.Close)
@@ -179,8 +176,8 @@ func TestJoinResidual_FenceAtOpenStart_MovingShardsWedge(t *testing.T) {
 	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
 
 	n1 := startReplicatedNodeCfg(t, "jr-a", "", uc, rf, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "jr-b", n1.BindAddr, uc, rf, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "jr-c", n1.BindAddr, uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "jr-b", n1.ClusterToken, uc, rf, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "jr-c", n1.ClusterToken, uc, rf, backing, mutate)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)
 	}
@@ -206,7 +203,7 @@ func TestJoinResidual_FenceAtOpenStart_MovingShardsWedge(t *testing.T) {
 	t.Logf("of %d units: %d MOVE onto jr-d, %d stay put (eager-fence: real-slatedb timing)", uc, len(moving), len(stable))
 
 	const mountDelay = 25 * time.Second
-	n4 := startReplicatedNodeSlowAcquire(t, "jr-d", n1.BindAddr, uc, rf, backing, mountDelay, 300*time.Millisecond)
+	n4 := startReplicatedNodeSlowAcquire(t, "jr-d", n1.ClusterToken, uc, rf, backing, mountDelay, 300*time.Millisecond)
 	cs4 := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
 	if err := waitForMembersAll(cs4, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)
@@ -298,8 +295,8 @@ func TestJoinIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
 
 	n1 := startReplicatedNodeCfg(t, "jn-a", "", uc, rf, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "jn-b", n1.BindAddr, uc, rf, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "jn-c", n1.BindAddr, uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "jn-b", n1.ClusterToken, uc, rf, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "jn-c", n1.ClusterToken, uc, rf, backing, mutate)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)
 	}
@@ -340,7 +337,7 @@ func TestJoinIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 	// A long mount so jn-d is provably still warming through the whole measurement,
 	// with generous headroom for the slower convergence under `-race`.
 	const mountDelay = 25 * time.Second
-	n4 := startReplicatedNodeSlowAcquire(t, "jn-d", n1.BindAddr, uc, rf, backing, mountDelay, 300*time.Millisecond)
+	n4 := startReplicatedNodeSlowAcquire(t, "jn-d", n1.ClusterToken, uc, rf, backing, mountDelay, 300*time.Millisecond)
 	cs4 := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
 	if err := waitForMembersAll(cs4, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)
@@ -471,9 +468,9 @@ func TestLeaveIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 		cfg.OpenConcurrency = 8
 	}
 	n1 := startReplicatedNodeCfg(t, "lv-a", "", uc, rf, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "lv-b", n1.BindAddr, uc, rf, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "lv-c", n1.BindAddr, uc, rf, backing, mutate)
-	n4 := startReplicatedNodeCfg(t, "lv-d", n1.BindAddr, uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "lv-b", n1.ClusterToken, uc, rf, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "lv-c", n1.ClusterToken, uc, rf, backing, mutate)
+	n4 := startReplicatedNodeCfg(t, "lv-d", n1.ClusterToken, uc, rf, backing, mutate)
 	survivors := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	all := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
 	if err := waitForMembersAll(all, 4, 30*time.Second); err != nil {

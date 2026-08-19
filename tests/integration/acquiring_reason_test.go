@@ -38,7 +38,7 @@ func acquiringReasonPair(t *testing.T, unitCount int) (owner, other *sharedNode,
 
 	backing := sharedfactory.NewBacking()
 	n1 := startSharedNode(t, "ar1", "", unitCount, backing)
-	n2 := startSharedNode(t, "ar2", n1.BindAddr, unitCount, backing)
+	n2 := startSharedNode(t, "ar2", n1.ClusterToken, unitCount, backing)
 
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {

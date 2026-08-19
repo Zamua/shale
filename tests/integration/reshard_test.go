@@ -133,7 +133,7 @@ func TestReshard_MultiNodeArbiterDoubling(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	store := storageunit.NewMemConditionalStore()
 	n1 := startR1StoreNode(t, "fb-a", "", unitCount, backing, store)
-	n2 := startR1StoreNode(t, "fb-b", n1.BindAddr, unitCount, backing, store)
+	n2 := startR1StoreNode(t, "fb-b", n1.ClusterToken, unitCount, backing, store)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
@@ -225,7 +225,7 @@ func TestReshard_MultiNodeRefusesWithoutConditionalStore(t *testing.T) {
 	const unitCount = 8
 	backing := sharedfactory.NewBacking()
 	n1 := startSharedNode(t, "fz-a", "", unitCount, backing)
-	n2 := startSharedNode(t, "fz-b", n1.BindAddr, unitCount, backing)
+	n2 := startSharedNode(t, "fz-b", n1.ClusterToken, unitCount, backing)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster}, 2, 15*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
 	}
@@ -431,7 +431,7 @@ func TestReshard_MultiNodeConcurrentWritesNoAckedWriteLost(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	store := storageunit.NewMemConditionalStore()
 	n1 := startR1StoreNode(t, "mc-a", "", unitCount, backing, store)
-	n2 := startR1StoreNode(t, "mc-b", n1.BindAddr, unitCount, backing, store)
+	n2 := startR1StoreNode(t, "mc-b", n1.ClusterToken, unitCount, backing, store)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)

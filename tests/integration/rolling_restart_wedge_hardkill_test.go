@@ -5,17 +5,16 @@ package integration
 //
 // The membership-divergence mechanism test forces the divergent ring directly.
 // This test asks the upstream question the live capture posed: does a rolling
-// restart where each node departs UNGRACEFULLY (memberlist Shutdown with no
-// Leave - a k8s pod delete / SIGKILL) and rejoins with the SAME stable node-name
-// but a NEW address naturally settle into the divergent member view observed in
-// staging (some nodes see 2 members, some see 3), which then produces the
-// conflicting desired sets / orphaned positions / stuck writes?
+// restart where each node departs UNGRACEFULLY (no graceful Leave - a k8s pod
+// delete / SIGKILL) and rejoins with the SAME stable node-name but a NEW
+// address naturally settle into a divergent member view (some nodes see 2
+// members, some see 3), which then produces the conflicting desired sets /
+// orphaned positions / stuck writes?
 //
-// It uses the test-only seams TestingHardKill (cluster) / TestingShutdownNoLeave
-// (membership): the departing node's transport is Shutdown WITHOUT the graceful
-// leave broadcast, so peers must reap it via SWIM failure detection, exactly the
-// regime the graceful-leave restarts (which converged 17/17 in the discovery
-// test) bypass.
+// It uses the test-only seams TestingHardKill (cluster) /
+// TestingShutdownNoLeave (coordinator): the departing node announces no
+// graceful leave, so peers must reap it via the coordinator's failure
+// detection, exactly the regime graceful-leave restarts bypass.
 //
 // Framed as a MEASUREMENT: it performs the hard-kill roll, then observes for a
 // bounded window whether every node converges on the same 3-member view, and
@@ -34,8 +33,8 @@ import (
 	"github.com/Zamua/shale/pkg/cluster"
 )
 
-// hardKill tears the node down UNGRACEFULLY (SIGKILL model): memberlist Shutdown
-// with no Leave + gRPC server stop. It deliberately does NOT mutate the
+// hardKill tears the node down UNGRACEFULLY (SIGKILL model): the coordinator
+// hard-stops with no leave announcement + gRPC server stop. It deliberately does NOT mutate the
 // sharedNode's Cluster/stop fields: a concurrent reader (the sampler / writers)
 // may still hold this pointer, and reading a CLOSED cluster is safe (Members
 // returns the frozen ring, Put returns ErrClosed), whereas niling the fields
@@ -282,15 +281,15 @@ func TestHardKillRoll_MembershipDivergence(t *testing.T) {
 // TestHardKillRoll_IsolatedRejoinDivergesPersistently pins the NECESSARY
 // condition for the persistent divergence, since the hard-kill roll with a
 // reachable seed converges every time (above). It hard-kills one node and rejoins
-// it ISOLATED - unable to reach any peer (empty seed) - which is the in-process
-// analogue of a rejoining pod whose seed (headless-service DNS) is stale or
-// unresolvable during address churn, or a real-network partition. This is NOT the
-// natural roll; it deprives the rejoin of a live seed on purpose to CONFIRM the
-// mechanism: when the same-name/new-address instance cannot re-bridge to the
-// cluster, the peers that reap its OLD (SIGKILLed, no-Leave) entry via SWIM settle
-// on a smaller member view and NEVER re-add it (their own rejoin seeds are stale
-// too), so the ring diverges PERSISTENTLY - exactly the live shape (nodes
-// disagree on the member set). It reliably diverges; that is the point.
+// it ISOLATED - unable to reach any peer (empty seed = a fresh membership
+// store) - which is the in-process analogue of a rejoining pod whose
+// coordination substrate is unreachable, or a real-network partition. This is
+// NOT the natural roll; it deprives the rejoin of the shared store on purpose
+// to CONFIRM the mechanism: when the same-name/new-address instance cannot
+// re-bridge to the cluster, the peers that reap its OLD (SIGKILLed, no-Leave)
+// entry settle on a smaller member view and NEVER re-add it, so the ring
+// diverges PERSISTENTLY - exactly the live shape (nodes disagree on the
+// member set). It reliably diverges; that is the point.
 func TestHardKillRoll_IsolatedRejoinDivergesPersistently(t *testing.T) {
 	const unitCount, rf = 16, 2
 	f := newLiveFleet(t, unitCount, rf)
@@ -303,32 +302,25 @@ func TestHardKillRoll_IsolatedRejoinDivergesPersistently(t *testing.T) {
 	}
 
 	// HARD-KILL n3 (no Leave) and rejoin it ISOLATED: empty seed, so its
-	// memberlist comes up SOLO and never contacts n1/n2. Same stable id, new
-	// address. Models the rejoin failing to reach a live seed.
+	// coordinator founds a FRESH membership store and never sees n1/n2. Same
+	// stable id, new address. Models the rejoin failing to reach the
+	// cluster's coordination substrate. The isolation is bidirectional by
+	// construction: the replacement writes a different membership document
+	// than the survivors read.
 	f.mu.Lock()
 	old := f.live["n3"]
 	f.live["n3"] = nil
 	f.mu.Unlock()
 	old.hardKill()
-	// The empty seed only removes n3's OUTBOUND path: it never calls Join, so
-	// it cannot reach n1/n2. Its INBOUND path is NOT isolated by that. n1/n2
-	// still hold n3#old at its bind address and keep gossiping to it for
-	// memberlist's GossipToTheDeadTime after declaring it dead, so anything
-	// that binds that address inside the window gets fused into the cluster
-	// and the fleet converges - defeating the divergence this test exists to
-	// pin. Nothing stops the replacement from drawing the corpse's port: it
-	// was just released, and on a randomized ephemeral-port allocator (Linux
-	// CI) reuse inside the window is reachable. Forbid it explicitly so the
-	// isolation is bidirectional by construction.
-	oldBindPort := bindPortOf(t, old.BindAddr)
-	n3 := startReplicatedNode(t, "n3", "", unitCount, rf, f.backing, oldBindPort) // seed="" -> solo
+	n3 := startReplicatedNode(t, "n3", "", unitCount, rf, f.backing) // seed="" -> solo
 	f.mu.Lock()
 	f.live["n3"] = n3
 	f.mu.Unlock()
 
-	// The cluster must NOT re-converge to a single agreed 3-member view: n1/n2 reap
-	// n3#old and drop to {n1,n2}; the isolated n3 sees only itself; there is no
-	// gossip path to re-bridge (n3 has no seed; n1/n2's rejoin seeds are stale).
+	// The cluster must NOT re-converge to a single agreed 3-member view: n1/n2
+	// reap n3#old and drop to {n1,n2}; the isolated n3 sees only itself; there
+	// is no coordination path to re-bridge (n3 writes a different membership
+	// store than the survivors read).
 	converged := waitFleetConverged(f, len(f.ids), 20*time.Second)
 	views := captureMemberViews(f)
 	if converged {

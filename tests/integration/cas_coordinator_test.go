@@ -2,12 +2,11 @@ package integration
 
 // A REAL CLUSTER ON THE CAS COORDINATOR (pkg/coord/cas).
 //
-// Every other multi-node fixture in this tree coordinates over the gossip
-// adapter (memberlist + ring). These tests stand up the SAME in-process
-// cluster - real gRPC forwarding, the shared sharedfactory backing, the
-// full mount/handoff machinery - with membership coordinated ENTIRELY
-// through one JSON document in a storageunit.ConditionalStore: no UDP, no
-// SWIM mesh, no seed addresses. The same MemConditionalStore doubles as
+// These tests stand up the full in-process cluster - real gRPC forwarding,
+// the shared sharedfactory backing, the full mount/handoff machinery - with
+// membership coordinated ENTIRELY through one JSON document in a
+// storageunit.ConditionalStore: no extra transport, no seed addresses. The
+// same MemConditionalStore doubles as
 // cluster.Config.ConditionalStore (the reshard-arbiter / bootstrap-marker
 // seam), which is exactly the production shape the adapter exists for: one
 // CAS-capable store is the whole coordination substrate.

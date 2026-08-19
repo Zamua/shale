@@ -6,6 +6,7 @@ import (
 	"log"
 	"testing"
 
+	"github.com/Zamua/shale/internal/coordstatic"
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/ring"
@@ -14,16 +15,14 @@ import (
 
 // TestClusterConfig_SingleBackendMapping pins the pure RunConfig ->
 // cluster.Config mapping for the LEGACY single-backend path: the Backend is
-// carried through, ReplicationFactor is threaded (the fix this milestone makes
-// - it used to be dropped), and UnitCount stays ZERO so cluster's
-// validateBackendMode accepts the legacy mode. BackendFactory must be nil.
+// carried through, ReplicationFactor is threaded, and UnitCount stays ZERO so
+// cluster's validateBackendMode accepts the legacy mode. BackendFactory must
+// be nil, and with no RunConfig.Coordinator the mapping is single-node.
 func TestClusterConfig_SingleBackendMapping(t *testing.T) {
 	be := memory.New()
 	cc := clusterConfig(RunConfig{
 		Std: StdConfig{
 			NodeID:            "n1",
-			BindAddr:          ":7946",
-			Seeds:             []string{"a:1"},
 			ReplicationFactor: 3,
 			UnitCount:         storageunit.MustUnitCount(8), // must be ignored in single-backend mode
 		},
@@ -45,18 +44,18 @@ func TestClusterConfig_SingleBackendMapping(t *testing.T) {
 	if cc.NodeID != "n1" || cc.GRPCAddr != "1.2.3.4:9999" {
 		t.Fatalf("single-backend mapping: common fields not threaded: %+v", cc)
 	}
-	// A bind address means multi-node, which is now expressed as a coordinator
-	// rather than a cluster-level BindAddr + Seeds pair.
-	if cc.Coordinator == nil {
-		t.Fatal("single-backend mapping: a non-empty BindAddr must produce a Coordinator")
+	if cc.Coordinator != nil {
+		t.Fatal("single-backend mapping: no RunConfig.Coordinator must map to a nil (single-node) Coordinator")
 	}
 }
 
 // TestClusterConfig_MultiBackendMapping pins the mapping for MULTI-BACKEND
 // mode: the BackendFactory is carried, UnitCount comes from Std, R is threaded,
-// and Backend stays nil (validateBackendMode requires that).
+// Backend stays nil (validateBackendMode requires that), and the
+// binary-constructed Coordinator is threaded through unchanged.
 func TestClusterConfig_MultiBackendMapping(t *testing.T) {
 	h := sharedfactory.NewBacking().Handle()
+	co := coordstatic.NewUnstarted()
 	cc := clusterConfig(RunConfig{
 		Std: StdConfig{
 			NodeID:            "n1",
@@ -64,6 +63,7 @@ func TestClusterConfig_MultiBackendMapping(t *testing.T) {
 			UnitCount:         storageunit.MustUnitCount(4),
 		},
 		BackendFactory: h,
+		Coordinator:    co,
 	}, "5.6.7.8:1234")
 
 	if cc.Backend != nil {
@@ -77,6 +77,9 @@ func TestClusterConfig_MultiBackendMapping(t *testing.T) {
 	}
 	if cc.ReplicationFactor != 2 {
 		t.Fatalf("multi-backend mapping: ReplicationFactor want 2, got %d", cc.ReplicationFactor)
+	}
+	if cc.Coordinator != co {
+		t.Fatal("multi-backend mapping: RunConfig.Coordinator must be threaded through")
 	}
 }
 
@@ -141,9 +144,9 @@ func TestBuildCluster_MultiBackendR2_WriteReadBack(t *testing.T) {
 	c, err := buildCluster(RunConfig{
 		Std: StdConfig{
 			NodeID: "key-test-node",
-			// BindAddr empty => single-node (no memberlist); the founder owns
-			// every replica position, so a single node satisfies R=2 against its
-			// own per-replica stores. No port is dialed.
+			// No Coordinator => single-node; the founder owns every replica
+			// position, so a single node satisfies R=2 against its own
+			// per-replica stores. No port is dialed.
 			ReplicationFactor: r,
 			UnitCount:         storageunit.MustUnitCount(unitCount),
 		},

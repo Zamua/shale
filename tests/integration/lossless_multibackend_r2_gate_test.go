@@ -38,10 +38,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -49,11 +49,10 @@ import (
 )
 
 // startReplicatedNode brings up one R=replicationFactor multi-backend node
-// whose factory is a per-replica handle over backing. seedAddr empty = founder.
-// forbiddenBindPorts are bind ports this node must not be given; see
-// openClusterRetryBind. Callers that hard-kill a node and start an
-// intentionally-isolated replacement pass the dead node's port here.
-func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicationFactor int, backing *sharedfactory.Backing, forbiddenBindPorts ...int) *sharedNode {
+// whose factory is a per-replica handle over backing. seedAddr empty =
+// founder of a NEW cluster (its own membership store), so a seedless
+// replacement is isolated from the survivors by construction.
+func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicationFactor int, backing *sharedfactory.Backing) *sharedNode {
 	t.Helper()
 	h := backing.Handle()
 
@@ -80,12 +79,8 @@ func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicati
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 300 * time.Millisecond,
 	}
-	gcfg := gossip.Config{LogOutput: io.Discard}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
-
-	c, bindAddr := openClusterRetryBind(t, cfg, gcfg, forbiddenBindPorts...)
+	store, token := coordStoreFor(t, seedAddr)
+	c := clustertest.OpenClusterCAS(t, cfg, store)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
@@ -94,11 +89,11 @@ func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicati
 	}()
 
 	n := &sharedNode{
-		ID:       id,
-		Cluster:  c,
-		Handle:   h,
-		BindAddr: bindAddr,
-		GRPCAddr: grpcAddr,
+		ID:           id,
+		Cluster:      c,
+		Handle:       h,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -131,8 +126,8 @@ func replicaSetOnRing(c *cluster.Cluster, key string, unitCount, r int) []string
 func start3NodeR2(t *testing.T, unitCount int, backing *sharedfactory.Backing) []*sharedNode {
 	t.Helper()
 	n1 := startReplicatedNode(t, "r2a", "", unitCount, 2, backing)
-	n2 := startReplicatedNode(t, "r2b", n1.BindAddr, unitCount, 2, backing)
-	n3 := startReplicatedNode(t, "r2c", n1.BindAddr, unitCount, 2, backing)
+	n2 := startReplicatedNode(t, "r2b", n1.ClusterToken, unitCount, 2, backing)
+	n3 := startReplicatedNode(t, "r2c", n1.ClusterToken, unitCount, 2, backing)
 	nodes := []*sharedNode{n1, n2, n3}
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {

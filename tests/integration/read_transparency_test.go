@@ -321,8 +321,8 @@ func TestJoinReadTransparent_GetScanEveryNode(t *testing.T) {
 	backing.SetStrictReadFencing(false)
 
 	n1 := startReplicatedNodeCfg(t, "rt-a", "", uc, rf, backing, nil)
-	n2 := startReplicatedNodeCfg(t, "rt-b", n1.BindAddr, uc, rf, backing, nil)
-	n3 := startReplicatedNodeCfg(t, "rt-c", n1.BindAddr, uc, rf, backing, nil)
+	n2 := startReplicatedNodeCfg(t, "rt-b", n1.ClusterToken, uc, rf, backing, nil)
+	n3 := startReplicatedNodeCfg(t, "rt-c", n1.ClusterToken, uc, rf, backing, nil)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)
 	}
@@ -365,7 +365,7 @@ func TestJoinReadTransparent_GetScanEveryNode(t *testing.T) {
 	// slept: the probes take ~1.2s and the latency is released immediately after,
 	// so the test still runs in ~3s.
 	const mountDelay = 5 * time.Minute
-	n4 := startReplicatedNodeSlowAcquire(t, "rt-d", n1.BindAddr, uc, rf, backing, mountDelay, 2*time.Second)
+	n4 := startReplicatedNodeSlowAcquire(t, "rt-d", n1.ClusterToken, uc, rf, backing, mountDelay, 2*time.Second)
 	all := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
 	if err := waitForMembersAll(all, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)
@@ -425,8 +425,8 @@ func TestSurgeReadTransparent_JoinLeaveJoinComposition(t *testing.T) {
 		cfg.OpenConcurrency = 8
 	}
 	na := startReplicatedNodeCfg(t, "sg-a", "", uc, rf, backing, mutate)
-	nb := startReplicatedNodeCfg(t, "sg-b", na.BindAddr, uc, rf, backing, mutate)
-	nc := startReplicatedNodeCfg(t, "sg-c", na.BindAddr, uc, rf, backing, mutate)
+	nb := startReplicatedNodeCfg(t, "sg-b", na.ClusterToken, uc, rf, backing, mutate)
+	nc := startReplicatedNodeCfg(t, "sg-c", na.ClusterToken, uc, rf, backing, mutate)
 	if err := waitForMembersAll([]*cluster.Cluster{na.Cluster, nb.Cluster, nc.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)
 	}
@@ -444,7 +444,7 @@ func TestSurgeReadTransparent_JoinLeaveJoinComposition(t *testing.T) {
 
 	// PHASE 1: join sg-d (slow mount, boot-defers via the planted markers).
 	const mountDelay = 5 * time.Second
-	nd := startReplicatedNodeSlowAcquireCfg(t, "sg-d", nb.BindAddr, uc, rf, backing, mountDelay, 2*time.Second, mutate)
+	nd := startReplicatedNodeSlowAcquireCfg(t, "sg-d", nb.ClusterToken, uc, rf, backing, mountDelay, 2*time.Second, mutate)
 	if err := waitForMembersAll([]*cluster.Cluster{na.Cluster, nb.Cluster, nc.Cluster, nd.Cluster}, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)
 	}
@@ -469,7 +469,7 @@ func TestSurgeReadTransparent_JoinLeaveJoinComposition(t *testing.T) {
 	drainDone := make(chan struct{})
 	go func() { defer close(drainDone); _ = na.Cluster.Close() }()
 	time.Sleep(2 * time.Second)
-	ne := startReplicatedNodeSlowAcquireCfg(t, "sg-e", nb.BindAddr, uc, rf, backing, 4*time.Second, 2*time.Second, mutate)
+	ne := startReplicatedNodeSlowAcquireCfg(t, "sg-e", nb.ClusterToken, uc, rf, backing, 4*time.Second, 2*time.Second, mutate)
 
 	// Probe continuously through the stable live nodes (sg-b, sg-c, sg-d),
 	// adding sg-e as an entry once its ring has converged on the final 4-node
@@ -551,9 +551,9 @@ func TestLeaveEntryServesWhileDraining(t *testing.T) {
 		cfg.RebalanceSettleDelay = 300 * time.Millisecond
 	}
 	n1 := startReplicatedNodeCfg(t, "le-a", "", uc, rf, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "le-b", n1.BindAddr, uc, rf, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "le-c", n1.BindAddr, uc, rf, backing, mutate)
-	n4 := startReplicatedNodeCfg(t, "le-d", n1.BindAddr, uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "le-b", n1.ClusterToken, uc, rf, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "le-c", n1.ClusterToken, uc, rf, backing, mutate)
+	n4 := startReplicatedNodeCfg(t, "le-d", n1.ClusterToken, uc, rf, backing, mutate)
 	all := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
 	if err := waitForMembersAll(all, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)

@@ -9,40 +9,19 @@ import (
 	"errors"
 	"io"
 	"net"
-	"strconv"
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/coordstatic"
 	"github.com/Zamua/shale/internal/memfactory"
 	"github.com/Zamua/shale/pkg/coord"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
 
-// freeTCPPort returns an OS-assigned ephemeral TCP port. Mirrors the
-// helper in cluster_test.go but duplicated here so the internal test
-// file compiles standalone.
-func freeTCPPort(t *testing.T) int {
-	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatalf("freeTCPPort: %v", err)
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port
-}
-
-func hp(port int) string {
-	return "127.0.0.1:" + strconv.Itoa(port)
-}
-
 // waitForLocalInView polls the coordination view until it contains the local
-// member or the deadline expires. The coordinator seeds itself from its own
-// join notification at Start, so this should be near-immediate but is racy
-// enough to need a poll.
+// member or the deadline expires.
 func waitForLocalInView(c *Cluster, timeout time.Duration) bool {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
@@ -56,23 +35,19 @@ func waitForLocalInView(c *Cluster, timeout time.Duration) bool {
 	return false
 }
 
-// openGossipNode opens a real multi-node Cluster on a loopback gossip
-// coordinator whose ring reconcile is parked far in the future, so a
-// background heal cannot steamroll a divergence a test induces on purpose.
-func openGossipNode(t *testing.T, nodeID string, mutate func(*Config)) *Cluster {
+// openStaticNode opens a real multi-node Cluster on a transport-free static
+// coordinator holding only this node, so the tests fully control when (and
+// whether) a view change arrives.
+func openStaticNode(t *testing.T, nodeID string, mutate func(*Config)) *Cluster {
 	t.Helper()
-	port := freeTCPPort(t)
+	self := coord.Node{ID: storageunit.NodeID(nodeID), Addr: "127.0.0.1:1"}
 	cfg := Config{
 		NodeID:         nodeID,
 		BackendFactory: memfactory.New(),
 		UnitCount:      storageunit.MustUnitCount(2),
 		GRPCAddr:       "127.0.0.1:1",
 		LogOutput:      io.Discard,
-		Coordinator: gossip.New(gossip.Config{
-			BindAddr:          hp(port),
-			LogOutput:         io.Discard,
-			ReconcileInterval: time.Hour,
-		}),
+		Coordinator:    coordstatic.New(self, []coord.Node{self}),
 	}
 	if mutate != nil {
 		mutate(&cfg)
@@ -84,10 +59,6 @@ func openGossipNode(t *testing.T, nodeID string, mutate func(*Config)) *Cluster 
 	t.Cleanup(func() { _ = c.Close() })
 	return c
 }
-
-// gossipCoord exposes c's coordinator as the concrete gossip adapter, for the
-// tests that drive its test seams.
-func gossipCoord(c *Cluster) *gossip.Coordinator { return c.coord.(*gossip.Coordinator) }
 
 // forceReconcileNow bypasses the settle-timer debounce and runs the
 // pending reconcile immediately, adopting whatever pending obligation is
@@ -110,66 +81,31 @@ func forceReconcileNow(c *Cluster) {
 	c.runScheduledReconcile()
 }
 
-// quiesceInitialSelfJoin drains the evaluation the local node's OWN
-// self-join schedules, so a test can establish a deterministic at-rest
-// baseline.
-//
-// The gossip transport fires a join notification for the local node, which the
-// coordinator turns into a change hint. runCoordLoop drains it asynchronously
-// and calls bumpRingGen -> scheduleEvaluate, which does settlePending.Add(1).
-// That drain is NOT ordered against the test body: waitForLocalInView returns
-// as soon as the view is SEEDED (synchronously, in Open), which can happen
-// before the self-join hint is processed. Under -race the events loop is
-// scheduled late enough that the re-Add / settlePending bump lands AFTER a
-// test's at-rest assertion, which is the sole cause of both
-// TestWaitForRebalanceIdle_BlocksWhileDebouncePending flaking under -race.
-//
-// This helper waits for that scheduled evaluation to appear
-// (settlePending == 1), then runs it to completion via runEvaluateNow so
-// settlePending returns to 0 and no background goroutine has an unrun re-arm
-// left in flight. After it returns, the only writers that can still touch
-// settlePending are the reconcile loop (which callers park far in the future)
-// and the test's own explicit drives.
-func quiesceInitialSelfJoin(t *testing.T, c *Cluster) {
-	t.Helper()
-	deadline := time.Now().Add(2 * time.Second)
-	for c.settlePending.Load() == 0 {
-		if time.Now().After(deadline) {
-			t.Fatalf("self-join evaluation never scheduled; settlePending stayed 0")
-		}
-		time.Sleep(5 * time.Millisecond)
-	}
-	forceReconcileNow(c)
-	if got := c.settlePending.Load(); got != 0 {
-		t.Fatalf("self-join evaluation did not drain; settlePending=%d", got)
-	}
-}
-
 // TestEventsLoop_EvictsClientOnAddrChange pins issue 6: when a peer's
-// GRPCAddr changes (NotifyUpdate path - same node ID, different Meta
-// bytes), the events loop must (a) update the ring to point the ID at
-// the new Addr and (b) evict the cached gRPC client for the OLD addr,
-// so a stale connection to a defunct endpoint cannot serve subsequent
-// requests for that peer.
+// GRPCAddr changes (same node ID, different address in the view), the
+// coordination loop must (a) update the view to point the ID at the new
+// Addr and (b) evict the cached gRPC client for the OLD addr, so a stale
+// connection to a defunct endpoint cannot serve subsequent requests for
+// that peer.
 //
-// Drives the path via membership.TestingInjectUpdate (the test-only
-// hook in pkg/membership), since memberlist exposes no public way to
-// force a Meta-rebroadcast with a different addr for an existing
-// node ID.
+// The addr flip is driven through the static coordinator's member seam:
+// the cluster reacts to the change hint by re-reading the whole view and
+// sweeping the client cache, so any mechanism that changes a member's
+// address exercises the same eviction path.
 //
-// Why this test would have caught a regression: if priorAddrForID or
-// the evictClient call in runEventsLoop is dropped, the old client
-// stays cached + a future forward dial returns the dead conn. The
-// assertion on clients[oldAddr] absence fires.
+// Why this test would have caught a regression: if the evictStaleClients
+// sweep in onViewChanged is dropped, the old client stays cached + a
+// future forward dial returns the dead conn. The assertion on
+// clients[oldAddr] absence fires.
 func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
-	// Park BOTH reconcilers far in the future (the cluster's unit reconcile and
-	// the coordinator's own ring heal) so the manual view + clients state we set
-	// up below cannot be steamrolled by a tick between the inject + assertion.
+	// Park the cluster's unit reconcile far in the future so the manual view +
+	// clients state set up below cannot be steamrolled by a tick between the
+	// addr flip + assertion.
 	saved := reconcileInterval
 	reconcileInterval = time.Hour
 	t.Cleanup(func() { reconcileInterval = saved })
 
-	c := openGossipNode(t, "solo", nil)
+	c := openStaticNode(t, "solo", nil)
 
 	if !waitForLocalInView(c, 2*time.Second) {
 		t.Fatalf("local member never landed in the coordination view")
@@ -199,10 +135,10 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 	defer newSrv.Stop()
 	newAddr := newLis.Addr().String()
 
-	// Seed the ring + client cache as if a peer "peer-1" had joined
-	// at oldAddr previously. Inject a NotifyUpdate that flips the
-	// same ID to newAddr; the events loop should rewrite the ring +
-	// evict the oldAddr client.
+	// Seed the view + client cache as if a peer "peer-1" had joined
+	// at oldAddr previously. Flip the same ID to newAddr; the
+	// coordination loop should rewrite the view + evict the oldAddr
+	// client.
 	addCoordMember(c, coord.Node{ID: "peer-1", Addr: oldAddr})
 
 	conn, err := grpc.NewClient(oldAddr, grpc.WithTransportCredentials(insecure.NewCredentials()))
@@ -213,7 +149,7 @@ func TestEventsLoop_EvictsClientOnAddrChange(t *testing.T) {
 	c.clients[oldAddr] = &peerClient{conn: conn}
 	c.clientsMu.Unlock()
 
-	gossipCoord(c).TestingInjectUpdate("peer-1", newAddr)
+	addCoordMember(c, coord.Node{ID: "peer-1", Addr: newAddr})
 
 	// Let the events loop drain + react. Poll for both conditions
 	// (ring updated + client evicted) up to 2s; the actual reaction
@@ -269,7 +205,7 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 
 	// Long delay: the armed timer must NOT fire on its own during the test. We
 	// drive the firing explicitly below.
-	c := openGossipNode(t, "rb-pending", func(cfg *Config) {
+	c := openStaticNode(t, "rb-pending", func(cfg *Config) {
 		cfg.RebalanceSettleDelay = time.Hour
 	})
 
@@ -277,15 +213,9 @@ func TestWaitForRebalanceIdle_BlocksWhileDebouncePending(t *testing.T) {
 		t.Fatalf("local member never landed in the coordination view")
 	}
 
-	// Drain the evaluation the local node's own self-join schedules so we
-	// have a deterministic at-rest baseline. Without this, the self-join's
-	// scheduleEvaluate races the assertion below: with a time.Hour settle
-	// the bump never decrements on its own, so an unhandled self-join makes
-	// settlePending read 1 here under -race's late goroutine scheduling.
-	quiesceInitialSelfJoin(t, c)
-
 	// Sanity: a quiescent node is idle immediately (no pending, no
-	// in-flight ranges).
+	// in-flight ranges). The static coordinator fires no hint at Open, so
+	// the at-rest baseline is deterministic.
 	if c.settlePending.Load() != 0 {
 		t.Fatalf("expected settlePending==0 at rest, got %d", c.settlePending.Load())
 	}
@@ -356,13 +286,12 @@ func TestScheduleReconcileIn_DebouncedRearmMustNotPostponeImmediate(t *testing.T
 	reconcileInterval = time.Hour
 	t.Cleanup(func() { reconcileInterval = saved })
 
-	c := openGossipNode(t, "sticky-prompt", func(cfg *Config) {
+	c := openStaticNode(t, "sticky-prompt", func(cfg *Config) {
 		cfg.RebalanceSettleDelay = time.Hour
 	})
 	if !waitForLocalInView(c, 2*time.Second) {
 		t.Fatal("local member never landed in the coordination view")
 	}
-	quiesceInitialSelfJoin(t, c)
 
 	// Inject a PENDING IMMEDIATE arm: a live stand-in timer (an hour out, so
 	// it cannot fire behind the assertions) plus the immediate flag and its

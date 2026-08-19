@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"fmt"
+
 	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -23,16 +25,20 @@ func (c *Cluster) TestingRunReconcile() {
 
 // TestingSetRingMembers replaces the local node's placement basis with the
 // given members, modelling a node whose topology view has DIVERGED from its
-// peers'. Test-only white-box hook; multi-node mode only, and only for a
-// coordinator that offers the seam - a no-op otherwise. Follows the Testing*
+// peers'. Test-only white-box hook; multi-node mode only. Follows the Testing*
 // convention.
+//
+// It PANICS on a coordinator without the MemberSetter seam rather than
+// no-opping: a divergence a test believes it induced but did not is a test
+// that pins nothing while reporting success, and only the caller's own
+// arming guard would catch it. Fail loud at the seam instead.
 //
 // It keeps taking ring.Member so the existing white-box call sites are
 // unchanged; the value is just an (id, addr) pair.
 func (c *Cluster) TestingSetRingMembers(members []ring.Member) {
 	setter, ok := c.coord.(coord.MemberSetter)
 	if !ok {
-		return
+		panic(fmt.Sprintf("cluster: TestingSetRingMembers needs a coord.MemberSetter, got %T; use a coordinator that offers the seam (internal/coordstatic)", c.coord))
 	}
 	nodes := make([]coord.Node, 0, len(members))
 	for _, m := range members {

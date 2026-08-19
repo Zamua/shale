@@ -2,7 +2,7 @@ package integration
 
 // Single-node mode is backend-agnostic, and this pins it.
 //
-// Config.Backend with an EMPTY BindAddr is local-only embedding: no
+// Config.Backend with an EMPTY ClusterToken is local-only embedding: no
 // membership, no ring, every operation served by the supplied Backend.
 // Nothing in that path inspects what the backend can do - it imposes no
 // fencing requirement, no unit-open requirement, no replica addressing.

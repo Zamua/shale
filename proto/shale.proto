@@ -54,7 +54,7 @@ service ShaleNode {
 
   // Topology describes the current cluster membership + ring layout.
   // In v0.1 single-node mode, single_node=true + nodes contains exactly
-  // this one node. In v0.2+ it reports the full memberlist view.
+  // this one node. In v0.2+ it reports the full membership view.
   rpc Topology(TopologyRequest) returns (TopologyResponse);
 
   // Stats returns per-node counters: how many keys this node holds,

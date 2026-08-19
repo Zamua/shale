@@ -159,16 +159,17 @@ type Config struct {
 	// multi-node mode.
 	//
 	// nil means SINGLE-NODE - this node owns the whole unit space and no op
-	// ever leaves the process - exactly as an empty BindAddr meant before the
-	// port existed. The caller constructs the coordinator (choosing the
-	// mechanism: pkg/coord/gossip today, a lease/CAS adapter later, a fake in
-	// a test) and this Cluster owns its lifecycle from there: Open starts it,
-	// Close closes it.
+	// ever leaves the process. The caller constructs the coordinator
+	// (choosing the mechanism: the shipped CAS adapter pkg/coord/cas, a
+	// fork's own adapter against the port, a fake in a test) and this
+	// Cluster owns its lifecycle from there: Open starts it, Close closes
+	// it.
 	//
-	// The knobs the MECHANISM needs (a memberlist bind address, seed peers, a
-	// gossip log sink) live on the adapter's own config, not here. What the
-	// cluster knows about ITSELF - NodeID, GRPCAddr, its declared unit count,
-	// whether it starts warming - is handed over at Open as coord.Params.
+	// The knobs the MECHANISM needs (the conditional store, the document
+	// key, cadences, a log sink) live on the adapter's own config, not
+	// here. What the cluster knows about ITSELF - NodeID, GRPCAddr, its
+	// declared unit count, whether it starts warming - is handed over at
+	// Open as coord.Params.
 	Coordinator coord.Coordinator
 
 	// GRPCAddr is this node's gRPC service address, broadcast to
@@ -380,8 +381,8 @@ type Config struct {
 
 	// GracefulLeaveDrainTimeout bounds the graceful-leave drain on shutdown
 	// (v0.8 Phase 2e, scale-down). When > 0 AND the cluster runs the
-	// multi-backend overlap path (multiReplicated()), Close() FIRST broadcasts
-	// the memberlist leave and BLOCKS until every position this node owns has
+	// multi-backend overlap path (multiReplicated()), Close() FIRST announces
+	// the leave through the coordinator and BLOCKS until every position this node owns has
 	// been handed off to its successor (the overlap drain seen from the losing
 	// side, for all positions at once) OR this timeout fires - all BEFORE any
 	// teardown, while the reconcile loop / serving / drainCheck / forward path
@@ -529,13 +530,13 @@ type Cluster struct {
 	// draining is a TEST-ONLY override for the gossiped Draining set: when
 	// non-nil, drainingIDs returns it directly instead of reading the membership
 	// snapshot. It lets the white-box pending-ranges tests inject a transition
-	// without a memberlist. Nil in production (the snapshot is authoritative).
+	// without a coordinator. Nil in production (the snapshot is authoritative).
 	draining map[storageunit.NodeID]struct{}
 
 	// joining is a TEST-ONLY override for the gossiped Joining set: when non-nil,
 	// joiningIDs returns it directly instead of reading the membership snapshot.
 	// It lets the white-box pending-ranges tests inject a JOIN transition (and
-	// exercise the quorum floor) without a memberlist. Nil in production (the
+	// exercise the quorum floor) without a coordinator. Nil in production (the
 	// snapshot is authoritative). The entry-side mirror of draining above.
 	joining map[storageunit.NodeID]struct{}
 
@@ -1035,9 +1036,10 @@ func (c *Cluster) Members() []ring.Member {
 
 // PlacementMembers returns the member set placement is currently computed
 // over (the coordinator's placement basis). It equals Members() whenever the
-// coordinator holds one basis; under gossip it can briefly trail Members()
-// after a dropped event. Guards protecting placement-derived decisions read
-// THIS; everything stance-related reads Members().
+// coordinator holds one basis (the CAS adapter always does); a dual-basis
+// adapter can briefly trail Members() after a dropped event. Guards
+// protecting placement-derived decisions read THIS; everything
+// stance-related reads Members().
 func (c *Cluster) PlacementMembers() []ring.Member {
 	if c.coord == nil {
 		return []ring.Member{{ID: c.cfg.NodeID, Addr: c.cfg.GRPCAddr}}
@@ -1487,7 +1489,7 @@ func (c *Cluster) evictClient(addr string) {
 // hint; the SDK wraps this transparently with a bounded retry budget.
 // Note the guard below sits INSIDE the `if local` branch, so on the
 // R=1 path it is not usually the end that rejects: ownerOf flips to
-// the destination as soon as memberlist gossips the join, which is
+// the destination as soon as the coordinator delivers the join, which is
 // before this node's settle-delayed Evaluate marks the range
 // StateSending. The write is forwarded and refused by the
 // destination's IsReceiving guard in LocalReplicaPut instead. The

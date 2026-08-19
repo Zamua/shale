@@ -58,7 +58,7 @@ func TestJoinAfterReshard_JoinerLearnsGenerationNoLoss(t *testing.T) {
 	// --- Stand up 2 nodes, multi-backend, N=8 units, sharing one conditional
 	// store (the arbiter-driven multi-node reshard requires it), and converge. ---
 	n1 := startR1StoreNode(t, "jar1", "", unitCount, backing, store)
-	n2 := startR1StoreNode(t, "jar2", n1.BindAddr, unitCount, backing, store)
+	n2 := startR1StoreNode(t, "jar2", n1.ClusterToken, unitCount, backing, store)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster}, 2, 20*time.Second); err != nil {
 		t.Fatalf("initial 2-node convergence: %v", err)
 	}
@@ -104,7 +104,7 @@ func TestJoinAfterReshard_JoinerLearnsGenerationNoLoss(t *testing.T) {
 	// The joiner must learn {gen 1, count 16} (here: from the __cluster/init
 	// marker in the shared store) before it mounts any unit, so it never routes
 	// / owns a key at gen 0. seedAddr is n1's bind.
-	n3 := startR1StoreNode(t, "jar3", n1.BindAddr, unitCount, backing, store)
+	n3 := startR1StoreNode(t, "jar3", n1.ClusterToken, unitCount, backing, store)
 	nodes := []*sharedNode{n1, n2, n3}
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("3-node convergence after join: %v", err)

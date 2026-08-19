@@ -73,13 +73,14 @@ FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=uniffi-build /src/target/release/libslatedb_uniffi.so /usr/local/lib/
 COPY --from=go-build /out/shaled-slate /shaled-slate
 
-# memberlist (7946) + gRPC (7947).
-EXPOSE 7946 7947
+# gRPC (7947). Membership needs no port of its own: the CAS coordinator
+# runs over the shared conditional store.
+EXPOSE 7947
 
 # LD_LIBRARY_PATH so the dynamic loader finds libslatedb_uniffi.so. The
 # operator supplies cluster + slate + multi-backend config via SHALE_* env:
-# SHALE_NODE_ID, SHALE_BIND_ADDR, SHALE_GRPC_ADDR, SHALE_SEEDS,
-# SHALE_REPLICATION_FACTOR, SHALE_UNIT_COUNT, SHALE_MULTI_BACKEND,
+# SHALE_NODE_ID, SHALE_GRPC_ADDR, SHALE_REPLICATION_FACTOR,
+# SHALE_UNIT_COUNT, SHALE_MULTI_BACKEND, SHALE_COORD_KEY,
 # SHALE_SLATE_* (bucket, endpoint, region, access-key, secret-key, use-ssl,
 # key-prefix).
 ENV LD_LIBRARY_PATH=/usr/local/lib

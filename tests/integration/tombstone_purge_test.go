@@ -32,7 +32,7 @@ func TestTombstonePurge_HalfPurgedClusterReadsDeletedConsistently(t *testing.T) 
 	na := startReplicatedNodeCfg(t, "tp-a", "", 4, 2, backing, func(c *cluster.Config) {
 		c.TombstoneGracePeriod = grace
 	})
-	nb := startReplicatedNodeCfg(t, "tp-b", na.BindAddr, 4, 2, backing, nil)
+	nb := startReplicatedNodeCfg(t, "tp-b", na.ClusterToken, 4, 2, backing, nil)
 	if err := waitForMembersAll([]*cluster.Cluster{na.Cluster, nb.Cluster}, 2, 30*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
 	}

@@ -16,7 +16,6 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -72,12 +71,11 @@ func TestClosed(t *testing.T) {
 // owns the key, only that the routing decision is correct + the data
 // crosses the gRPC boundary when it has to.
 func TestTwoNode_PutRoutesToOwner(t *testing.T) {
-	n1Bind := hostPort(freePort(t))
-	n2Bind := hostPort(freePort(t))
+	store := storageunit.NewMemConditionalStore()
 
-	c1, stop1 := openMultiBackendNodeAt(t, "n1", n1Bind, "")
+	c1, stop1 := openMultiBackendNode(t, "n1", store)
 	defer stop1()
-	c2, stop2 := openMultiBackendNodeAt(t, "n2", n2Bind, n1Bind)
+	c2, stop2 := openMultiBackendNode(t, "n2", store)
 	defer stop2()
 
 	if err := waitForRingSize(c1, 2, 5*time.Second); err != nil {
@@ -140,18 +138,6 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 	if string(val) != "from-n1" {
 		t.Fatalf("c2.Get: want from-n1, got %q", val)
 	}
-}
-
-// freePort + hostPort delegate to the shared harness package so the
-// port-probing strategy cannot drift from the integration tree's copy.
-// See internal/clustertest.
-func freePort(t *testing.T) int {
-	t.Helper()
-	return clustertest.FreePort(t)
-}
-
-func hostPort(port int) string {
-	return clustertest.HostPort(port)
 }
 
 // grpcHarness is a started gRPC server with a known address that the
@@ -338,12 +324,11 @@ func TestCloseRace(t *testing.T) {
 // (no leave event yet) so Aggregate fans out to it; the snapshot
 // transport fails; the per-peer result lands in .Err.
 func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
-	n1Bind := hostPort(freePort(t))
-	n2Bind := hostPort(freePort(t))
+	store := storageunit.NewMemConditionalStore()
 
-	c1, stop1 := openMultiBackendNodeAt(t, "n1", n1Bind, "")
+	c1, stop1 := openMultiBackendNode(t, "n1", store)
 	defer stop1()
-	c2, stop2, n2GRPC := openMultiBackendNodeAtWithHarness(t, "n2", n2Bind, n1Bind)
+	c2, stop2, n2GRPC := openMultiBackendNodeWithHarness(t, "n2", store)
 	defer stop2()
 	_ = c2
 
@@ -398,30 +383,26 @@ func TestAggregateResult_DistinguishesPeerError(t *testing.T) {
 	}
 }
 
-// openMultiBackendNodeAt brings up a multi-backend Cluster + its gRPC
-// server at a known bind address, registers it for cleanup, and returns
-// the cluster + teardown closure. Caller supplies bindAddr so
-// peer-discovery seeds are predictable.
+// openMultiBackendNode brings up a multi-backend Cluster + its gRPC server,
+// coordinated over store: every node of one test cluster passes the SAME
+// store, which is the whole discovery mechanism (the first Open founds, later
+// ones join).
 //
-// The gRPC server is REAL and registered before the joiner dials: a
-// multi-backend joiner asks a live seed for the cluster's unit generation
-// during Open (learnGenerationFromSeed), so a fixture that advertises an
-// address nothing serves makes the joiner's Open burn its whole
-// gen-learn budget and fail.
-func openMultiBackendNodeAt(t *testing.T, id, bindAddr, seedBindAddr string) (*cluster.Cluster, func()) {
-	c, stop, _ := openMultiBackendNodeAtWithHarness(t, id, bindAddr, seedBindAddr)
+// The gRPC server is REAL and registered before the next node opens: a
+// multi-backend joiner asks a live incumbent for the cluster's unit
+// generation during Open (learnGenerationFromSeed), so a fixture that
+// advertises an address nothing serves makes the joiner's Open burn its
+// whole gen-learn budget and fail.
+func openMultiBackendNode(t *testing.T, id string, store storageunit.ConditionalStore) (*cluster.Cluster, func()) {
+	c, stop, _ := openMultiBackendNodeWithHarness(t, id, store)
 	return c, stop
 }
 
-// openMultiBackendNodeAtWithHarness is openMultiBackendNodeAt plus the gRPC
+// openMultiBackendNodeWithHarness is openMultiBackendNode plus the gRPC
 // harness, for tests that need to kill one node's server mid-test.
-func openMultiBackendNodeAtWithHarness(t *testing.T, id, bindAddr, seedBindAddr string) (*cluster.Cluster, func(), *grpcHarness) {
+func openMultiBackendNodeWithHarness(t *testing.T, id string, store storageunit.ConditionalStore) (*cluster.Cluster, func(), *grpcHarness) {
 	t.Helper()
 	grpcHarness, stop := startGRPC(t)
-	gcfg := gossip.Config{BindAddr: bindAddr, LogOutput: io.Discard}
-	if seedBindAddr != "" {
-		gcfg.Seeds = []string{seedBindAddr}
-	}
 	cfg := cluster.Config{
 		NodeID:               id,
 		BackendFactory:       memfactory.New(),
@@ -429,12 +410,12 @@ func openMultiBackendNodeAtWithHarness(t *testing.T, id, bindAddr, seedBindAddr 
 		GRPCAddr:             grpcHarness.addr,
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 100 * time.Millisecond,
-		Coordinator:          gossip.New(gcfg),
+		Coordinator:          clustertest.CASCoordinator(store),
 	}
 	c, err := cluster.Open(cfg)
 	if err != nil {
 		stop()
-		t.Fatalf("openMultiBackendNodeAt %s: %v", id, err)
+		t.Fatalf("openMultiBackendNode %s: %v", id, err)
 	}
 	grpcHarness.register(c)
 	return c, func() {
@@ -460,15 +441,15 @@ func openMultiBackendNodeAtWithHarness(t *testing.T, id, bindAddr, seedBindAddr 
 // dials its seed's gRPC during Open, and pkg/rpc imports pkg/cluster, so
 // an in-package test cannot stand up a server to answer.
 func TestOpen_MountsBeforeEventsLoop(t *testing.T) {
-	seedBind := hostPort(freePort(t))
-	_, seedStop := openMultiBackendNodeAt(t, "race-seed", seedBind, "")
+	store := storageunit.NewMemConditionalStore()
+	_, seedStop := openMultiBackendNode(t, "race-seed", store)
 	defer seedStop()
 
 	// Join a few nodes in a row. With the bug, even one is enough for
 	// -race to fire; the loop shortens the odds on a quiet machine.
 	for i := range 3 {
-		joiner, joinerStop := openMultiBackendNodeAt(t,
-			fmt.Sprintf("race-joiner-%d", i), hostPort(freePort(t)), seedBind)
+		joiner, joinerStop := openMultiBackendNode(t,
+			fmt.Sprintf("race-joiner-%d", i), store)
 		if err := waitForRingSize(joiner, 2, 5*time.Second); err != nil {
 			t.Fatalf("joiner %d never saw the seed: %v", i, err)
 		}

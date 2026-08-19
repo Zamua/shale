@@ -3,9 +3,9 @@
 // key" lookup that honors Redis-style hash tags.
 //
 // The ring is pure logic - no I/O, no goroutines beyond the RWMutex
-// that guards membership mutations. The cluster layer (pkg/cluster)
-// owns wiring the ring to memberlist events + to gRPC forwarding;
-// this package just answers ownership questions.
+// that guards membership mutations. The coordination adapters own
+// wiring the ring to membership; this package just answers ownership
+// questions.
 //
 // Hashing model: ring-based consistent hashing with bounded loads
 // (Karger 1997 + Mirrokni-Thorup 2017). Each Member gets
@@ -302,7 +302,7 @@ func (r *Ring) ReplicasForPartition(partitionID uint64, n int) []Member {
 // this matches Redis Cluster's behavior + means apps that don't
 // opt-in to tagging just get whole-key hashing.
 //
-// Exported so callers (memberlist event hooks, debug tools, tests)
+// Exported so callers (coordination adapters, debug tools, tests)
 // can ask "what would this key hash on" without invoking the ring.
 func ShardKey(key []byte) []byte {
 	open := -1

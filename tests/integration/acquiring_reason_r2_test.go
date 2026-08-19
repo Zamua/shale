@@ -49,7 +49,7 @@ func r2AcquiringPair(t *testing.T, unitCount int) (n1, n2 *sharedNode, key strin
 	}
 	backing := sharedfactory.NewBacking()
 	n1 = startReplicatedNodeCfg(t, "arr1", "", unitCount, 2, backing, shortBudgets)
-	n2 = startReplicatedNodeCfg(t, "arr2", n1.BindAddr, unitCount, 2, backing, shortBudgets)
+	n2 = startReplicatedNodeCfg(t, "arr2", n1.ClusterToken, unitCount, 2, backing, shortBudgets)
 
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
@@ -329,8 +329,8 @@ func TestAcquiringReason_R2PeerDownDoesNotMatchErrAcquiring(t *testing.T) {
 	const unitCount = 8
 	n1, n2, key, _ := r2AcquiringPair(t, unitCount)
 
-	// Kill ONLY n2's gRPC listener; memberlist keeps running so the ring still
-	// routes a replica leg to it and the write fails at the dial - a real
+	// Kill ONLY n2's gRPC listener; its coordinator keeps running so the ring
+	// still routes a replica leg to it and the write fails at the dial - a real
 	// transport failure, not a synthesized one. At W=2 that shortfall is fatal.
 	n2.stop()
 	n2.stop = nil

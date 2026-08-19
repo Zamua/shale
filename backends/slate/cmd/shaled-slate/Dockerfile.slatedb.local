@@ -68,7 +68,7 @@ RUN GOOS=linux GOARCH=$(uname -m | sed 's/x86_64/amd64/;s/aarch64/arm64/') \
 FROM gcr.io/distroless/cc-debian12:nonroot
 COPY --from=uniffi-build /src/target/release/libslatedb_uniffi.so /usr/local/lib/
 COPY --from=go-build /out/shaled-slate /shaled-slate
-EXPOSE 7946 7947
+EXPOSE 7947
 ENV LD_LIBRARY_PATH=/usr/local/lib
 USER nonroot:nonroot
 ENTRYPOINT ["/shaled-slate"]

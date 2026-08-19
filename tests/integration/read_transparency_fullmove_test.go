@@ -431,9 +431,9 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 		cfg.RebalanceSettleDelay = 300 * time.Millisecond
 	}
 	na := startReplicatedNodeCfg(t, "sg-a", "", uc, rf, backing, mutate)
-	nb := startReplicatedNodeCfg(t, "sg-b", na.BindAddr, uc, rf, backing, mutate)
-	nc := startReplicatedNodeCfg(t, "sg-c", na.BindAddr, uc, rf, backing, mutate)
-	nd := startReplicatedNodeCfg(t, "sg-d", na.BindAddr, uc, rf, backing, mutate)
+	nb := startReplicatedNodeCfg(t, "sg-b", na.ClusterToken, uc, rf, backing, mutate)
+	nc := startReplicatedNodeCfg(t, "sg-c", na.ClusterToken, uc, rf, backing, mutate)
+	nd := startReplicatedNodeCfg(t, "sg-d", na.ClusterToken, uc, rf, backing, mutate)
 	all4 := []*cluster.Cluster{na.Cluster, nb.Cluster, nc.Cluster, nd.Cluster}
 	if err := waitForMembersAll(all4, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)
@@ -456,7 +456,7 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 	// for the entire drain, no pre-flip view (old placement, approximated
 	// pending, full 5-ring) ever assigns the full-move unit to a final owner,
 	// so nothing can hand one a copy early (asserted by the precondition above).
-	ne := startReplicatedNodeSlowAcquireCfg(t, joiner, nb.BindAddr, uc, rf, backing, 2*time.Second, 2*time.Second, mutate)
+	ne := startReplicatedNodeSlowAcquireCfg(t, joiner, nb.ClusterToken, uc, rf, backing, 2*time.Second, 2*time.Second, mutate)
 	all5 := []*cluster.Cluster{na.Cluster, nb.Cluster, nc.Cluster, nd.Cluster, ne.Cluster}
 	if err := waitForMembersAll(all5, 5, 30*time.Second); err != nil {
 		t.Fatalf("5-node convergence: %v", err)

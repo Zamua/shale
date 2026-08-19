@@ -7,7 +7,14 @@
 // Pebble is pure Go, no cgo, no build-tag gating: `go build
 // ./cmd/shaled-pebble` (run from backends/pebble) always works.
 //
-// Flags (in addition to the standard cluster/node flags exposed by
+// SINGLE-NODE ONLY. Multi-node needs a coordination adapter
+// (shaled.RunConfig.Coordinator) plus a BackendFactory, and pebble has
+// neither: its data lives on one node's local disk, so there is no shared
+// store for a conditional-store coordinator to run on and no way for a
+// peer to take over a unit's bytes. The deployable multi-node binary is
+// backends/slate/cmd/shaled-slate in --multi-backend mode.
+//
+// Flags (in addition to the standard node flags exposed by
 // pkg/shaled.BindStdFlags):
 //
 //	--pebble-dir   SHALE_PEBBLE_DIR    on-disk data directory (required)

@@ -1,8 +1,15 @@
 // Command shaled runs a single shale node as its own process with
 // the in-process memory backend. It opens a memory.Memory, wraps it
 // in a cluster.Cluster, and serves the gRPC ShaleNode service
-// (pkg/rpc) on --grpc-addr. The CLI (cmd/shale) and peer nodes talk
-// to this service.
+// (pkg/rpc) on --grpc-addr. The CLI (cmd/shale) talks to this
+// service.
+//
+// SINGLE-NODE ONLY. Multi-node needs a coordination adapter
+// (shaled.RunConfig.Coordinator) plus a BackendFactory, and this
+// binary wires neither: the memory backend is a single backend.Backend
+// with no shared store for peers to coordinate or hand units over.
+// The deployable multi-node binary is backends/slate/cmd/shaled-slate
+// in --multi-backend mode.
 //
 // Why memory-only:
 //
@@ -18,8 +25,6 @@
 // cluster + gRPC stack against the in-process memory store. This is
 // enough for:
 //
-//   - Integration tests in tests/integration (multi-node in-process
-//     clusters that wouldn't benefit from durable storage anyway).
 //   - Smoke tests + demos (start a node, hit it from the CLI, see
 //     it work).
 //   - Operators who explicitly don't need durability.
