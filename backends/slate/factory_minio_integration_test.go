@@ -415,8 +415,10 @@ func TestFactory_DoubleOpenRejected(t *testing.T) {
 	// would succeed. We do NOT re-open the same prefix in THIS process here -
 	// real slatedb does not support re-opening a db prefix in the same
 	// process after it has been opened (process-local epoch state), so the
-	// re-open-after-close path is exercised cross-process by the chaosreal
-	// adapter, not here. Closing simply must succeed and clear the slot.
+	// re-open-after-close path is therefore NOT covered anywhere: the
+	// cross-process harness that would have covered it was decided against
+	// (docs/SPEC.md, "Decided against"). Closing simply must succeed and
+	// clear the slot.
 	if err := h.CloseUnit(storageunit.SoleMount(unit)); err != nil {
 		t.Fatalf("close: %v", err)
 	}
