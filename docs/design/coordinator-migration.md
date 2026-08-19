@@ -39,8 +39,13 @@ CAS-configured node against the same storage.** The switch is a full-stop.
 
 1. **Prepare the CAS configuration** ahead of time: a
    `storageunit.ConditionalStore` (the same store class the slate backend
-   already uses) plus a document `Key` naming this cluster. Validate the
-   config on a staging cluster first - including one full stop/start cycle.
+   already uses) plus a document `Key` naming this cluster. Note the
+   document's effective object key is the store's KeyPrefix concatenated
+   with Key EXACTLY as given - no separator is inserted - so a prefix
+   without a trailing delimiter yields `<prefix>__coord/members`, not
+   `<prefix>/__coord/members`; put any desired separator in the prefix.
+   Validate the config on a staging cluster first - including one full
+   stop/start cycle.
 2. **Disable the leave drain for the stopping deploy**: set
    `GracefulLeaveDrainTimeout` to 0. Drain-for-leave hands positions to
    successors; in a full stop there are none, so every node would otherwise
