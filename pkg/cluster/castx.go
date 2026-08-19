@@ -8,6 +8,7 @@ package cluster
 // of cas.go (which owns the OWNER-side validate-and-apply). See doc.go.
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -270,18 +271,29 @@ func (t *clusterTx) guardShard(key []byte) error {
 	// comparing owner nodes would admit a cross-unit transaction that then
 	// commits against only the pin unit. Compare units.
 	//
-	// TODO(reshard-tx): pinUnit is captured at pin time and genUnitForKey here
-	// reads the CURRENT genState. If a reshard cut-over for the pin key's old
-	// unit commits between the pin and a later same-shard op, the same shard
-	// key resolves to a different GenUnit and this returns a SPURIOUS
-	// ErrCrossShard, failing a legitimate single-node transaction mid-reshard.
-	// Transactions during a reshard are rare (reshard is an explicit op) and
-	// this is not data-loss, but the fix is to resolve the pin unit and all
-	// guardShard comparisons against the generation captured AT pin time (a
-	// stable snapshot for the tx lifetime) so a mid-tx cut-over does not flip
-	// the comparison. The reshard cut-over should also be made tx-aware.
+	// PERMANENT vs TRANSIENT, distinguished by the SHARD KEY. Two keys with
+	// the same shard key always resolve to the same unit under one layout, so
+	// a same-shard-key mismatch can only mean the layout moved underneath this
+	// transaction (a reshard cut-over committed after the pin). That is
+	// retryable and nothing is wrong with the caller's keys. A DIFFERENT shard
+	// key landing in a different unit is the real cross-shard case, and no
+	// amount of retrying will fix it.
+	//
+	// Collapsing both into ErrCrossShard forced every caller to pick a default
+	// that is wrong for the other case: retry, and a genuine key bug loops
+	// forever; fail, and a sub-second cut-over becomes a client error.
+	//
+	// pinUnit is still captured at pin time while this reads the CURRENT
+	// genState, so the mid-transaction cut-over still ends the transaction -
+	// it now ends RETRYABLY, which is what the caller can act on. Resolving
+	// every comparison against the generation captured at pin time would
+	// remove the case entirely; that is a deeper change and deliberately not
+	// taken here.
 	if t.c.multi {
 		if t.c.genUnitForKey(key) != t.pinUnit {
+			if bytes.Equal(t.c.shardKey(key), t.c.shardKey(t.pinKey)) {
+				return errUnitAcquiringBecause("Transact", "the unit layout changed mid-transaction (reshard cut-over); retry")
+			}
 			return backend.ErrCrossShard
 		}
 		return nil
