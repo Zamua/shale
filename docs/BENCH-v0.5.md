@@ -1,7 +1,7 @@
 # shale v0.5 benchmark results
 
 Generated: 2026-06-09 16:45 UTC
-Hardware: Apple Mac mini (M-series), single process, loopback memberlist + loopback gRPC.
+Hardware: Apple Mac mini (M-series), single process, loopback membership + loopback gRPC. Membership ran on the gossip adapter that shipped at the time; it was removed in v0.19.0.
 Workload: 10000 ops per phase (write then read), 1024-byte random values, 4 concurrent client goroutines.
 Harness: `cmd/shale-bench` (in-process spin-up via `tests/integration` patterns).
 Re-run: `make bench-v0.5 > docs/BENCH-v0.5.md`.
@@ -152,7 +152,7 @@ The script brings up `shale-bench-minio` on host port 19000, creates the `shale-
 
 ## What this bench does NOT measure
 
-- **Cross-host network cost.** Loopback gRPC + loopback memberlist have no real RTT. Real-world R=3 numbers will be worse (~ +1 inter-host RTT per fan-out) but multi-host setups may also recover throughput because each pebble backend gets its own disk.
+- **Cross-host network cost.** Loopback gRPC + loopback membership have no real RTT. Real-world R=3 numbers will be worse (~ +1 inter-host RTT per fan-out) but multi-host setups may also recover throughput because each pebble backend gets its own disk.
 - **Cross-region S3 RTT for the slate suite.** Local-MinIO numbers are a floor; real AWS S3 RTTs push slate write p50 into the 50-200ms range depending on placement.
 - **Topology change cost.** Membership churn (node add/leave/rebalance) is its own measurement; the v0.5 suite assumes a stable cluster.
 - **Large values.** 1KB is small; gRPC overhead dominates. A 64KB/256KB variant would tell a different story (backend cost rises, gRPC cost stays roughly fixed per call).

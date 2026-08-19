@@ -398,7 +398,7 @@ func (c *Cluster) Reshard() error {
 	// which on a ConditionalStore cluster is two real failures: a single-node
 	// cluster that reshards inline and restarts authoritatively adopts the
 	// STALE marker (acked-write loss: the retired generation's units serve
-	// again), and a member whose gossip view momentarily collapses to itself
+	// again), and a member whose coordinator view momentarily collapses to itself
 	// mid-partition would fork the cluster with a local-only generation the
 	// healed peers never converge to. Gating on the wiring, not the member
 	// VIEW, removes the view from the decision entirely. reshardDelegated

@@ -21,7 +21,7 @@ package integration
 // THE MECHANISM THAT REMAINS (documented and accepted; see the tolerance block
 // on the assertions at the bottom of this file). A successor fences the
 // predecessor at OPEN-START, but nothing feeds a fence back into ROUTING. A
-// node whose gossip view is momentarily stale - the joiner's Joining bit has
+// node whose view is momentarily stale - the joiner's Joining bit has
 // arrived, the leaver's Draining bit has not - therefore routes the unit only
 // to legs it can no longer read, while the true post-leave owners are not in its
 // routed set at all. Every such leg is SKIPPED rather than counted as
@@ -384,7 +384,7 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 		}
 		// The final owners must appear in NO pre-flip view - not the old
 		// placement, not the approximated drain pending, not the full 5-ring
-		// (the joiner-in-ring view) - so no interleaving of gossip/bit arrival
+		// (the joiner-in-ring view) - so no interleaving of view/role arrival
 		// can hand a final owner a copy before the leaver exits. That is what
 		// makes the post-exit zero-holder window STRUCTURAL, not a race.
 		if intersects(fin, old4) || intersects(fin, appr) || intersects(fin, five) {
@@ -426,7 +426,7 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 		cfg.OpenConcurrency = 8
 		// The joiner fixture does not set the snappy test debounce by default;
 		// without it the joiner's reconcile idles on the 5s production settle
-		// (re-armed by every gossip event of the in-flight transition) and the
+		// (re-armed by every membership event of the in-flight transition) and the
 		// timeline degenerates to the drain timeout.
 		cfg.RebalanceSettleDelay = 300 * time.Millisecond
 	}
@@ -582,7 +582,7 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 	// The full-move availability write-up measured this exact mechanism on this
 	// exact scenario and reached the verdict REQUIRES_DESIGN_CHANGE with no fix
 	// scheduled: a successor fences the predecessor at open-start, nothing feeds
-	// that fence back into routing, and a node whose gossip view is briefly
+	// that fence back into routing, and a node whose view is briefly
 	// stale is left routing only to legs it can no longer read. Every option
 	// that actually closes it costs a durable format change, new synchronous I/O
 	// on the read hot path, or an inversion of an existing safety invariant, so

@@ -33,7 +33,8 @@ Coordinator. Between the membership event and the moment `runEvaluate` actually
 calls `Coordinator.Evaluate`, the Coordinator's `c.ranges` map is still empty (or
 holds only previously-terminal entries). So:
 
-- Test joins node, ring converges (sub-second under SWIM on loopback).
+- Test joins node, ring converges (sub-second on loopback; measured under the
+  gossip adapter that shipped at the time).
 - Test calls `WaitForRebalanceIdle` BEFORE `settleDelay` (500ms in the fixture) elapses.
 - Coordinator has no non-terminal ranges -> `idle()` returns true -> the wait returns immediately.
 - The settle timer fires mid-test, `Evaluate` registers Sending/Receiving ranges, and

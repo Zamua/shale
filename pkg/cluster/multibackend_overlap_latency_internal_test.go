@@ -14,7 +14,7 @@ package cluster
 //     second of the successor's serving marker (not the next tick).
 //
 // The event-driven QUEUE CHAINING itself (permit frees -> next queued open
-// starts immediately) is pinned end-to-end on a real gossip cluster in
+// starts immediately) is pinned end-to-end on a real multi-node cluster in
 // tests/integration/handoff_cycle_latency_test.go.
 
 import (

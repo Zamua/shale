@@ -4,8 +4,9 @@
 // The ring-input encoding must be identical on every node AND under every
 // adapter: two nodes disagreeing about it would route the same unit to
 // different owners, and a cluster migrated from one adapter to another (the
-// gossip -> CAS path) must keep placing every unit exactly where it already
-// lives. That is why the encoding lives in exactly one place, internal to
+// gossip -> CAS switchover shale ran; docs/design/coordinator-migration.md)
+// must keep placing every unit exactly where it already lives. That is why
+// the encoding lives in exactly one place, internal to
 // pkg/coord's adapters, and each adapter's export forwards here.
 package placement
 

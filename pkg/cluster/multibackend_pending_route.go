@@ -4,9 +4,10 @@
 // transition, plus the stable-R ack bar the dual-write fan-out holds.
 //
 // THE MODEL (see docs/SPEC.md "v0.8 Phase 2e" + docs/design/overlap-handoff.md).
-// A node that is LEAVING gossips a Draining bit but STAYS a current owner in the
-// ring (the ring is NOT pruned of draining members - that exclusion is REVERSED;
-// see reconcileRingFromMembership). For a key's unit:
+// A node that is LEAVING publishes coord.RoleDraining through the coordinator
+// but STAYS a current owner in the ring (the ring is NOT pruned of draining
+// members - that exclusion is REVERSED; see reconcileRingFromMembership). For
+// a key's unit:
 //
 //   - CURRENT  = unitReplicas over the ring INCLUDING draining members.
 //     The nodes that own the position TODAY and have it mounted (the leaver is
@@ -50,8 +51,8 @@ import (
 // bit, read from the authoritative membership snapshot (NOT the ring, which now
 // carries draining members). Empty (nil) in the common steady state, so the
 // transition test below short-circuits to the stable replica set with no
-// allocation. A nil membership (legacy / test harness without gossip) yields no
-// draining members, collapsing every key to its stable set.
+// allocation. A nil membership (legacy / test harness without a coordinator)
+// yields no draining members, collapsing every key to its stable set.
 func (c *Cluster) drainingIDs() map[storageunit.NodeID]struct{} {
 	// Test hook: white-box tests without a coordinator inject the draining set
 	// directly. In production c.draining is nil and the view is authoritative.

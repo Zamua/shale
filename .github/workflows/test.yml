@@ -96,7 +96,7 @@ jobs:
           echo "forward pairing clean against $CORE"
 
   # BLOCKING race-detector gate, fanned out across runners. The race detector
-  # is the primary defense against the concurrency bugs a gossip-membership +
+  # is the primary defense against the concurrency bugs a distributed-membership +
   # multi-node-handoff store is prone to, so it gates merges.
   #
   # Why a matrix and not one job: -race carries heavy CPU+memory overhead, and

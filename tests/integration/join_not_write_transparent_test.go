@@ -6,7 +6,7 @@ package integration
 // Draining bit, stays a CURRENT owner in the ring, and the write fan-out dual-
 // writes to the routed UNION, so a node that physically holds the data is always
 // in the write set until the successor mounts. v0.8 Phase 2e now makes a JOIN the
-// exact mirror via a gossiped Joining bit and the UNIFIED SPLIT: current = ring
+// exact mirror via an advertised Joining role and the UNIFIED SPLIT: current = ring
 // EXCLUDING joining (quorum-floored); pending = ring EXCLUDING draining. A node
 // that boots into a live cluster with DEFERRED positions advertises Joining, so:
 //
@@ -165,8 +165,9 @@ func probeClass(entry *cluster.Cluster, uk map[storageunit.UnitID]string, units 
 // test uses) hides this: it keeps the displaced owner unfenced during the
 // modeled mount.
 //
-// This proves the residual is the FENCE TIMING, not the gossip-ordering race the
-// Joining bit already closes (it rides the first Meta; cluster.go startJoining).
+// This proves the residual is the FENCE TIMING, not the role-ordering race the
+// Joining bit already closes (it rides the node's first announcement through the
+// coordinator, coord.Params.InitialRoles; cluster.go startJoining).
 func TestJoinResidual_FenceAtOpenStart_MovingShardsWedge(t *testing.T) {
 	const uc, rf = 16, 2
 	// The backing defaults to eager fence timing (real slatedb: fence at
@@ -508,7 +509,7 @@ func TestLeaveIsWriteTransparent_MovingShardsStayAvailable(t *testing.T) {
 	drainDone := make(chan struct{})
 	go func() { defer close(drainDone); _ = n4.Cluster.Close() }()
 
-	// Let the Draining bit gossip to the survivors so their routing switches to the
+	// Let the Draining role reach the survivors so their routing switches to the
 	// current/pending union.
 	time.Sleep(600 * time.Millisecond)
 

@@ -113,7 +113,7 @@ func (c *Cluster) LocalReplicaGetAt(ru storageunit.ReplicaUnit, key []byte) ([]b
 // the explicit ru's mounted backend (with the same mounted-position fallback
 // as LocalReplicaGetAt), with NO ring-ownership guard: the union deliberately
 // routes a scan to a member the receiver's own ring view may not consider the
-// owner (gossip lag), and the receiver answers from what it physically holds.
+// owner (view lag), and the receiver answers from what it physically holds.
 // An unmounted unit returns the acquiring refusal recoded for the wire so the
 // originator's leg walk skips this member and tries the next union member.
 func (c *Cluster) LocalReplicaScanAt(ru storageunit.ReplicaUnit, prefix []byte) (backend.Iterator, error) {

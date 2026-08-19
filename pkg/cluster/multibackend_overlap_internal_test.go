@@ -520,7 +520,7 @@ func TestOverlap_drainCheck_ReleasesOnServingMarker(t *testing.T) {
 // opens). Under a >= gate the node would read its OWN stale marker E and release
 // while the real successor is still mid-mount. The strict > gate rejects the
 // stale self-marker (exactly E) and releases ONLY when a genuine successor writes
-// a marker STRICTLY above E. Deterministic, no gossip timing.
+// a marker STRICTLY above E. Deterministic, no membership timing.
 func TestOverlap_drainCheck_StaleSelfMarkerDoesNotRelease(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "self", 4, 2, backing, "self", "n2", "n3")

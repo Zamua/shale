@@ -156,8 +156,8 @@ func (c *Cluster) genLearnBudget() time.Duration {
 // (the generation is committed as a side effect). Returns (false, lastErr) if no
 // visible seed answered this pass - lastErr says why (no peer visible YET, or
 // the last query error), so the patient caller can retry or surface it. The
-// addr set is re-fetched each pass so a seed that only just joined gossip (or
-// only just began serving gRPC) is picked up on the next sweep.
+// addr set is re-fetched each pass so a seed that only just appeared in the
+// view (or only just began serving gRPC) is picked up on the next sweep.
 func (c *Cluster) trySeedGenSweep() (committed bool, lastErr error) {
 	addrs := c.seedGRPCAddrs()
 	if len(addrs) == 0 {

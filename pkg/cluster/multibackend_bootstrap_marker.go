@@ -5,9 +5,9 @@
 //
 //   - FORM-LOCK. A fresh cluster's nodes all PutIfAbsent it; exactly one wins
 //     and becomes the founder, so concurrent first-boot can never split-brain
-//     into multiple gen-0 rings. Gossip alone is NOT a sufficient tiebreak (two
-//     nodes that have not yet gossip-connected both believe they are alone); the
-//     CAS is the authoritative single-winner.
+//     into multiple gen-0 rings. The coordinator's view alone is NOT a
+//     sufficient tiebreak (two nodes whose views have not yet converged both
+//     believe they are alone); the CAS is the authoritative single-winner.
 //   - DURABLE {gen, count}. Its value carries the cluster's current generation
 //     and unit count. Generation is otherwise in-memory only (a joiner learns it
 //     via the GenState RPC from a live seed), so a FULL-cluster restart - no live

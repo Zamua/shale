@@ -41,10 +41,11 @@ type Node struct {
 }
 
 // Role is a node's TRANSITIONAL stance in the overlap handoff protocol, as a
-// bit set. It is a shale-protocol concept, not a gossip concept: any
-// coordinator has to be able to express "I am warming into an assignment I do
-// not serve yet" and "I am yielding an assignment I still serve", because the
-// current/pending routing split is defined in terms of them.
+// bit set. It is a shale-protocol concept, not a property of whatever
+// mechanism carries it: any coordinator has to be able to express "I am
+// warming into an assignment I do not serve yet" and "I am yielding an
+// assignment I still serve", because the current/pending routing split is
+// defined in terms of them.
 //
 // The zero Role is STEADY STATE: neither warming nor yielding.
 type Role uint8
@@ -151,9 +152,9 @@ type Placement struct {
 type Params struct {
 	// Self is this node's identity and dial address.
 	Self Node
-	// DeclaredUnitCount is this node's standing declared unit count, gossiped
-	// so the cluster can detect agreement on a desired count. 0 = do not
-	// advertise (unknown).
+	// DeclaredUnitCount is this node's standing declared unit count, published
+	// by the coordinator so the cluster can detect agreement on a desired
+	// count. 0 = do not advertise (unknown).
 	DeclaredUnitCount uint32
 	// InitialRoles is the role set this node ASKS to advertise in its VERY
 	// FIRST announcement, atomically with its own presence. Seeding RoleJoining

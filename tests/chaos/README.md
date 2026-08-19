@@ -257,8 +257,9 @@ membership change so the two coordinators do not livelock). Event types:
 2. **NODE JOIN** (`join`). Starts a new `sharedNode` on the shared backing,
    seeded at an existing member. The ring redistributes units to it via the
    Phase 3 lease handoff (copy-free). No acked write lost across the handoff.
-3. **NODE LEAVE** (`leave`). Gracefully closes a node (broadcasts the memberlist
-   Leave). Survivors converge and re-acquire its units. No acked write lost.
+3. **NODE LEAVE** (`leave`). Gracefully closes a node (a clean coordinator
+   departure, not a hard kill). Survivors converge and re-acquire its units. No
+   acked write lost.
 4. **RESHARD** (`reshard`). Calls `Reshard()` on a coordinator node, doubling
    the unit count cluster-wide via the freeze barrier. No acked write lost across
    the reshard; the concurrent writers' freeze-window refusals are retried, not

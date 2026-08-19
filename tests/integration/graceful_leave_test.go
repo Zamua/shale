@@ -6,8 +6,9 @@ package integration
 // docs/design/overlap-handoff.md "Graceful leave (scale-down)" are the
 // canonical behavior. A graceful leave is the overlap drain seen from the
 // LOSING side, for ALL of a node's positions at once: on Close() the leaving
-// node broadcasts the memberlist leave (survivors re-own its positions and
-// begin Acquiring), then DrainForLeave BLOCKS until every position handed off
+// node announces its departure through the coordinator (survivors re-own its
+// positions and begin Acquiring), then DrainForLeave BLOCKS until every
+// position handed off
 // (the successors are Ready and drainCheck released them) before tearing the
 // mounts down. The leaving node keeps serving (directly + via the survivors'
 // forwards) throughout the drain, so there is no unserved window.

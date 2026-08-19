@@ -190,7 +190,8 @@ func countScan(n *sharedNode, prefix []byte) (int, error) {
 // RETIRED: TestFreshBoot_HomogeneousStagger_NoWriteGap.
 //
 // It differed from the staggered test above in ONE way: node A booted seeded
-// at a peer that was not up yet, which under the SWIM adapter made A raise the
+// at a peer that was not up yet, which under the removed SWIM adapter made A
+// raise the
 // Joining bit at membership open and retract it once its solo boot completed -
 // so a peer booting inside that window read A as not-established. That
 // tentative-then-retract dance was an artifact of discovering membership by

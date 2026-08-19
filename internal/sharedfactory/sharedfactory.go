@@ -466,10 +466,11 @@ func (h *Handle) SetAcquireDelay(d time.Duration) {
 // mount window open while it probes that window. Latching it at open-start makes
 // the knob ONE-WAY: a test can widen a window but never close one, so the
 // duration has to be guessed in advance against everything that runs between
-// arming it and probing (a gossip convergence wait, most of all). Guess low and a
-// slow runner closes the window before the probes issue a single read; guess high
-// and teardown waits out the whole latency it armed - on the SAME slow runner,
-// because that is exactly when opens are in flight. Re-reading dissolves the
+// arming it and probing (a membership convergence wait, most of all). Guess low
+// and a slow runner closes the window before the probes issue a single read;
+// guess high and teardown waits out the whole latency it armed - on the SAME
+// slow runner, because that is exactly when opens are in flight. Re-reading
+// dissolves the
 // tradeoff: arm it far longer than any bounded wait, then release it the moment
 // the probing is done. The window stops being a race and becomes a thing the test
 // opens and closes.

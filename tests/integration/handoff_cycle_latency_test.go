@@ -2,7 +2,7 @@ package integration
 
 // Handoff-cycle LATENCY pin (docs/SPEC.md "The pending owners acquire in the
 // background"): with the node-wide open bound at the PRODUCTION DEFAULT (1)
-// and N positions moving in a real-gossip join, the full acquire cycle must
+// and N positions moving in a real multi-node join, the full acquire cycle must
 // cost ~N x the open itself - the queued opens CHAIN event-driven off the
 // permit (each next open starts the moment the previous finishes), never
 // waiting a reconcile tick between opens. Pre-dissection this was the feared

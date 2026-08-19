@@ -86,8 +86,8 @@ func startCASNode(t *testing.T, id string, unitCount, rf int, backing *sharedfac
 		GRPCAddr:          grpcAddr,
 		LogOutput:         io.Discard,
 		WriteTimeout:      writeTimeout,
-		// Snappy debounce, as the gossip fixtures use; tests that need the
-		// production cadence override via mutate.
+		// Snappy debounce, as the other integration fixtures use; tests that
+		// need the production cadence override via mutate.
 		RebalanceSettleDelay: 300 * time.Millisecond,
 		// The production shape: the SAME conditional store serves the
 		// cluster-side arbiter seams (bootstrap marker, reshard arbiter)
@@ -125,7 +125,8 @@ func startCASNode(t *testing.T, id string, unitCount, rf int, backing *sharedfac
 // basesAgree asserts that on node n BOTH member bases - the membership view
 // and the placement basis - hold exactly the same IDs. The CAS adapter
 // publishes {view, ring} as one snapshot, so any divergence here is a bug,
-// not a window (contrast the gossip adapter's documented event-loop-hop lag).
+// not a window (contrast the removed gossip adapter's documented
+// event-loop-hop lag).
 func basesAgree(t *testing.T, n *sharedNode) {
 	t.Helper()
 	view := n.Cluster.Members()
@@ -194,7 +195,7 @@ func TestCASCoordinator_ThreeNodeLifecycle(t *testing.T) {
 	}
 
 	// CONVERGENCE, both member bases, then write readiness - the same gates
-	// every gossip fixture passes, now answered from the document poll.
+	// every multi-node fixture passes, here answered from the document poll.
 	waitForClusterReady(t, cs, 45*time.Second)
 	waitForWriteReady(t, cs, 45*time.Second)
 	for _, n := range nodes {
@@ -283,7 +284,8 @@ func TestCASCoordinator_ThreeNodeLifecycle(t *testing.T) {
 
 // TestCASCoordinator_FreshBootStagger_NoWriteGap is the v0.14.2 fresh-boot
 // smoke on the CAS coordinator: the boot-defer + serving-marker machinery
-// must compose with CAS membership exactly as it does with gossip.
+// must compose with CAS membership exactly as it did under the removed
+// gossip adapter.
 //
 // Node A boots alone: its coordinator's PutIfAbsent founds the cluster (so
 // the requested Joining role is dropped, per the port), it mounts every
@@ -304,7 +306,8 @@ func TestCASCoordinator_ThreeNodeLifecycle(t *testing.T) {
 //     positions drain).
 func TestCASCoordinator_FreshBootStagger_NoWriteGap(t *testing.T) {
 	const (
-		// 16 units for the same reason the homogeneous gossip gate uses 16:
+		// 16 units for the same reason the retired homogeneous stagger gate
+		// used 16:
 		// at 4 units an unlucky ID pair can leave B primary for nothing,
 		// deferring nothing, and the test would pass vacuously. The vacuity
 		// guard below makes the residual case loud.
@@ -317,7 +320,7 @@ func TestCASCoordinator_FreshBootStagger_NoWriteGap(t *testing.T) {
 	// Real open latency (500ms per open) makes the warm-up's CONCURRENCY
 	// observable, and RebalanceSettleDelay 0 selects the PRODUCTION debounce
 	// so the prompt path - not a snappy test cadence - is what must close
-	// the gap. Same teeth as the gossip fresh-boot gates.
+	// the gap. Same teeth as the other fresh-boot gates.
 	bootCfg := func(cfg *cluster.Config) {
 		cfg.RebalanceSettleDelay = 0 // 0 = the production default debounce
 		cfg.OpenConcurrency = 8

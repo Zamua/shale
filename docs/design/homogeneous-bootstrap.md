@@ -24,8 +24,8 @@ In `cluster.Open` (`pkg/cluster/cluster.go`), the rule is structural:
 
 Because "empty seeds" is a static config flag, the founder needs a DIFFERENT
 config than the joiners, which forces two StatefulSets. The runtime peers are
-already homogeneous (same ownership math, same gossip, no leader); only
-bootstrap config + the deployment packaging differ.
+already homogeneous (same ownership math, same membership mechanism, no
+leader); only bootstrap config + the deployment packaging differ.
 
 This also causes bug #453: a RESTARTING founder still has empty seeds, so it
 re-forms a fresh gen-0 1-node ring (desiring every position) instead of
@@ -51,8 +51,10 @@ Identical for every pod. No "empty seeds" special case.
 
 On `Open` (multi-node), the node:
 
-1. **Try to JOIN.** `membership.Open` Joins the seed list (the headless
-   Service). memberlist resolves it to the live peer set.
+1. **Try to JOIN.** The coordinator's `Start` discovers the incumbent
+   membership. (Written against the gossip adapter, which Joined a seed list
+   resolved from the headless Service; the CAS adapter reads the membership
+   document instead. The bootstrap decision below is the same either way.)
    - If Join returns peers (a ring already exists) -> this node is a JOINER:
      learn the live `{generation, unit-count}` from a peer (the existing
      `len(Seeds)>0` path), then serve. NO re-form.
@@ -79,14 +81,15 @@ a tiebreak they ALL form -> N split-brain gen-0 rings -> data divergence.
 
 The `cluster-init` CAS-lease is the tiebreak: exactly ONE conditional-write of
 the marker succeeds; the other N-1 get a precondition failure, fall back to
-re-Join, and find the winner (directly, or transitively once gossip converges).
-This reuses shale's existing CAS / conditional-write primitive (the same
+re-Join, and find the winner (directly, or transitively once the coordinator's
+view converges). This reuses shale's existing CAS / conditional-write primitive
+(the same
 `If-None-Match` semantics the serving markers and slatedb manifest fencing rely
 on - see #435 CAS-lease serving markers).
 
-memberlist gossip alone is NOT a sufficient tiebreak: two pods that haven't yet
-gossip-connected can both believe they are alone. The CAS-lease is the
-authoritative single-winner; gossip then converges everyone onto the winner.
+The coordinator's view alone is NOT a sufficient tiebreak: two pods whose views
+have not yet converged can both believe they are alone. The CAS-lease is the
+authoritative single-winner; the view then converges everyone onto the winner.
 
 ### 4. Generation persistence (so a full restart resumes, not re-forms)
 
@@ -222,8 +225,8 @@ full-restart -> resumes-generation, concurrent-boot -> single founder).
 - **Full-cluster restart resumes generation:** bump the generation (reshard),
   stop all nodes, restart all -> the cluster resumes at the bumped generation,
   not gen-0; ownership matches pre-restart.
-- **Single-winner under partition:** two nodes that cannot gossip-connect still
-  produce one founder (the CAS-lease, not gossip, is the tiebreak).
+- **Single-winner under partition:** two nodes whose views have not converged
+  still produce one founder (the CAS-lease, not the view, is the tiebreak).
 
 ## Open questions
 

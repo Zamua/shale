@@ -99,14 +99,14 @@ func (r BootReason) String() string {
 // node's ring is a PARTIAL view and its deferred set was computed against that
 // partial view. Acting immediately means acquiring positions it will not own
 // once the ring converges, at epochs that fence sibling booting nodes' live
-// mounts mid-boot. The debounce is what gives gossip time to converge before
+// mounts mid-boot. The debounce is what gives the view time to converge before
 // anyone acts; skipping it in the mass case deterministically lost acked
 // writes. An established peer is the discriminator because it is exact rather
 // than heuristic: every multi-node replicated node advertises Joining from
 // membership-open and clears it only once warmed, so in a mass boot every
 // visible peer says Joining, while in a staggered join the established peers
-// long ago cleared it. A peer that has not gossiped at all is not visible,
-// which also (correctly) reads as not established.
+// long ago cleared it. A peer that has not reached this node's view at all is
+// not visible, which also (correctly) reads as not established.
 func BootWarmUp(s BootState) BootAction {
 	act := BootAction{Joining: s.Joining()}
 	switch {

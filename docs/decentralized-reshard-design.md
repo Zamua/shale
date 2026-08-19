@@ -29,8 +29,9 @@ The review confirmed the *foundations* are sound (verified against source):
 It found these **blocking** problems, all of which v2 must (and below does) close:
 
 1. **No cross-node flip-ordering primitive.** `cutOver` is node-local and never
-   gossiped; two nodes can route the same key to different generations, and a
-   write acked only on a child (single replica) can be lost when another node
+   shared cluster-wide; two nodes can route the same key to different
+   generations, and a write acked only on a child (single replica) can be lost
+   when another node
    retires the parent. The freeze barrier exists for exactly this
    (`multibackend_reshard_barrier.go:7-9`, `multibackend_reshard.go:329-338`);
    removing it requires *re-providing the ordering decentrally*, not deleting it.
@@ -113,11 +114,12 @@ durable cut-over marker," but its AUTHORITY is the durable marker. A node sets i
 local `cutOver[K]` (and routes `K` to gen+1) only after reading the durable marker.
 
 The desired count is declared once (preferred: a single config source the nodes
-read, e.g. a ConfigMap; acceptable: gossiped per-pod via `Meta` + agreed). Gossip
-(`membership.Meta`, extended with a NUL-separated `desired-count`/`epoch` segment
-that `decodeMeta` already tolerates) is a fast *hint* to "go read the CAS epoch";
-the CAS object is the authority, so a rolling-update disagreement window cannot
-cause two plans.
+read, e.g. a ConfigMap; acceptable: advertised per-node through the
+coordinator, then agreed). The advertised value is a fast *hint* to "go read
+the CAS epoch"; the CAS object is the authority, so a rolling-update
+disagreement window cannot cause two plans. (As shipped this is `coord.Params.DeclaredUnitCount`; the
+proposal was written when the advertising mechanism was the removed gossip
+adapter's `Meta` payload.)
 
 ## 3. The split protocol (`N -> 2N`)
 
@@ -263,7 +265,7 @@ Two parents `K`, `K+N` (gen g) collapse into survivor `K` (gen g+1, `Halve()`).
   `next_count`, the agreed `reshard_epoch`, and the observed cut-over unit ids;
   `learnGenerationFromSeed` commits the full mid-reshard `genState` before mounting
   and **fails closed** if seeds disagree on the reshard state (they shouldn't —
-  the CAS epoch is authoritative — but a partial gossip view must not let a joiner
+  the CAS epoch is authoritative — but a partial view must not let a joiner
   route to a retired parent).
 - **Transact / CAS spanning a mid-split unit (closes hole 8c):** the CAS commit
   re-resolves the unit under the per-unit pause and returns `codes.FailedPrecondition`
