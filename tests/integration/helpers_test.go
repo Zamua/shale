@@ -24,10 +24,12 @@ import (
 	"time"
 
 	"github.com/Zamua/shale/internal/clustertest"
+	"github.com/Zamua/shale/internal/coordstatic"
 	"github.com/Zamua/shale/internal/goleakignore"
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
+	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"go.uber.org/goleak"
@@ -483,4 +485,83 @@ func waitForClusterReady(t *testing.T, clusters []*cluster.Cluster, deadline tim
 			t.Fatalf("waitForClusterReady: rebalance idle wait on cluster %d (%s): %v", i, c.NodeID(), err)
 		}
 	}
+}
+
+// start3NodeR2Static stands up a 3-node R=2 cluster on the STATIC coordinator
+// (internal/coordstatic) rather than the CAS one the rest of this suite uses.
+//
+// It exists for the ONE test that must force a placement basis diverged from
+// the view (cluster.TestingSetRingMembers). The CAS adapter deliberately does
+// not offer that seam - its single-snapshot design makes such a divergence
+// structurally absent - so a divergence test must run on a coordinator that
+// does. Real gRPC servers are still wired: the wedge being reproduced is about
+// routing and forwarding, only the membership basis is static.
+func start3NodeR2Static(
+	t *testing.T,
+	unitCount int,
+	backing *sharedfactory.Backing,
+	mutate func(*cluster.Config),
+) []*sharedNode {
+	t.Helper()
+	ids := []string{"ovh-a", "ovh-b", "ovh-c"}
+
+	// Listeners first: the static member set needs every node's dial address
+	// before any cluster opens.
+	lis := make([]net.Listener, len(ids))
+	members := make([]coord.Node, len(ids))
+	for i, id := range ids {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("start3NodeR2Static %s: listen gRPC: %v", id, err)
+		}
+		lis[i] = l
+		members[i] = coord.Node{ID: storageunit.NodeID(id), Addr: l.Addr().String()}
+	}
+
+	nodes := make([]*sharedNode, len(ids))
+	for i, id := range ids {
+		h := backing.Handle()
+		cfg := cluster.Config{
+			NodeID:               id,
+			BackendFactory:       h,
+			UnitCount:            storageunit.MustUnitCount(unitCount),
+			ReplicationFactor:    2,
+			WriteConsistency:     cluster.WriteAll,
+			ReadConsistency:      cluster.ReadAll,
+			GRPCAddr:             members[i].Addr,
+			LogOutput:            io.Discard,
+			RebalanceSettleDelay: 300 * time.Millisecond,
+		}
+		if mutate != nil {
+			mutate(&cfg)
+		}
+		cfg.Coordinator = coordstatic.New(members[i], members)
+		c, err := cluster.Open(cfg)
+		if err != nil {
+			t.Fatalf("start3NodeR2Static %s: cluster.Open: %v", id, err)
+		}
+
+		grpcSrv := grpc.NewServer()
+		rpc.NewServer(c).Register(grpcSrv)
+		serveDone := make(chan struct{})
+		go func(l net.Listener) {
+			defer close(serveDone)
+			_ = grpcSrv.Serve(l)
+		}(lis[i])
+
+		n := &sharedNode{
+			ID:       id,
+			Cluster:  c,
+			Handle:   h,
+			GRPCAddr: members[i].Addr,
+			stop: func() {
+				grpcSrv.GracefulStop()
+				<-serveDone
+			},
+		}
+		t.Cleanup(n.Close)
+		nodes[i] = n
+	}
+	clustertest.WaitForWriteReady(t, []*cluster.Cluster{nodes[0].Cluster, nodes[1].Cluster, nodes[2].Cluster}, 30*time.Second)
+	return nodes
 }

@@ -133,7 +133,10 @@ func TestRollingRestartWedge_MembershipDivergence(t *testing.T) {
 	// Short WriteTimeout so each probe Put returns quickly (its internal
 	// retry-through-handoff budget is bounded by WriteTimeout), giving many probe
 	// samples in the observation window instead of a couple of 5s-blocking calls.
-	nodes := start3NodeR2Cfg(t, unitCount, backing, func(cfg *cluster.Config) {
+	// STATIC coordinator, not the suite's CAS default: this test forces a
+	// placement basis diverged from the view, and only a coordinator offering
+	// the MemberSetter seam can express that (see start3NodeR2Static).
+	nodes := start3NodeR2Static(t, unitCount, backing, func(cfg *cluster.Config) {
 		cfg.WriteTimeout = 250 * time.Millisecond
 	}) // ids ovh-a, ovh-b, ovh-c
 	byID := map[string]*sharedNode{}
@@ -242,9 +245,22 @@ func TestRollingRestartWedge_MembershipDivergence(t *testing.T) {
 		total, success, midAcquire, other, sampleErr)
 	t.Logf("members-agree-across-nodes=%v (expected FALSE: the membership-race arm)", membersAgreeNow)
 
-	// Stop holding the divergence so the victim self-heals for the recovery check.
+	// Stop holding the divergence, then RESTORE the correct basis explicitly.
+	// On a static coordinator the forced set IS the membership, so there is no
+	// background snapshot for a reconcile to revert to - releasing the hold
+	// alone would leave the divergence in place. (The self-heal-by-reconcile
+	// property this once also exercised belongs to a coordinator that re-derives
+	// its view; in production the CAS poll loop provides it, and a divergence
+	// like this one cannot arise there at all.)
 	holding.Store(false)
 	holdWG.Wait()
+	correctMembers := []ring.Member{
+		{ID: realIDs[0], Addr: byID[realIDs[0]].GRPCAddr},
+		{ID: realIDs[1], Addr: byID[realIDs[1]].GRPCAddr},
+		{ID: realIDs[2], Addr: byID[realIDs[2]].GRPCAddr},
+	}
+	victim.TestingSetRingMembers(correctMembers)
+	victim.TestingRunReconcile()
 
 	// ASSERTIONS (the deterministic repro).
 	//

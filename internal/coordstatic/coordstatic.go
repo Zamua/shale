@@ -11,12 +11,12 @@
 package coordstatic
 
 import (
-	"encoding/binary"
 	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
 
+	"github.com/Zamua/shale/internal/placement"
 	"github.com/Zamua/shale/pkg/coord"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -195,7 +195,7 @@ func (c *Coordinator) memberFacts() map[storageunit.NodeID]coord.Member {
 }
 
 // Locate returns up to n nodes for u, primary first - the same pkg/ring math
-// and the same genUnitBytes input as every other adapter, so this coordinator
+// and the same placement.GenUnitBytes input as every other adapter, so this coordinator
 // places identically over the same member set.
 //
 // An exclusion is honored by locating over a ring GENUINELY REBUILT from the
@@ -215,7 +215,7 @@ func (c *Coordinator) Locate(u storageunit.GenUnit, n int, p coord.Placement) []
 			return nil
 		}
 	}
-	ms := r.LocateKeyN(genUnitBytes(u), n)
+	ms := r.LocateKeyN(placement.GenUnitBytes(u), n)
 	if len(ms) == 0 {
 		return nil
 	}
@@ -260,18 +260,6 @@ func excludeKey(exclude map[storageunit.NodeID]struct{}) string {
 	}
 	sort.Strings(ids)
 	return strings.Join(ids, "\x00")
-}
-
-// genUnitBytes is the STABLE ring-input encoding of a generation-qualified
-// unit: 8 big-endian bytes of Generation followed by 4 of UnitID. It must be
-// byte-identical to pkg/coord/internal/placement.GenUnitBytes (unreachable
-// from here by the internal rule) or this coordinator places units on
-// different nodes than the real adapters over the same member set.
-func genUnitBytes(gu storageunit.GenUnit) []byte {
-	b := make([]byte, 12)
-	binary.BigEndian.PutUint64(b[:8], uint64(gu.Gen))
-	binary.BigEndian.PutUint32(b[8:], uint32(gu.ID))
-	return b
 }
 
 // SetRole records this node's complete role set locally; there are no peers
