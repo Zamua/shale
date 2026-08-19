@@ -170,9 +170,16 @@ type Params struct {
 	InitialRoles Role
 	// SoloStart permits the coordinator to come up WITHOUT reaching any peer.
 	// The storage layer sets it when it holds an independent durable
-	// form-lock, so a homogeneous deployment whose members all carry the same
-	// seed list can have its first member up. Without it a coordinator that
+	// form-lock, so a homogeneous deployment whose members are configured
+	// identically can have its first member up. Without it a coordinator that
 	// cannot reach its peers MUST fail Start rather than silently fork.
+	//
+	// An adapter whose discovery mechanism IS a durable store can ignore it:
+	// the store is that adapter's one required peer, so unreachability fails
+	// Start regardless, and the conditional write makes founded-vs-joined
+	// definitive with no silent-fork risk to guard (see pkg/coord/cas). The
+	// field remains in the port for adapters that discover by probing peers,
+	// where the distinction is real.
 	SoloStart bool
 }
 
