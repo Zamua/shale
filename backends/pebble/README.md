@@ -10,6 +10,15 @@ cgo-free durability story.
 Pure Go, no build tags, no native libs. `go build ./...` always includes
 this package.
 
+## Single-node only
+
+The `shaled-pebble` binary (and any embedding of this backend via
+`cluster.Config.Backend`) is single-node. Multi-node shale coordinates
+through a shared conditional store and hands storage units between nodes
+over shared storage; pebble's data is one node's local disk, so it has
+neither. For a multi-node cluster use the slate backend's multi-backend
+mode (`backends/slate/cmd/shaled-slate --multi-backend`).
+
 ## Usage
 
 ```go

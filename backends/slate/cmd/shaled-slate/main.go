@@ -32,6 +32,7 @@
 //	--slate-key-prefix   SHALE_SLATE_KEY_PREFIX  shared-bucket prefix (multi-backend only)
 //	--slate-relaxed-durability SHALE_SLATE_RELAXED_DURABILITY  R>=2 replica relaxed durability (default false)
 //	--multi-backend      SHALE_MULTI_BACKEND     one slatedb per unit (default false)
+//	--coord-key          SHALE_COORD_KEY         membership-document key (multi-backend only; default cas.DefaultKey)
 //
 // In multi-backend mode (--multi-backend=true, paired with the std
 // --unit-count > 1), the binary builds a slate Backing over the shared
@@ -39,6 +40,12 @@
 // is ignored (per-unit DbNames are derived from each GenUnit). The
 // multi-backend constructor is also slatedb-tagged (real slatedb), so a
 // tag-less build fails fast on it the same way the single backend does.
+//
+// Multi-backend mode is also MULTI-NODE: membership rides the SAME bucket
+// through the CAS coordinator (pkg/coord/cas) over the conditional store,
+// so nodes need no extra port, no seed list - every node points at the
+// bucket and coordinates through the membership document at --coord-key.
+// Single-backend mode is single-node only.
 package main
 
 import (
@@ -49,6 +56,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/Zamua/shale/pkg/coord/cas"
 	"github.com/Zamua/shale/pkg/shaled"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
@@ -126,6 +134,8 @@ func run(argv []string, stderr *os.File) error {
 		"slate: shared-bucket key prefix for per-unit databases (multi-backend mode only)")
 	multiBackend := fs.String("multi-backend", shaled.EnvOr("SHALE_MULTI_BACKEND", "false"),
 		"run in multi-backend mode: one slatedb per storage unit over a shared bucket (true|false)")
+	coordKey := fs.String("coord-key", shaled.EnvOr("SHALE_COORD_KEY", ""),
+		"membership-document key for the CAS coordinator (multi-backend mode only; empty = the well-known default)")
 	slateRelaxedDurability := fs.String("slate-relaxed-durability", shaled.EnvOr("SHALE_SLATE_RELAXED_DURABILITY", "false"),
 		"slate: relaxed durability on the R>=2 replica path - ack at memtable insert, durable via background WAL flush (true|false). Safe only at R>=2")
 
@@ -172,12 +182,21 @@ func run(argv []string, stderr *os.File) error {
 		}
 		logger.Printf("shaled-slate: homogeneous bootstrap armed (conditional store over bucket=%s key-prefix=%q)",
 			cfg.Bucket, cfg.KeyPrefix)
+		// Membership rides the same conditional store: the CAS coordinator's
+		// document is this cluster's one truth channel, so a node needs only
+		// the bucket credentials to find its peers. An empty Key selects
+		// cas.DefaultKey.
+		coordinator := cas.New(cas.Config{
+			Store: condStore,
+			Key:   *coordKey,
+		})
 		return shaled.Run(shaled.RunConfig{
 			Std:              *std,
 			BackendLabel:     "slate-multi",
 			BackendFactory:   factory,
 			CloseFactory:     closeFactory,
 			ConditionalStore: condStore,
+			Coordinator:      coordinator,
 			Logger:           logger,
 		})
 	}
