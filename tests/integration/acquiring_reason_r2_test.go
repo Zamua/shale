@@ -49,7 +49,7 @@ func r2AcquiringPair(t *testing.T, unitCount int) (n1, n2 *sharedNode, key strin
 	}
 	backing := sharedfactory.NewBacking()
 	n1 = startReplicatedNodeCfg(t, "arr1", "", unitCount, 2, backing, shortBudgets)
-	n2 = startReplicatedNodeCfg(t, "arr2", n1.BindAddr, unitCount, 2, backing, shortBudgets)
+	n2 = startReplicatedNodeCfg(t, "arr2", n1.ClusterToken, unitCount, 2, backing, shortBudgets)
 
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {

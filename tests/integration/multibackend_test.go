@@ -33,11 +33,11 @@ import (
 // multiNode bundles a multi-backend cluster node with the factory the test
 // peers at to confirm physical per-unit placement.
 type multiNode struct {
-	ID       string
-	Cluster  *cluster.Cluster
-	Factory  *memfactory.Factory
-	BindAddr string
-	GRPCAddr string
+	ID           string
+	Cluster      *cluster.Cluster
+	Factory      *memfactory.Factory
+	ClusterToken string
+	GRPCAddr     string
 
 	stop func()
 }
@@ -86,11 +86,11 @@ func startMultiBackendNode(t *testing.T, id, seedAddr string, unitCount int) *mu
 	}()
 
 	n := &multiNode{
-		ID:       id,
-		Cluster:  c,
-		Factory:  fac,
-		BindAddr: token,
-		GRPCAddr: grpcAddr,
+		ID:           id,
+		Cluster:      c,
+		Factory:      fac,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -151,7 +151,7 @@ func keyForOwner(t *testing.T, c *cluster.Cluster, unitCount int, wantOwner stri
 func TestMultiBackend_ForwardsToUnitOwner(t *testing.T) {
 	const unitCount = 8
 	n1 := startMultiBackendNode(t, "mb1", "", unitCount)
-	n2 := startMultiBackendNode(t, "mb2", n1.BindAddr, unitCount)
+	n2 := startMultiBackendNode(t, "mb2", n1.ClusterToken, unitCount)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("ring convergence: %v", err)
@@ -263,7 +263,7 @@ func assertAbsentOn(t *testing.T, node *multiNode, key string) {
 func TestMultiBackend_UnitOwnerGuardRefusesForward(t *testing.T) {
 	const unitCount = 8
 	n1 := startMultiBackendNode(t, "mb1", "", unitCount)
-	n2 := startMultiBackendNode(t, "mb2", n1.BindAddr, unitCount)
+	n2 := startMultiBackendNode(t, "mb2", n1.ClusterToken, unitCount)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster}, 2, 15*time.Second); err != nil {
 		t.Fatalf("ring convergence: %v", err)
 	}

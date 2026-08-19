@@ -99,8 +99,8 @@ func TestCASJoinTransparency_MovingUnitsStayAvailable(t *testing.T) {
 	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
 
 	n1 := startReplicatedNodeCfg(t, "cj-a", "", uc, rf, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "cj-b", n1.BindAddr, uc, rf, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "cj-c", n1.BindAddr, uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "cj-b", n1.ClusterToken, uc, rf, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "cj-c", n1.ClusterToken, uc, rf, backing, mutate)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}, 3, 20*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestCASJoinTransparency_MovingUnitsStayAvailable(t *testing.T) {
 	// acquire (delay armed before Open), so the moving units sit owned-but-
 	// unmounted on cj-d for the window.
 	const mountDelay = 25 * time.Second
-	n4 := startReplicatedNodeSlowAcquire(t, "cj-d", n1.BindAddr, uc, rf, backing, mountDelay, 300*time.Millisecond)
+	n4 := startReplicatedNodeSlowAcquire(t, "cj-d", n1.ClusterToken, uc, rf, backing, mountDelay, 300*time.Millisecond)
 	cs4 := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster, n4.Cluster}
 	if err := waitForMembersAll(cs4, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)

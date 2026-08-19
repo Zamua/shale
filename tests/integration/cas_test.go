@@ -31,7 +31,7 @@ func (f *twoNodeFixture) Clusters() []*cluster.Cluster {
 func newTwoNodeFixture(t *testing.T) *twoNodeFixture {
 	t.Helper()
 	n1 := startTestNode(t, "n1", "")
-	n2 := startTestNode(t, "n2", n1.BindAddr)
+	n2 := startTestNode(t, "n2", n1.ClusterToken)
 	f := &twoNodeFixture{N1: n1, N2: n2}
 	waitForClusterReady(t, f.Clusters(), 15*time.Second)
 	return f

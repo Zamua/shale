@@ -216,7 +216,7 @@ func gatedAggregatePair(t *testing.T, unitCount, n int, prefix string) (n1, n2 *
 
 	backing := sharedfactory.NewBacking()
 	n1 = startReplicatedNodeCfg(t, "agx1", "", unitCount, 1, backing, shortPeerConnect)
-	n2 = startReplicatedNodeCfg(t, "agx2", n1.BindAddr, unitCount, 1, backing, withPause)
+	n2 = startReplicatedNodeCfg(t, "agx2", n1.ClusterToken, unitCount, 1, backing, withPause)
 
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {

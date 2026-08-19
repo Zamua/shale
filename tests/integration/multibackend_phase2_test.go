@@ -158,7 +158,7 @@ func TestMBPhase2_SingleNodeMultiUnitPlacement(t *testing.T) {
 func TestMBPhase2_ForwardingAndCoLocation(t *testing.T) {
 	const unitCount = 16
 	n1 := startMultiBackendNode(t, "mbp1", "", unitCount)
-	n2 := startMultiBackendNode(t, "mbp2", n1.BindAddr, unitCount)
+	n2 := startMultiBackendNode(t, "mbp2", n1.ClusterToken, unitCount)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("ring convergence: %v", err)
@@ -278,7 +278,7 @@ func TestMBPhase2_ConfigValidationAtOpen(t *testing.T) {
 			// take part in a lease handoff. Accepting it would come up and
 			// serve traffic while silently never moving data on a topology
 			// change, so Open refuses it outright.
-			name:    "backend + bind addr (legacy multi-node): error",
+			name:    "backend + coordinator (legacy multi-node): error",
 			cfg:     cluster.Config{NodeID: "x", Backend: memory.New(), Coordinator: coordstatic.NewUnstarted(), GRPCAddr: "127.0.0.1:1", LogOutput: io.Discard},
 			wantErr: true,
 		},
@@ -332,7 +332,7 @@ func TestMBPhase2_ConfigValidationAtOpen(t *testing.T) {
 func TestMBPhase2_OwnerGuardNoLoop(t *testing.T) {
 	const unitCount = 16
 	n1 := startMultiBackendNode(t, "guard1", "", unitCount)
-	n2 := startMultiBackendNode(t, "guard2", n1.BindAddr, unitCount)
+	n2 := startMultiBackendNode(t, "guard2", n1.ClusterToken, unitCount)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster}, 2, 15*time.Second); err != nil {
 		t.Fatalf("ring convergence: %v", err)
 	}

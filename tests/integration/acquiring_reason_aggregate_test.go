@@ -248,7 +248,7 @@ func aggregatePair(t *testing.T, unitCount, n int, prefix string) (n1, n2 *share
 	shortPeerConnect := func(cfg *cluster.Config) { cfg.PeerConnectTimeout = 750 * time.Millisecond }
 	backing := sharedfactory.NewBacking()
 	n1 = startReplicatedNodeCfg(t, "agr1", "", unitCount, 1, backing, shortPeerConnect)
-	n2 = startReplicatedNodeCfg(t, "agr2", n1.BindAddr, unitCount, 1, backing, shortPeerConnect)
+	n2 = startReplicatedNodeCfg(t, "agr2", n1.ClusterToken, unitCount, 1, backing, shortPeerConnect)
 
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {

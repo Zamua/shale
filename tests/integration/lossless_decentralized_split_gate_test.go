@@ -117,8 +117,8 @@ func runDecentralizedReshard(t *testing.T, opts splitGateOpts) splitGateResult {
 	}
 
 	n1 := startReplicatedNodeCfg(t, "dsp-a", "", unitCount, 2, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "dsp-b", n1.BindAddr, unitCount, 2, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "dsp-c", n1.BindAddr, unitCount, 2, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "dsp-b", n1.ClusterToken, unitCount, 2, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "dsp-c", n1.ClusterToken, unitCount, 2, backing, mutate)
 	nodes := []*sharedNode{n1, n2, n3}
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {

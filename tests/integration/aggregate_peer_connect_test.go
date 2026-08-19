@@ -37,11 +37,11 @@ import (
 // preface error, failing this test.
 func TestThreeNode_AggregateWaitsForPeerGRPCColdStart(t *testing.T) {
 	n1 := startTestNode(t, "pcn1", "")
-	n2 := startTestNode(t, "pcn2", n1.BindAddr)
+	n2 := startTestNode(t, "pcn2", n1.ClusterToken)
 	// n3 joins the membership but its gRPC server is DOWN (port reserved +
 	// advertised, nothing listening yet) - exactly the cold-start window where a
 	// peer is a known member but not yet serving gRPC.
-	n3 := startTestNodeGRPCDown(t, "pcn3", n1.BindAddr)
+	n3 := startTestNodeGRPCDown(t, "pcn3", n1.ClusterToken)
 
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	// Membership converges through the shared store, independent of n3's gRPC.
@@ -112,11 +112,11 @@ func startTestNodeGRPCDown(t *testing.T, id, seedAddr string) *testNode {
 	store, token := coordStoreFor(t, seedAddr)
 	c := clustertest.OpenClusterCAS(t, cfg, store)
 	n := &testNode{
-		ID:       id,
-		Cluster:  c,
-		Handle:   h,
-		BindAddr: token,
-		GRPCAddr: grpcAddr,
+		ID:           id,
+		Cluster:      c,
+		Handle:       h,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
 		// grpcServer + stop are nil until startNodeGRPC; testNode.Close handles nil.
 	}
 	t.Cleanup(n.Close)

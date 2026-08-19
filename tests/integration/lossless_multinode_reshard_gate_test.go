@@ -163,8 +163,8 @@ func startR1StoreGateCluster(t *testing.T, idPrefix string, unitCount int, backi
 		}
 	}
 	n1 := startReplicatedNodeCfg(t, idPrefix+"1", "", unitCount, 1, backing, mk)
-	n2 := startReplicatedNodeCfg(t, idPrefix+"2", n1.BindAddr, unitCount, 1, backing, mk)
-	n3 := startReplicatedNodeCfg(t, idPrefix+"3", n1.BindAddr, unitCount, 1, backing, mk)
+	n2 := startReplicatedNodeCfg(t, idPrefix+"2", n1.ClusterToken, unitCount, 1, backing, mk)
+	n3 := startReplicatedNodeCfg(t, idPrefix+"3", n1.ClusterToken, unitCount, 1, backing, mk)
 	nodes := []*sharedNode{n1, n2, n3}
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {

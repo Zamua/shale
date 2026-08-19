@@ -51,7 +51,7 @@ func TestJoinMassBoot_QuorumFloorNeverFalseAcks(t *testing.T) {
 	mutate := func(cfg *cluster.Config) { cfg.WriteTimeout = 300 * time.Millisecond }
 
 	n1 := startReplicatedNodeCfg(t, "mb-a", "", uc, rf, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "mb-b", n1.BindAddr, uc, rf, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "mb-b", n1.ClusterToken, uc, rf, backing, mutate)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster}, 2, 20*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
 	}
@@ -78,7 +78,7 @@ func TestJoinMassBoot_QuorumFloorNeverFalseAcks(t *testing.T) {
 	n2.Close()
 	const mountDelay = 3 * time.Second
 	r1 := startReplicatedNodeSlowAcquire(t, "mb-a", "", uc, rf, backing, mountDelay, 300*time.Millisecond)
-	r2 := startReplicatedNodeSlowAcquire(t, "mb-b", r1.BindAddr, uc, rf, backing, mountDelay, 300*time.Millisecond)
+	r2 := startReplicatedNodeSlowAcquire(t, "mb-b", r1.ClusterToken, uc, rf, backing, mountDelay, 300*time.Millisecond)
 	if err := waitForMembersAll([]*cluster.Cluster{r1.Cluster, r2.Cluster}, 2, 30*time.Second); err != nil {
 		t.Fatalf("post-mass-restart convergence: %v", err)
 	}

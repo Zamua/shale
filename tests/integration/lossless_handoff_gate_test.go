@@ -95,11 +95,11 @@ func startSharedNodeWithFactory(t *testing.T, id, seedAddr string, unitCount int
 	}()
 
 	n := &sharedNode{
-		ID:       id,
-		Cluster:  c,
-		Handle:   h,
-		BindAddr: token,
-		GRPCAddr: grpcAddr,
+		ID:           id,
+		Cluster:      c,
+		Handle:       h,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -162,7 +162,7 @@ func TestLosslessHandoffGate(t *testing.T) {
 
 	// --- Stand up 2 nodes, multi-backend, N=16 units. ---
 	n1 := startSharedNode(t, "gate1", "", unitCount, backing)
-	n2 := startSharedNode(t, "gate2", n1.BindAddr, unitCount, backing)
+	n2 := startSharedNode(t, "gate2", n1.ClusterToken, unitCount, backing)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster}, 2, 15*time.Second); err != nil {
 		t.Fatalf("initial 2-node convergence: %v", err)
 	}
@@ -239,7 +239,7 @@ func TestLosslessHandoffGate(t *testing.T) {
 	// hands off the moved units COPY-FREE (close-on-old / open-at-epoch+1-on-
 	// new). Record which units the 3rd node will own so we can assert at least
 	// one real handoff happened and probe it specifically.
-	n3 := startSharedNode(t, "gate3", n1.BindAddr, unitCount, backing)
+	n3 := startSharedNode(t, "gate3", n1.ClusterToken, unitCount, backing)
 	nodes3 := []*sharedNode{n1, n2, n3}
 	all3 := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(all3, 3, 15*time.Second); err != nil {
@@ -619,7 +619,7 @@ func TestGateCatchesLostWrite(t *testing.T) {
 	// Now add the 2nd node. The ring hands `predicted` units off; the founder
 	// releases breakUnit (wiping it) and n2 acquires it.
 	bh2 := &brokenHandle{Handle: backing.Handle(), backing: backing, breakUnit: &atomicUnit{}}
-	n2 := startSharedNodeWithFactory(t, n2ID, n1.BindAddr, unitCount, bh2)
+	n2 := startSharedNodeWithFactory(t, n2ID, n1.ClusterToken, unitCount, bh2)
 	if err := waitForMembersAll([]*cluster.Cluster{n1.Cluster, n2.Cluster}, 2, 15*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
 	}

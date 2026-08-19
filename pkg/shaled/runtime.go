@@ -161,6 +161,17 @@ func (s *StdConfig) Validate() error {
 	if strings.TrimSpace(s.NodeID) == "" {
 		return errors.New("--node-id is required (or set SHALE_NODE_ID)")
 	}
+	// RETIRED KNOBS. These configured the removed SWIM adapter's mesh. An
+	// operator whose manifests still set them is describing a cluster shape
+	// that no longer exists, and silently ignoring them is how a node comes
+	// up believing it is alone; the flags are gone, so only the env survives
+	// to be rejected here.
+	for _, k := range []string{"SHALE_BIND_ADDR", "SHALE_SEEDS"} {
+		if v, ok := os.LookupEnv(k); ok && strings.TrimSpace(v) != "" {
+			return fmt.Errorf("%s is set (%q) but the gossip adapter it configured was removed; "+
+				"membership now comes from the coordinator this binary constructs, so drop the variable", k, v)
+		}
+	}
 	s.ReplicationFactor = s.replicationFactorRaw
 	uc, err := storageunit.NewUnitCount(s.unitCountRaw)
 	if err != nil {

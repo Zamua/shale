@@ -46,8 +46,8 @@ func TestReclaimGate_FullClusterRejoinRecovers(t *testing.T) {
 		})
 	}
 	n1 := mk("n1", "", b1)
-	n2 := mk("n2", n1.BindAddr, b2)
-	n3 := mk("n3", n1.BindAddr, nil)
+	n2 := mk("n2", n1.ClusterToken, b2)
+	n3 := mk("n3", n1.ClusterToken, nil)
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {
 		t.Fatalf("baseline convergence: %v", err)
@@ -73,7 +73,7 @@ func TestReclaimGate_FullClusterRejoinRecovers(t *testing.T) {
 	t.Logf("n3 reaped DEAD: n1 + n2 both see 2 members")
 
 	// REJOIN n3 with the SAME stable id, a NEW address, seeded to the live n1.
-	n3b := mk("n3", n1.BindAddr, nil)
+	n3b := mk("n3", n1.ClusterToken, nil)
 	cs = []*cluster.Cluster{n1.Cluster, n2.Cluster, n3b.Cluster}
 
 	// The ring must re-converge to 3 on EVERY node (the successor is superseded in,

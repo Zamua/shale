@@ -76,8 +76,8 @@ func TestRF2_NoKeyDropsBelowReplicationFactorOnLeave(t *testing.T) {
 	// replica set is "both survivors" (LocateKeyN(key,2) over 2 members
 	// = both), so after settle every survivor must hold every key.
 	n1 := startTestNodeWithReplication(t, "rf2s-n1", "", 2, cluster.WriteQuorum, cluster.ReadQuorum)
-	n2 := startTestNodeWithReplication(t, "rf2s-n2", n1.BindAddr, 2, cluster.WriteQuorum, cluster.ReadQuorum)
-	n3 := startTestNodeWithReplication(t, "rf2s-n3", n1.BindAddr, 2, cluster.WriteQuorum, cluster.ReadQuorum)
+	n2 := startTestNodeWithReplication(t, "rf2s-n2", n1.ClusterToken, 2, cluster.WriteQuorum, cluster.ReadQuorum)
+	n3 := startTestNodeWithReplication(t, "rf2s-n3", n1.ClusterToken, 2, cluster.WriteQuorum, cluster.ReadQuorum)
 	trio := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	// waitForClusterReady (not just membership convergence) so the first
 	// R=2 write does not race a peer that has not yet become ack-ready.
@@ -189,7 +189,7 @@ func TestRF2_OverRetention_GrowTwoToThree(t *testing.T) {
 
 	// Joiner arrives + backfills. Precondition: at N=2 R=2 both nodes
 	// hold every key (total*2 copies).
-	n2 := startTestNodeWithReplication(t, "rf2o-n2", n1.BindAddr, 2, cluster.WriteQuorum, cluster.ReadQuorum)
+	n2 := startTestNodeWithReplication(t, "rf2o-n2", n1.ClusterToken, 2, cluster.WriteQuorum, cluster.ReadQuorum)
 	pair := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(pair, 2, 10*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)
@@ -200,7 +200,7 @@ func TestRF2_OverRetention_GrowTwoToThree(t *testing.T) {
 	}
 
 	// Grow: a third node joins.
-	n3 := startTestNodeWithReplication(t, "rf2o-n3", n1.BindAddr, 2, cluster.WriteQuorum, cluster.ReadQuorum)
+	n3 := startTestNodeWithReplication(t, "rf2o-n3", n1.ClusterToken, 2, cluster.WriteQuorum, cluster.ReadQuorum)
 	trio := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(trio, 3, 10*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)

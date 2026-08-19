@@ -72,7 +72,7 @@ func TestFreshBoot_StaggeredJoin_NoWriteGap(t *testing.T) {
 	// for the write retry to ride the gap. Production runs the 5s debounce, and
 	// the downstream failure was precisely that the gap outlived the write
 	// budget. Reproducing THAT requires the real cadence.
-	b := startReplicatedNodeSettle(t, "boot-b", a.BindAddr, unitCount, rf, backing, 0)
+	b := startReplicatedNodeSettle(t, "boot-b", a.ClusterToken, unitCount, rf, backing, 0)
 
 	// THE MOMENT OF TRUTH: B's Open has returned. Write to every unit NOW,
 	// through BOTH entry nodes, with no settling sleep. Every write must

@@ -129,9 +129,9 @@ func runGracefulLeaveConc(t *testing.T, drainTimeout, mountDelay time.Duration, 
 	// resolved (no artificial mount delay armed yet). ovh-a is the seed; we leave
 	// a NON-seed node (ovh-d) so the seed's gRPC stays reachable for the readback.
 	n1 := startReplicatedNodeCfg(t, "gl-a", "", unitCount, 2, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "gl-b", n1.BindAddr, unitCount, 2, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "gl-c", n1.BindAddr, unitCount, 2, backing, mutate)
-	n4 := startReplicatedNodeCfg(t, "gl-d", n1.BindAddr, unitCount, 2, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "gl-b", n1.ClusterToken, unitCount, 2, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "gl-c", n1.ClusterToken, unitCount, 2, backing, mutate)
+	n4 := startReplicatedNodeCfg(t, "gl-d", n1.ClusterToken, unitCount, 2, backing, mutate)
 	all := []*sharedNode{n1, n2, n3, n4}
 	csAll := make([]*cluster.Cluster, 0, len(all))
 	for _, n := range all {

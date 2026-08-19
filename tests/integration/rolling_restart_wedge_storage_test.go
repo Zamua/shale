@@ -120,8 +120,8 @@ func TestRollingRestartWedge_BootDeferHealsOnConsistentRing(t *testing.T) {
 		})
 	}
 	r2a := mk("r2a", "")
-	r2b := mk("r2b", r2a.BindAddr)
-	r2c := mk("r2c", r2a.BindAddr)
+	r2b := mk("r2b", r2a.ClusterToken)
+	r2c := mk("r2c", r2a.ClusterToken)
 	restarted := []*sharedNode{r2a, r2b, r2c}
 
 	// CONFIRM boot-defer actually fired: at least one node's boot log must report

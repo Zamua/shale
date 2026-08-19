@@ -123,7 +123,7 @@ func TestMembershipChangeWriteAvailabilityGate(t *testing.T) {
 	for _, n := range nodes {
 		n.Handle.SetAcquireDelay(120 * time.Millisecond)
 	}
-	n4 := startReplicatedNode(t, "r2d", nodes[0].BindAddr, unitCount, 2, backing)
+	n4 := startReplicatedNode(t, "r2d", nodes[0].ClusterToken, unitCount, 2, backing)
 	n4.Handle.SetAcquireDelay(120 * time.Millisecond)
 	all := append(append([]*sharedNode{}, nodes...), n4)
 

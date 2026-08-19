@@ -22,9 +22,9 @@ import (
 // through the production NewBlobKV constructor (cfg.BlobStore set) so the
 // integration test exercises the real wiring, not a test-only wrapper.
 type blobNode struct {
-	ID       string
-	Blob     *cluster.BlobKV
-	BindAddr string
+	ID           string
+	Blob         *cluster.BlobKV
+	ClusterToken string
 
 	stop func()
 }
@@ -80,9 +80,9 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 	}()
 
 	n := &blobNode{
-		ID:       id,
-		Blob:     bkv,
-		BindAddr: token,
+		ID:           id,
+		Blob:         bkv,
+		ClusterToken: token,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -114,8 +114,8 @@ func TestBlobMultiNode_PointerRoutesBytesShared(t *testing.T) {
 	// it; a blob staged via one node is byte-reachable from any node.
 	store := blobmem.New()
 	n1 := startBlobNode(t, "bn1", "", store)
-	n2 := startBlobNode(t, "bn2", n1.BindAddr, store)
-	n3 := startBlobNode(t, "bn3", n1.BindAddr, store)
+	n2 := startBlobNode(t, "bn2", n1.ClusterToken, store)
+	n3 := startBlobNode(t, "bn3", n1.ClusterToken, store)
 
 	clusters := []*cluster.Cluster{n1.Blob.Cluster(), n2.Blob.Cluster(), n3.Blob.Cluster()}
 	waitForClusterReady(t, clusters, 15*time.Second)

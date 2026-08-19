@@ -30,8 +30,8 @@ func (f *threeNodeFixture) Clusters() []*cluster.Cluster {
 func newThreeNodeFixture(t *testing.T) *threeNodeFixture {
 	t.Helper()
 	n1 := startTestNode(t, "n1", "")
-	n2 := startTestNode(t, "n2", n1.BindAddr)
-	n3 := startTestNode(t, "n3", n1.BindAddr)
+	n2 := startTestNode(t, "n2", n1.ClusterToken)
+	n3 := startTestNode(t, "n3", n1.ClusterToken)
 	f := &threeNodeFixture{N1: n1, N2: n2, N3: n3}
 	// Full settle (ring convergence + rebalance quiescence) before
 	// tests start writing. Plain ring convergence isn't enough: when

@@ -67,11 +67,11 @@ import (
 // (the shared byte plane). It mirrors startReplicatedNodeCfg but opens the
 // cluster via NewBlobKV so the test reaches StageBlob / BindBlob / GetBlob.
 type blobShardNode struct {
-	ID       string
-	Blob     *cluster.BlobKV
-	Cluster  *cluster.Cluster
-	Handle   *sharedfactory.Handle
-	BindAddr string
+	ID           string
+	Blob         *cluster.BlobKV
+	Cluster      *cluster.Cluster
+	Handle       *sharedfactory.Handle
+	ClusterToken string
 
 	stop func()
 }
@@ -137,11 +137,11 @@ func startBlobShardNode(
 	}()
 
 	n := &blobShardNode{
-		ID:       id,
-		Blob:     bkv,
-		Cluster:  bkv.Cluster(),
-		Handle:   h,
-		BindAddr: token,
+		ID:           id,
+		Blob:         bkv,
+		Cluster:      bkv.Cluster(),
+		Handle:       h,
+		ClusterToken: token,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -163,8 +163,8 @@ func start3NodeBlobShard(
 ) []*blobShardNode {
 	t.Helper()
 	n1 := startBlobShardNode(t, "brz-a", "", unitCount, backing, condStore, blobStore)
-	n2 := startBlobShardNode(t, "brz-b", n1.BindAddr, unitCount, backing, condStore, blobStore)
-	n3 := startBlobShardNode(t, "brz-c", n1.BindAddr, unitCount, backing, condStore, blobStore)
+	n2 := startBlobShardNode(t, "brz-b", n1.ClusterToken, unitCount, backing, condStore, blobStore)
+	n3 := startBlobShardNode(t, "brz-c", n1.ClusterToken, unitCount, backing, condStore, blobStore)
 	nodes := []*blobShardNode{n1, n2, n3}
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {

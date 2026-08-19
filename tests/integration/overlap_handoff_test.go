@@ -113,11 +113,11 @@ func startReplicatedNodeCfg(
 	}()
 
 	n := &sharedNode{
-		ID:       id,
-		Cluster:  c,
-		Handle:   h,
-		BindAddr: token,
-		GRPCAddr: grpcAddr,
+		ID:           id,
+		Cluster:      c,
+		Handle:       h,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -137,8 +137,8 @@ func start3NodeR2Cfg(
 ) []*sharedNode {
 	t.Helper()
 	n1 := startReplicatedNodeCfg(t, "ovh-a", "", unitCount, 2, backing, mutate)
-	n2 := startReplicatedNodeCfg(t, "ovh-b", n1.BindAddr, unitCount, 2, backing, mutate)
-	n3 := startReplicatedNodeCfg(t, "ovh-c", n1.BindAddr, unitCount, 2, backing, mutate)
+	n2 := startReplicatedNodeCfg(t, "ovh-b", n1.ClusterToken, unitCount, 2, backing, mutate)
+	n3 := startReplicatedNodeCfg(t, "ovh-c", n1.ClusterToken, unitCount, 2, backing, mutate)
 	nodes := []*sharedNode{n1, n2, n3}
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {
@@ -236,7 +236,7 @@ func runOverlapMembershipChange(t *testing.T, forceCleanCut bool, mountDelay tim
 	for _, n := range nodes {
 		n.Handle.SetAcquireDelay(mountDelay)
 	}
-	n4 := startReplicatedNodeCfg(t, "ovh-d", nodes[0].BindAddr, unitCount, 2, backing, mutate)
+	n4 := startReplicatedNodeCfg(t, "ovh-d", nodes[0].ClusterToken, unitCount, 2, backing, mutate)
 	n4.Handle.SetAcquireDelay(mountDelay)
 	all := append(append([]*sharedNode{}, nodes...), n4)
 

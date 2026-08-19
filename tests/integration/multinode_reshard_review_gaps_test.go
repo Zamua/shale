@@ -75,7 +75,7 @@ func TestMultiNodeReshard_DeletedKeyStaysDeletedAcrossReshard(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	store := storageunit.NewMemConditionalStore()
 	n1 := startR1StoreNode(t, "p1b-1", "", unitCount, backing, store)
-	n2 := startR1StoreNode(t, "p1b-2", n1.BindAddr, unitCount, backing, store)
+	n2 := startR1StoreNode(t, "p1b-2", n1.ClusterToken, unitCount, backing, store)
 	nodes := []*sharedNode{n1, n2}
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 20*time.Second); err != nil {
@@ -157,7 +157,7 @@ func TestMultiNodeReshard_TransactDuringReshardRetriesThenCommits(t *testing.T) 
 	backing := sharedfactory.NewBacking()
 	store := storageunit.NewMemConditionalStore()
 	n1 := startR1StoreNode(t, "p2a-1", "", unitCount, backing, store)
-	n2 := startR1StoreNode(t, "p2a-2", n1.BindAddr, unitCount, backing, store)
+	n2 := startR1StoreNode(t, "p2a-2", n1.ClusterToken, unitCount, backing, store)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 20*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)

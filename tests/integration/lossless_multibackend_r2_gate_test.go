@@ -89,11 +89,11 @@ func startReplicatedNode(t *testing.T, id, seedAddr string, unitCount, replicati
 	}()
 
 	n := &sharedNode{
-		ID:       id,
-		Cluster:  c,
-		Handle:   h,
-		BindAddr: token,
-		GRPCAddr: grpcAddr,
+		ID:           id,
+		Cluster:      c,
+		Handle:       h,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -126,8 +126,8 @@ func replicaSetOnRing(c *cluster.Cluster, key string, unitCount, r int) []string
 func start3NodeR2(t *testing.T, unitCount int, backing *sharedfactory.Backing) []*sharedNode {
 	t.Helper()
 	n1 := startReplicatedNode(t, "r2a", "", unitCount, 2, backing)
-	n2 := startReplicatedNode(t, "r2b", n1.BindAddr, unitCount, 2, backing)
-	n3 := startReplicatedNode(t, "r2c", n1.BindAddr, unitCount, 2, backing)
+	n2 := startReplicatedNode(t, "r2b", n1.ClusterToken, unitCount, 2, backing)
+	n3 := startReplicatedNode(t, "r2c", n1.ClusterToken, unitCount, 2, backing)
 	nodes := []*sharedNode{n1, n2, n3}
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(cs, 3, 20*time.Second); err != nil {

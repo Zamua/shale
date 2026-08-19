@@ -64,7 +64,7 @@ func TestRF2_FounderRetainsKeysWhenJoinerArrives(t *testing.T) {
 	}
 
 	// A second node JOINS (seeds off the founder).
-	n2 := startTestNodeWithReplication(t, "rf2-j2", n1.BindAddr, 2, cluster.WriteQuorum, cluster.ReadQuorum)
+	n2 := startTestNodeWithReplication(t, "rf2-j2", n1.ClusterToken, 2, cluster.WriteQuorum, cluster.ReadQuorum)
 	pair := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(pair, 2, 10*time.Second); err != nil {
 		t.Fatalf("2-node convergence: %v", err)

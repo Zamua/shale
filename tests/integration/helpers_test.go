@@ -78,11 +78,11 @@ type testNode struct {
 	ID      string
 	Cluster *cluster.Cluster
 	Handle  *sharedfactory.Handle
-	// BindAddr is this node's cluster-membership token: a later node passes
+	// ClusterToken names the cluster this node coordinates in: a later node passes
 	// it as its seed argument to join the same cluster (it resolves to the
 	// shared conditional store the CAS coordinator runs on).
-	BindAddr string
-	GRPCAddr string
+	ClusterToken string
+	GRPCAddr     string
 
 	stop       func()
 	grpcServer *grpc.Server
@@ -329,12 +329,12 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	}()
 
 	n := &testNode{
-		ID:         id,
-		Cluster:    c,
-		Handle:     h,
-		BindAddr:   token,
-		GRPCAddr:   grpcAddr,
-		grpcServer: grpcSrv,
+		ID:           id,
+		Cluster:      c,
+		Handle:       h,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
+		grpcServer:   grpcSrv,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -403,7 +403,7 @@ func startReplicatedCluster(t *testing.T, count, replicationFactor int, wc clust
 	for i := range count {
 		n := startTestNodeWithReplication(t, fmt.Sprintf("rn%d", i+1), seed, replicationFactor, wc, rc)
 		if i == 0 {
-			seed = n.BindAddr
+			seed = n.ClusterToken
 		}
 		nodes = append(nodes, n)
 	}

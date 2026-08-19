@@ -35,8 +35,8 @@ import (
 func TestBlobMultiNode_LargeBlobStreamsCrossNode(t *testing.T) {
 	store := blobmem.New() // one shared byte plane reachable from every node
 	n1 := startBlobNode(t, "lbn1", "", store)
-	n2 := startBlobNode(t, "lbn2", n1.BindAddr, store)
-	n3 := startBlobNode(t, "lbn3", n1.BindAddr, store)
+	n2 := startBlobNode(t, "lbn2", n1.ClusterToken, store)
+	n3 := startBlobNode(t, "lbn3", n1.ClusterToken, store)
 
 	clusters := []*cluster.Cluster{n1.Blob.Cluster(), n2.Blob.Cluster(), n3.Blob.Cluster()}
 	waitForClusterReady(t, clusters, 15*time.Second)

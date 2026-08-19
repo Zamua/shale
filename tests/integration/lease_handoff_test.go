@@ -43,11 +43,11 @@ import (
 // a shared backing. Several sharedNodes off one Backing model a cluster
 // whose units live in shared storage, so a lease handoff is copy-free.
 type sharedNode struct {
-	ID       string
-	Cluster  *cluster.Cluster
-	Handle   *sharedfactory.Handle
-	BindAddr string
-	GRPCAddr string
+	ID           string
+	Cluster      *cluster.Cluster
+	Handle       *sharedfactory.Handle
+	ClusterToken string
+	GRPCAddr     string
 
 	stop func()
 }
@@ -97,11 +97,11 @@ func startSharedNode(t *testing.T, id, seedAddr string, unitCount int, backing *
 	}()
 
 	n := &sharedNode{
-		ID:       id,
-		Cluster:  c,
-		Handle:   h,
-		BindAddr: token,
-		GRPCAddr: grpcAddr,
+		ID:           id,
+		Cluster:      c,
+		Handle:       h,
+		ClusterToken: token,
+		GRPCAddr:     grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone
@@ -165,7 +165,7 @@ func TestLeaseHandoff_NoAckedWriteLost(t *testing.T) {
 
 	// Join the second node. Membership convergence + the reconcile (debounced
 	// by the 300ms settle delay) hand off roughly half the units to it.
-	n2 := startSharedNode(t, "lh2", n1.BindAddr, unitCount, backing)
+	n2 := startSharedNode(t, "lh2", n1.ClusterToken, unitCount, backing)
 	clusters := []*cluster.Cluster{n1.Cluster, n2.Cluster}
 	if err := waitForMembersAll(clusters, 2, 15*time.Second); err != nil {
 		t.Fatalf("ring convergence: %v", err)
@@ -249,8 +249,8 @@ func TestLeaseHandoff_NodeLeaveSurvivorReacquires(t *testing.T) {
 	const unitCount = 16
 	backing := sharedfactory.NewBacking()
 	n1 := startSharedNode(t, "lv1", "", unitCount, backing)
-	n2 := startSharedNode(t, "lv2", n1.BindAddr, unitCount, backing)
-	n3 := startSharedNode(t, "lv3", n1.BindAddr, unitCount, backing)
+	n2 := startSharedNode(t, "lv2", n1.ClusterToken, unitCount, backing)
+	n3 := startSharedNode(t, "lv3", n1.ClusterToken, unitCount, backing)
 	all := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
 	if err := waitForMembersAll(all, 3, 15*time.Second); err != nil {
 		t.Fatalf("3-node convergence: %v", err)
