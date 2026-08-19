@@ -26,9 +26,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	pb "github.com/Zamua/shale/pkg/rpc/proto"
@@ -87,16 +87,8 @@ func startSharedNode(t *testing.T, id, seedAddr string, unitCount int, backing *
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 300 * time.Millisecond,
 	}
-	gcfg := gossip.Config{LogOutput: io.Discard}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
-
-	// openClusterRetryBind fills in the coordinator's bind address (re-rolling
-	// a fresh port and retrying if memberlist hits the release-rebind port
-	// race) and returns the address actually bound, which the node advertises
-	// as its seed.
-	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
+	store, token := coordStoreFor(t, seedAddr)
+	c := clustertest.OpenClusterCAS(t, cfg, store)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
@@ -108,7 +100,7 @@ func startSharedNode(t *testing.T, id, seedAddr string, unitCount int, backing *
 		ID:       id,
 		Cluster:  c,
 		Handle:   h,
-		BindAddr: bindAddr,
+		BindAddr: token,
 		GRPCAddr: grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()

@@ -65,7 +65,7 @@ func newDeclaredReshardCluster(t *testing.T, founded int, declared uint32) *Clus
 	// One member, advertising the declared count: the unanimity gate reads the
 	// coordination view, so a lone declaring member IS unanimity.
 	setCoordMembers(c, coord.Node{ID: "n1", Addr: "n1:0"})
-	gossipCoord(c).TestingSetFacts(coord.Member{
+	staticCoordOf(c).TestingSetFacts(coord.Member{
 		Node:              coord.Node{ID: "n1", Addr: "n1:0"},
 		DeclaredUnitCount: declared,
 	})
@@ -133,7 +133,7 @@ func TestObserveDeclaredReshardTarget_DefersWhileConverging(t *testing.T) {
 func TestObserveDeclaredReshardTarget_NoArbiterIsNoop(t *testing.T) {
 	backing := sharedfactory.NewBacking()
 	c := newReplicatedCluster(t, "n1", 4, 2, backing, "n1", "n2", "n3")
-	gossipCoord(c).TestingSetFacts(coord.Member{
+	staticCoordOf(c).TestingSetFacts(coord.Member{
 		Node:              coord.Node{ID: "n1", Addr: "n1:0"},
 		DeclaredUnitCount: 8,
 	})

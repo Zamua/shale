@@ -1,7 +1,8 @@
 // Package integration drives shale's multi-node code paths end to end:
-// real memberlist gossip over loopback UDP, real gRPC forwarding between
-// in-process Cluster instances, real consistent-hash routing. The shared
-// fixtures live here; each *_test.go file builds on them.
+// real CAS-coordinated membership over a shared conditional store, real
+// gRPC forwarding between in-process Cluster instances, real
+// consistent-hash routing. The shared fixtures live here; each *_test.go
+// file builds on them.
 //
 // Why a separate tests/ tree (vs adding to pkg/cluster/cluster_test.go):
 // the cluster package's own tests cover the routing decision at the
@@ -16,9 +17,9 @@ import (
 	"fmt"
 	"io"
 	"net"
-	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -27,7 +28,6 @@ import (
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"go.uber.org/goleak"
@@ -80,9 +80,12 @@ const defaultTestUnitCount = 8
 // therefore a question about its MOUNTED UNITS, which is what
 // physicalGet / physicalKeyCount answer.
 type testNode struct {
-	ID       string
-	Cluster  *cluster.Cluster
-	Handle   *sharedfactory.Handle
+	ID      string
+	Cluster *cluster.Cluster
+	Handle  *sharedfactory.Handle
+	// BindAddr is this node's cluster-membership token: a later node passes
+	// it as its seed argument to join the same cluster (it resolves to the
+	// shared conditional store the CAS coordinator runs on).
 	BindAddr string
 	GRPCAddr string
 
@@ -213,17 +216,14 @@ func (n *testNode) Close() {
 	}
 }
 
-// startTestNode brings up one cluster node with its own memberlist +
-// gRPC endpoint, joined to the given seed (empty = first node). The
+// startTestNode brings up one cluster node with its own gRPC endpoint,
+// joined to the given seed token (empty = founds a new cluster). The
 // returned node registers itself for cleanup via t.Cleanup so tests
 // that forget to Close it explicitly still tear down.
 //
-// Port allocation: the gRPC listener binds 127.0.0.1:0 directly (held
-// open, no rebind gap). The memberlist BindAddr is allocated through
-// openClusterRetryBind, which re-rolls a fresh freePort and retries if
-// the release-then-rebind window lets another listener grab the port -
-// so a port collision under a stress loop self-heals instead of failing
-// the test.
+// The gRPC listener binds 127.0.0.1:0 directly (held open, no rebind
+// gap). Membership needs no port at all: nodes coordinate through the
+// shared conditional store the seed token names.
 func startTestNode(t *testing.T, id, seedAddr string) *testNode {
 	return startTestNodeWithReplication(t, id, seedAddr, 1, 0, 0)
 }
@@ -260,6 +260,34 @@ func fixtureBacking(t *testing.T) *sharedfactory.Backing {
 	return actual.(*sharedfactory.Backing)
 }
 
+// coordStores maps a cluster token to the shared conditional store the
+// token's cluster coordinates on. Entries live for the test binary; the
+// stores are small in-memory documents.
+var (
+	coordStores   sync.Map // token -> *storageunit.MemConditionalStore
+	coordTokenSeq atomic.Int64
+)
+
+// coordStoreFor resolves seed to a cluster's shared conditional store. An
+// empty seed FOUNDS a new cluster: a fresh store under a fresh token, so
+// seedless nodes are isolated by construction (the analogue of a solo
+// transport). A non-empty seed joins the cluster the token names. The
+// returned token is what later nodes pass as their seed.
+func coordStoreFor(t *testing.T, seed string) (*storageunit.MemConditionalStore, string) {
+	t.Helper()
+	if seed != "" {
+		v, ok := coordStores.Load(seed)
+		if !ok {
+			t.Fatalf("coordStoreFor: unknown cluster token %q", seed)
+		}
+		return v.(*storageunit.MemConditionalStore), seed
+	}
+	token := fmt.Sprintf("coord-token-%d", coordTokenSeq.Add(1))
+	store := storageunit.NewMemConditionalStore()
+	coordStores.Store(token, store)
+	return store, token
+}
+
 // startTestNodeWithReplication is the replication-aware variant. R=1
 // + zero-valued consistency knobs reproduce startTestNode exactly (the
 // Cluster's normalizeConfig fills in WriteQuorum + ReadNearest at
@@ -271,8 +299,8 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 	h := fixtureBacking(t).Handle()
 
 	// The gRPC listener has to exist BEFORE cluster.Open so we know the
-	// address to advertise via memberlist Meta. Same two-phase pattern
-	// shaled's main.go uses.
+	// address to advertise through the membership document. Same two-phase
+	// pattern shaled's main.go uses.
 	lis, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("startTestNode %s: listen gRPC: %v", id, err)
@@ -296,16 +324,8 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 		WriteConsistency:     wc,
 		ReadConsistency:      rc,
 	}
-	gcfg := gossip.Config{LogOutput: io.Discard}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
-
-	// openClusterRetryBind fills in the coordinator's bind address (re-rolling
-	// a fresh port and retrying if memberlist hits the release-rebind port
-	// race) and returns the address actually bound, which the node advertises
-	// as its seed.
-	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
+	store, token := coordStoreFor(t, seedAddr)
+	c := clustertest.OpenClusterCAS(t, cfg, store)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
@@ -317,7 +337,7 @@ func startTestNodeWithReplication(t *testing.T, id, seedAddr string, replication
 		ID:         id,
 		Cluster:    c,
 		Handle:     h,
-		BindAddr:   bindAddr,
+		BindAddr:   token,
 		GRPCAddr:   grpcAddr,
 		grpcServer: grpcSrv,
 		stop: func() {
@@ -349,37 +369,12 @@ func ownerOf(c *cluster.Cluster, key string) string {
 	return unitOwnerID(c, key, defaultTestUnitCount)
 }
 
-// freePort, isBindConflict and openClusterRetryBind delegate to the
-// shared harness package so the port-probing + bind-retry strategy
-// cannot drift from pkg/cluster's external tests. See
-// internal/clustertest.
+// freePort + hostPort delegate to the shared harness package. Only the
+// gRPC fixtures that must RESERVE an address without listening yet
+// (startTestNodeGRPCDown) still need them.
 func freePort(t *testing.T) int {
 	t.Helper()
 	return clustertest.FreePort(t)
-}
-
-func isBindConflict(err error) bool {
-	return clustertest.IsBindConflict(err)
-}
-
-func openClusterRetryBind(t *testing.T, cfg cluster.Config, gcfg gossip.Config, forbiddenPorts ...int) (*cluster.Cluster, string) {
-	t.Helper()
-	return clustertest.OpenClusterRetryBind(t, cfg, gcfg, forbiddenPorts...)
-}
-
-// bindPortOf extracts the port from a "host:port" bind address. Used to
-// forbid a just-killed node's port when starting its replacement.
-func bindPortOf(t *testing.T, addr string) int {
-	t.Helper()
-	_, portStr, err := net.SplitHostPort(addr)
-	if err != nil {
-		t.Fatalf("bindPortOf %q: %v", addr, err)
-	}
-	port, err := strconv.Atoi(portStr)
-	if err != nil {
-		t.Fatalf("bindPortOf %q: parse port: %v", addr, err)
-	}
-	return port
 }
 
 func hostPort(port int) string {
@@ -394,7 +389,7 @@ func hostPort(port int) string {
 // each node.
 //
 // The two-phase wait matters: ring convergence (every node sees N
-// members) happens quickly under SWIM gossip, but the rebalance
+// members) happens quickly on the poll cadence, but the rebalance
 // Coordinator on each node debounces membership events for
 // RebalanceSettleDelay (500ms in the integration fixture) before
 // evaluating + dispatching the migrations the joins triggered. If we
@@ -454,7 +449,7 @@ func waitForWriteReady(t *testing.T, clusters []*cluster.Cluster, deadline time.
 // Two-phase wait:
 //
 //  1. Ring convergence: every node's Members() reports len(clusters)
-//     entries. Under SWIM gossip this is sub-second on loopback but
+//     entries. On the poll cadence this is sub-second but
 //     not synchronous, so a multi-node assertion that fires before
 //     convergence races.
 //  2. Rebalance quiescence: every Coordinator's WaitForRebalanceIdle

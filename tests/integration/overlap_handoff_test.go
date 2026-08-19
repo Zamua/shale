@@ -40,9 +40,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -99,15 +99,12 @@ func startReplicatedNodeCfg(
 		LogOutput:            io.Discard,
 		RebalanceSettleDelay: 300 * time.Millisecond,
 	}
-	gcfg := gossip.Config{LogOutput: io.Discard}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
 	if mutate != nil {
 		mutate(&cfg)
 	}
 
-	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
+	store, token := coordStoreFor(t, seedAddr)
+	c := clustertest.OpenClusterCAS(t, cfg, store)
 
 	rpc.NewServer(c).Register(grpcSrv)
 	go func() {
@@ -119,7 +116,7 @@ func startReplicatedNodeCfg(
 		ID:       id,
 		Cluster:  c,
 		Handle:   h,
-		BindAddr: bindAddr,
+		BindAddr: token,
 		GRPCAddr: grpcAddr,
 		stop: func() {
 			grpcSrv.GracefulStop()

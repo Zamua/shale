@@ -9,10 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/pkg/blob"
 	"github.com/Zamua/shale/pkg/blob/blobmem"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -66,31 +66,11 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 		RebalanceSettleDelay: 500 * time.Millisecond,
 		ReplicationFactor:    1,
 	}
-	gcfg := gossip.Config{LogOutput: io.Discard}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
-
-	// NewBlobKV opens the cluster internally; retry the bind on the
-	// release-rebind port race, mirroring openClusterRetryBind.
-	var bkv *cluster.BlobKV
-	var bindAddr string
-	const maxAttempts = 8
-	for range maxAttempts {
-		bindAddr = hostPort(freePort(t))
-		gcfg.BindAddr = bindAddr
-		cfg.Coordinator = gossip.New(gcfg)
-		b, oerr := cluster.NewBlobKV(cfg)
-		if oerr == nil {
-			bkv = b
-			break
-		}
-		if !isBindConflict(oerr) {
-			t.Fatalf("startBlobNode %s: NewBlobKV: %v", id, oerr)
-		}
-	}
-	if bkv == nil {
-		t.Fatalf("startBlobNode %s: all bind attempts hit a port conflict", id)
+	condStore, token := coordStoreFor(t, seedAddr)
+	cfg.Coordinator = clustertest.CASCoordinator(condStore)
+	bkv, err := cluster.NewBlobKV(cfg)
+	if err != nil {
+		t.Fatalf("startBlobNode %s: NewBlobKV: %v", id, err)
 	}
 
 	rpc.NewServer(bkv.Cluster()).Register(grpcSrv)
@@ -102,7 +82,7 @@ func startBlobNode(t *testing.T, id, seedAddr string, store blob.Store) *blobNod
 	n := &blobNode{
 		ID:       id,
 		Blob:     bkv,
-		BindAddr: bindAddr,
+		BindAddr: token,
 		stop: func() {
 			grpcSrv.GracefulStop()
 			<-serveDone

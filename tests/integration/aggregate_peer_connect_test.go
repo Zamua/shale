@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -38,13 +38,13 @@ import (
 func TestThreeNode_AggregateWaitsForPeerGRPCColdStart(t *testing.T) {
 	n1 := startTestNode(t, "pcn1", "")
 	n2 := startTestNode(t, "pcn2", n1.BindAddr)
-	// n3 joins the gossip ring but its gRPC server is DOWN (port reserved +
+	// n3 joins the membership but its gRPC server is DOWN (port reserved +
 	// advertised, nothing listening yet) - exactly the cold-start window where a
 	// peer is a known member but not yet serving gRPC.
 	n3 := startTestNodeGRPCDown(t, "pcn3", n1.BindAddr)
 
 	cs := []*cluster.Cluster{n1.Cluster, n2.Cluster, n3.Cluster}
-	// Membership converges over gossip (memberlist), independent of n3's gRPC.
+	// Membership converges through the shared store, independent of n3's gRPC.
 	if err := waitForMembersAll(cs, 3, 30*time.Second); err != nil {
 		t.Fatalf("ring did not converge to 3 members: %v", err)
 	}
@@ -89,9 +89,9 @@ func TestThreeNode_AggregateWaitsForPeerGRPCColdStart(t *testing.T) {
 	}
 }
 
-// startTestNodeGRPCDown brings up a cluster node that JOINS the gossip ring but
+// startTestNodeGRPCDown brings up a cluster node that JOINS the membership but
 // is NOT serving gRPC yet: the gRPC port is reserved (so the address it
-// advertises via memberlist Meta is stable) but no listener is bound, so a peer
+// advertises in its membership row is stable) but no listener is bound, so a peer
 // dialing it gets connection-refused until startNodeGRPC is called. Used to
 // reproduce the "peer is a known member but its gRPC server is not ready yet"
 // cold-start window. Cleanup is wired via t.Cleanup (testNode.Close tolerates a
@@ -109,16 +109,13 @@ func startTestNodeGRPCDown(t *testing.T, id, seedAddr string) *testNode {
 		RebalanceSettleDelay: 500 * time.Millisecond,
 		ReplicationFactor:    1,
 	}
-	gcfg := gossip.Config{LogOutput: io.Discard}
-	if seedAddr != "" {
-		gcfg.Seeds = []string{seedAddr}
-	}
-	c, bindAddr := openClusterRetryBind(t, cfg, gcfg)
+	store, token := coordStoreFor(t, seedAddr)
+	c := clustertest.OpenClusterCAS(t, cfg, store)
 	n := &testNode{
 		ID:       id,
 		Cluster:  c,
 		Handle:   h,
-		BindAddr: bindAddr,
+		BindAddr: token,
 		GRPCAddr: grpcAddr,
 		// grpcServer + stop are nil until startNodeGRPC; testNode.Close handles nil.
 	}

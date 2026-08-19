@@ -5,13 +5,14 @@ package chaos
 // In-process adapter: the live cluster the chaos soak drives. This is the
 // INFRASTRUCTURE layer behind the small ClusterClient + Topology interfaces the
 // workload driver and chaos scheduler depend on. It stands up N shale nodes via
-// goroutines + ephemeral ports over ONE sharedfactory backing - the same shape
-// tests/integration uses (the shared backing + a shared MemConditionalStore),
+// goroutines + ephemeral gRPC ports over ONE sharedfactory backing - the same
+// shape tests/integration uses (the shared backing + a shared
+// MemConditionalStore that doubles as the CAS coordinator's membership store),
 // so a lease handoff is copy-free and a reshard exercises the real
 // arbiter-driven (delegated) multi-node flow.
 //
 // It is gated behind `//go:build chaos` because it pulls in the whole multi-node
-// stack (memberlist gossip, gRPC servers) and is only built for the soak. The
+// stack (CAS coordination, gRPC servers) and is only built for the soak. The
 // oracle + driver + scheduler logic that depends on these interfaces is reusable
 // against a REAL N-node deploy by swapping this file for a gRPC-client +
 // orchestrator implementation (see README "Extending to a real N-node deploy").
@@ -25,9 +26,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/Zamua/shale/internal/clustertest"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
@@ -36,14 +37,12 @@ import (
 
 // node is one in-process shale node: its cluster handle, the shared-backing
 // factory handle (the mount/lease seam; an in-memory double or the real slatedb
-// factory, behind the factoryProvider), its memberlist bind address (so a new
-// joiner can seed off it), its gRPC server (so it can be killed hard or shut
-// gracefully).
+// factory, behind the factoryProvider), its gRPC server (so it can be killed
+// hard or shut gracefully).
 type node struct {
 	id         string
 	cl         *cluster.Cluster
 	handle     storageunit.BackendFactory
-	bindAddr   string
 	grpcAddr   string
 	grpcServer *grpc.Server
 	serveDone  chan struct{}
@@ -62,8 +61,10 @@ type inProcCluster struct {
 	unitCount int
 	// condStore is the ONE shared conditional store every node's Config points
 	// at (the arbiter agreement object + the __cluster/init marker + the
-	// per-unit cut-over markers). The in-process analogue of the shared
-	// MinIO/S3 conditional store the deployable multi-node cluster requires.
+	// per-unit cut-over markers) AND every node's CAS coordinator runs its
+	// membership document on: the store is the whole discovery mechanism. The
+	// in-process analogue of the shared MinIO/S3 conditional store the
+	// deployable multi-node cluster requires.
 	condStore storageunit.ConditionalStore
 
 	mu       sync.Mutex // guards nodes + nextID
@@ -116,15 +117,10 @@ func newInProcCluster(provider factoryProvider, count, unitCount int, settleDela
 		memberConverge: time.Duration(float64(8*time.Second) * scale),
 		reconcileIdle:  time.Duration(float64(3*time.Second) * scale),
 	}
-	seed := ""
 	for i := 0; i < count; i++ {
-		n, err := c.startNode(seed)
-		if err != nil {
+		if _, err := c.startNode(); err != nil {
 			c.CloseAll()
 			return nil, err
-		}
-		if i == 0 {
-			seed = n.bindAddr
 		}
 	}
 	if err := c.waitConverged(count, time.Duration(float64(20*time.Second)*scale)); err != nil {
@@ -137,10 +133,10 @@ func newInProcCluster(provider factoryProvider, count, unitCount int, settleDela
 	return c, nil
 }
 
-// startNode brings up one node seeded at seedAddr (empty = founder), retrying a
-// memberlist bind conflict with a fresh port (the release-rebind race the
-// integration helpers also self-heal). It appends the node and returns it.
-func (c *inProcCluster) startNode(seedAddr string) (*node, error) {
+// startNode brings up one node coordinated over the cluster's shared
+// condStore (the first node to Open founds; later ones join by CAS-appending
+// their membership rows). It appends the node and returns it.
+func (c *inProcCluster) startNode() (*node, error) {
 	c.mu.Lock()
 	c.nextID++
 	id := "chaos-n" + strconv.Itoa(c.nextID)
@@ -156,43 +152,20 @@ func (c *inProcCluster) startNode(seedAddr string) (*node, error) {
 	grpcSrv := grpc.NewServer()
 	serveDone := make(chan struct{})
 
-	const maxAttempts = 8
-	var cl *cluster.Cluster
-	var bindAddr string
-	for attempt := 0; attempt < maxAttempts; attempt++ {
-		port, perr := freeTCPPort()
-		if perr != nil {
-			_ = lis.Close()
-			return nil, fmt.Errorf("startNode %s: free port: %w", id, perr)
-		}
-		bindAddr = "127.0.0.1:" + strconv.Itoa(port)
-		cfg := cluster.Config{
-			NodeID:               id,
-			BackendFactory:       h,
-			UnitCount:            storageunit.MustUnitCount(c.unitCount),
-			ConditionalStore:     c.condStore,
-			GRPCAddr:             grpcAddr,
-			LogOutput:            io.Discard,
-			RebalanceSettleDelay: c.settleDelay,
-		}
-		gcfg := gossip.Config{BindAddr: bindAddr, LogOutput: io.Discard}
-		if seedAddr != "" {
-			gcfg.Seeds = []string{seedAddr}
-		}
-		cfg.Coordinator = gossip.New(gcfg)
-		var oerr error
-		cl, oerr = cluster.Open(cfg)
-		if oerr == nil {
-			break
-		}
-		if !isBindConflict(oerr) {
-			_ = lis.Close()
-			return nil, fmt.Errorf("startNode %s: cluster.Open: %w", id, oerr)
-		}
-		if attempt == maxAttempts-1 {
-			_ = lis.Close()
-			return nil, fmt.Errorf("startNode %s: %d bind attempts all conflicted: %w", id, maxAttempts, oerr)
-		}
+	cfg := cluster.Config{
+		NodeID:               id,
+		BackendFactory:       h,
+		UnitCount:            storageunit.MustUnitCount(c.unitCount),
+		ConditionalStore:     c.condStore,
+		GRPCAddr:             grpcAddr,
+		LogOutput:            io.Discard,
+		RebalanceSettleDelay: c.settleDelay,
+		Coordinator:          clustertest.CASCoordinator(c.condStore),
+	}
+	cl, err := cluster.Open(cfg)
+	if err != nil {
+		_ = lis.Close()
+		return nil, fmt.Errorf("startNode %s: cluster.Open: %w", id, err)
 	}
 
 	rpc.NewServer(cl).Register(grpcSrv)
@@ -205,7 +178,6 @@ func (c *inProcCluster) startNode(seedAddr string) (*node, error) {
 		id:         id,
 		cl:         cl,
 		handle:     h,
-		bindAddr:   bindAddr,
 		grpcAddr:   grpcAddr,
 		grpcServer: grpcSrv,
 		serveDone:  serveDone,
@@ -287,18 +259,17 @@ func (c *inProcCluster) waitConverged(want int, timeout time.Duration) error {
 
 // --- Topology mutations (chaos events) ----------------------------------
 
-// AddNode joins a fresh node seeded off an existing live member and waits for
-// the new member count to converge. The Phase 3 lease handoff redistributes
-// units to it.
+// AddNode joins a fresh node through the shared membership store and waits
+// for the new member count to converge. The Phase 3 lease handoff
+// redistributes units to it.
 func (c *inProcCluster) AddNode() (string, error) {
 	c.structMu.Lock()
 	defer c.structMu.Unlock()
 	live := c.liveNodes()
 	if len(live) == 0 {
-		return "", fmt.Errorf("AddNode: no live node to seed off")
+		return "", fmt.Errorf("AddNode: no live node to join")
 	}
-	seed := live[0].bindAddr
-	n, err := c.startNode(seed)
+	n, err := c.startNode()
 	if err != nil {
 		return "", err
 	}
@@ -307,9 +278,9 @@ func (c *inProcCluster) AddNode() (string, error) {
 	return n.id, nil
 }
 
-// RemoveNode gracefully closes a live node (broadcasts the memberlist Leave) and
-// waits for survivors to converge. Survivors re-acquire its units via reconcile.
-// Never removes the last node.
+// RemoveNode gracefully closes a live node (its coordinator removes its
+// membership row on the way out) and waits for survivors to converge.
+// Survivors re-acquire its units via reconcile. Never removes the last node.
 func (c *inProcCluster) RemoveNode(id string) error {
 	c.structMu.Lock()
 	defer c.structMu.Unlock()
@@ -349,14 +320,15 @@ func (c *inProcCluster) removeLocked(id string, graceful bool) error {
 	}
 
 	if graceful {
-		// Clean Leave: close the cluster (which gracefully leaves memberlist +
-		// closes the backend handle), then stop the gRPC server.
+		// Clean leave: close the cluster (which gracefully removes its
+		// membership row + closes the backend handle), then stop the gRPC
+		// server.
 		_ = target.cl.Close()
 		target.grpcServer.GracefulStop()
 		<-target.serveDone
 	} else {
-		// Crash: hard-stop the gRPC server first (interrupts in-flight forwards),
-		// then close the cluster so memberlist eventually fails-detects it.
+		// Crash: hard-stop the gRPC server first (interrupts in-flight
+		// forwards), then close the cluster so peers observe the departure.
 		target.grpcServer.Stop()
 		<-target.serveDone
 		_ = target.cl.Close()
@@ -543,37 +515,6 @@ func (c *inProcCluster) WaitSettled(expectedUnits int, timeout time.Duration) {
 }
 
 // --- small helpers --------------------------------------------------------
-
-// freeTCPPort grabs an OS-assigned ephemeral port + releases it (the caller binds
-// it for real, accepting the release-rebind race that the retry loop heals).
-func freeTCPPort() (int, error) {
-	l, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		return 0, err
-	}
-	port := l.Addr().(*net.TCPAddr).Port
-	_ = l.Close()
-	return port, nil
-}
-
-// isBindConflict reports whether err is a memberlist bind conflict (the
-// release-then-rebind race), matched on the stable wrapped substring.
-func isBindConflict(err error) bool {
-	return err != nil && contains(err.Error(), "address already in use")
-}
-
-func contains(s, sub string) bool {
-	return len(s) >= len(sub) && indexOf(s, sub) >= 0
-}
-
-func indexOf(s, sub string) int {
-	for i := 0; i+len(sub) <= len(s); i++ {
-		if s[i:i+len(sub)] == sub {
-			return i
-		}
-	}
-	return -1
-}
 
 // genUnitBytes mirrors the cluster's internal unit-id encoding (8-byte big-endian
 // generation, then 4-byte big-endian unit id) so a test-side ring placement

@@ -19,13 +19,12 @@ import (
 	"github.com/Zamua/shale/internal/sharedfactory"
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/coord"
-	"github.com/Zamua/shale/pkg/coord/gossip"
 	"github.com/Zamua/shale/pkg/storageunit"
 )
 
 // newReplicatedCluster builds a minimal R>1 multi-backend Cluster wired to a
 // per-replica shared-backing handle + a transport-free coordinator over
-// memberIDs, with no gossip / gRPC. self is this node's id.
+// memberIDs, with no transport / gRPC. self is this node's id.
 func newReplicatedCluster(t *testing.T, self string, n, r int, backing *sharedfactory.Backing, memberIDs ...string) *Cluster {
 	t.Helper()
 	h := backing.Handle()
@@ -505,7 +504,7 @@ func TestBootWarmUp_PublishesTheJoiningBitBeforeSamplingTheView(t *testing.T) {
 	peerFacts := func(roles coord.Role) coord.Member {
 		return coord.Member{Node: coord.Node{ID: "n2", Addr: "n2:0"}, Roles: roles}
 	}
-	inner := c.coord.(*gossip.Coordinator)
+	inner := staticCoordOf(c)
 	inner.TestingSetFacts(peerFacts(coord.RoleJoining))
 	c.coord = &roleHookCoord{
 		Coordinator: inner,
