@@ -181,11 +181,19 @@ func TestDesiredReplicaUnits_Characterization(t *testing.T) {
 		unit storageunit.UnitID
 		pos  uint8
 	}
+	// Placement values, regenerated when the ring library changed (see
+	// docs/SPEC.md "Ring placement is a compatibility surface"). They pin the
+	// ORDER and shape of the derivation, not a distribution property; the
+	// fleet-level canary for an unintended placement change is
+	// pkg/ring/placement_golden_test.go.
 	golden := []want{
 		{0, 1},
-		{3, 1},
+		{1, 1},
+		{2, 0},
+		{3, 0},
+		{4, 0},
 		{5, 0},
-		{6, 1},
+		{7, 1},
 	}
 	if len(got) != len(golden) {
 		t.Fatalf("desiredReplicaUnits len = %d, want %d; got = %v", len(got), len(golden), got)
