@@ -22,7 +22,7 @@
 # Dockerfile.slatedb; the uniffi stage is byte-identical so the two share the
 # (heavy) Rust build-cache layer.
 
-ARG SLATEDB_VERSION=v0.14.1
+ARG SLATEDB_VERSION=v0.15.0
 
 # ---- uniffi-build stage (identical to Dockerfile.slatedb; shares its cache) --
 FROM rust:1.91-slim-bookworm AS uniffi-build
