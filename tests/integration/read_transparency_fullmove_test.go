@@ -361,11 +361,15 @@ func waitNoUndesiredMounts(t *testing.T, nodes []*sharedNode, timeout time.Durat
 
 func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 	const uc, rf = 16, 2
-	base := []string{"sg-a", "sg-b", "sg-c", "sg-d"} // sg-a leaves
-	joiner := "sg-e"
-	leaver := "sg-a"
+	// The NAME SET is fixture data, not arbitrary: it is searched so that the
+	// shape below exists under the current ring. A ring change (a placement
+	// library bump) invalidates it, which the FIXTURE DRIFT failure below
+	// reports explicitly rather than passing vacuously - re-search then.
+	base := []string{"mv-a", "mv-b", "mv-c", "mv-d"} // mv-a leaves
+	joiner := "mv-e"
+	leaver := "mv-a"
 	with5 := append(append([]string(nil), base...), joiner)
-	finalIDs := []string{"sg-b", "sg-c", "sg-d", "sg-e"}
+	finalIDs := []string{"mv-b", "mv-c", "mv-d", "mv-e"}
 
 	// PRECONDITION (the full-move unit): a unit the leaver holds whose true
 	// post-transition placement shares NO member with its pre-transition
@@ -430,10 +434,10 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 		// timeline degenerates to the drain timeout.
 		cfg.RebalanceSettleDelay = 300 * time.Millisecond
 	}
-	na := startReplicatedNodeCfg(t, "sg-a", "", uc, rf, backing, mutate)
-	nb := startReplicatedNodeCfg(t, "sg-b", na.ClusterToken, uc, rf, backing, mutate)
-	nc := startReplicatedNodeCfg(t, "sg-c", na.ClusterToken, uc, rf, backing, mutate)
-	nd := startReplicatedNodeCfg(t, "sg-d", na.ClusterToken, uc, rf, backing, mutate)
+	na := startReplicatedNodeCfg(t, "mv-a", "", uc, rf, backing, mutate)
+	nb := startReplicatedNodeCfg(t, "mv-b", na.ClusterToken, uc, rf, backing, mutate)
+	nc := startReplicatedNodeCfg(t, "mv-c", na.ClusterToken, uc, rf, backing, mutate)
+	nd := startReplicatedNodeCfg(t, "mv-d", na.ClusterToken, uc, rf, backing, mutate)
 	all4 := []*cluster.Cluster{na.Cluster, nb.Cluster, nc.Cluster, nd.Cluster}
 	if err := waitForMembersAll(all4, 4, 30*time.Second); err != nil {
 		t.Fatalf("4-node convergence: %v", err)
@@ -451,7 +455,7 @@ func TestLeaveJoinOverlap_FullMoveUnit_ReadTransparent(t *testing.T) {
 
 	// Join the 5th node FIRST (it boot-defers via the planted markers, sets
 	// Joining, and slow-warms through the whole drain - the leave+join overlap),
-	// then gracefully remove sg-a once every node sees 5 members. Joining before
+	// then gracefully remove mv-a once every node sees 5 members. Joining before
 	// the leave removes the last interleaving mask: with the joiner in the ring
 	// for the entire drain, no pre-flip view (old placement, approximated
 	// pending, full 5-ring) ever assigns the full-move unit to a final owner,

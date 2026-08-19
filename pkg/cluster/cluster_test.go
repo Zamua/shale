@@ -16,7 +16,6 @@ import (
 	"github.com/Zamua/shale/pkg/backend"
 	"github.com/Zamua/shale/pkg/backend/memory"
 	"github.com/Zamua/shale/pkg/cluster"
-	"github.com/Zamua/shale/pkg/ring"
 	"github.com/Zamua/shale/pkg/rpc"
 	"github.com/Zamua/shale/pkg/storageunit"
 	"google.golang.org/grpc"
@@ -101,8 +100,8 @@ func TestTwoNode_PutRoutesToOwner(t *testing.T) {
 	// forwarding). Then the same in the other direction. Unit placement is
 	// deterministic across both nodes since both compute the same ring from
 	// the same membership.
-	keyOwnedByN2 := findKeyOwnedBy(t, c1, "n2", 1000)
-	keyOwnedByN1 := findKeyOwnedBy(t, c2, "n1", 1000)
+	keyOwnedByN2 := findKeyOwnedBy(t, c1, c2, 1000)
+	keyOwnedByN1 := findKeyOwnedBy(t, c2, c1, 1000)
 
 	if err := c1.Put([]byte(keyOwnedByN2), []byte("from-n1")); err != nil {
 		t.Fatalf("c1.Put(n2-key): %v", err)
@@ -215,32 +214,24 @@ func pollUntil(timeout, interval time.Duration, cond func() bool) bool {
 // public Members() snapshot + a freshly-constructed ring, so it sees
 // exactly the routing decision Put/Get would make. Bounded by maxProbes
 // iterations so a misconfigured test fails loudly instead of looping.
-func findKeyOwnedBy(t *testing.T, c *cluster.Cluster, wantOwner string, maxProbes int) string {
+func findKeyOwnedBy(t *testing.T, c *cluster.Cluster, owner *cluster.Cluster, maxProbes int) string {
 	t.Helper()
 	if len(c.Members()) < 2 {
 		t.Fatalf("findKeyOwnedBy: ring needs >=2 members, got %v", c.Members())
 	}
+	// Ask the OWNER ITSELF, do not model the routing here. A test-local
+	// model has to know which mode the cluster is in (legacy routes the key
+	// against the ring; multi-backend routes key -> unit -> node), and a model
+	// that gets it wrong still finds a key - just the wrong one, which then
+	// fails downstream as a missing value rather than as a bad prediction.
 	for i := range maxProbes {
 		k := fmt.Sprintf("probe-%d", i)
-		if ownerFor(c, k) == wantOwner {
+		if owner.OwnsKey([]byte(k)) {
 			return k
 		}
 	}
-	t.Fatalf("could not find a key owned by %s in %d probes", wantOwner, maxProbes)
+	t.Fatalf("could not find a key owned by %s in %d probes", owner.NodeID(), maxProbes)
 	return ""
-}
-
-// ownerFor mirrors what cluster.ownerOf does, using the public
-// Members() snapshot + the same ring algorithm. Implemented here in
-// the test so we don't have to export an internal hook. Two rings
-// built from the same Members() snapshot agree (consistent hashing is
-// deterministic), so this is a faithful preview of the routing.
-func ownerFor(c *cluster.Cluster, key string) string {
-	r := ring.New()
-	for _, m := range c.Members() {
-		r.Add(m)
-	}
-	return r.LocateKey([]byte(key)).ID
 }
 
 func TestAggregate_SingleNode(t *testing.T) {

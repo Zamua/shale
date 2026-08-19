@@ -2091,6 +2091,47 @@ was removed after v0.18.1, so there is no adapter left that takes a bind
 address or a seed list. A fork that wants one implements the port and pins
 itself with `internal/coordcontract`.
 
+## Ring placement is a compatibility surface
+
+Placement - which node MOUNTS which storage unit - is computed by the
+consistent-hash ring (`pkg/ring`, wrapping `buraksezer/consistent`) over the
+coordinator's member set. Both the shipped adapter and the test coordinator
+feed the same ring, so placement is a pure function of (member set, unit,
+replication factor).
+
+**A change to that function is a fleet event, not an implementation detail.**
+Every reassigned position is released by one node and acquired by another, so
+a placement change is a mass handoff. It is survivable by construction: unit
+databases are addressed by POSITION (`g<gen>/u<N>/r<M>`), never by node, so no
+DATA moves and the durable epoch fence keeps the handoff lossless. What it
+costs is a fleet-wide remount, plus a window in which nodes computing
+placement differently disagree about ownership.
+
+Consequences, in order of how easily they are forgotten:
+
+- **Upgrading across a placement change requires a coordinated restart.** A
+  rolling upgrade puts old-placement and new-placement nodes in one cluster,
+  each believing it owns positions the other is serving. The epoch fence
+  bounds that to availability churn rather than loss, but it is an outage.
+  Use the full-stop choreography in `docs/design/coordinator-migration.md`;
+  the mechanics are identical, only the disagreement's cause differs.
+- **The ring library's version is part of the contract.** A major bump of
+  `buraksezer/consistent` may change the virtual-node layout or the load cap
+  and therefore the answers, with no API change to signal it. Treat such a
+  bump as a coordinated-restart upgrade, never as a routine dependency
+  update.
+- **`pkg/ring` has a golden placement test** (`placement_golden_test.go`) that
+  pins the ring's OUTPUT for a fixed topology. Nothing else would notice a
+  silent change: the `GenUnitBytes` vectors pin the ring's INPUT, and the
+  cross-adapter equivalence test proves the adapters agree with each other,
+  which stays true when the shared ring moves underneath both. A deliberate
+  change updates the vectors AND ships the restart note; an unexplained
+  failure means something altered placement by accident.
+
+Key-to-unit routing is NOT affected by any of this: it is `hash & mask` in
+`pkg/storageunit` and does not touch the ring, so a key's home unit is stable
+across ring changes, doublings aside.
+
 ## The CAS coordinator (pkg/coord/cas)
 
 The ONE SHIPPED adapter: `pkg/coord/cas` answers the port from ONE shared

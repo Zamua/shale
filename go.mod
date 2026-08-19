@@ -7,7 +7,7 @@ toolchain go1.26.4
 require (
 	github.com/Zamua/shale/backends/pebble v0.1.0
 	github.com/Zamua/shale/backends/slate v0.11.1
-	github.com/buraksezer/consistent v0.10.0
+	github.com/buraksezer/consistent v1.0.0
 	github.com/cespare/xxhash/v2 v2.3.0
 	github.com/minio/minio-go/v7 v7.3.0
 	go.uber.org/goleak v1.3.0
