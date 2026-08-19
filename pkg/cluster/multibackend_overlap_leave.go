@@ -1,7 +1,8 @@
 // Graceful-leave drain (v0.8 Phase 2e, pending ranges, scale-down). Under the
-// pending-ranges model a leaving node sets a gossiped Draining bit but STAYS a
-// full, alive member AND a current owner of every position it serves: it is NOT
-// removed from the consistent-hash ownership ring. Every node's
+// pending-ranges model a leaving node publishes coord.RoleDraining through the
+// coordinator but STAYS a full, alive member AND a current owner of every
+// position it serves: it is NOT removed from the consistent-hash ownership
+// ring. Every node's
 // routedReplicasForKey then computes the leaver's positions as
 // CURRENT-but-not-PENDING (current = ring
 // including the leaver, pending = ring excluding it), forms the routed UNION, and
@@ -37,7 +38,7 @@ import (
 const drainPollInterval = 50 * time.Millisecond
 
 // DrainForLeave performs the graceful-leave drain for a scale-down: it SETS THIS
-// NODE DRAINING (gossiping the Draining bit, so every node recomputes the
+// NODE DRAINING (publishing the Draining role, so every node recomputes the
 // pending split current-minus-this-node, forms the routed union, and dual-writes
 // the leaver + its successors while it stays alive + a current owner + serving),
 // then BLOCKS until every position this node owns has a PENDING SUCCESSOR that is

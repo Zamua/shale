@@ -2,11 +2,12 @@
 // the quorum-floor-guarded MIRROR of the graceful-leave drain. A node that boots
 // into a LIVE cluster with DEFERRED positions (owned-but-not-yet-mounted, because
 // a peer's serving marker was present so the node did not fence the live peer) is
-// WARMING: it advertises a gossiped Joining bit, so every node's per-op split
-// EXCLUDES it from the CURRENT set (subject to the quorum floor in
-// currentUnitReplicas) while INCLUDING it in the PENDING set. The still-mounted
-// DISPLACED owner therefore stays a stable current owner (it keeps serving,
-// dual-written via the union) and this node acquires its positions via the
+// WARMING: it advertises the Joining role through the coordinator, so every
+// node's per-op split EXCLUDES it from the CURRENT set (subject to the quorum
+// floor in currentUnitReplicas) while INCLUDING it in the PENDING set. The
+// still-mounted DISPLACED owner therefore stays a stable current owner (it
+// keeps serving, dual-written via the union) and this node acquires its
+// positions via the
 // background pending-owner path (acquireReplicaUnitOverlap), serving-marking each
 // on mount-complete - which gates the displaced owner's drain. A moving shard
 // stays AVAILABLE throughout the slow mount, exactly as it does through a leave.

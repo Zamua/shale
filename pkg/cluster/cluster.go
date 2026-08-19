@@ -122,17 +122,18 @@ type Config struct {
 	ConditionalStore storageunit.ConditionalStore
 
 	// DeclarativeReshard makes the cluster DRIVE the arbiter target from the
-	// cluster-wide gossiped DECLARED unit count (UnitCount, advertised in
-	// membership metadata): on every reconcile tick, when the cluster is steady
-	// AND every live member agrees on the same declared count, the cluster
-	// CAS-retargets the arbiter to it and the decentralized driver converges
-	// online. This is the "declare SHALE_UNIT_COUNT in the deployment and
-	// apply" operator surface for the homogeneous deployment (see
+	// cluster-wide DECLARED unit count (UnitCount, advertised through the
+	// coordinator as coord.Params.DeclaredUnitCount): on every reconcile tick,
+	// when the cluster is steady AND every live member agrees on the same
+	// declared count, the cluster CAS-retargets the arbiter to it and the
+	// decentralized driver converges online. This is the "declare
+	// SHALE_UNIT_COUNT in the deployment and apply" operator surface for the
+	// homogeneous deployment (see
 	// observeDeclaredReshardTarget + docs/SPEC.md "Declarative reshard").
 	//
 	// Default false: the arbiter target is then set ONLY externally (the
 	// imperative Reshard path, or a test driving reshard.Arbiter.Retarget
-	// directly), and the gossiped declared count is informational. Tests that
+	// directly), and the advertised declared count is informational. Tests that
 	// drive a reshard imperatively (the lossless split/merge gate) MUST leave
 	// this false so their target is not reconciled back to the founded count.
 	// Requires ConditionalStore (an arbiter); a no-op without one.
@@ -183,7 +184,7 @@ type Config struct {
 	// (an under-replicated CAS commit, a failed unit acquire). nil is a
 	// silent sink for the gated warnings and stderr for the ones that must
 	// never be lost; tests pass io.Discard. It is NOT the coordinator's log
-	// sink - a gossip transport's chatter is the adapter's own config.
+	// sink - a coordinator adapter's own diagnostics are that adapter's config.
 	LogOutput io.Writer
 
 	// ShardKeyFn lets the app extract a shard key from a full key.
@@ -420,10 +421,11 @@ type Config struct {
 // coordination engine (plan key ranges, stream them between peers, verify,
 // sweep) which no longer exists: shale has ONE distributed model, the
 // unit lease handoff, and that needs a BackendFactory. Accepting the
-// combination would be worse than failing: the cluster would come up,
-// gossip, build a ring and serve reads and writes, but nothing would move
-// data on a topology change, so keys would silently become unreachable the
-// moment the ring reassigned them to a node that never held their bytes.
+// combination would be worse than failing: the cluster would come up, join
+// through the coordinator, build a ring and serve reads and writes, but
+// nothing would move data on a topology change, so keys would silently become
+// unreachable the moment the ring reassigned them to a node that never held
+// their bytes.
 // A refused Open turns that into a failed startup instead.
 func validateBackendMode(cfg *Config) (multi bool, err error) {
 	hasFactory := cfg.BackendFactory != nil
@@ -527,13 +529,13 @@ type Cluster struct {
 	// instead of waiting for the periodic reconcile tick.
 	drainPollerActive atomic.Bool
 
-	// draining is a TEST-ONLY override for the gossiped Draining set: when
+	// draining is a TEST-ONLY override for the advertised Draining set: when
 	// non-nil, drainingIDs returns it directly instead of reading the membership
 	// snapshot. It lets the white-box pending-ranges tests inject a transition
 	// without a coordinator. Nil in production (the snapshot is authoritative).
 	draining map[storageunit.NodeID]struct{}
 
-	// joining is a TEST-ONLY override for the gossiped Joining set: when non-nil,
+	// joining is a TEST-ONLY override for the advertised Joining set: when non-nil,
 	// joiningIDs returns it directly instead of reading the membership snapshot.
 	// It lets the white-box pending-ranges tests inject a JOIN transition (and
 	// exercise the quorum floor) without a coordinator. Nil in production (the
@@ -544,7 +546,7 @@ type Cluster struct {
 	// Set true at boot when mountReplicaUnits boot-defers one or more owned
 	// positions (a peer is serving them); cleared by the reconcile once every
 	// owned position is mounted. Kept as a local atomic so the reconcile's
-	// clear-decision does not race a self-snapshot; the authoritative gossiped bit
+	// clear-decision does not race a self-snapshot; the authoritative bit
 	// is published through the coordination port alongside this flag.
 	selfJoining atomic.Bool
 

@@ -115,7 +115,8 @@ func TestMembershipChangeWriteAvailabilityGate(t *testing.T) {
 	// mounts fire on several nodes. We arm a wide acquiring window on the
 	// EXISTING nodes BEFORE the join so those reconcile re-mounts genuinely
 	// stall and the handoff window overlaps the in-flight writes (the pre-fix
-	// drop needs that). The delay only affects OpenReplicaUnit, NOT gossip, so
+	// drop needs that). The delay only affects OpenReplicaUnit, NOT the
+	// coordinator, so
 	// membership still converges. 120ms per acquire: comfortably under the 5s
 	// WriteTimeout the retry rides, but long enough that without the retry a
 	// write landing on a re-mounting replica fails.

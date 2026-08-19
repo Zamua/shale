@@ -49,9 +49,10 @@ func (c *Cluster) TestingSetRingMembers(members []ring.Member) {
 
 // TestingHardKill tears this node down like Close BUT WITHOUT the graceful
 // membership Leave, modeling a SIGKILLed process / a k8s pod delete: peers do
-// not get a clean leave and must reap the node via SWIM failure detection. It
-// first hard-shuts the coordinator's transport (no departure announcement) via
-// its TestingShutdownNoLeave seam, then runs the normal Close teardown (which,
+// not get a clean leave and must reap the node via the coordinator's own
+// failure detection (lease expiry under the CAS adapter). It first hard-shuts
+// the coordinator's transport (no departure announcement) via its
+// TestingShutdownNoLeave seam, then runs the normal Close teardown (which,
 // seeing the transport already down, skips its own leave/shutdown) so every
 // cluster goroutine - the coordination + reconcile loops, the read-repair pool,
 // the rebalance coordinator, the settle timer - stops cleanly and no goroutine

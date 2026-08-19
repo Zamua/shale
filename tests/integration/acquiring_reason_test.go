@@ -149,8 +149,8 @@ func TestAcquiringReason_PeerDownDoesNotMatchErrAcquiring(t *testing.T) {
 	const unitCount = 8
 	owner, other, key, _ := acquiringReasonPair(t, unitCount)
 
-	// Kill ONLY the owner's gRPC listener. Memberlist keeps running, so the
-	// ring is unchanged and `other` still forwards the key to it.
+	// Kill ONLY the owner's gRPC listener. Its coordinator keeps running, so
+	// the ring is unchanged and `other` still forwards the key to it.
 	owner.stop()
 	owner.stop = nil
 

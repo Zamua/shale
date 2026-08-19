@@ -3,7 +3,7 @@ package cluster
 // Shared white-box coordination fixtures. The tests in this package build
 // Cluster values by hand (no Open, no transport) and need deterministic
 // placement over a member set they control, so they stand up a TRANSPORT-FREE
-// static coordinator instead of a gossip mesh: same placement math, nothing to
+// static coordinator instead of a real one: same placement math, nothing to
 // join, nothing to reconcile.
 
 import (

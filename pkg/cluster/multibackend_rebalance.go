@@ -205,8 +205,8 @@ func (c *Cluster) reconcileUnits() {
 	// redistribution runs against the advanced generation.
 	//
 	// First, reconcile the agreed target toward the cluster-wide DECLARED
-	// unit count (the operator's SHALE_UNIT_COUNT, gossiped in membership
-	// metadata): when the cluster is steady AND every live member agrees on
+	// unit count (the operator's SHALE_UNIT_COUNT, advertised through the
+	// coordinator): when the cluster is steady AND every live member agrees on
 	// the same declared count, CAS the arbiter target to it. observeReshard
 	// below then picks the new target up THIS SAME tick and enters the
 	// split/merge. No-op without an arbiter, or until the live set is

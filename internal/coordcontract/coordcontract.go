@@ -3,17 +3,16 @@
 // EVERY adapter must satisfy, run by each adapter's own suite through
 // RunContract.
 //
-// Why a shared package: the contract tests grew up inside the gossip
-// adapter's suite, which made them look gossip-specific when they are
-// port-specific. A second adapter (the CAS coordinator) has exactly the
-// same bar to clear - Populated tracking View, TransitionSets matching
-// View's roles, the PlacementMembers basis, Locate determinism, the
-// genuinely reduced placement under exclusion - and hand-copying the
-// tests is how two suites drift apart (internal/clustertest exists for
-// the same reason). Adapter-SPECIFIC behavior stays in each adapter's own
-// tests: the gossip suite keeps its ring-drop heal, reconcile idempotence
-// and bootstrap-discovery tests; a CAS suite owns lease expiry and
-// document GC.
+// Why a shared package: the contract tests grew up inside the removed
+// gossip adapter's suite, which made them look adapter-specific when they
+// are port-specific. Every adapter has exactly the same bar to clear -
+// Populated tracking View, TransitionSets matching View's roles, the
+// PlacementMembers basis, Locate determinism, the genuinely reduced
+// placement under exclusion - and hand-copying the tests is how two suites
+// drift apart (internal/clustertest exists for the same reason).
+// Adapter-SPECIFIC behavior stays in each adapter's own tests: the CAS
+// suite owns lease expiry and document GC; the gossip suite owned its
+// ring-drop heal, reconcile idempotence and bootstrap-discovery tests.
 //
 // The harness reaches an adapter only through the Adapter hooks and the
 // port itself, so it can never depend on one implementation's interior.
@@ -29,7 +28,7 @@ import (
 
 // DefaultRoleVisibilityTimeout bounds how long RunContract waits for a
 // role flip to reach the query methods when Adapter.RoleVisibilityTimeout
-// is zero. It matches the waits the gossip suite always used.
+// is zero. It matches the waits the removed gossip suite always used.
 const DefaultRoleVisibilityTimeout = 2 * time.Second
 
 // contractUnitCount is the unit universe the Locate tests sweep. 64 units
@@ -61,8 +60,8 @@ type Adapter struct {
 
 	// SetMemberRoles makes member id advertise exactly roles (roles == 0
 	// retracts them all), through whatever mechanism the adapter has: a
-	// test seam on a static coordinator (gossip's facts override), or the
-	// real SetRole driven on the peer instance that owns id (a CAS
+	// test seam on a static coordinator (coordstatic's facts override), or
+	// the real SetRole driven on the peer instance that owns id (a CAS
 	// cluster). Visibility may lag delivery by the adapter's own refresh
 	// cadence; the harness waits up to RoleVisibilityTimeout for the flip
 	// to land, then asserts exactly.
@@ -71,7 +70,7 @@ type Adapter struct {
 	// RoleVisibilityTimeout bounds how long a role flip may take to reach
 	// the query methods; zero means DefaultRoleVisibilityTimeout. The wait
 	// exists because the port lets role delivery ride the adapter's own
-	// refresh mechanism (a gossip Meta broadcast, a CAS poll). What it
+	// refresh mechanism (a CAS poll, a broadcast in a fork's adapter). What it
 	// must NEVER ride is the change hint - which is why the wait loop
 	// never reads Changed(): an adapter that refreshed roles only when
 	// the caller consumed a hint would time out here.
@@ -252,9 +251,10 @@ func (a Adapter) waitTransitionSets(t *testing.T, co coord.Coordinator, wantJ, w
 // testPlacementMembersMatchViewBasis pins the steady-state agreement of
 // the two bases: with a stable membership, PlacementMembers returns
 // exactly View's member set, in the same (ID-sorted) order. An adapter
-// whose bases can transiently diverge (gossip's ring vs snapshot) pins
-// that divergence in its OWN suite; a single-basis adapter (CAS) never
-// diverges at all. The contract here is the point both agree on.
+// whose bases can transiently diverge (as the removed gossip adapter's
+// ring did from its snapshot) pins that divergence in its OWN suite; a
+// single-basis adapter (CAS) never diverges at all. The contract here is
+// the point both agree on.
 func (a Adapter) testPlacementMembersMatchViewBasis(t *testing.T) {
 	members := nodes("a", "b", "c")
 	co := a.open(t, members[0], members)

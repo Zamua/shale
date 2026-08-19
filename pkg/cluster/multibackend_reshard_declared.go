@@ -1,4 +1,5 @@
-// Declarative reshard: the unit count is config, declared and gossiped.
+// Declarative reshard: the unit count is config, declared and advertised
+// through the coordinator (coord.Params.DeclaredUnitCount).
 //
 // The v0.9 decentralized reshard driver (multibackend_reshard_driver.go) is
 // DRIVEN by the arbiter's agreed `target`, but nothing yet SETS that target
@@ -41,7 +42,7 @@ import (
 func (c *Cluster) observeDeclaredReshardTarget() {
 	if !c.cfg.DeclarativeReshard {
 		return // opt-in: the homogeneous deployment drives the target from the
-		// gossiped declared count; everything else (tests driving the arbiter
+		// advertised declared count; everything else (tests driving the arbiter
 		// imperatively, legacy) leaves the target externally set.
 	}
 	if c.arbiter == nil || c.coord == nil {

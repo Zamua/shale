@@ -27,14 +27,15 @@ package integration
 // a write's fan-out targets a node that neither owns nor mounts the position ->
 // perpetual 1-of-2. This is the MEMBERSHIP-RACE arm.
 //
-// Why "inject the divergence" rather than let real gossip produce it: with the
-// identity-decouple (#473) + rejoin + meta-refresh fixes, in-process gossip on
-// loopback CONVERGES, so the divergence the live cluster suffered (believed to be
+// Why "inject the divergence" rather than let real membership churn produce it:
+// with the identity-decouple (#473) + rejoin + meta-refresh fixes, in-process
+// membership on loopback CONVERGES, so the divergence the live cluster suffered
+// (believed to be
 // a churn-induced convergence race, plausibly aggravated by real-network timing,
 // hard SIGKILLs with no Leave, and/or an in-flight reshard) does not arise from a
 // graceful in-process roll. Forcing the exact divergent RING state is the
 // deterministic stand-in the task calls for: it proves the wedge SHAPE + its
-// diagnostic fingerprint without depending on losing a gossip timing race.
+// diagnostic fingerprint without depending on losing a membership timing race.
 
 import (
 	"fmt"
@@ -343,7 +344,7 @@ func isMidAcquire(err error) bool {
 //
 // It deliberately reads PlacementMembers, not Members: the divergence this
 // mechanism test engineers is a ring-only one (TestingSetRingMembers mutates
-// the placement basis; gossip still agrees), which is exactly the production
+// the placement basis; the view still agrees), which is exactly the production
 // shape of a dropped membership event. The membership VIEW is snapshot-based
 // and agrees across nodes throughout - by design - so reading it here would
 // make the vacuity guard unsatisfiable rather than protective.

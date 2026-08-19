@@ -17,7 +17,7 @@ package integration
 //     DIFFERENT replica pair per unit, so a write's fan-out targets a node that
 //     does not own (and never mounts) that position -> perpetual 1-ack.
 //
-// This file is the DISCOVERY arm: it stands up the real-gossip harness, churns
+// This file is the DISCOVERY arm: it stands up the real multi-node harness, churns
 // the cluster with repeated restarts (accumulating stale marker/membership
 // state the way the live cluster did), performs a rolling restart, then polls
 // for write recovery. If writes do NOT recover it dumps each node's member view
@@ -367,7 +367,7 @@ func TestRollingRestartWedge_Churned(t *testing.T) {
 	// CHURN: repeated rolling restarts (reverse ordinal), each node coming back on
 	// a new address over the same durable backing, with background writers running
 	// throughout so every unit accrues writes + climbing epochs. The rolls OVERLAP
-	// convergence: only a SHORT settle between kills (well under the SWIM
+	// convergence: only a SHORT settle between kills (well under the membership
 	// convergence + reconcile cadence), modeling the "hard-kill exactly as the
 	// previous node rejoins" interleaving. We do NOT wait for full convergence
 	// between individual kills - only once per round - so a node can be killed

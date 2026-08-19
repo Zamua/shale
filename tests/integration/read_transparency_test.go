@@ -22,7 +22,7 @@ package integration
 //     entry point for the whole drain.
 //
 // WHAT THE WIRE PATH IS FOR, AND WHAT IT IS NOT. These gates exist to catch
-// what only appears once real nodes, real mounts and real gossip are in play.
+// what only appears once real nodes, real mounts and real membership are in play.
 // They are a poor instrument for the ROUTING DECISION itself - which replicas
 // an op touches during a transition - because reaching a given topology through
 // them means holding a mount window open against a drain that ends on its own,
@@ -39,8 +39,8 @@ package integration
 // THE OBSERVATION WINDOW IS PART OF THE ASSERTION. A gate here is only
 // meaningful while its transition is actually in flight, and no such window
 // stays open on its own: a modeled mount latency elapses, a drain finishes. A
-// window left to whatever ran before the probes - a gossip convergence wait,
-// most of all - fails in one of two equally useless directions. It fails LOUDLY
+// window left to whatever ran before the probes - a membership convergence
+// wait, most of all - fails in one of two equally useless directions. It fails LOUDLY
 // but vacuously, reporting a fixture-window miss as a transparency verdict (the
 // JOIN gate did exactly that in CI, on a merge that changed no executable
 // code); or it fails SILENTLY, asserting nothing while reporting a pass. So a
@@ -266,8 +266,9 @@ func summarizeReadFailures(t *testing.T, label string, fails []readFailure, limi
 //
 // It exists because the alternative - assuming the window is open because a
 // modeled acquire latency was armed - is a race against everything that runs
-// between arming it and probing (a gossip convergence wait, most of all). Losing
-// that race produces a gate that fails having observed no reads at all, which is
+// between arming it and probing (a membership convergence wait, most of all).
+// Losing that race produces a gate that fails having observed no reads at all,
+// which is
 // a fixture-window miss reported as a transparency result.
 //
 // The two non-positive readings are separated deliberately: desiredButUnmounted
@@ -349,7 +350,7 @@ func TestJoinReadTransparent_GetScanEveryNode(t *testing.T) {
 	// THE MOUNT WINDOW IS HELD OPEN, NOT TIMED. rt-d's modeled acquire latency is
 	// armed far longer than any convergence and is closed EXPLICITLY below, once
 	// the probes have run. Sizing it against wall clock instead raced the
-	// UNBOUNDED gossip-convergence wait that follows: on a slow runner the whole
+	// UNBOUNDED membership-convergence wait that follows: on a slow runner the whole
 	// modeled mount elapses while the cluster is still converging, the probe loop
 	// then finds nothing outstanding and the gate fails HAVING ISSUED NO READ. That
 	// is a fixture-window miss reported as a transparency verdict, and it is the
@@ -567,7 +568,7 @@ func TestLeaveEntryServesWhileDraining(t *testing.T) {
 	}
 	drainDone := make(chan struct{})
 	go func() { defer close(drainDone); _ = n4.Cluster.Close() }()
-	time.Sleep(600 * time.Millisecond) // let the Draining bit gossip
+	time.Sleep(600 * time.Millisecond) // let the Draining role reach the peers
 
 	// ENTRY THROUGH THE LEAVER, for the whole drain: every Get and ScanPrefix
 	// must serve (single attempt per op; the union + the leaver's still-mounted

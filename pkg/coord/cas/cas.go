@@ -64,9 +64,9 @@
 // swap. Every per-op query (View, Populated, TransitionSets,
 // PlacementMembers, Locate) reads the currently published pair: no locks, no
 // I/O, per the port. Because view and ring are one artifact derived from one
-// source, PlacementMembers() equals View()'s member set ALWAYS: the gossip
-// adapter's documented window (ring trails the snapshot, heals on the
-// reconcile cadence) cannot exist here.
+// source, PlacementMembers() equals View()'s member set ALWAYS: the removed
+// gossip adapter's documented window (its ring trailed its snapshot and
+// healed on the reconcile cadence) cannot exist here.
 //
 // ROLE VISIBILITY RIDES THE POLL, NEVER THE HINT. SetRole CAS-updates self's
 // row and returns; the flip reaches the query methods when a poll next
@@ -153,7 +153,7 @@ type Config struct {
 	// LogOutput is where the adapter's own diagnostics write - a
 	// rate-limited line when consecutive store failures cross the
 	// degradation threshold, and the matching recovery line. nil means
-	// stderr (the gossip adapter's LogOutput convention); tests pass
+	// stderr (the convention the removed gossip adapter set); tests pass
 	// io.Discard.
 	LogOutput io.Writer
 }
@@ -414,7 +414,7 @@ var (
 )
 
 // intervalOr returns def when v is zero, and disables (returns 0) when v is
-// negative - the same convention the gossip adapter uses.
+// negative - the same convention the removed gossip adapter used.
 func intervalOr(v, def time.Duration) time.Duration {
 	switch {
 	case v == 0:
@@ -442,11 +442,12 @@ func casBackoff(attempt int) {
 // only self succeeding IS founding; ErrPrecondition means an incumbent
 // document exists, so Start CAS-appends self's row and reports joined.
 // Params.InitialRoles ride in that first row, atomic with this node's first
-// appearance (the same atomicity gossip gets from the first Meta payload),
-// and a FOUNDER drops a requested RoleJoining per the port: there is no
-// incumbent to warm against. A document that exists but holds ZERO rows also
-// founds: everyone left gracefully, so there is no incumbent to learn a
-// generation from and "did anyone else already exist" is answered no.
+// appearance (the same atomicity the removed gossip adapter got from its
+// first Meta payload), and a FOUNDER drops a requested RoleJoining per the
+// port: there is no incumbent to warm against. A document that exists but
+// holds ZERO rows also founds: everyone left gracefully, so there is no
+// incumbent to learn a generation from and "did anyone else already exist" is
+// answered no.
 //
 // SoloStart collapses to store reachability: the store is this adapter's one
 // required peer, so an unreachable store fails Start regardless of the flag,
@@ -1030,8 +1031,8 @@ func (c *Coordinator) TransitionSets() (joining, draining map[storageunit.NodeID
 
 // Locate returns up to n nodes for u, primary first, off the published
 // snapshot's ring - the same pkg/ring math and the same GenUnitBytes input
-// as the gossip adapter, so the two adapters place identically over the
-// same live member set.
+// every adapter of the port uses, so any two adapters place identically
+// over the same live member set.
 //
 // An exclusion is honored by locating over a ring GENUINELY REBUILT from
 // the non-excluded members, never by filtering the full answer: bounded-load
@@ -1066,10 +1067,10 @@ func (c *Coordinator) Locate(u storageunit.GenUnit, n int, p coord.Placement) []
 }
 
 // reducedRing returns a ring holding every member of snapshot s except the
-// excluded ids, memoized on (exclusion set, snapshot epoch) exactly like the
-// gossip adapter: a reconcile pass asks the same exclusion once per unit,
-// and the epoch key guarantees a stale reduced ring can never outlive the
-// membership it was built from.
+// excluded ids, memoized on (exclusion set, snapshot epoch) exactly as the
+// removed gossip adapter did: a reconcile pass asks the same exclusion once
+// per unit, and the epoch key guarantees a stale reduced ring can never
+// outlive the membership it was built from.
 func (c *Coordinator) reducedRing(s *snapshot, exclude map[storageunit.NodeID]struct{}) *ring.Ring {
 	key := excludeKey(exclude)
 	epoch := s.view.Epoch

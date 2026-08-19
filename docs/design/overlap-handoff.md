@@ -4,7 +4,19 @@ Status: DESIGN (rebuilt on the PENDING-RANGES model). This is the design
 companion to the SPEC section "v0.8 Phase 2e: pending ranges". The SPEC is
 the source of truth for behavior; this doc carries the current/pending/union
 computation, the handoff sequence, the package/file layout, and the R/W
-crash matrix. No pending-ranges code has landed yet.
+crash matrix. The model SHIPPED: the current/pending/union computation lives
+in pkg/cluster (multibackend_overlap.go, multibackend_pending_route.go), so
+read this doc for the reasoning, not as a statement of what is outstanding.
+
+MEMBERSHIP MECHANISM: this doc was written against the gossip adapter, which
+was REMOVED in v0.19.0 along with `pkg/membership` and the memberlist
+dependency. Every `memberlist.*`, `Meta` bit and "gossips" below names that
+adapter. The MODEL is unchanged and still shipping: the Draining and Joining
+bits are `coord.RoleDraining` / `coord.RoleJoining`, published with
+`Coordinator.SetRole` and observed through `View` / `TransitionSets` on the
+coordination port (`pkg/coord`); the shipped CAS adapter carries them as rows
+in one membership document. Read the memberlist calls as the shape those port
+calls now take.
 
 The file name `overlap-handoff.md` is kept for continuity, but the design is
 no longer the per-position OVERLAP/FORWARDING model. The prior forwarding
@@ -45,7 +57,7 @@ Shale already has the pieces pending ranges needs:
   new owner writes the instant it has MOUNTED a position. This is exactly the
   "the new owner has the data now" gate that CEP-21 / ScyllaDB implement with
   a linearized topology epoch. Shale gets it without consensus.
-- The DRAINING Meta bit (gossiped node-state) - the signal that a node is
+- The DRAINING role (advertised node-state) - the signal that a node is
   leaving, the input to the current/pending split.
 - Shared object storage - "streaming" is a near-zero-cost MOUNT, so the
   transition window is tiny.
@@ -84,7 +96,7 @@ Routing is computed per-op inside `replicasForKey(key)`. Let
   The nodes that will own the position once the leaver is gone (the successor
   taking the leaver's exact position is here).
 - **TRANSITION DETECTION**: a position is IN TRANSITION when CURRENT !=
-  PENDING. Two gossip-observable causes:
+  PENDING. Two coordinator-observable causes:
   - LEAVE: some member of CURRENT is `Draining`, so excluding it changes the
     set. The `Draining` bit is the linearization-free analogue of
     Cassandra/ScyllaDB's topology epoch.
@@ -98,7 +110,7 @@ Routing is computed per-op inside `replicasForKey(key)`. Let
   set when not in transition (CURRENT == PENDING, R nodes); UNION(CURRENT,
   PENDING) when in transition (at R=2, up to 3 distinct nodes). The union is
   a SUPERSET of every node's possibly-disagreeing ownership opinion during
-  gossip lag, so any single-node routing decision still reaches a node that
+  view lag, so any single-node routing decision still reaches a node that
   physically holds the position. This is the property that fixes the
   forwarding model's post-leave readback failure.
 
@@ -187,7 +199,7 @@ covered:
 
 ```
   1. ADD pending owners to the routed set (writes + reads).
-     -> the union forms the instant gossip observes the transition;
+     -> the union forms the instant the coordinator observes the transition;
         pending owners receive every write while they mount.
   2. pending owners STREAM = near-zero-cost MOUNT from shared object storage;
      on mount-complete each writes WriteServingMarker(ru, E).
