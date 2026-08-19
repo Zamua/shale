@@ -4,7 +4,9 @@ Status: DESIGN (rebuilt on the PENDING-RANGES model). This is the design
 companion to the SPEC section "v0.8 Phase 2e: pending ranges". The SPEC is
 the source of truth for behavior; this doc carries the current/pending/union
 computation, the handoff sequence, the package/file layout, and the R/W
-crash matrix. No pending-ranges code has landed yet.
+crash matrix. The model SHIPPED: the current/pending/union computation lives
+in pkg/cluster (multibackend_overlap.go, multibackend_pending_route.go), so
+read this doc for the reasoning, not as a statement of what is outstanding.
 
 MEMBERSHIP MECHANISM: this doc was written against the gossip adapter, which
 was REMOVED in v0.19.0 along with `pkg/membership` and the memberlist
