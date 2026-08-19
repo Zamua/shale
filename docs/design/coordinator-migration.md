@@ -1,7 +1,8 @@
 # Switching coordination adapters on a live cluster (gossip -> CAS)
 
 How to move a running shale cluster from one coordination adapter to another.
-Written for the gossip -> CAS direction; the choreography is symmetric.
+Written for the gossip -> CAS direction, the migration shale actually ran; the
+choreography is symmetric and applies to any adapter swap.
 
 ## Why there is no rolling switch
 
@@ -67,14 +68,23 @@ CAS-configured node against the same storage.** The switch is a full-stop.
 
 ## Rollback
 
-Symmetric: full stop, flip the config back to gossip, scale up. The CAS
-membership document is additive state; a gossip cluster simply ignores it.
-Delete the document key once the migration is final.
+**The rollback window is closed in the current tree.** `pkg/coord/gossip`,
+`pkg/membership` and the memberlist dependency were REMOVED after v0.18.1, so
+there is no gossip adapter to flip back to. A rollback is therefore a rollback
+of the shale VERSION as well as the config: redeploy an image built from
+v0.18.1 or earlier, wired with the gossip adapter, using the same full-stop
+choreography in reverse. The CAS membership document is additive state; a
+gossip cluster simply ignores it, so leave it in place until the rollback
+option is retired, then delete the document key.
 
-## Retiring the gossip adapter afterwards
+## The gossip adapter is gone
 
-Once no deployment runs the gossip adapter, it can leave the tree entirely:
-`pkg/coord/gossip`, `pkg/membership`, and the memberlist dependency (plus its
-transitive tree). The coordination PORT (`pkg/coord`) and the contract harness
+It left the tree once no deployment ran it: `pkg/coord/gossip`,
+`pkg/membership`, and the memberlist dependency (plus its transitive tree).
+The coordination PORT (`pkg/coord`) and the contract harness
 (`internal/coordcontract`) stay - an out-of-tree adapter implements the same
-interface and can pin itself with the same contract tests.
+interface and pins itself with the same contract tests. This document is kept
+because it is the record of how the switchover was done, and because the same
+full-stop choreography applies to ANY adapter swap: two adapters that discover
+members through disjoint mechanisms can never run concurrently against the
+same storage.

@@ -53,9 +53,15 @@ pkg/
   cluster/             public API surface (what apps import)
     cluster.go         Cluster struct, Put/Get/Delete/ScanPrefix/Begin
   ring/                consistent hash ring (wraps buraksezer/consistent)
-  membership/          memberlist wrapper + topology change events
+  coord/               coordination PORT: who is a member, where a unit sits,
+                       what transitional role each member advertises
+    cas/               the ONE shipped adapter: membership as one JSON document
+                       in a conditional store, CAS-mutated and polled
+  storageunit/         storage-unit domain types (UnitID, UnitCount, epochs,
+                       the BackendFactory mount/lease seam)
+  reshard/             the CAS arbiter: declarative unit-count agreement
+  blob/                value-separation plane for large values
   rpc/                 gRPC server + client for inter-node ops
-  rebalance/           shard handoff during membership changes
   shaled/              shared run-loop helper used by every shaled-* binary
 backends/              each backend is its own Go module (own go.mod, own deps)
   slate/               SlateDB-on-object-storage impl
@@ -77,6 +83,9 @@ internal/              private helpers + test fixtures
   decide/              coordination decisions as pure functions (no *Cluster,
                        no lock, no clock, no I/O), so each decision's state
                        space is a table rather than a hand-built fixture
+  coordcontract/       the shared coord.Coordinator contract harness every
+                       adapter (in-tree or forked) must pass
+  coordstatic/         transport-free static coordinator for tests
 tests/
   unit/                per-package tests
   integration/         multi-node in-process cluster, full path
