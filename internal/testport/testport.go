@@ -4,8 +4,8 @@
 // shows under load. A test that needs a port typically opens a TCP listener on
 // :0, reads the number the kernel assigned, closes it, and hands the number to
 // whatever is about to bind. That certifies the TCP half. Anything binding
-// BOTH halves - memberlist does, on the same number - can still fail, because
-// the kernel allocates the two independently and the UDP half may be in use.
+// BOTH halves on the same number can still fail, because the kernel allocates
+// the two independently and the UDP half may be in use.
 //
 // Under a single package that is rare. Under `go test ./...`, which runs
 // package binaries concurrently and churns hundreds of ports, it is frequent

@@ -429,11 +429,9 @@ func (c *Cluster) peerJoiningCounts() (peers, joining int) {
 // os.Stderr when no sink is wired. The fallback is deliberate: degraded boot is
 // a rare, operator-critical event (a node came up missing a replica), so it must
 // NOT be silent just because the deployment did not wire a log sink - otherwise
-// the crash-loop this change removes is merely replaced by a silently half-
-// functional node. We do NOT route this through the (nil-in-prod) LogOutput-only
-// path that membership's verbose internal logger uses, precisely so this stays
-// visible without re-enabling memberlist's DEBUG spam. It is only ever called
-// for a degraded boot (once, at Open), never on a hot path.
+// a crash-loop is merely replaced by a silently half-functional node, so a nil
+// LogOutput falls back to stderr here. It is only ever called for a degraded
+// boot (once, at Open), never on a hot path.
 func (c *Cluster) logf(format string, args ...any) {
 	w := c.cfg.LogOutput
 	if w == nil {

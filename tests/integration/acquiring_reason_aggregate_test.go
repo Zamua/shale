@@ -420,9 +420,9 @@ func TestAcquiringReason_AggregatePeerDownDoesNotMatchErrAcquiring(t *testing.T)
 	)
 	n1, n2, _ := aggregatePair(t, unitCount, n, prefix)
 
-	// Kill ONLY the peer's gRPC listener; memberlist keeps running so the ring
-	// still fans out to it and the leg fails at a real dial, not a synthesized
-	// error.
+	// Kill ONLY the peer's gRPC listener; its coordinator keeps running so the
+	// ring still fans out to it and the leg fails at a real dial, not a
+	// synthesized error.
 	n2.stop()
 	n2.stop = nil
 

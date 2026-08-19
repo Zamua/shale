@@ -7,8 +7,8 @@ import (
 
 // TestThreeNode_PeerCrashForwardingReturnsError simulates a peer
 // dying ungracefully: we kill its gRPC server WITHOUT going through
-// the cluster's graceful Close path, so memberlist doesn't get the
-// quick "I'm leaving" notice. From the surviving nodes' perspective
+// the cluster's graceful Close path, so the coordinator doesn't get
+// the quick "I'm leaving" notice. From the surviving nodes' perspective
 // the peer is still on the ring; routed operations to that peer must
 // surface a real error within a sensible time bound (no panic, no
 // hang).

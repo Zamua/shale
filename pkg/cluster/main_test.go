@@ -8,16 +8,15 @@ package cluster_test
 // goleak.VerifyTestMain catches goroutine leaks that survive the
 // last test's t.Cleanup. The cluster surface spawns many background
 // goroutines (events loop, reconcile loop, sweep loop, read-repair
-// workers, fan-out drainers, memberlist gossip, gRPC client streams)
-// so a leak that escapes Close shows up here as a per-test or
-// per-binary residue.
+// workers, fan-out drainers, gRPC client streams) so a leak that
+// escapes Close shows up here as a per-test or per-binary residue.
 //
 // The set of known third-party leakers we IGNORE lives in ONE shared
 // place - internal/goleakignore.Options() - so this binary and the
 // integration binary can never drift (they ignore exactly the same
-// set; see that package's doc for the rationale + the push-pull
-// teardown story). The Cluster's OWN goroutines are deliberately NOT
-// ignored, so a real leak still fails here.
+// set; see that package's doc for the rationale). The Cluster's OWN
+// goroutines are deliberately NOT ignored, so a real leak still fails
+// here.
 
 import (
 	"testing"

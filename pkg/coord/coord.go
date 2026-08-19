@@ -7,14 +7,16 @@
 // writer, and never gates a write: shale's safety comes from the durable
 // store's own fencing (a higher-epoch open displaces a lower one), so a
 // Coordinator that is stale, split-brained or plain wrong costs AVAILABILITY,
-// never CORRECTNESS. That is what makes the port swappable: a gossip +
-// consistent-hash coordinator and a lease/CAS coordinator differ in how fast
-// and how consistently they converge, not in what a wrong answer can destroy.
+// never CORRECTNESS. That is what makes the port swappable: adapters differ
+// in how fast and how consistently they converge, not in what a wrong answer
+// can destroy.
 //
 // The port is deliberately free of the mechanism that answers it. There is no
 // Add, no Remove, no ring, no member table mutation here: membership discovery
-// and placement are IMPLEMENTATION, owned entirely by an adapter (today
-// pkg/coord/gossip: SWIM gossip + a bounded-load consistent hash ring). The
+// and placement are IMPLEMENTATION, owned entirely by an adapter. The shipped
+// adapter is pkg/coord/cas (one membership document in a conditional store +
+// a bounded-load consistent hash ring); a fork implements its own against
+// this interface and pins it with the internal/coordcontract harness. The
 // cluster layer never tells a Coordinator who the members are; it only asks.
 //
 // The types are pure: this package imports pkg/storageunit (shale's storage
@@ -221,11 +223,11 @@ type Coordinator interface {
 	Populated() bool
 
 	// PlacementMembers returns the member set Locate currently computes
-	// placement over, sorted by ID. For a single-basis coordinator (an
-	// assignment table; the static test coordinator) this IS View's member
-	// set. The gossip adapter is dual-basis: its placement ring trails the
-	// membership view by an event-loop hop and heals a dropped event only on
-	// the reconcile cadence, so this can briefly differ from View - which is
+	// placement over, sorted by ID. For a single-basis coordinator (the CAS
+	// adapter; an assignment table; the static test coordinator) this IS
+	// View's member set. A dual-basis adapter (one whose placement ring
+	// trails the membership view, e.g. by an event-loop hop healed only on
+	// a reconcile cadence) can briefly differ from View - which is
 	// precisely why it exists: a guard protecting a decision COMPUTED ON
 	// PLACEMENT (the reshard barrier's abort-on-membership-change) must be
 	// able to see the placement basis deviate, not only the view. MUST NOT

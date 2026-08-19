@@ -5,8 +5,8 @@ package integration
 // places on it, and a Put issued at one node is forwarded over gRPC to the
 // node that owns the key's unit, landing physically in that node's mounted
 // unit. This is the wired-together analogue of pkg/cluster's white-box
-// per-unit routing tests; it exercises memberlist + gRPC forwarding + the
-// unit-based owner guard end to end.
+// per-unit routing tests; it exercises coordinated membership + gRPC
+// forwarding + the unit-based owner guard end to end.
 
 import (
 	"bytes"

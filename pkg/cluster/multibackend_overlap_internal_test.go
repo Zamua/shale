@@ -4,7 +4,7 @@ package cluster
 // They drive the unexported controller helpers (desiredPendingReplicaUnits,
 // pendingUnitReplicas, reconcileReplicaUnitsOverlap, acquireReplicaUnitOverlap,
 // drainCheck) against a per-replica shared-backing factory + a real ring, with no
-// membership / gRPC, so they run fast and deterministically (no memberlist). The
+// coordinator / gRPC, so they run fast and deterministically. The
 // pure HandoffState FSM is covered in pkg/storageunit/handoff_test.go; the wired
 // cross-node union dual-write + the slow-mount loss oracle are covered by the
 // integration acceptance gate.

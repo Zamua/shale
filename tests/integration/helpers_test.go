@@ -43,23 +43,16 @@ import (
 // Wraps goleak.VerifyTestMain so a regression that leaks goroutines
 // out of a Cluster (events loop, sweep, fanout drainer, read-repair,
 // etc.) surfaces as a test-binary leak at the end of the run. Known
-// third-party background goroutines (memberlist gossip / probe /
-// gRPC keepalive / etc.) are explicitly ignored: they're stable +
-// well-behaved in production but their teardown is async + can
-// flicker on a fast CI box.
+// third-party background goroutines (gRPC keepalive etc.) are
+// explicitly ignored: they're stable + well-behaved in production but
+// their teardown is async + can flicker on a fast CI box.
 //
 // This file is helpers_test.go (not helpers.go) because TestMain is
 // only honored in _test.go files (testNode + friends are test-only
 // anyway).
 func TestMain(m *testing.M) {
 	// Share the ONE canonical ignore set with pkg/cluster's TestMain via
-	// internal/goleakignore so the two lists can never drift. The drift
-	// this closes was real: the integration list used to be a hand-copied
-	// SUBSET that missed IgnoreAnyFunction for memberlist pushPullTrigger,
-	// so an in-flight push-pull blocked in network I/O at teardown (its
-	// top frame net/bufio, pushPullTrigger only deeper in the stack)
-	// slipped past the IgnoreTopFunction form and failed the whole binary
-	// intermittently.
+	// internal/goleakignore so the two lists cannot drift.
 	goleak.VerifyTestMain(m, goleakignore.Options()...)
 }
 

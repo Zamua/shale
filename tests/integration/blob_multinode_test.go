@@ -41,7 +41,7 @@ func (n *blobNode) Close() {
 }
 
 // startBlobNode brings up one blob-capable node joined to seedAddr (empty = the
-// first node). It mirrors startTestNodeWithReplication's gRPC + memberlist
+// first node). It mirrors startTestNodeWithReplication's gRPC + coordinator
 // wiring, but builds the cluster via NewBlobKV with the SHARED object store so
 // every node reaches the same byte plane. The gRPC server is registered against
 // the underlying *Cluster so routed pointer ops forward between nodes.

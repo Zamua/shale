@@ -329,8 +329,8 @@ func TestAcquiringReason_R2PeerDownDoesNotMatchErrAcquiring(t *testing.T) {
 	const unitCount = 8
 	n1, n2, key, _ := r2AcquiringPair(t, unitCount)
 
-	// Kill ONLY n2's gRPC listener; memberlist keeps running so the ring still
-	// routes a replica leg to it and the write fails at the dial - a real
+	// Kill ONLY n2's gRPC listener; its coordinator keeps running so the ring
+	// still routes a replica leg to it and the write fails at the dial - a real
 	// transport failure, not a synthesized one. At W=2 that shortfall is fatal.
 	n2.stop()
 	n2.stop = nil

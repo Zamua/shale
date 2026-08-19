@@ -17,14 +17,14 @@
 //     baseline for "what does shale cost?". A separate harness keeps
 //     that comparison honest.
 //   - In-process clusters spin up + tear down in seconds via the same
-//     pattern tests/integration uses (memberlist over loopback +
+//     pattern tests/integration uses (in-process coordination +
 //     ephemeral ports). One binary can drive every scenario in the
 //     suite without an operator wrangling multiple shaled processes.
 //
 // What the harness DOES NOT do:
 //
-//   - It does not pretend to be the production load test. Loopback
-//     memberlist + a single Go process with N goroutines is a
+//   - It does not pretend to be the production load test. A
+//     single Go process with N goroutines is a
 //     best-case-with-coordination measurement: zero packet loss, no
 //     real network, shared L3 cache. Cross-host numbers will diverge
 //     (likely WORSE for shale because the gRPC hop becomes a real
@@ -400,7 +400,7 @@ type builtCluster struct {
 // backend and returns it wrapped in a putGetter, so the bench measures
 // what the cluster layer costs on top of the raw backend.
 //
-// Single-node by construction: no memberlist, no ring, no gRPC. A
+// Single-node by construction: no coordinator, no ring, no gRPC. A
 // multi-node bench would need a BackendFactory (the only distributed model
 // shale has is the unit lease handoff, and that requires opening a unit and
 // fencing the prior writer); memory and pebble cannot satisfy that, and
