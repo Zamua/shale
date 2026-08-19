@@ -20,8 +20,8 @@
 # NOT as part of the wiring milestone.
 
 # SlateDB tag to clone + build. Keep aligned with the slatedb-go version
-# pinned in backends/slate/go.mod (slatedb.io/slatedb-go v0.14.1).
-ARG SLATEDB_VERSION=v0.14.1
+# pinned in backends/slate/go.mod (slatedb.io/slatedb-go v0.15.0).
+ARG SLATEDB_VERSION=v0.15.0
 
 # ---- uniffi-build stage -----------------------------------------------------
 FROM rust:1.91-slim-bookworm AS uniffi-build
