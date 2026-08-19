@@ -242,7 +242,9 @@ github.com/Zamua/shale                       core module (go.mod at repo root)
   pkg/backend/memory/                        in-process map; stays in core for tests + dev
   pkg/cluster/                               public Cluster surface
   pkg/ring/                                  consistent hash ring
-  pkg/membership/                            memberlist wrapper
+  pkg/coord/                                 coordination PORT (who holds what)
+  pkg/coord/cas/                             the shipped adapter: membership over
+                                             one CAS document in a conditional store
   pkg/rpc/                                   gRPC server/client for inter-node ops
   cmd/shale/                                 the CLI
   cmd/shaled/                                the standalone-node binary (thin shell; see below)
@@ -397,53 +399,13 @@ The shale repo doesn't ship this; the external-backend story is "publish your ow
 
 ### Membership
 
-Each node runs a `memberlist` instance (HashiCorp's SWIM gossip protocol). Nodes discover each other via configured seed addresses. Memberlist handles:
-- Heartbeats + failure detection
-- Broadcast of node-join / node-leave events
-- Node metadata (the node's gRPC listen address AND a `Draining` flag - see below)
+Membership lives behind the COORDINATION PORT (`pkg/coord`): the cluster layer never discovers, probes, or gossips with peers itself. It asks a `coord.Coordinator` who the members are, where each storage unit should sit, and what transitional stance (Joining / Draining) each member advertises. The answers are ADVISORY: a stale or wrong view costs availability, never correctness, because the durable store's own epoch fencing is what keeps two nodes that disagree about an owner safe.
 
-shale subscribes to membership events; when membership changes, the ring is recomputed + shard ownership shifts trigger rebalancing.
+The ONE SHIPPED adapter is the CAS coordinator (`pkg/coord/cas`): all membership state - presence, dial addresses, roles, declared unit counts, liveness - is one JSON document in a `storageunit.ConditionalStore`, mutated by CompareAndSet and observed by polling. No extra port, no seed list, no mesh to operate; the store the data lives in is the one required peer. See "The CAS coordinator (pkg/coord/cas)" below for the full mechanism (lease counters, observer-side expiry, displacement).
 
-**Node metadata: address + a `Draining` bit.** Each node publishes a small `Meta` payload over gossip. It carries the node's gRPC dial address (so peers can route writes/reads to it) AND a boolean `Draining` flag used by the graceful-leave (scale-down) path (see "v0.8 Phase 2e: Graceful leave"). The `Member` value object the membership layer returns from `Members()` / `Snapshot()` exposes both fields (`Addr` and `Draining`), decoded from the peer's `Meta` in the `NotifyJoin` / `NotifyUpdate` callbacks. A `Membership.SetDraining(bool)` method updates the LOCAL node's `Meta` flag and calls `memberlist.UpdateNode` so the change gossips out; the node STAYS a full, alive member - `SetDraining(true)` is NOT `Leave()`. A `Draining` member is REACHABLE (still in the snapshot, address known, serving gRPC) AND, under the pending-ranges model (Phase 2e), it STAYS A CURRENT OWNER in the consistent-hash ring: it keeps the positions it already serves and is NOT dropped from ownership when it sets `Draining`. The `Draining` bit is consumed by the ROUTING layer (`routedReplicasForKey`), which computes a position's CURRENT replica set over the ring INCLUDING draining members and its PENDING replica set over the ring EXCLUDING draining members, and during a transition ROUTES to the UNION (so the draining node keeps receiving writes + serving reads until its successor is provably serving, at which point ordered removal collapses the union onto the pending set). The ring-from-membership reconcile (`reconcileRingFromMembership`) therefore does NOT exclude a draining member - the exclusion is computed per-op inside `routedReplicasForKey`, not baked into the ring. This is the foundation of the draining node-state described in Phase 2e. (NB this REVERSES the earlier draining-exclusion design, where `reconcileRingFromMembership` dropped a draining member from the ring and survivors forwarded back to it; that per-position forwarding model is SUPERSEDED - see Phase 2e.)
+**The SWIM/gossip adapter was removed.** An earlier adapter (`pkg/coord/gossip` over hashicorp/memberlist, with its `pkg/membership` wrapper) answered the same port from a SWIM mesh; once no deployment ran it, it left the tree along with the memberlist dependency. `docs/design/coordinator-migration.md` holds the live-cluster switchover choreography that moved deployments off it. A fork that wants a gossip-style (or any other) mechanism implements the port and pins itself with the shared contract harness (`internal/coordcontract`); nothing above the port changes.
 
-The membership layer's event delegate uses non-blocking sends to its event channel so a slow subscriber can't deadlock memberlist's gossip goroutines. When the channel is full, the event is dropped + `Membership.DropCount()` is incremented. To keep the ring consistent with reality despite drops, the cluster runs a periodic reconciler (~5s) that calls `Membership.Snapshot()` and applies any missed adds / removes.
-
-**Periodic re-join (seed anti-entropy) heals post-startup gossip splits.** `Open` contacts the configured seeds exactly once at startup (`memberlist.Join`). memberlist's own PushPull anti-entropy only syncs with members already in the local member list: it never re-dials an address that has been pruned out. A mass rolling restart (every pod gets a NEW address; old addresses go suspect/dead and are reaped while new ones join in disjoint waves) can fragment the gossip ring into two groups that have pruned each other out of their member lists. Once that happens neither group's PushPull can pick a node in the other group, the seed (the only stable bridge) is never re-dialed, and the transient startup split becomes PERMANENT (cross-node gRPC keeps working - this is a gossip split, not a network partition, so the ring never heals on its own). To close this, a Membership configured with seeds runs a background goroutine that periodically re-calls `memberlist.Join(seeds)` (interval = `Config.RejoinInterval`; `0` disables it, used by in-process tests that don't churn addresses). `Join` is idempotent: a no-op when the seed is already a known live member (healthy cluster), a MERGE when split (it re-contacts the seed and PushPull reconciles the two member lists across the bridge). The loop stops cleanly on `Close` and, crucially, does NOT re-join once the node has called `Leave` (a draining / departing node must not re-advertise itself back into the cluster it is leaving). Production wires a non-zero default so a real cluster recovers from a mass restart automatically; the manual workaround (scale the StatefulSet to 0 and back up so pods rejoin a stable seed-anchored cluster one at a time) is no longer required.
-
-**Stale-NodeMeta convergence after a rolling restart (gossiped `Meta` self-heals, address reclaim).** A node's gossiped `Meta` (its gRPC address + `Draining` bit + declared unit count) can go STALE on a peer after a StatefulSet ROLLING restart, and a peer with stale `Meta` for even one member breaks any cluster-wide agreement computed over the membership snapshot (the declarative-reshard unanimity gate is the consumer - see "Declarative reshard"). The root cause is two memberlist mechanics, both confirmed in the v0.5.4 source:
-
-  - **Reset incarnation.** A node's memberlist incarnation is a process-local counter that RESETS to 0 on restart. A restarted pod keeps its stable memberlist node NAME (the `NodeID`) but starts incarnation low. memberlist's `aliveNode` REJECTS an incoming alive message whose incarnation is `<= ` the value a peer already remembers for that name (the staleness guard). So the restarted pod's fresh `Meta` (carrying the NEW declared count after a re-declare) is dropped as "stale" by every peer that still remembers the OLD process's higher incarnation, until that peer independently re-learns the node.
-  - **Address-reclaim gate.** A restarted pod also has a NEW pod IP. When `aliveNode` sees an alive message for a known name carrying a DIFFERENT address, it only accepts the address change if the peer's recorded state for that name is `StateLeft` (a graceful `Leave` was observed) OR `StateDead` AND `DeadNodeReclaimTime` has elapsed. With `DeadNodeReclaimTime` unset (memberlist's default 0), a `StateDead` old entry can NEVER be reclaimed by a new IP - the conflicting-address branch `return`s before the incarnation is even considered. On a hard pod kill (no graceful `Leave` reaching that peer in time), the peer marks the old entry `StateDead` via its own failure detector, which does NOT fire on every peer at the same moment - so the new pod's `Meta` reaches SOME peers and is permanently rejected by others. The result is an inconsistent, per-peer-divergent view of one member's `Meta` that does not self-heal, turning any unanimity-style gate into a RACE (it converges only if a peer happens to heal; if none do it can hang for minutes).
-
-  Two coordinated fixes make the `Meta` view self-heal on a bounded interval:
-
-  1. **Periodic local-`Meta` re-broadcast (`MetaRefreshInterval`).** Each node periodically calls `memberlist.UpdateNode`, which re-reads the local `NodeMeta` and broadcasts a fresh alive message with a BUMPED incarnation (`UpdateNode` increments the process-local incarnation each call - the same mechanism `SetDraining` already uses to gossip the draining bit). Repeated bumps monotonically climb the local incarnation, so within a bounded number of ticks the broadcast incarnation overtakes whatever a stale peer remembered for this name, clearing the incarnation-staleness rejection. This is a SEPARATE concern from `RejoinInterval` (which re-bridges a gossip SPLIT by re-`Join`ing seeds); meta-refresh re-publishes THIS node's own metadata so a non-split peer with a stale-but-connected view updates it. It reuses the rejoin loop's lifecycle: it runs only on a non-zero interval, stops on `Close`, and SKIPS once the node is `leaving` (a departing node must not re-advertise itself - identical guard to the rejoin loop). The local node's own cache is already authoritative for its `Meta` (set at `Open` / `SetDraining`), so meta-refresh changes nothing locally; it only re-broadcasts. Default `MetaRefreshInterval` is a small bounded value (~10s) so a stale peer heals within a couple of refresh rounds without meaningfully adding gossip load (UpdateNode on an unchanged `Meta` is a single small broadcast). The `UpdateNode` call passes a BOUNDED (non-zero) broadcast timeout: with a live peer, `UpdateNode` blocks until the queued alive broadcast's `notify` channel fires, and that channel does NOT fire if the broadcast is superseded by the next tick's re-broadcast before it transmits (memberlist's `TransmitLimitedQueue` invalidates the older same-node broadcast) - so a `0` timeout (memberlist's "wait forever", NOT "do not wait") can WEDGE the loop on a tick whose broadcast is superseded, hanging the goroutine permanently. The bounded timeout makes a tick that cannot flush promptly return; the next tick (with a still-higher incarnation) retries. A timed-out tick is best-effort, not an error - the re-broadcast still propagates via normal gossip - so it counts as an attempt.
-
-  2. **Bounded `DeadNodeReclaimTime`.** The incarnation bump alone is INSUFFICIENT when a peer holds the old entry as `StateDead` with a different (old) IP: the conflicting-address branch rejects the new IP before the incarnation matters, and with `DeadNodeReclaimTime=0` that rejection is permanent. Setting a bounded `DeadNodeReclaimTime` (a small value, e.g. ~30s, set on the gossip config in `Open`) lets a peer reclaim a dead node's NAME for the new IP once that much time has elapsed since the old entry went dead - exactly the rolling-restart case (the old pod is gone for good, the new pod legitimately owns the name). It is safe because the name is the stable `NodeID` and a genuine same-name address conflict between two LIVE pods cannot occur under the StatefulSet identity model (one pod per ordinal). Without this, fix 1's re-broadcast would keep being dropped at the address gate for any peer that reaped the old pod as dead rather than observing its graceful leave.
-
-  Together: the address-reclaim window opens after `DeadNodeReclaimTime`, and the periodic re-broadcast (with its climbing incarnation) then lands the new `Meta` on every peer, so every node's snapshot converges to the same per-member `Meta` within a bounded time after the roll - which is what the declarative-reshard unanimity gate needs to fire deterministically rather than racing. A clean SIMULTANEOUS restart already converges (every node re-`Join`s and re-learns peers fresh); these fixes specifically harden the STAGGERED rolling-restart path. References the rolling-restart gossip-convergence issue documented for the declarative-reshard activation.
-
-#### Stable node identity vs memberlist node name
-
-The two convergence fixes above (`MetaRefreshInterval`, `DeadNodeReclaimTime`) treat a restart's symptoms: they widen memberlist's address-reclaim gate and climb the incarnation until a peer eventually accepts the restarted pod's new `Meta`. They do NOT remove the underlying COLLISION, and on a HARD-KILL roll the collision can persist long enough to wedge the declarative-reshard gate. The root cause is that shale used the stable node identity AS the memberlist node name, so a restart looks to memberlist like the SAME node changing its address rather than a NEW node joining. The decouple below makes a restart a clean new-node join and removes the collision entirely; with it in place the two convergence fixes are no longer load-bearing for restarts (they stay, harmless, covering the residual stale-`Meta`-on-a-non-restart-peer case).
-
-**The collision (proven).** A homogeneous StatefulSet pod keeps its STABLE node id across restarts (the pod name, passed as `SHALE_NODE_ID` -> `Config.NodeID`) but gets a NEW pod IP, so a NEW memberlist bind address AND a new gRPC address. shale set the memberlist node `Name` to that stable id. When the old instance does NOT cleanly `Leave` (a rolling restart's graceful leave is frequently MISSED by peers that are themselves cycling - staging logs show peers "Refuting a dead message", i.e. the old entry reached `StateDead`, not `StateLeft`), the old same-name entry never settles to `Dead`/`Left`: it oscillates `Alive`<->`Suspect`. memberlist's `aliveNode` then logs "Conflicting address for `<name>`. Mine:`<oldIP>` Theirs:`<newIP>` Old state:0" and REJECTS the new address BEFORE the incarnation is even compared. The restarted pod's NEW `Meta` (carrying its newly-declared unit count) rides in that rejected alive message, so peers keep the STALE declared count indefinitely, the unanimity gate never holds, and the reshard never fires. Measured in-process: a GRACEFUL restart (old `Leave` -> `StateLeft`, reclaimable) converges in ~3s; a HARD-KILL restart (no `Leave`) stays stuck >50s.
-
-**The fix: the memberlist node name is per-PROCESS, the stable id rides in `Meta`.** Each process gets a UNIQUE memberlist node name, so a restart is a brand-new memberlist node: the old process dies a NORMAL death (a different name, so NO same-name/new-address conflict to reject), and the new one joins cleanly. The name is `Config.NodeID + "#" + <bootEpoch>`, where `bootEpoch` is a per-process monotonic token captured at `Open` (`time.Now().UnixNano()`). The stable node id and the boot epoch travel in the `Meta` payload alongside the existing address, draining bit, and declared count, so peers recover the stable identity from `Meta` rather than from the name.
-
-  - **Wire format (two new optional, order-independent segments).** `encodeMeta` / `decodeMeta` gain two trailing NUL-delimited segments in the SAME forward-compatible style as the existing `U<count>` draining/unit-count segments: a stable-id segment `I<nodeID>` and an epoch segment `E<bootEpoch>` (decimal). They compose with `D` and `U<count>` in any order; the decoder still takes the head (up to the first NUL) as the address and ignores any segment prefix it does not recognize. A node id can contain arbitrary bytes EXCEPT NUL (NUL is the segment separator and never appears in a pod name), so `I<nodeID>` is unambiguous; the epoch is a decimal `uint64`. The address head stays byte-identical to the legacy bare-address form, so an OLD peer (pre-decouple image) still parses addr/draining/count correctly and simply does not see the stable-id/epoch segments. A node that publishes the new segments still publishes the SAME `U<count>` it always did, so an old peer's declared-count view is unchanged.
-
-  - **`nodeToMember`: stable id from `Meta`, fall back to the name.** `Member.ID` is now the stable id decoded from `Meta`, FALLING BACK to the memberlist node `Name` when `Meta` carries no stable-id segment. The fallback is the BACKWARD-COMPAT path for the prod rolling upgrade: a LEGACY peer (old image) still has its memberlist name EQUAL to its stable id, so taking the name yields the correct id for it. `Member` also gains an UNEXPORTED `epoch uint64` field (decoded from the `E` segment, 0 when absent) used ONLY for the dedup tie-break below; it is NOT added to any public field the ring or cluster consumes (`Member.ID`, `Addr`, `Draining`, `DeclaredUnitCount` are unchanged on the public surface).
-
-  - **The cache is keyed by the UNIQUE memberlist name, not the stable id.** The internal membership cache (`map[string]Member`, fed by `NotifyJoin`/`NotifyLeave`/`NotifyUpdate`, see the next paragraph) keys by the memberlist node `Name`, NOT by `Member.ID`. This is load-bearing for the restart LEAVE-HAZARD: during a restart BOTH the old process (name `A`, stable id `S`) and the new process (name `B`, stable id `S`) are briefly present, and the old process's `NotifyLeave(A)` must remove ONLY entry `A` and must NOT drop stable id `S` while `B` is alive. Keying by name makes this correct mechanically: `removeCache` deletes by name `A` and leaves `B` (id `S`) intact. `Members()` / `Snapshot()` then PROJECT the per-name cache down to ONE `Member` per stable id (a dedup keyed on `Member.ID`), and when two names share an id the winner is the HIGHEST `epoch` (the newest process). The local node is seeded into the cache under its own unique name at `Open` (the belt-and-suspenders self seed and the `SetDraining` self-update both key by the local memberlist name, not by `Config.NodeID`), and is included in the projection with its stable id like any other member.
-
-  - **The ring (`pkg/ring`) and `pkg/cluster` are UNCHANGED.** The ring keys on `Member.ID` and must continue to see exactly ONE stable id per logical node - which is precisely what the `Members()` per-id dedup guarantees. `pkg/cluster` keeps comparing `Member.ID` against `Config.NodeID` (still the stable id) everywhere. The only membership-layer behavior change a consumer can observe is that a restart now surfaces as an `EventLeave` for the old name's stable id followed (or preceded) by an `EventJoin` for the same stable id at the new address; the cluster's event loop already handles a same-id address change (it Adds the id with the new addr + evicts the stale client) and its periodic reconcile re-derives the ring from the DEDUPED `Snapshot()`, so a transient per-event ring remove/add for a restarting id self-heals within one reconcile tick exactly as a same-id `NotifyUpdate` does today.
-
-  This is the real fix for the rolling-restart reshard wedge. A graceful restart was already fast; the decouple makes a HARD-KILL restart equally fast (no conflicting-address gate to wait out, so it no longer depends on `DeadNodeReclaimTime` elapsing), which is the faithful model of a SIGKILLed pod whose `Leave` never reached its peers.
-
-`Members()` and `Snapshot()` return from an internal cache that the event delegate maintains: every `NotifyJoin` / `NotifyLeave` / `NotifyUpdate` callback updates the cache (keyed by the unique memberlist node name, see "Stable node identity vs memberlist node name"), and reads consult the cache under a `sync.RWMutex` and PROJECT it to one `Member` per stable id (highest-`epoch` wins) before returning. Reading directly from `memberlist.Members()` instead would race with memberlist's internal `aliveNode` goroutine, which mutates the `*Node` fields exposed by that call without exposing a per-node lock. The event callbacks are serialized against those internal transitions, so cache writes from inside the callbacks are race-free, and the cache stays consistent with the authoritative state memberlist itself publishes via those same events. Even when the channel drops, the cache update happens before the send attempt, so a dropped notification still leaves the cache (and therefore `Snapshot`) authoritative for the reconciler.
-
-`Membership.Close()` performs a best-effort graceful leave (broadcast "I am leaving" to peers so they record a clean `EventLeave` rather than waiting for failure detection) followed by `Shutdown()` of the local memberlist. The leave broadcast is given a **bounded timeout**: if the broadcast does not complete within it, `Close` proceeds to `Shutdown` anyway. The wait is bounded because memberlist only completes a leave broadcast once the departing node's message is actually gossiped out, which requires at least one live peer to receive it; an unbounded wait would block `Close` forever when peers are slow, unreachable, or the broadcast never finishes (the failure-detection path on the remaining peers still observes the departure regardless). Close is idempotent and never blocks indefinitely.
+Membership changes reach the cluster as a coalescing change hint plus periodic reconciliation: when the view moves, the ring is recomputed and shard-ownership shifts trigger the handoff machinery.
 
 ### Routing
 
@@ -707,10 +669,10 @@ ring, every operation local. ANY backend satisfies it, because the mode imposes
 no requirement on the adapter beyond `backend.Backend`. This is the shape a
 toolkit should have: the simple case stays simple.
 
-`Config.Backend` together with a `BindAddr` is REJECTED at `Open`. It used to
-select the retired second engine. Accepting it now would be worse than an
-error and worse than a panic: the cluster would come up, gossip, build a ring
-and serve reads and writes, but nothing would move data on a topology change,
+`Config.Backend` together with a `Coordinator` is REJECTED at `Open`. It used
+to select the retired second engine. Accepting it now would be worse than an
+error and worse than a panic: the cluster would come up, coordinate, build a
+ring and serve reads and writes, but nothing would move data on a topology change,
 so keys would silently become unreachable the moment the ring reassigned them
 to a node that had never held their bytes. A three-node deployment would look
 healthy while losing reads. `Open` therefore fails with a message naming the
@@ -926,7 +888,7 @@ This is **implemented in v0.6.x.** v0.6 shipped the OCC commit at R=1 with full 
 
 - **Single node crashes**: keys it owned are temporarily unavailable at R=1. With R>1 (v0.4+), replicas take over reads + writes up to (R - W) / (R - N) tolerated failures per the configured consistency.
 - **Network partition**: nodes on each side see the other as failed. Both sides accept writes. On heal, conflicts resolve via Last-Write-Wins (LWW) using the originator's stamp (drawn from the per-node monotone stamp source) + nodeID tiebreak (see "Replication (v0.4+)" for the full envelope + comparator). R=1 has no replication conflicts; R>1 relies on LWW.
-- **Backend failure on one node**: that node reports unhealthy to memberlist; gets removed from ring; data unavailable until restored (or served from replicas under R>1).
+- **Backend failure on one node**: a node that cannot reach the shared store cannot renew its coordination lease; observers expire it and it drops from the ring; data unavailable until restored (or served from replicas under R>1).
 
 ---
 
@@ -948,28 +910,30 @@ shale ships two binaries from v0.1, separate from the library import path. Their
 ### `shaled` (standalone node)
 
 Runs a shale node as its own process, without an app embedding it. Useful for:
-  - Integration tests (shell scripts spin up N nodes on ephemeral ports)
-  - Local multi-node dev clusters
-  - Operators who want a managed shale process per host (instead of embedding inside their app)
+  - Smoke tests + demos (start a node, hit it from the CLI)
+  - A managed shale process per host (instead of embedding inside their app)
 
-As of v0.5, shaled is a thin shell + the backend choice is the binary you build, not a flag (see "Repo layout / `shaled` as a thin shell" above). The core `cmd/shaled` ships memory-only. Per-backend builds live in each backend module:
+As of v0.5, shaled is a thin shell + the backend choice is the binary you build, not a flag (see "Repo layout / `shaled` as a thin shell" above). The core `cmd/shaled` ships memory-only. Per-backend builds live in each backend module.
+
+`shaled` (memory) and `shaled-pebble` are SINGLE-NODE: multi-node needs a coordination adapter plus a `BackendFactory`, and those binaries wire neither. `shaled-slate --multi-backend` is the multi-node binary: membership rides the shared bucket through the CAS coordinator, so every node is launched with the SAME config and no seed list.
 
 ```
 shaled                      # core build: memory backend, no external deps
 shaled-pebble               # built from backends/pebble/cmd/shaled-pebble/
 shaled-slate                # built from backends/slate/cmd/shaled-slate/ with -tags slatedb
 
-# Memory shaled (the default; used by integration tests):
-shaled --node-id node-1 --bind-addr :7946 --grpc-addr :7947 --seeds node-2:7946
+# Memory shaled (single node):
+shaled --node-id node-1 --grpc-addr :7947
 
-# Pebble shaled (durable, pure Go):
-shaled-pebble --node-id node-1 --bind-addr :7946 --grpc-addr :7947 \
-  --seeds node-2:7946 --pebble-dir /var/lib/shale/node-1
+# Pebble shaled (durable, pure Go; single node):
+shaled-pebble --node-id node-1 --grpc-addr :7947 --pebble-dir /var/lib/shale/node-1
 
-# Slate shaled (S3-compatible object storage; cgo build):
-shaled-slate --node-id node-1 --bind-addr :7946 --grpc-addr :7947 \
-  --seeds node-2:7946 \
-  --slate-bucket my-bucket --slate-db-name node-1 \
+# Slate shaled, multi-backend multi-node (S3-compatible object storage; cgo build).
+# Identical config on every node except --node-id; membership + coordination
+# live in the bucket:
+shaled-slate --node-id node-1 --grpc-addr :7947 \
+  --multi-backend true --unit-count 8 --replication-factor 2 \
+  --slate-bucket my-bucket --slate-key-prefix my-cluster/ \
   --slate-endpoint http://minio:9000 \
   --slate-access-key X --slate-secret-key Y
 ```
@@ -1022,30 +986,29 @@ Local multi-node testing on a single machine is a first-class workflow. It valid
 ### Available per version
 
   - **v0.1**: NOT available. v0.1 ships single-node only. Multiple shaled processes run side-by-side but are independent islands; no cross-node routing.
-  - **v0.2+**: full local multi-node testing. N shaled processes join a single logical cluster via memberlist + gRPC forwarding. Throughput tests + topology-change tests become possible.
+  - **v0.2+**: full local multi-node testing. N shaled processes join a single logical cluster via shared-store coordination + gRPC forwarding. Throughput tests + topology-change tests become possible.
   - **v0.3+**: rebalancing tests (kill a node, watch keys migrate to survivors; bring the node back, watch keys rebalance home).
   - **v0.4+**: replication tests (with R>1, kill a node mid-test, observe reads + writes continue against the surviving replicas).
 
-### Local 3-node cluster (v0.2+ example)
+### Local 3-node cluster (example)
 
-Each node uses a distinct bucket prefix in shared object storage so their SlateDB stores don't conflict on the single-writer epoch:
+All three nodes share one bucket; per-unit databases are namespaced under the key prefix and membership lives in the CAS coordinator's document in the same bucket, so the three commands differ ONLY in --node-id and --grpc-addr:
 
 ```
 # shared object storage (any S3-compatible; local MinIO works)
-# each node writes under its own prefix:
-#   shale-test/node-1/
-#   shale-test/node-2/
-#   shale-test/node-3/
 
-shaled-slate --node-id n1 --grpc-addr :7947 --bind-addr :7946 \
-       --slate-bucket shale-test --slate-db-name node-1 \
+shaled-slate --node-id n1 --grpc-addr :7947 \
+       --multi-backend true --unit-count 8 \
+       --slate-bucket shale-test --slate-key-prefix cluster-a/ \
        --slate-endpoint http://localhost:9000 ...
 
-shaled-slate --node-id n2 --grpc-addr :7949 --bind-addr :7948 --seeds 127.0.0.1:7946 \
-       --slate-bucket shale-test --slate-db-name node-2 ...
+shaled-slate --node-id n2 --grpc-addr :7949 \
+       --multi-backend true --unit-count 8 \
+       --slate-bucket shale-test --slate-key-prefix cluster-a/ ...
 
-shaled-slate --node-id n3 --grpc-addr :7951 --bind-addr :7950 --seeds 127.0.0.1:7946 \
-       --slate-bucket shale-test --slate-db-name node-3 ...
+shaled-slate --node-id n3 --grpc-addr :7951 \
+       --multi-backend true --unit-count 8 \
+       --slate-bucket shale-test --slate-key-prefix cluster-a/ ...
 
 # inspect + load test
 shale topology --addr 127.0.0.1:7947   # all 3 nodes + ring assignments
@@ -1060,7 +1023,7 @@ shale bench --addr 127.0.0.1:7947 --writes 100k --keys-prefix bench:
 
 > "What is shale's overhead vs the raw backend, and what does R=3 cost vs R=1?"
 
-It spins up every scenario in one process via the same in-process pattern as `tests/integration/` (loopback memberlist + ephemeral-port gRPC), drives an identical workload through `putGetter` adapters that wrap either a bare `backend.Backend` or a `*cluster.Cluster`, and emits one markdown table. Scenarios:
+It spins up every scenario in one process via the same in-process pattern as `tests/integration/` (in-process coordination + ephemeral-port gRPC), drives an identical workload through `putGetter` adapters that wrap either a bare `backend.Backend` or a `*cluster.Cluster`, and emits one markdown table. Scenarios:
 
   - `raw-pebble` / `raw-memory` - baseline; no shale layer
   - `cluster-*-n1-r1` - shale overhead at 1 node, R=1 (cluster code path, no gRPC hop)
@@ -1093,7 +1056,7 @@ The more valuable local tests are the failure-injection ones:
      - v0.2: it rejoins as an empty node. New keys hashing to it will land; old keys it used to own stay on the temporary takeover node (which v0.2 doesn't have, so they're just gone).
      - v0.3+: rebalancer migrates keys back from successors; ownership returns to the rejoined node.
 
-  3. **Network partition**: simulate one side losing sight of the other (block memberlist UDP between two groups of processes).
+  3. **Network partition**: simulate one side losing sight of the other (block one side's access to the coordination store / gRPC between two groups of processes).
      - v0.2 with R=1: both sides accept writes to keys they think they own. On heal, writes diverge; conflicts resolve via LWW or whatever policy is configured.
      - v0.4+ with R>=2: quorum reads/writes prevent split-brain divergence.
 
@@ -1102,7 +1065,7 @@ The more valuable local tests are the failure-injection ones:
      - Validates that the bounded-loads consistent hashing doesn't pile work onto a struggling node.
 
   5. **Backend failure**: kill the MinIO instance one node depends on.
-     - Validates that the node detects the failure, marks itself unhealthy, propagates that to memberlist, peers route around it.
+     - Validates that the node's coordination lease lapses, observers expire it, peers route around it.
 
 ### Test framework
 
@@ -1601,7 +1564,7 @@ The v0.9 reshard above is DRIVEN by the arbiter's agreed `target`, but nothing y
 
 **Why the declared value cannot drive the target directly (the rolling-deploy flap).** The arbiter `target` lives in ONE durable object so the cluster plans one direction; if each node independently CAS'd the target to ITS OWN declared value, a rolling deploy - during which old pods declare the OLD count and new pods declare the NEW count for ~a roll's duration - would have nodes fighting the target back and forth (split, then merge, then split). The original design rejected per-node-desired for exactly this reason and left the target operator-set. The fix is not to abandon per-node config but to gate the retarget on AGREEMENT.
 
-**Gossip the declared count; retarget only on unanimity + steadiness (coordinator-free, flap-proof).** Each node advertises its standing declared unit count in its membership metadata (the memberlist `NodeMeta` payload that already carries the address + draining bit gains a `U<count>` trailing segment; unknown segments are ignored on decode, so it is backward + forward compatible). On every R>1 reconcile tick, `observeDeclaredReshardTarget` runs alongside `observeReshard` and retargets the arbiter to a declared count `D` ONLY when ALL of:
+**Advertise the declared count; retarget only on unanimity + steadiness (flap-proof).** Each node advertises its standing declared unit count through the coordinator (`coord.Params.DeclaredUnitCount`, carried per-member in the membership document). On every R>1 reconcile tick, `observeDeclaredReshardTarget` runs alongside `observeReshard` and retargets the arbiter to a declared count `D` ONLY when ALL of:
 
   - the arbiter is STEADY (`count == target`, no generation step pending) AND no split/merge is in flight locally (`genState.nextCount == 0`); and
   - EVERY live member (including self) advertises a KNOWN declared count and they are ALL EQUAL to the same `D` (UNANIMITY); a member with an unknown/absent declared count - an older image that does not gossip it - breaks unanimity and defers the retarget (fail-safe); and
@@ -1792,7 +1755,7 @@ The two sections above state WHAT the deploy gap closes; this section pins the E
 
 **How `Run` threads `ReplicationFactor` + `UnitCount` into `cluster.Config`.** `Run` builds ONE `cluster.Config` from `cfg.Std` plus whichever backend field is set:
 
-  - common (both modes): `NodeID`, `BindAddr`, `GRPCAddr` (resolved listener addr), `Seeds` as today, PLUS `ReplicationFactor: cfg.Std.ReplicationFactor` (this is the fix: single-backend `Run` today omits it, pinning the legacy path to the cluster default; now both modes carry the operator's R).
+  - common (both modes): `NodeID`, `GRPCAddr` (resolved listener addr), the binary-constructed `Coordinator` (`RunConfig.Coordinator`; nil = single-node), PLUS `ReplicationFactor: cfg.Std.ReplicationFactor` (both modes carry the operator's R).
   - single-backend mode (`cfg.Backend != nil`): `Backend: cfg.Backend`. `UnitCount` is left zero (`cluster.validateBackendMode` requires it zero in legacy mode).
   - multi-backend mode (`cfg.BackendFactory != nil`): `BackendFactory: cfg.BackendFactory`, `UnitCount: cfg.Std.UnitCount`, `Backend: nil`.
 
@@ -1811,7 +1774,7 @@ The `RunConfig` -> `cluster.Config` mapping is factored into two pure (no-I/O) h
 
   1. **uniffi-build** (`rust:1.91-slim-bookworm`): `git clone --depth 1 --branch ${SLATEDB_VERSION} https://github.com/slatedb/slatedb.git` then `cargo build --release -p slatedb-uniffi`, producing `libslatedb_uniffi.so`.
   2. **go-build** (`golang:1.26-bookworm` + gcc/libc6-dev): copies the `.so` to `/usr/local/lib`, then `CGO_ENABLED=1 CGO_LDFLAGS="-L/usr/local/lib" LD_LIBRARY_PATH=/usr/local/lib go build -tags slatedb -buildvcs=false -ldflags="-s -w" -o /out/shaled-slate ./cmd/shaled-slate`, from the `backends/slate` module root (so the module's own `go.mod` resolves; `GOWORK=off` for the release build per the repo's go.work note). `GOOS`/`GOARCH` derive from `uname -m` exactly as the hostthis Dockerfile does.
-  3. **runtime** (`gcr.io/distroless/cc-debian12:nonroot` - cc, not static, for the glibc dynamic loader): copies `libslatedb_uniffi.so` to `/usr/local/lib` + the `shaled-slate` binary, sets `LD_LIBRARY_PATH=/usr/local/lib`, `EXPOSE 7946 7947` (memberlist + gRPC), `ENTRYPOINT ["/shaled-slate"]`. The operator supplies the cluster + slate + multi-backend config via the `SHALE_*` env vars (`SHALE_NODE_ID`, `SHALE_BIND_ADDR`, `SHALE_GRPC_ADDR`, `SHALE_SEEDS`, `SHALE_UNIT_COUNT`, `SHALE_MULTI_BACKEND`, `SHALE_SLATE_*`).
+  3. **runtime** (`gcr.io/distroless/cc-debian12:nonroot` - cc, not static, for the glibc dynamic loader): copies `libslatedb_uniffi.so` to `/usr/local/lib` + the `shaled-slate` binary, sets `LD_LIBRARY_PATH=/usr/local/lib`, `EXPOSE 7947` (gRPC; membership needs no port of its own), `ENTRYPOINT ["/shaled-slate"]`. The operator supplies the cluster + slate + multi-backend config via the `SHALE_*` env vars (`SHALE_NODE_ID`, `SHALE_GRPC_ADDR`, `SHALE_UNIT_COUNT`, `SHALE_MULTI_BACKEND`, `SHALE_COORD_KEY`, `SHALE_SLATE_*`).
 
   The Dockerfile is NOT built as part of this milestone (the Rust compile is heavy; the operator builds it with colima). It is committed alongside the wiring so the deployable artifact is reproducible.
 
@@ -1970,7 +1933,8 @@ removed.
 
 ### What was retired (the fallback engine)
 
-`Config.Backend` WITH a `BindAddr` (legacy multi-node) and everything reachable
+`Config.Backend` in multi-node mode (the legacy per-node engine, selected at
+the time by `Config.Backend` plus a bind address) and everything reachable
 only from it:
 
   - `pkg/rebalance`, the range state machine, plan, execute, reconcile and
@@ -1988,7 +1952,7 @@ only from it:
 
 ### What survives, and why
 
-  - **Single-node mode, untouched.** `Config.Backend` with an EMPTY `BindAddr`
+  - **Single-node mode, untouched.** `Config.Backend` with a nil `Coordinator`
     is local-only embedding and keeps working with ANY backend. `Open` returns
     for single-node before membership is built, so nothing removed here was
     reachable from it.
