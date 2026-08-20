@@ -2091,6 +2091,56 @@ was removed after v0.18.1, so there is no adapter left that takes a bind
 address or a seed list. A fork that wants one implements the port and pins
 itself with `internal/coordcontract`.
 
+## Unit-mount notification (Config.OnUnitMounted)
+
+An app that does per-unit recovery work (repairing whatever a crash left
+half-finished) can only sweep units this node has MOUNTED. Sweeping at
+startup covers a set that stops being true immediately: units move on every
+scale change, rollout and placement change, so work owed on a unit acquired
+AFTER boot waits for the next restart. Gating readiness on the sweep instead
+is not an option - deciding a half-finished operation reads a shard that may
+not be mounted yet, so a cold cluster would deadlock on itself.
+
+`Config.OnUnitMounted func(unit string)` closes that: it fires after a
+position becomes locally serving, carrying the same opaque token
+`MountedUnits` returns. Registered before enumerating `MountedUnits`, the two
+give complete coverage - the enumeration for what is already held, the hook
+for everything acquired later.
+
+It hangs off the SAME seam as the serving-marker publish and the tombstone
+purge (the single place a position becomes serving), which is what makes it
+complete without any mount path having to remember it.
+
+**shale carries the EVENT and decides nothing else.** It does not know what
+the app's recovery work is, cannot judge whether a pass succeeded, and
+therefore owns no retry, no backoff, no grace window and no poison-record
+policy. Those require domain predicates - "is this record stale or merely
+unrecognised", "does rolling back destroy live data" - that only the app has.
+An app needing durable saga records builds them on top; shale deliberately
+does not, because a compensation is a program rather than an
+action/compensation pair, and owning the sweeper would mean owning the
+bookkeeping too.
+
+Contract, each clause load-bearing:
+
+- **Per POSITION.** At R>1 the same unit token can arrive more than once.
+  At-least-once with duplicates; callbacks must be idempotent, and an app for
+  which a repeated pass is expensive coalesces on its own side. Deduping in
+  shale would mean shale holding the app's bookkeeping.
+- **On its own goroutine**, so a slow callback cannot stall a mount. `Close`
+  WAITS for in-flight callbacks (they are tracked), so a callback that blocks
+  forever blocks shutdown.
+- **The mount can vanish underneath it.** The position may be released or
+  fenced mid-callback; a backend error means the pass is over, not that it
+  should retry internally. The successor's own mount fires the hook again.
+- **A panic is RECOVERED and logged** with the unit token and stack; that pass
+  is abandoned and the process survives. shale spawned the goroutine, so the
+  app had no chance to wrap it, and a bug in cleanup work must not fell a node
+  that is serving correctly. Consequence for app instrumentation: a panic
+  never reaches a counter on the app's error path, so a failure count cannot
+  distinguish healthy from panicking. The signal must come from stored state
+  (age of the oldest outstanding record) or from shale's log.
+
 ## Ring placement is a compatibility surface
 
 Placement - which node MOUNTS which storage unit - is computed by the
