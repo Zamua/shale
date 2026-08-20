@@ -1143,6 +1143,10 @@ func (c *Cluster) OwnsKey(key []byte) bool {
 // where the receiver explicitly wants to see what's physically on
 // this node's storage, not "what the ring says belongs here".
 //
+// VALUES ARE RAW: at R>1 that is the stored LWW envelope, not the
+// payload. See ScanPrefix for the full warning; the same Decode +
+// skip-empty-payload handling applies here.
+//
 // In multi-backend mode (v0.8 Phase 2) "the local backend" is the union
 // of every MOUNTED unit, so the scan walks all mounted units in unit
 // order and concatenates their iterators. keysHeld + Aggregate's
@@ -1729,6 +1733,22 @@ func (c *Cluster) Delete(key []byte) error {
 // the owning shard. The prefix is treated as a shard key + routed to
 // the owning node; the scan runs entirely on that node's backend. For
 // cross-shard scans, use Aggregate.
+//
+// VALUES ARE RAW, AND AT R>1 THAT MEANS ENVELOPES, NOT YOUR PAYLOAD.
+// Get DECODES the stored LWW envelope and returns the payload; this
+// does NOT - it yields exactly what is stored. At R=1 the two are the
+// same bytes, so a consumer built and tested at R=1 sees no difference
+// and the mistake stays invisible until replication is turned on,
+// which is when it is least likely to be suspected. Callers scanning a
+// replicated keyspace MUST run each value through Decode and use
+// env.Payload, and MUST skip entries whose payload is empty: those are
+// delete tombstones, which are ordinary rows to a scan and would
+// otherwise surface as empty records.
+//
+// A parse loop that silently skips unparseable values will report an
+// EMPTY RANGE rather than an error when this is got wrong, because
+// every row fails identically. If your loop tolerates bad rows, make it
+// loud when it parses NONE of them.
 func (c *Cluster) ScanPrefix(prefix []byte) (backend.Iterator, error) {
 	if c.notReady() {
 		return nil, backend.ErrClosed

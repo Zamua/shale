@@ -2141,6 +2141,30 @@ Contract, each clause load-bearing:
   distinguish healthy from panicking. The signal must come from stored state
   (age of the oldest outstanding record) or from shale's log.
 
+## Scans return raw values; Get returns payloads
+
+`Get` decodes the stored LWW envelope and returns the caller's payload.
+`ScanPrefix` and `LocalScanPrefix` return what is STORED, which at R>1 is the
+envelope (stamp + payload), not the payload.
+
+At R=1 there is no envelope, so the two are the same bytes. That is what makes
+the asymmetry a trap rather than merely an inconsistency: a consumer builds and
+tests single-node, sees scans work, and the mistake surfaces only when
+replication is enabled - the moment they are least likely to suspect the read
+path. A consumer scanning a replicated keyspace must `Decode` each value, use
+`env.Payload`, and skip entries whose payload is empty, since delete tombstones
+are ordinary rows to a scan.
+
+The failure presents as an EMPTY RANGE, not an error: every row fails to parse
+identically, so a loop that tolerates bad rows discards all of them and reports
+nothing found. Any per-row tolerance therefore needs an aggregate check - loud
+when a pass reads rows and parses none.
+
+Decoding in the scan path would match `Get` and remove the trap, but it is a
+silent behavior change for any consumer already decoding, which would corrupt
+their parse in the other direction. The asymmetry is documented rather than
+changed for that reason.
+
 ## Ring placement is a compatibility surface
 
 Placement - which node MOUNTS which storage unit - is computed by the
