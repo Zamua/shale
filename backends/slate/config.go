@@ -35,7 +35,16 @@ type Config struct {
 	// it is NOT is a way to distinguish peers within a cluster.
 	DbName string
 
-	// Endpoint is the S3 endpoint URL (e.g. "http://minio:9000").
+	// Endpoint is the S3 endpoint URL WITH a scheme (e.g.
+	// "http://minio:9000").
+	//
+	// NOTE the asymmetry with MinioConditionalStoreConfig.EndpointHost in
+	// this same package, which takes "host:port" and NO scheme. Getting
+	// either the wrong way round fails deep inside a client rather than at
+	// construction - this one surfaces as an InvalidUri panic through the
+	// Rust FFI - so the two are worth checking together when wiring a node
+	// that uses both (the usual shape: slate backend plus a CAS
+	// coordinator over the same object store).
 	// Empty for AWS S3 (the SDK picks the standard endpoint).
 	Endpoint string
 
