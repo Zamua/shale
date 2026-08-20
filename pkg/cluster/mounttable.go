@@ -119,6 +119,12 @@ type mountTable struct {
 	// background pass (eligibility-gated inside), but is still invoked with mu
 	// RELEASED, beside publish. nil in a bare white-box fixture.
 	purge func(ru storageunit.ReplicaUnit)
+	// notifyMounted tells the CONSUMER a unit became locally serving
+	// (Config.OnUnitMounted). Held beside publish and purge for the same
+	// reason: it is a property of the serving transition, so no mount path
+	// can omit it. Spawn-only and invoked with mu RELEASED. nil when the app
+	// registered no callback, and in a bare white-box fixture.
+	notifyMounted func(ru storageunit.ReplicaUnit)
 	// closed points at the Cluster's closed flag. Read under mu by
 	// mountUnlessClosed / startAcquire so the "is the cluster shutting down"
 	// check pairs atomically with the mutation, exactly as the old call sites
@@ -139,6 +145,7 @@ func (t *mountTable) init(c *Cluster) {
 	t.wrap = c.newFencedSelfHealing
 	t.publish = c.publishServingMarker
 	t.purge = c.startTombstonePurge
+	t.notifyMounted = c.notifyUnitMounted
 	t.closed = &c.closed
 }
 
@@ -393,6 +400,9 @@ func (t *mountTable) finishStuckGainer(ru storageunit.ReplicaUnit) bool {
 	if t.purge != nil {
 		t.purge(ru) // becoming serving purges, on THIS path exactly as on mountServing.
 	}
+	if t.notifyMounted != nil {
+		t.notifyMounted(ru) // and notifies, on THIS path exactly as on mountServing.
+	}
 	return true
 }
 
@@ -497,6 +507,9 @@ func (t *mountTable) mountServing(ru storageunit.ReplicaUnit, b backend.Backend,
 	t.publishServing(ru, opened, site) // I/O: strictly after the unlock.
 	if t.purge != nil {
 		t.purge(ru) // spawn-only; eligibility-gated inside.
+	}
+	if t.notifyMounted != nil {
+		t.notifyMounted(ru) // spawn-only; no-op when the app registered nothing.
 	}
 	return out
 }

@@ -192,6 +192,42 @@ type Config struct {
 	// hash tags). Override for custom shard key shapes.
 	ShardKeyFn func(key []byte) []byte
 
+	// OnUnitMounted, when set, is called after this node finishes mounting a
+	// storage unit and begins serving it. It exists for per-unit recovery
+	// work an app must run for units it did not hold at boot: units move on
+	// every scale change, rollout and placement change, so an app that only
+	// sweeps at startup covers a set that stops being true immediately.
+	// Pair it with MountedUnits: REGISTER THIS FIRST, then enumerate, or a
+	// unit mounting between the two falls in a gap a rollout widens.
+	//
+	// The argument is the same opaque unit token MountedUnits returns.
+	// Nothing else about the mount is exposed: this is a notification that
+	// a unit became available, not a handle on shale's mount state.
+	//
+	// CONTRACT, all of which an implementation must assume:
+	//   - PER POSITION, so at R>1 the same token can arrive more than once
+	//     for one unit. At-least-once with duplicates; be idempotent, and
+	//     coalesce on your side if a repeated pass is expensive.
+	//   - ON ITS OWN GOROUTINE, so a slow callback cannot stall a mount.
+	//     Close WAITS for in-flight callbacks, so a callback that blocks
+	//     forever blocks shutdown; bound your own work.
+	//   - A MOUNT CAN VANISH UNDERNEATH IT. The position may be released or
+	//     fenced while the callback runs; treat a backend error as "this
+	//     pass is over" rather than retrying inside the callback. The
+	//     successor's own mount fires the hook again.
+	//   - A PANIC IS RECOVERED AND LOGGED, and that pass is abandoned; it
+	//     does not take the process down, because shale spawned the
+	//     goroutine and a bug in cleanup work must not fell a node that is
+	//     correctly serving data. NOTE the consequence for instrumentation:
+	//     a panic never reaches a counter that lives on your error path, so
+	//     "zero failures" cannot distinguish healthy from panicking. Derive
+	//     the signal from stored state (age of the oldest outstanding
+	//     record) or from shale's log, not from your own failure counter.
+	//   - NO RETRY AND NO ERROR CHANNEL. shale does not know what a failed
+	//     recovery pass means for your data, so it does not decide; parking,
+	//     counting and alerting are yours.
+	OnUnitMounted func(unit string)
+
 	// RebalanceSettleDelay is how long the cluster waits after a
 	// membership event before running the unit reconcile. Each
 	// subsequent event in the window resets the timer (debounce). Zero
