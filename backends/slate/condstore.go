@@ -31,7 +31,11 @@ type MinioConditionalStore struct {
 
 // MinioConditionalStoreConfig configures a MinioConditionalStore.
 type MinioConditionalStoreConfig struct {
-	EndpointHost string // "host:port", no scheme
+	// EndpointHost is "host:port" with NO scheme. Note the asymmetry with
+	// Config.Endpoint in this same package, which REQUIRES a scheme; a
+	// value passed the wrong way round fails inside the client rather than
+	// at construction.
+	EndpointHost string
 	AccessKey    string
 	SecretKey    string
 	UseSSL       bool

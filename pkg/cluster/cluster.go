@@ -178,6 +178,15 @@ type Config struct {
 	// Format: "host:port" (host should be a routable address; an
 	// empty host works for loopback tests but won't reach peers on
 	// other machines).
+	//
+	// SHALE DOES NOT BIND OR SERVE THIS. It is the address the node
+	// ADVERTISES, not one it listens on: the embedding app owns the
+	// listener and must register the peer service itself
+	// (rpc.NewServer(cluster).Register(grpcServer)). Skipping that is
+	// nearly invisible - the cluster forms, units mount, membership
+	// converges, local reads and writes work, and ONLY cross-node
+	// requests fail, which presents as a network problem rather than a
+	// missing server.
 	GRPCAddr string
 
 	// LogOutput is where the cluster writes its own operational warnings
