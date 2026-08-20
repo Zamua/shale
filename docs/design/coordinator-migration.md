@@ -47,23 +47,38 @@ CAS-configured node against the same storage.** The switch is a full-stop.
    `<prefix>/__coord/members`; put any desired separator in the prefix.
    Validate the config on a staging cluster first - including one full
    stop/start cycle.
-2. **Disable the leave drain for the stopping deploy**: set
+2. **Prove the NEW artifact pulls, BEFORE scaling anything down.** Pull the
+   image the restart will use, through the cluster's own credential path, on
+   the nodes that will run it. This step exists because a full stop has no
+   rollback while quiesced: between "zero pods" and "new pods serving" there
+   is no running version to fall back to, so a bad tag, a missing image or a
+   broken pull secret discovered AFTER quiescence leaves the service down
+   with no forward and no backward move. Every other failure in this
+   choreography is recoverable; this one is not, which is why it goes first.
+
+   Beware what the verification itself reports. A pull check can conclude
+   SUCCESS from a state that means the pull is still running
+   (`ContainerCreating`), and can conclude FAILURE from an error it caused
+   itself (a deliberately bogus command in the probe pod). Read the event
+   log, not the pod phase, and confirm the failure you see is the failure
+   you predicted.
+3. **Disable the leave drain for the stopping deploy**: set
    `GracefulLeaveDrainTimeout` to 0. Drain-for-leave hands positions to
    successors; in a full stop there are none, so every node would otherwise
    stall its shutdown for the full drain budget waiting on hand-offs that
    cannot happen. With the timeout at 0, Close skips the drain and proceeds
    straight to flush-and-close.
-3. **Scale to zero, gracefully.** SIGTERM -> Close flushes and closes every
+4. **Scale to zero, gracefully.** SIGTERM -> Close flushes and closes every
    mount. Under relaxed backend durability a clean Close is what makes the
    acked-but-unflushed window empty; do not hard-kill the pods.
-4. **Verify quiescence**: zero pods running.
-5. **Flip the adapter config** (remove the gossip BindAddr/Seeds wiring;
+5. **Verify quiescence**: zero pods running.
+6. **Flip the adapter config** (remove the gossip BindAddr/Seeds wiring;
    construct the CAS coordinator with the prepared store + key) and restore
    `GracefulLeaveDrainTimeout` to its normal value.
-6. **Scale back up.** The first node to claim the membership document
+7. **Scale back up.** The first node to claim the membership document
    bootstraps as the founder; the rest observe it and join. Nodes mount their
    (unchanged) placements, epochs bump, markers publish.
-7. **Verify**: MountReadiness pending=0 on every node; PlacementMembers
+8. **Verify**: MountReadiness pending=0 on every node; PlacementMembers
    agrees with View; no fence-recode churn in the logs after settling.
 
 ## Rollback
